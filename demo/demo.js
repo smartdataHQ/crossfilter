@@ -87,6 +87,8 @@ const state = {
   },
   tableSort: 'top', // 'top' = most recent, 'bottom' = oldest
   tableOffset: 0,
+  tableRenderedCount: 0,
+  tableScrollBusy: false,
   charts: {},
   dirty: false,
   rafId: null,
@@ -150,9 +152,8 @@ function cacheDom() {
     listLocality: document.getElementById('list-locality'),
     listPostal: document.getElementById('list-postal'),
     tableSortToggle: document.getElementById('table-sort-toggle'),
-    tablePrev: document.getElementById('table-prev'),
-    tableNext: document.getElementById('table-next'),
-    tablePageInfo: document.getElementById('table-page-info'),
+    tableRowCount: document.getElementById('table-row-count'),
+    tableScroll: document.querySelector('.table-scroll'),
     tableHead: document.getElementById('table-head'),
     tableBody: document.getElementById('table-body'),
     addRowsBtn: document.getElementById('add-rows-btn'),
@@ -1477,19 +1478,25 @@ function renderDataTable() {
     ).join('');
   }
 
+  // Full reset — clear existing rows and load first batch
+  state.tableOffset = 0;
+  state.tableRenderedCount = 0;
+  dom.tableBody.innerHTML = '';
+  appendTableRows(TABLE_PAGE_SIZE);
+}
+
+function appendTableRows(count) {
   const dim = state.dimensions.time;
   if (!dim) return;
 
-  const size = state.cf.size();
-  const pageSize = TABLE_PAGE_SIZE;
-  const offset = state.tableOffset;
-
+  const offset = state.tableRenderedCount;
   let rows;
   if (state.tableSort === 'top') {
-    rows = dim.top(pageSize, offset);
+    rows = dim.top(count, offset);
   } else {
-    rows = dim.bottom(pageSize, offset);
+    rows = dim.bottom(count, offset);
   }
+  if (!rows.length) return;
 
   // Build row index map for isElementFiltered — use Map for O(1) lookups
   const allData = state.cf.all();
@@ -1498,7 +1505,7 @@ function renderDataTable() {
     rowIndexMap.set(allData[i], i);
   }
 
-  dom.tableBody.innerHTML = rows.map(row => {
+  const html = rows.map(row => {
     const idx = rowIndexMap.get(row);
     const muted = (idx != null && typeof state.cf.isElementFiltered === 'function' && !state.cf.isElementFiltered(idx))
       ? ' class="row-muted"' : '';
@@ -1514,12 +1521,25 @@ function renderDataTable() {
     }).join('')}</tr>`;
   }).join('');
 
-  // Page info
-  const page = Math.floor(offset / pageSize) + 1;
-  const totalPages = Math.max(1, Math.ceil(size / pageSize));
-  dom.tablePageInfo.textContent = `Page ${page} of ${totalPages}`;
-  dom.tablePrev.disabled = offset === 0;
-  dom.tableNext.disabled = offset + pageSize >= size;
+  dom.tableBody.insertAdjacentHTML('beforeend', html);
+  state.tableRenderedCount += rows.length;
+
+  // Update row count display
+  const size = state.cf.size();
+  dom.tableRowCount.textContent = `${state.tableRenderedCount.toLocaleString()} of ${size.toLocaleString()} rows`;
+}
+
+function onTableScroll() {
+  if (state.tableScrollBusy) return;
+  const el = dom.tableScroll;
+  // Load more when within 100px of bottom
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 100) {
+    state.tableScrollBusy = true;
+    requestAnimationFrame(() => {
+      appendTableRows(TABLE_PAGE_SIZE);
+      state.tableScrollBusy = false;
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1604,20 +1624,13 @@ async function init() {
     // Table controls
     dom.tableSortToggle.addEventListener('click', () => {
       state.tableSort = state.tableSort === 'top' ? 'bottom' : 'top';
-      state.tableOffset = 0;
       dom.tableSortToggle.textContent = state.tableSort === 'top' ? 'Showing: Most Recent' : 'Showing: Oldest First';
+      dom.tableScroll.scrollTop = 0;
       renderDataTable();
     });
 
-    dom.tablePrev.addEventListener('click', () => {
-      state.tableOffset = Math.max(0, state.tableOffset - TABLE_PAGE_SIZE);
-      renderDataTable();
-    });
-
-    dom.tableNext.addEventListener('click', () => {
-      state.tableOffset += TABLE_PAGE_SIZE;
-      renderDataTable();
-    });
+    // Infinite scroll
+    dom.tableScroll.addEventListener('scroll', onTableScroll, { passive: true });
 
     // Demo controls
     dom.addRowsBtn.addEventListener('click', onAddRows);
