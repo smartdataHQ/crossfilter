@@ -10,12 +10,15 @@ const ARROW_FILE = '../test/data/query-result.arrow';
 const FIELDS = {
   event:            'semantic_events__event',
   customer_country: 'semantic_events__dimensions_customer_country',
+  location_label:   'semantic_events__location_label',
   location_country: 'semantic_events__location_country',
   region:           'semantic_events__location_region',
   division:         'semantic_events__location_division',
   municipality:     'semantic_events__location_municipality',
   locality:         'semantic_events__location_locality',
   postal_code:      'semantic_events__location_postal_code',
+  postal_name:      'semantic_events__location_postal_name',
+  location_code:    'semantic_events__location_code',
   time:             'semantic_events__timestamp_minute',
   latitude:         'semantic_events__location_latitude',
 };
@@ -23,19 +26,23 @@ const FIELDS = {
 const FIELD_LABELS = {
   event: 'Event',
   customer_country: 'Customer Country',
+  location_label: 'Location',
   location_country: 'Location Country',
   region: 'Region',
   division: 'Division',
   municipality: 'Municipality',
   locality: 'Locality',
   postal_code: 'Postal Code',
+  postal_name: 'Postal Name',
+  location_code: 'Location Code',
   time: 'Time',
   latitude: 'Latitude',
 };
 
 const TABLE_COLUMNS = [
   'event', 'customer_country', 'location_country', 'region',
-  'division', 'municipality', 'locality', 'postal_code', 'time', 'latitude',
+  'division', 'municipality', 'locality', 'location_label',
+  'postal_code', 'postal_name', 'location_code', 'latitude', 'time',
 ];
 
 const MODES = {
@@ -274,7 +281,9 @@ async function loadData() {
   // Validate required fields
   const missing = Object.values(FIELDS).filter(f => !state.allFieldNames.includes(f));
   if (missing.length) {
-    appendLog(`Warning: missing fields: ${missing.join(', ')}`);
+    const msg = `Missing fields in Arrow data: ${missing.join(', ')}`;
+    appendLog(`Warning: ${msg}`);
+    showError(msg);
   }
 
   // Pre-materialize rows for row-based modes
@@ -393,7 +402,7 @@ function timeBucketFn(v) {
 // ---------------------------------------------------------------------------
 function buildCombinedKpi(cf) {
   const latField = FIELDS.latitude;
-  const locField = FIELDS.region; // use region as proxy for unique location
+  const locField = FIELDS.location_label;
   const timeField = FIELDS.time;
 
   const ga = cf.groupAll().reduce(
@@ -467,14 +476,14 @@ function buildSeparateKpis(cf) {
   });
   const locations = cf.groupAll().reduce(
     function(p, row) {
-      const loc = row[FIELDS.region];
+      const loc = row[FIELDS.location_label];
       if (loc != null && loc !== '') {
         p.set(loc, (p.get(loc) || 0) + 1);
       }
       return p;
     },
     function(p, row) {
-      const loc = row[FIELDS.region];
+      const loc = row[FIELDS.location_label];
       if (loc != null && loc !== '') {
         const c = (p.get(loc) || 0) - 1;
         if (c <= 0) p.delete(loc);
@@ -608,13 +617,32 @@ function restoreFilterState(saved) {
 
 function switchMode(modeId) {
   if (!MODES[modeId]) return;
+  const previousMode = state.mode;
   const saved = saveFilterState();
-  destroyEnvironment();
-  state.mode = MODES[modeId];
-  buildEnvironment();
-  restoreFilterState(saved);
-  updateModeButtons();
-  renderAll();
+  try {
+    destroyEnvironment();
+    state.mode = MODES[modeId];
+    buildEnvironment();
+    restoreFilterState(saved);
+    updateModeButtons();
+    renderAll();
+    hideError();
+  } catch (err) {
+    // Revert to previous working mode
+    showError('Mode switch failed: ' + err.message + '. Reverting to ' + previousMode.id);
+    console.error(err);
+    try {
+      destroyEnvironment();
+      state.mode = previousMode;
+      buildEnvironment();
+      restoreFilterState(saved);
+      updateModeButtons();
+      renderAll();
+    } catch (revertErr) {
+      showError('Fatal: could not revert mode. ' + revertErr.message);
+      console.error(revertErr);
+    }
+  }
 }
 
 function updateModeButtons() {
@@ -658,11 +686,15 @@ function renderAll() {
 function updateRuntimeBadge() {
   if (typeof crossfilter.runtimeInfo === 'function') {
     const info = crossfilter.runtimeInfo();
-    dom.runtimeBadge.textContent = `Runtime: ${info.active.toUpperCase()}`;
+    let text = `${info.active.toUpperCase()} | ${state.cf ? state.cf.size().toLocaleString() + ' rows' : ''}`;
+    if (state.mode.wasm && info.active !== 'wasm') {
+      text += ' (WASM unavailable)';
+    }
+    dom.runtimeBadge.textContent = text;
     dom.runtimeBadge.style.background = info.active === 'wasm' ? '#2e7d32' : '';
     dom.runtimeBadge.style.color = info.active === 'wasm' ? '#fff' : '';
   } else {
-    dom.runtimeBadge.textContent = 'Runtime: JS';
+    dom.runtimeBadge.textContent = 'JS';
   }
 }
 
@@ -720,20 +752,26 @@ function populateFilterControls() {
     dom.regionCheckboxes.appendChild(label);
   });
 
-  // Region search
-  dom.regionSearch.addEventListener('input', () => {
-    const q = dom.regionSearch.value.toLowerCase();
-    dom.regionCheckboxes.querySelectorAll('label').forEach(lbl => {
-      lbl.style.display = lbl.textContent.toLowerCase().includes(q) ? '' : 'none';
+  // One-time event listeners (guarded to avoid stacking on mode switch)
+  if (!populateFilterControls._listenersAttached) {
+    populateFilterControls._listenersAttached = true;
+
+    dom.regionSearch.addEventListener('input', () => {
+      const q = dom.regionSearch.value.toLowerCase();
+      dom.regionCheckboxes.querySelectorAll('label').forEach(lbl => {
+        lbl.style.display = lbl.textContent.toLowerCase().includes(q) ? '' : 'none';
+      });
     });
-  });
 
-  // Time range slider
+    dom.latMin.addEventListener('change', applyLatFilter);
+    dom.latMax.addEventListener('change', applyLatFilter);
+
+    dom.timeMin.addEventListener('input', applyTimeFilter);
+    dom.timeMax.addEventListener('input', applyTimeFilter);
+  }
+
+  // Time range slider (bounds may change on mode switch)
   computeTimeBoundsForSliders();
-
-  // Latitude inputs
-  dom.latMin.addEventListener('change', applyLatFilter);
-  dom.latMax.addEventListener('change', applyLatFilter);
 }
 
 function populateSelect(selectEl, groupData, filterKey) {
@@ -746,11 +784,15 @@ function populateSelect(selectEl, groupData, filterKey) {
     opt.textContent = `${g.key} (${g.value})`;
     selectEl.appendChild(opt);
   });
-  selectEl.addEventListener('change', () => {
-    const val = selectEl.value || null;
-    state.filterValues[filterKey] = val;
-    applyFilter(filterKey, val);
-  });
+  // Only attach listener once
+  if (!selectEl._listenerAttached) {
+    selectEl._listenerAttached = true;
+    selectEl.addEventListener('change', () => {
+      const val = selectEl.value || null;
+      state.filterValues[filterKey] = val;
+      applyFilter(filterKey, val);
+    });
+  }
 }
 
 function updatePillStates() {
@@ -782,8 +824,6 @@ function computeTimeBoundsForSliders() {
   dom.timeMax.value = maxT;
   dom.timeRangeLabel.textContent = `${formatTimestamp(minT)} — ${formatTimestamp(maxT)}`;
 
-  dom.timeMin.addEventListener('input', applyTimeFilter);
-  dom.timeMax.addEventListener('input', applyTimeFilter);
 }
 
 function applyTimeFilter() {
@@ -905,53 +945,29 @@ function clearAllFilters() {
 // ---------------------------------------------------------------------------
 function renderFilterChips() {
   dom.filterChips.innerHTML = '';
-  const fv = state.filterValues;
 
-  if (fv.event.length) {
-    addChip(`Event: ${fv.event.join(', ')}`, () => {
-      fv.event = [];
-      applyFilter('event', []);
-      updatePillStates();
-    });
-  }
-  if (fv.customer_country) {
-    addChip(`Customer: ${fv.customer_country}`, () => {
-      fv.customer_country = null;
-      dom.customerCountrySelect.value = '';
-      applyFilter('customer_country', null);
-    });
-  }
-  if (fv.location_country) {
-    addChip(`Location: ${fv.location_country}`, () => {
-      fv.location_country = null;
-      dom.locationCountrySelect.value = '';
-      applyFilter('location_country', null);
-    });
-  }
-  if (fv.region.length) {
-    addChip(`Region: ${fv.region.join(', ')}`, () => {
-      fv.region = [];
-      dom.regionCheckboxes.querySelectorAll('input').forEach(cb => cb.checked = false);
-      applyFilter('region', []);
-    });
-  }
-  if (fv.time) {
-    addChip(`Time: ${formatTimestamp(fv.time[0])} — ${formatTimestamp(fv.time[1])}`, () => {
-      fv.time = null;
-      dom.timeMin.value = state.timeBounds.min;
-      dom.timeMax.value = state.timeBounds.max;
-      dom.timeRangeLabel.textContent = `${formatTimestamp(state.timeBounds.min)} — ${formatTimestamp(state.timeBounds.max)}`;
-      state.dimensions.time.filterAll();
-      scheduleRender();
-    });
-  }
-  if (fv.latitude) {
-    addChip(`Lat: ${fv.latitude[0]} — ${fv.latitude[1]}`, () => {
-      fv.latitude = null;
-      dom.latMin.value = '';
-      dom.latMax.value = '';
-      state.dimensions.latitude.filterAll();
-      scheduleRender();
+  // Use dimension.hasCurrentFilter() and dimension.currentFilter() to detect active filters
+  for (const key of Object.keys(state.dimensions)) {
+    const dim = state.dimensions[key];
+    if (typeof dim.hasCurrentFilter !== 'function' || !dim.hasCurrentFilter()) continue;
+
+    const label = FIELD_LABELS[key] || key;
+    const currentFilter = typeof dim.currentFilter === 'function' ? dim.currentFilter() : null;
+    let display;
+    if (Array.isArray(currentFilter)) {
+      display = key === 'time'
+        ? `${formatTimestamp(currentFilter[0])} — ${formatTimestamp(currentFilter[1])}`
+        : currentFilter.length + ' selected';
+    } else if (currentFilter != null) {
+      display = String(currentFilter);
+    } else {
+      display = 'active';
+    }
+
+    addChip(`${label}: ${display}`, () => {
+      state.filterValues[key] = Array.isArray(state.filterValues[key]) ? [] : null;
+      applyFilter(key, null);
+      resetFilterControl(key);
     });
   }
 }
@@ -1253,14 +1269,16 @@ function renderDataTable() {
     rows = dim.bottom(pageSize, offset);
   }
 
-  // Build row index map for isElementFiltered
-  // We need the index of each row in the crossfilter
+  // Build row index map for isElementFiltered — use Map for O(1) lookups
   const allData = state.cf.all();
+  const rowIndexMap = new Map();
+  for (let i = 0; i < allData.length; i++) {
+    rowIndexMap.set(allData[i], i);
+  }
 
   dom.tableBody.innerHTML = rows.map(row => {
-    // Find the index of this row in allData for isElementFiltered check
-    const idx = allData.indexOf(row);
-    const muted = (idx >= 0 && typeof state.cf.isElementFiltered === 'function' && !state.cf.isElementFiltered(idx))
+    const idx = rowIndexMap.get(row);
+    const muted = (idx != null && typeof state.cf.isElementFiltered === 'function' && !state.cf.isElementFiltered(idx))
       ? ' class="row-muted"' : '';
 
     return `<tr${muted}>${TABLE_COLUMNS.map(key => {
@@ -1391,20 +1409,33 @@ async function init() {
       const value = item.dataset.value;
       if (!key || !value || !state.dimensions[key]) return;
 
-      if (key === 'customer_country' || key === 'location_country') {
-        // Single-select from list: toggle
-        if (state.filterValues[key] === value) {
-          state.filterValues[key] = null;
-          applyFilter(key, null);
-          if (key === 'customer_country') dom.customerCountrySelect.value = '';
-          else dom.locationCountrySelect.value = '';
+      if (e.ctrlKey || e.metaKey) {
+        // Multi-select: accumulate into filterIn
+        let current = state.filterValues[key];
+        if (!Array.isArray(current)) current = current ? [current] : [];
+        const idx = current.indexOf(value);
+        if (idx >= 0) {
+          current = current.filter(v => v !== value);
         } else {
-          state.filterValues[key] = value;
-          applyFilter(key, value);
-          if (key === 'customer_country') dom.customerCountrySelect.value = value;
-          else dom.locationCountrySelect.value = value;
+          current = current.concat([value]);
+        }
+        state.filterValues[key] = current.length > 0 ? current : (Array.isArray(state.filterValues[key]) ? [] : null);
+        applyFilter(key, current.length > 0 ? current : null);
+      } else {
+        // Single-select toggle
+        const currentVal = state.filterValues[key];
+        const isActive = currentVal === value || (Array.isArray(currentVal) && currentVal.length === 1 && currentVal[0] === value);
+        if (isActive) {
+          state.filterValues[key] = Array.isArray(state.filterValues[key]) ? [] : null;
+          applyFilter(key, null);
+        } else {
+          state.filterValues[key] = Array.isArray(state.filterValues[key]) ? [value] : value;
+          applyFilter(key, Array.isArray(state.filterValues[key]) ? [value] : value);
         }
       }
+      // Sync dropdown if applicable
+      if (key === 'customer_country') dom.customerCountrySelect.value = state.filterValues[key] || '';
+      if (key === 'location_country') dom.locationCountrySelect.value = state.filterValues[key] || '';
     });
 
     // Resize ECharts on window resize
