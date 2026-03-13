@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crossfilter2 Interactive Demo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="demo.css">
+</head>
+<body>
+
+<div id="error-banner" class="error-banner" hidden></div>
+
+<header id="header" class="header">
+  <div class="header-left">
+    <h1 class="header-title">Crossfilter2 <span class="header-subtitle">Interactive Demo</span></h1>
+  </div>
+  <div class="header-center">
+    <div id="mode-selector" class="mode-selector">
+      <button data-mode="row_baseline" class="mode-btn">Row (baseline)</button>
+      <button data-mode="row_native" class="mode-btn">Row (native)</button>
+      <button data-mode="arrow_js" class="mode-btn">Arrow + JS</button>
+      <button data-mode="arrow_wasm" class="mode-btn mode-btn--active">Arrow + WASM</button>
+    </div>
+  </div>
+  <div class="header-right">
+    <span id="runtime-badge" class="badge">—</span>
+    <span id="latency-display" class="badge badge--latency">— ms</span>
+    <span id="load-time" class="badge">Load: — ms</span>
+  </div>
+</header>
+
+<section id="filter-bar" class="filter-bar glass-card">
+  <div class="filter-controls">
+    <div class="filter-group">
+      <label class="filter-label">Event Type</label>
+      <div id="event-pills" class="pill-group"></div>
+    </div>
+    <div class="filter-group">
+      <label class="filter-label">Customer Country</label>
+      <select id="customer-country-select" class="filter-select"><option value="">All</option></select>
+    </div>
+    <div class="filter-group">
+      <label class="filter-label">Location Country</label>
+      <select id="location-country-select" class="filter-select"><option value="">All</option></select>
+    </div>
+    <div class="filter-group">
+      <label class="filter-label">Region</label>
+      <div id="region-multiselect" class="multiselect-container">
+        <input type="text" id="region-search" class="filter-input" placeholder="Search regions...">
+        <div id="region-checkboxes" class="checkbox-list"></div>
+      </div>
+    </div>
+    <div class="filter-group">
+      <label class="filter-label">Time Range</label>
+      <div id="time-range-container" class="range-container">
+        <input type="range" id="time-min" class="range-input" step="1">
+        <input type="range" id="time-max" class="range-input" step="1">
+        <div id="time-range-label" class="range-label">—</div>
+      </div>
+    </div>
+    <div class="filter-group">
+      <label class="filter-label">Latitude Range</label>
+      <div class="lat-range">
+        <input type="number" id="lat-min" class="filter-input filter-input--small" placeholder="Min" step="0.1">
+        <span>–</span>
+        <input type="number" id="lat-max" class="filter-input filter-input--small" placeholder="Max" step="0.1">
+      </div>
+    </div>
+    <button id="clear-all-btn" class="btn btn--clear">Clear All</button>
+  </div>
+  <div id="filter-chips" class="filter-chips"></div>
+</section>
+
+<section id="kpi-row" class="kpi-row">
+  <div id="kpi-total" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Total Events</div></div>
+  <div id="kpi-locations" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Unique Locations</div></div>
+  <div id="kpi-latitude" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Avg Latitude</div></div>
+  <div id="kpi-timespan" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Time Span</div></div>
+</section>
+
+<section class="chart-grid">
+  <div class="chart-col">
+    <div class="glass-card chart-card"><div class="chart-header">Events by Type <span class="group-size-badge" id="event-group-size"></span></div><div id="chart-event" class="chart-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Customer Country <span class="group-size-badge" id="cc-group-size"></span></div><div id="list-customer-country" class="list-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Location Country <span class="group-size-badge" id="lc-group-size"></span></div><div id="list-location-country" class="list-container"></div></div>
+  </div>
+  <div class="chart-col">
+    <div class="glass-card chart-card chart-card--tall"><div class="chart-header">Events over Time</div><div id="chart-timeline" class="chart-container chart-container--tall"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Region <span class="group-size-badge" id="region-group-size"></span></div><div id="chart-region" class="chart-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Division <span class="group-size-badge" id="division-group-size"></span></div><div id="chart-division" class="chart-container"></div></div>
+  </div>
+  <div class="chart-col">
+    <div class="glass-card chart-card"><div class="chart-header">By Municipality (Top 20) <span class="group-size-badge" id="muni-group-size"></span></div><div id="list-municipality" class="list-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Locality (Least Frequent) <span class="group-size-badge" id="loc-group-size"></span></div><div id="list-locality" class="list-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">Top Postal Codes <span class="group-size-badge" id="postal-group-size"></span></div><div id="list-postal" class="list-container"></div></div>
+  </div>
+</section>
+
+<section class="glass-card table-section">
+  <div class="table-header">
+    <span class="chart-header">Data Table</span>
+    <div class="table-controls">
+      <button id="table-sort-toggle" class="btn btn--small">Showing: Most Recent</button>
+      <button id="table-prev" class="btn btn--small" disabled>← Prev</button>
+      <span id="table-page-info" class="table-page-info">Page 1</span>
+      <button id="table-next" class="btn btn--small">Next →</button>
+    </div>
+  </div>
+  <div class="table-scroll">
+    <table id="data-table" class="data-table">
+      <thead><tr id="table-head"></tr></thead>
+      <tbody id="table-body"></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="demo-controls">
+  <div class="demo-buttons">
+    <button id="add-rows-btn" class="btn">Add 1000 Rows</button>
+    <button id="remove-filtered-btn" class="btn btn--danger">Remove Excluded</button>
+  </div>
+  <div class="glass-card log-card">
+    <div class="chart-header">Performance Log</div>
+    <pre id="perf-log" class="perf-log"></pre>
+  </div>
+</section>
+
+<div id="loading-overlay" class="loading-overlay">
+  <div class="loading-spinner"></div>
+  <div class="loading-text">Loading data...</div>
+</div>
+
+<script src="../crossfilter.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<script>
+  // Load Arrow via dynamic import, then load demo.js as a module
+  import('https://cdn.jsdelivr.net/npm/apache-arrow@17.0.0/+esm').then(function(m) {
+    window.Arrow = m;
+    var script = document.createElement('script');
+    script.type = 'module';
+    script.src = 'demo.js';
+    document.body.appendChild(script);
+  }).catch(function(err) {
+    console.warn('Arrow load failed, proceeding without Arrow:', err);
+    window.Arrow = null;
+    var script = document.createElement('script');
+    script.type = 'module';
+    script.src = 'demo.js';
+    document.body.appendChild(script);
+  });
+</script>
+
+</body>
+</html>
