@@ -135,23 +135,8 @@
 
 <script src="../crossfilter.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
-<script>
-  // Load Arrow via dynamic import, then load demo.js as a module
-  import('https://cdn.jsdelivr.net/npm/apache-arrow@17.0.0/+esm').then(function(m) {
-    window.Arrow = m;
-    var script = document.createElement('script');
-    script.type = 'module';
-    script.src = 'demo.js';
-    document.body.appendChild(script);
-  }).catch(function(err) {
-    console.warn('Arrow load failed, proceeding without Arrow:', err);
-    window.Arrow = null;
-    var script = document.createElement('script');
-    script.type = 'module';
-    script.src = 'demo.js';
-    document.body.appendChild(script);
-  });
-</script>
+<script src="../node_modules/apache-arrow/Arrow.es2015.min.js"></script>
+<script type="module" src="demo.js"></script>
 
 </body>
 </html>
