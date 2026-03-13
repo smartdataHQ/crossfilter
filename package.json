@@ -60,6 +60,7 @@
   },
   "scripts": {
     "benchmark": "node test/benchmark.js",
+    "benchmark:arrow": "node test/benchmark-arrow.mjs",
     "build": "rollup -c rollup.config.js",
     "clean": "rm -f crossfilter.js crossfilter.min.js",
     "test": "vitest && eslint src/"

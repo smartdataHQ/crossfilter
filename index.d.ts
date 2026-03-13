@@ -23,6 +23,43 @@ declare namespace crossfilter {
     | [NaturallyOrderedValue, NaturallyOrderedValue]
     | Predicate<NaturallyOrderedValue>;
 
+  export type ColumnSource<TValue = unknown> =
+    | ArrayLike<TValue>
+    | {
+        at?(index: number): TValue;
+        get?(index: number): TValue;
+        length?: number;
+        size?: number;
+        [index: number]: TValue;
+      };
+
+  export interface ColumnarOptions<TRecord> {
+    fields?: string[];
+    length?: number;
+    rowFactory?: (
+      index: number,
+      columns: Record<string, ColumnSource>,
+      fields: string[],
+    ) => TRecord;
+    transforms?: Record<string, (value: unknown, index: number) => unknown>;
+  }
+
+  export interface ArrowFieldLike {
+    name: string;
+  }
+
+  export interface ArrowTableLike {
+    columnNames?: string[];
+    getChild?(name: string): ColumnSource | undefined;
+    getChildAt?(index: number): ColumnSource | undefined;
+    getColumn?(name: string): ColumnSource | undefined;
+    numRows?: number;
+    schema?: {
+      fields?: ArrowFieldLike[];
+    };
+    [key: string]: unknown;
+  }
+
   export interface Grouping<TKey extends NaturallyOrderedValue, TValue> {
     key: TKey;
     value: TValue;
@@ -59,6 +96,7 @@ declare namespace crossfilter {
   export interface Dimension<TRecord, TValue extends NaturallyOrderedValue> {
     filter(filterValue: FilterValue): Dimension<TRecord, TValue>;
     filterExact(value: TValue): Dimension<TRecord, TValue>;
+    filterIn(values: TValue[]): Dimension<TRecord, TValue>;
     filterRange(range: [TValue, TValue]): Dimension<TRecord, TValue>;
     filterFunction(predicate: Predicate<TValue>): Dimension<TRecord, TValue>;
     filterAll(): Dimension<TRecord, TValue>;
@@ -95,6 +133,26 @@ declare namespace crossfilter {
     onChange(callback: (type: EventType) => void): () => void;
     isElementFiltered(index: number, ignoreDimensions?: number[]): boolean;
   }
+
+  export function rowsFromColumns<TRecord>(
+    columns: Record<string, ColumnSource>,
+    options?: ColumnarOptions<TRecord>,
+  ): TRecord[];
+
+  export function fromColumns<TRecord>(
+    columns: Record<string, ColumnSource>,
+    options?: ColumnarOptions<TRecord>,
+  ): Crossfilter<TRecord>;
+
+  export function rowsFromArrowTable<TRecord>(
+    table: ArrowTableLike,
+    options?: ColumnarOptions<TRecord>,
+  ): TRecord[];
+
+  export function fromArrowTable<TRecord>(
+    table: ArrowTableLike,
+    options?: ColumnarOptions<TRecord>,
+  ): Crossfilter<TRecord>;
 
   export type HeapSelector<T> = (records: T[], lo: number, hi: number, k: number) => T[];
 

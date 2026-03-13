@@ -9,6 +9,13 @@ import bisect from './bisect.js';
 import permute from './permute.js';
 import xfilterReduce from './reduce.js';
 import result from './result.js';
+import {
+  getColumnValue,
+  getColumnarBatch,
+  materializeColumnarRow,
+  rowsFromColumns,
+  rowsFromArrowTable
+} from './columnar.js';
 
 // constants
 var REMOVED_INDEX = -1;
@@ -17,6 +24,14 @@ crossfilter.heap = xfilterHeap;
 crossfilter.heapselect = xfilterHeapselect;
 crossfilter.bisect = bisect;
 crossfilter.permute = permute;
+crossfilter.rowsFromColumns = rowsFromColumns;
+crossfilter.fromColumns = function(columns, options) {
+  return crossfilter(rowsFromColumns(columns, options));
+};
+crossfilter.rowsFromArrowTable = rowsFromArrowTable;
+crossfilter.fromArrowTable = function(table, options) {
+  return crossfilter(rowsFromArrowTable(table, options));
+};
 export default crossfilter;
 
 function crossfilter() {
@@ -38,9 +53,145 @@ function crossfilter() {
       filterListeners = [], // when the filters change
       dataListeners = [], // when data is added
       removeDataListeners = [], // when data is removed
-      callbacks = [];
+      callbacks = [],
+      columnarBatches = [];
 
   filters = new xfilterArray.bitarray(0);
+
+  function appendData(newData) {
+    var offset = data.length;
+    data.length = offset + newData.length;
+    var batch = getColumnarBatch(newData);
+    if (batch) {
+      for (var key in batch.rows) {
+        if (Object.prototype.hasOwnProperty.call(batch.rows, key)) {
+          data[offset + Number(key)] = batch.rows[key];
+        }
+      }
+      return;
+    }
+    for (var i = 0; i < newData.length; ++i) {
+      data[offset + i] = newData[i];
+    }
+  }
+
+  function rememberColumnarBatch(newData, n0, n1) {
+    var batch = getColumnarBatch(newData);
+    if (!batch) {
+      return;
+    }
+
+    columnarBatches.push({
+      batch: batch,
+      columns: batch.columns,
+      start: n0,
+      end: n0 + n1
+    });
+  }
+
+  function findColumnarBatch(rowIndex) {
+    var lo = 0,
+        hi = columnarBatches.length;
+
+    while (lo < hi) {
+      var mid = lo + hi >>> 1,
+          batch = columnarBatches[mid];
+      if (rowIndex < batch.start) hi = mid;
+      else if (rowIndex >= batch.end) lo = mid + 1;
+      else return batch;
+    }
+
+    return null;
+  }
+
+  function getRecord(rowIndex) {
+    var row = data[rowIndex];
+    if (row !== undefined || rowIndex in data) {
+      return row;
+    }
+
+    var batch = findColumnarBatch(rowIndex);
+    if (!batch) {
+      return row;
+    }
+
+    row = materializeColumnarRow(batch.batch, rowIndex - batch.start);
+    data[rowIndex] = row;
+    return row;
+  }
+
+  function materializeAllRecords() {
+    if (!columnarBatches.length) {
+      return;
+    }
+    for (var rowIndex = 0; rowIndex < n; ++rowIndex) {
+      getRecord(rowIndex);
+    }
+  }
+
+  function copyFieldValuesFromRows(target, targetOffset, field, start, end) {
+    for (var i = start; i < end; ++i) {
+      target[targetOffset++] = getRecord(i)[field];
+    }
+    return targetOffset;
+  }
+
+  function extractColumnValues(field, start, count) {
+    if (!count) {
+      return [];
+    }
+
+    var values = new Array(count),
+        cursor = start,
+        targetOffset = 0,
+        end = start + count;
+
+    if (!columnarBatches.length) {
+      copyFieldValuesFromRows(values, 0, field, start, end);
+      return values;
+    }
+
+    for (var batchIndex = 0; batchIndex < columnarBatches.length && cursor < end; ++batchIndex) {
+      var batch = columnarBatches[batchIndex];
+
+      if (batch.end <= cursor) {
+        continue;
+      }
+
+      if (batch.start >= end) {
+        break;
+      }
+
+      if (cursor < batch.start) {
+        var gapEnd = Math.min(batch.start, end);
+        targetOffset = copyFieldValuesFromRows(values, targetOffset, field, cursor, gapEnd);
+        cursor = gapEnd;
+        if (cursor >= end) {
+          break;
+        }
+      }
+
+      var segmentStart = Math.max(cursor, batch.start),
+          segmentEnd = Math.min(batch.end, end),
+          column = batch.columns[field];
+
+      if (column != null) {
+        for (var valueIndex = segmentStart; valueIndex < segmentEnd; ++valueIndex) {
+          values[targetOffset++] = getColumnValue(column, valueIndex - batch.start);
+        }
+      } else {
+        targetOffset = copyFieldValuesFromRows(values, targetOffset, field, segmentStart, segmentEnd);
+      }
+
+      cursor = segmentEnd;
+    }
+
+    if (cursor < end) {
+      copyFieldValuesFromRows(values, targetOffset, field, cursor, end);
+    }
+
+    return values;
+  }
 
   // Adds the specified new records to this crossfilter.
   function add(newData) {
@@ -52,7 +203,8 @@ function crossfilter() {
     // Lengthen the filter bitset to handle the new records.
     // Notify listeners (dimensions and groups) that new data is available.
     if (n1) {
-      data = data.concat(newData);
+      appendData(newData);
+      rememberColumnarBatch(newData, n0, n1);
       filters.lengthen(n += n1);
       dataListeners.forEach(function(l) { l(newData, n0, n1); });
       triggerOnChange('dataAdded');
@@ -64,12 +216,13 @@ function crossfilter() {
   // Removes all records that match the current filters, or if a predicate function is passed,
   // removes all records matching the predicate (ignoring filters).
   function removeData(predicate) {
+    materializeAllRecords();
     var // Mapping from old record indexes to new indexes (after records removed)
         newIndex = new Array(n),
         removed = [],
         usePred = typeof predicate === 'function',
         shouldRemove = function (i) {
-          return usePred ? predicate(data[i], i) : filters.zero(i)
+          return usePred ? predicate(getRecord(i), i) : filters.zero(i)
         };
 
     for (var index1 = 0, index2 = 0; index1 < n; ++index1) {
@@ -97,6 +250,7 @@ function crossfilter() {
 
     data.length = n = index4;
     filters.truncate(index4);
+    columnarBatches = [];
     triggerOnChange('dataRemoved');
   }
 
@@ -134,6 +288,7 @@ function crossfilter() {
     var dimension = {
       filter: filter,
       filterExact: filterExact,
+      filterIn: filterIn,
       filterRange: filterRange,
       filterFunction: filterFunction,
       filterAll: filterAll,
@@ -170,12 +325,205 @@ function crossfilter() {
         refilterFunction, // the custom filter function in use
         filterValue, // the value used for filtering (value, array, function or undefined)
         filterValuePresent, // true if filterValue contains something
+        filterMode = 'all',
+        filterInValues = null,
+        exactRangeCache = new Map(),
         indexListeners = [], // when data is added
         dimensionGroups = [],
         lo0 = 0,
         hi0 = 0,
         t = 0,
         k;
+
+    function normalizeExactFilterValues(filterValues) {
+      var uniqueValues = Array.from(new Set(filterValues));
+      uniqueValues.sort(function(a, b) {
+        return a < b ? -1 : a > b ? 1 : 0;
+      });
+      return uniqueValues;
+    }
+
+    function getExactRange(value) {
+      if (exactRangeCache.has(value)) {
+        return exactRangeCache.get(value);
+      }
+
+      var lo = bisect.left(values, value, 0, values.length),
+          hi = bisect.right(values, value, lo, values.length),
+          range = lo === hi ? null : [lo, hi];
+
+      exactRangeCache.set(value, range);
+      return range;
+    }
+
+    function exactRanges(filterValues) {
+      if (!filterValues || !filterValues.length) {
+        return [];
+      }
+
+      var ranges = [];
+      for (var valueIndex = 0; valueIndex < filterValues.length; ++valueIndex) {
+        var range = getExactRange(filterValues[valueIndex]),
+            lastRange = ranges[ranges.length - 1];
+
+        if (!range) {
+          continue;
+        }
+
+        if (lastRange && range[0] <= lastRange[1]) {
+          lastRange[1] = Math.max(lastRange[1], range[1]);
+        } else {
+          ranges.push([range[0], range[1]]);
+        }
+      }
+
+      return ranges;
+    }
+
+    function resolveCurrentRanges() {
+      if (!values) {
+        return [];
+      }
+
+      switch (filterMode) {
+        case 'all':
+          return values.length ? [[0, values.length]] : [];
+        case 'bounds':
+          return lo0 === hi0 ? [] : [[lo0, hi0]];
+        case 'in':
+          return exactRanges(filterInValues);
+        default:
+          return null;
+      }
+    }
+
+    function appendIndexedRange(rows, rowIndexes, start, end) {
+      for (var i = start; i < end; ++i) {
+        rows.push(index[i]);
+        rowIndexes.push(i);
+      }
+    }
+
+    function applyFilterChanges(added, removed, valueIndexAdded, valueIndexRemoved, includeEmptyRows) {
+      var i,
+          k,
+          row;
+
+      if(!iterable) {
+        for(i = 0; i < added.length; i++) {
+          filters[offset][added[i]] ^= one;
+        }
+
+        for(i = 0; i < removed.length; i++) {
+          filters[offset][removed[i]] ^= one;
+        }
+      } else {
+        var newAdded = [];
+        var newRemoved = [];
+
+        for (i = 0; i < added.length; i++) {
+          iterablesIndexCount[added[i]]++;
+          iterablesIndexFilterStatus[valueIndexAdded[i]] = 0;
+          if(iterablesIndexCount[added[i]] === 1) {
+            filters[offset][added[i]] ^= one;
+            newAdded.push(added[i]);
+          }
+        }
+        for (i = 0; i < removed.length; i++) {
+          iterablesIndexCount[removed[i]]--;
+          iterablesIndexFilterStatus[valueIndexRemoved[i]] = 1;
+          if(iterablesIndexCount[removed[i]] === 0) {
+            filters[offset][removed[i]] ^= one;
+            newRemoved.push(removed[i]);
+          }
+        }
+
+        added = newAdded;
+        removed = newRemoved;
+
+        if(includeEmptyRows) {
+          for(i = 0; i < iterablesEmptyRows.length; i++) {
+            if((filters[offset][row = iterablesEmptyRows[i]] & one)) {
+              filters[offset][row] ^= one;
+              added.push(row);
+            }
+          }
+        } else {
+          for(i = 0; i < iterablesEmptyRows.length; i++) {
+            if(!(filters[offset][row = iterablesEmptyRows[i]] & one)) {
+              filters[offset][row] ^= one;
+              removed.push(row);
+            }
+          }
+        }
+      }
+
+      filterListeners.forEach(function(l) { l(one, offset, added, removed); });
+      triggerOnChange('filtered');
+      return dimension;
+    }
+
+    function filterIndexRanges(oldRanges, newRanges, includeEmptyRows) {
+      var added = [],
+          removed = [],
+          valueIndexAdded = [],
+          valueIndexRemoved = [],
+          previousRanges = oldRanges.map(function(range) { return [range[0], range[1]]; }),
+          nextRanges = newRanges.map(function(range) { return [range[0], range[1]]; }),
+          oldIndex = 0,
+          newIndexPointer = 0;
+
+      while (oldIndex < previousRanges.length || newIndexPointer < nextRanges.length) {
+        var oldRange = previousRanges[oldIndex],
+            newRange = nextRanges[newIndexPointer];
+
+        if (!oldRange) {
+          appendIndexedRange(added, valueIndexAdded, newRange[0], newRange[1]);
+          ++newIndexPointer;
+          continue;
+        }
+
+        if (!newRange) {
+          appendIndexedRange(removed, valueIndexRemoved, oldRange[0], oldRange[1]);
+          ++oldIndex;
+          continue;
+        }
+
+        if (oldRange[1] <= newRange[0]) {
+          appendIndexedRange(removed, valueIndexRemoved, oldRange[0], oldRange[1]);
+          ++oldIndex;
+          continue;
+        }
+
+        if (newRange[1] <= oldRange[0]) {
+          appendIndexedRange(added, valueIndexAdded, newRange[0], newRange[1]);
+          ++newIndexPointer;
+          continue;
+        }
+
+        if (oldRange[0] < newRange[0]) {
+          appendIndexedRange(removed, valueIndexRemoved, oldRange[0], newRange[0]);
+        } else if (newRange[0] < oldRange[0]) {
+          appendIndexedRange(added, valueIndexAdded, newRange[0], oldRange[0]);
+        }
+
+        if (oldRange[1] < newRange[1]) {
+          nextRanges[newIndexPointer] = [oldRange[1], newRange[1]];
+          ++oldIndex;
+        } else if (newRange[1] < oldRange[1]) {
+          previousRanges[oldIndex] = [newRange[1], oldRange[1]];
+          ++newIndexPointer;
+        } else {
+          ++oldIndex;
+          ++newIndexPointer;
+        }
+      }
+
+      lo0 = newRanges.length ? newRanges[0][0] : 0;
+      hi0 = newRanges.length ? newRanges[newRanges.length - 1][1] : 0;
+
+      return applyFilterChanges(added, removed, valueIndexAdded, valueIndexRemoved, includeEmptyRows);
+    }
 
     // Updating a dimension is a two-stage process. First, we must update the
     // associated filters for the newly-added records. Once all dimensions have
@@ -204,7 +552,13 @@ function crossfilter() {
     // This function is responsible for updating filters, values, and index.
     function preAdd(newData, n0, n1) {
       var newIterablesIndexCount,
+          sourceValues = accessorPath ? extractColumnValues(accessorPath, n0, n1) : null,
+          useStoredRecords = !accessorPath && newData === data && columnarBatches.length,
           newIterablesIndexFilterStatus;
+
+      function getSourceRecord(localIndex) {
+        return useStoredRecords ? getRecord(n0 + localIndex) : newData[localIndex];
+      }
 
       if (iterable){
         // Count all the values
@@ -213,7 +567,7 @@ function crossfilter() {
         k = [];
 
         for (var i0 = 0; i0 < newData.length; i0++) {
-          for(j = 0, k = value(newData[i0]); j < k.length; j++) {
+          for(j = 0, k = sourceValues ? sourceValues[i0] : value(getSourceRecord(i0)); j < k.length; j++) {
             t++;
           }
         }
@@ -224,7 +578,7 @@ function crossfilter() {
         var unsortedIndex = cr_range(t);
 
         for (var l = 0, index1 = 0; index1 < newData.length; index1++) {
-          k = value(newData[index1])
+          k = sourceValues ? sourceValues[index1] : value(getSourceRecord(index1));
           //
           if(!k.length){
             newIterablesIndexCount[index1] = 0;
@@ -252,7 +606,16 @@ function crossfilter() {
 
       } else{
         // Permute new values into natural order using a standard sorted index.
-        newValues = newData.map(value);
+        if (sourceValues) {
+          newValues = sourceValues;
+        } else if (useStoredRecords) {
+          newValues = new Array(n1);
+          for (var recordIndex = 0; recordIndex < n1; ++recordIndex) {
+            newValues[recordIndex] = value(getSourceRecord(recordIndex));
+          }
+        } else {
+          newValues = newData.map(value);
+        }
         newIndex = sortRange(n1);
         newValues = permute(newValues, newIndex);
       }
@@ -310,6 +673,7 @@ function crossfilter() {
         index = newIndex;
         iterablesIndexCount = newIterablesIndexCount;
         iterablesIndexFilterStatus = newIterablesIndexFilterStatus;
+        exactRangeCache.clear();
         lo0 = lo1;
         hi0 = hi1;
         return;
@@ -374,6 +738,7 @@ function crossfilter() {
       }
 
       // Bisect again to recompute lo0 and hi0.
+      exactRangeCache.clear();
       bounds = refilter(values), lo0 = bounds[0], hi0 = bounds[1];
     }
 
@@ -418,35 +783,52 @@ function crossfilter() {
       while (j < n0) index[j++] = 0;
 
       // Bisect again to recompute lo0 and hi0.
+      exactRangeCache.clear();
       var bounds = refilter(values);
       lo0 = bounds[0], hi0 = bounds[1];
     }
 
     // Updates the selected values based on the specified bounds [lo, hi].
     // This implementation is used by all the public filter methods.
-    function filterIndexBounds(bounds) {
-
+    function filterIndexBounds(bounds, includeEmptyRows, nextMode) {
       var lo1 = bounds[0],
-          hi1 = bounds[1];
+          hi1 = bounds[1],
+          previousMode = filterMode,
+          oldRanges = resolveCurrentRanges(),
+          newRanges = lo1 === hi1 ? [] : [[lo1, hi1]];
 
-      if (refilterFunction) {
+      if (includeEmptyRows === undefined) {
+        includeEmptyRows = false;
+      }
+      if (nextMode === undefined) {
+        nextMode = 'bounds';
+      }
+
+      if (oldRanges === null) {
         refilterFunction = null;
-        filterIndexFunction(function(d, i) { return lo1 <= i && i < hi1; }, bounds[0] === 0 && bounds[1] === values.length);
+        filterMode = nextMode;
+        filterInValues = null;
+        filterIndexFunction(function(d, i) { return lo1 <= i && i < hi1; }, includeEmptyRows);
         lo0 = lo1;
         hi0 = hi1;
         return dimension;
       }
 
+      refilterFunction = null;
+      filterMode = nextMode;
+      filterInValues = null;
+
+      if (previousMode === 'in') {
+        return filterIndexRanges(oldRanges, newRanges, includeEmptyRows);
+      }
+
       var i,
           j,
-          k,
           added = [],
           removed = [],
           valueIndexAdded = [],
           valueIndexRemoved = [];
 
-
-      // Fast incremental update based on previous lo index.
       if (lo1 < lo0) {
         for (i = lo1, j = Math.min(lo0, hi1); i < j; ++i) {
           added.push(index[i]);
@@ -459,7 +841,6 @@ function crossfilter() {
         }
       }
 
-      // Fast incremental update based on previous hi index.
       if (hi1 > hi0) {
         for (i = Math.max(lo1, hi0), j = hi1; i < j; ++i) {
           added.push(index[i]);
@@ -472,70 +853,10 @@ function crossfilter() {
         }
       }
 
-      if(!iterable) {
-        // Flip filters normally.
-
-        for(i=0; i<added.length; i++) {
-          filters[offset][added[i]] ^= one;
-        }
-
-        for(i=0; i<removed.length; i++) {
-          filters[offset][removed[i]] ^= one;
-        }
-
-      } else {
-        // For iterables, we need to figure out if the row has been completely removed vs partially included
-        // Only count a row as added if it is not already being aggregated. Only count a row
-        // as removed if the last element being aggregated is removed.
-
-        var newAdded = [];
-        var newRemoved = [];
-        for (i = 0; i < added.length; i++) {
-          iterablesIndexCount[added[i]]++
-          iterablesIndexFilterStatus[valueIndexAdded[i]] = 0;
-          if(iterablesIndexCount[added[i]] === 1) {
-            filters[offset][added[i]] ^= one;
-            newAdded.push(added[i]);
-          }
-        }
-        for (i = 0; i < removed.length; i++) {
-          iterablesIndexCount[removed[i]]--
-          iterablesIndexFilterStatus[valueIndexRemoved[i]] = 1;
-          if(iterablesIndexCount[removed[i]] === 0) {
-            filters[offset][removed[i]] ^= one;
-            newRemoved.push(removed[i]);
-          }
-        }
-
-        added = newAdded;
-        removed = newRemoved;
-
-        // Now handle empty rows.
-        if(refilter === xfilterFilter.filterAll) {
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if((filters[offset][k = iterablesEmptyRows[i]] & one)) {
-              // Was not in the filter, so set the filter and add
-              filters[offset][k] ^= one;
-              added.push(k);
-            }
-          }
-        } else {
-          // filter in place - remove empty rows if necessary
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if(!(filters[offset][k = iterablesEmptyRows[i]] & one)) {
-              // Was in the filter, so set the filter and remove
-              filters[offset][k] ^= one;
-              removed.push(k);
-            }
-          }
-        }
-      }
-
       lo0 = lo1;
       hi0 = hi1;
-      filterListeners.forEach(function(l) { l(one, offset, added, removed); });
-      triggerOnChange('filtered');
-      return dimension;
+
+      return applyFilterChanges(added, removed, valueIndexAdded, valueIndexRemoved, includeEmptyRows);
     }
 
     // Filters this dimension using the specified range, value, or null.
@@ -554,7 +875,33 @@ function crossfilter() {
     function filterExact(value) {
       filterValue = value;
       filterValuePresent = true;
-      return filterIndexBounds((refilter = xfilterFilter.filterExact(bisect, value))(values));
+      refilter = xfilterFilter.filterExact(bisect, value);
+      var range = getExactRange(value);
+      return filterIndexBounds(range || [0, 0], false, 'bounds');
+    }
+
+    function filterIn(valuesToSelect) {
+      var exactFilterValues = normalizeExactFilterValues(valuesToSelect),
+          nextRanges = exactRanges(exactFilterValues),
+          previousRanges = resolveCurrentRanges(),
+          selectedValues = new Set(exactFilterValues),
+          predicate = function(d) { return selectedValues.has(d); };
+
+      filterValue = valuesToSelect;
+      filterValuePresent = true;
+      refilter = xfilterFilter.filterAll;
+      refilterFunction = predicate;
+      filterMode = 'in';
+      filterInValues = exactFilterValues;
+
+      if (previousRanges === null) {
+        filterIndexFunction(predicate, false);
+        lo0 = nextRanges.length ? nextRanges[0][0] : 0;
+        hi0 = nextRanges.length ? nextRanges[nextRanges.length - 1][1] : 0;
+        return dimension;
+      }
+
+      return filterIndexRanges(previousRanges, nextRanges, false);
     }
 
     // Filters this dimension to select the specified range [lo, hi].
@@ -562,14 +909,16 @@ function crossfilter() {
     function filterRange(range) {
       filterValue = range;
       filterValuePresent = true;
-      return filterIndexBounds((refilter = xfilterFilter.filterRange(bisect, range))(values));
+      return filterIndexBounds((refilter = xfilterFilter.filterRange(bisect, range))(values), false, 'bounds');
     }
 
     // Clears any filters on this dimension.
     function filterAll() {
       filterValue = undefined;
       filterValuePresent = false;
-      return filterIndexBounds((refilter = xfilterFilter.filterAll)(values));
+      refilter = xfilterFilter.filterAll;
+
+      return filterIndexBounds((refilter = xfilterFilter.filterAll)(values), true, 'all');
     }
 
     // Filters this dimension using an arbitrary function.
@@ -579,6 +928,8 @@ function crossfilter() {
 
       refilterFunction = f;
       refilter = xfilterFilter.filterAll;
+      filterMode = 'function';
+      filterInValues = null;
 
       filterIndexFunction(f, false);
 
@@ -706,7 +1057,7 @@ function crossfilter() {
             //skip matching row
             --toSkip;
           } else {
-            array.push(data[j]);
+            array.push(getRecord(j));
             --k;
           }
         }
@@ -720,7 +1071,7 @@ function crossfilter() {
               //skip matching row
               --toSkip;
             } else {
-              array.push(data[j]);
+              array.push(getRecord(j));
               --k;
             }
           }
@@ -748,7 +1099,7 @@ function crossfilter() {
               //skip matching row
               --toSkip;
             } else {
-              array.push(data[j]);
+              array.push(getRecord(j));
               --k;
             }
           }
@@ -763,7 +1114,7 @@ function crossfilter() {
             //skip matching row
             --toSkip;
           } else {
-            array.push(data[j]);
+            array.push(getRecord(j));
             --k;
           }
         }
@@ -907,8 +1258,8 @@ function crossfilter() {
 
             // Always add new values to groups. Only remove when not in filter.
             // This gives groups full information on data life-cycle.
-            g.value = add(g.value, data[j], true);
-            if (!filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, data[j], false);
+            g.value = add(g.value, getRecord(j), true);
+            if (!filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, getRecord(j), false);
             if (++i1 >= n1) break;
             x1 = key(newValues[i1]);
           }
@@ -1079,7 +1430,7 @@ function crossfilter() {
             if (filters.zeroExcept(k = added[i], offset, zero)) {
               for (j = 0; j < groupIndex[k].length; j++) {
                 g = groups[groupIndex[k][j]];
-                g.value = reduceAdd(g.value, data[k], false, j);
+                g.value = reduceAdd(g.value, getRecord(k), false, j);
               }
             }
           }
@@ -1089,7 +1440,7 @@ function crossfilter() {
             if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
               for (j = 0; j < groupIndex[k].length; j++) {
                 g = groups[groupIndex[k][j]];
-                g.value = reduceRemove(g.value, data[k], notFilter, j);
+                g.value = reduceRemove(g.value, getRecord(k), notFilter, j);
               }
             }
           }
@@ -1100,7 +1451,7 @@ function crossfilter() {
         for (i = 0, n = added.length; i < n; ++i) {
           if (filters.zeroExcept(k = added[i], offset, zero)) {
             g = groups[groupIndex[k]];
-            g.value = reduceAdd(g.value, data[k], false);
+            g.value = reduceAdd(g.value, getRecord(k), false);
           }
         }
 
@@ -1108,7 +1459,7 @@ function crossfilter() {
         for (i = 0, n = removed.length; i < n; ++i) {
           if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
             g = groups[groupIndex[k]];
-            g.value = reduceRemove(g.value, data[k], notFilter);
+            g.value = reduceRemove(g.value, getRecord(k), notFilter);
           }
         }
       }
@@ -1127,14 +1478,14 @@ function crossfilter() {
         // Add the added values.
         for (i = 0, n = added.length; i < n; ++i) {
           if (filters.zeroExcept(k = added[i], offset, zero)) {
-            g.value = reduceAdd(g.value, data[k], false);
+            g.value = reduceAdd(g.value, getRecord(k), false);
           }
         }
 
         // Remove the removed values.
         for (i = 0, n = removed.length; i < n; ++i) {
           if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
-            g.value = reduceRemove(g.value, data[k], notFilter);
+            g.value = reduceRemove(g.value, getRecord(k), notFilter);
           }
         }
       }
@@ -1158,14 +1509,14 @@ function crossfilter() {
           for (i = 0; i < n; ++i) {
             for (j = 0; j < groupIndex[i].length; j++) {
               g = groups[groupIndex[i][j]];
-              g.value = reduceAdd(g.value, data[i], true, j);
+              g.value = reduceAdd(g.value, getRecord(i), true, j);
             }
           }
           for (i = 0; i < n; ++i) {
             if (!filters.zeroExcept(i, offset, zero)) {
               for (j = 0; j < groupIndex[i].length; j++) {
                 g = groups[groupIndex[i][j]];
-                g.value = reduceRemove(g.value, data[i], false, j);
+                g.value = reduceRemove(g.value, getRecord(i), false, j);
               }
             }
           }
@@ -1174,12 +1525,12 @@ function crossfilter() {
 
         for (i = 0; i < n; ++i) {
           g = groups[groupIndex[i]];
-          g.value = reduceAdd(g.value, data[i], true);
+          g.value = reduceAdd(g.value, getRecord(i), true);
         }
         for (i = 0; i < n; ++i) {
           if (!filters.zeroExcept(i, offset, zero)) {
             g = groups[groupIndex[i]];
-            g.value = reduceRemove(g.value, data[i], false);
+            g.value = reduceRemove(g.value, getRecord(i), false);
           }
         }
       }
@@ -1197,12 +1548,12 @@ function crossfilter() {
         // can build an 'unfiltered' view even if there are already filters in
         // place on other dimensions.
         for (i = 0; i < n; ++i) {
-          g.value = reduceAdd(g.value, data[i], true);
+          g.value = reduceAdd(g.value, getRecord(i), true);
         }
 
         for (i = 0; i < n; ++i) {
           if (!filters.zeroExcept(i, offset, zero)) {
-            g.value = reduceRemove(g.value, data[i], false);
+            g.value = reduceRemove(g.value, getRecord(i), false);
           }
         }
       }
@@ -1338,11 +1689,11 @@ function crossfilter() {
       for (i = n0; i < n; ++i) {
 
         // Add all values all the time.
-        reduceValue = reduceAdd(reduceValue, data[i], true);
+        reduceValue = reduceAdd(reduceValue, getRecord(i), true);
 
         // Remove the value if filtered.
         if (!filters.zero(i)) {
-          reduceValue = reduceRemove(reduceValue, data[i], false);
+          reduceValue = reduceRemove(reduceValue, getRecord(i), false);
         }
       }
     }
@@ -1358,14 +1709,14 @@ function crossfilter() {
       // Add the added values.
       for (i = 0, n = added.length; i < n; ++i) {
         if (filters.zero(k = added[i])) {
-          reduceValue = reduceAdd(reduceValue, data[k], notFilter);
+          reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
         }
       }
 
       // Remove the removed values.
       for (i = 0, n = removed.length; i < n; ++i) {
         if (filters.only(k = removed[i], filterOffset, filterOne)) {
-          reduceValue = reduceRemove(reduceValue, data[k], notFilter);
+          reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
         }
       }
     }
@@ -1380,11 +1731,11 @@ function crossfilter() {
       for (i = 0; i < n; ++i) {
 
         // Add all values all the time.
-        reduceValue = reduceAdd(reduceValue, data[i], true);
+        reduceValue = reduceAdd(reduceValue, getRecord(i), true);
 
         // Remove the value if it is filtered.
         if (!filters.zero(i)) {
-          reduceValue = reduceRemove(reduceValue, data[i], false);
+          reduceValue = reduceRemove(reduceValue, getRecord(i), false);
         }
       }
     }
@@ -1434,6 +1785,7 @@ function crossfilter() {
 
   // Returns the raw row data contained in this crossfilter
   function all(){
+    materializeAllRecords();
     return data;
   }
 
@@ -1445,7 +1797,7 @@ function crossfilter() {
 
       for (i = 0; i < n; i++) {
         if (filters.zeroExceptMask(i, mask)) {
-          array.push(data[i]);
+          array.push(getRecord(i));
         }
       }
 
