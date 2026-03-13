@@ -184,8 +184,24 @@ body {
 
 .filter-controls {
   display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Filter rows for 2-row layout */
+.filter-row {
+  display: flex;
   flex-wrap: wrap;
   gap: 16px;
+  align-items: flex-start;
+}
+
+.filter-row--events {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.filter-row--controls {
   align-items: flex-end;
 }
 
@@ -196,12 +212,70 @@ body {
   min-width: 0;
 }
 
+.filter-group--wide {
+  flex: 1 1 100%;
+}
+
+/* Filter group header with label + clear button */
+.filter-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .filter-label {
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--brand-primary);
+}
+
+.filter-clear-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--border-default);
+  border-radius: 50%;
+  background: transparent;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--brand-secondary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  padding: 0;
+}
+
+.filter-clear-btn:hover {
+  background: #d32f2f;
+  color: #fff;
+  border-color: #d32f2f;
+}
+
+.filter-clear-btn[hidden] {
+  display: none;
+}
+
+/* Filter hint text */
+.filter-hint {
+  font-size: 10px;
+  color: var(--brand-secondary);
+  margin-top: 2px;
+  font-style: italic;
+}
+
+/* Selected count text */
+.filter-selected-count {
+  font-size: 10px;
+  color: var(--brand-secondary);
+  font-weight: 700;
+  min-height: 14px;
+}
+
+.filter-selected-count:empty {
+  display: none;
 }
 
 /* --- Pills --- */
@@ -220,7 +294,7 @@ body {
   font-size: 12px;
   color: var(--brand-primary);
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s;
 }
 
 .pill:hover {
@@ -231,24 +305,169 @@ body {
   background: var(--brand-primary);
   color: #fff;
   border-color: var(--brand-primary);
+  font-weight: 700;
+  box-shadow: 0 1px 4px rgba(63, 101, 135, 0.3);
 }
 
-/* --- Filter Select --- */
-.filter-select {
+.pill--active:hover {
+  background: var(--brand-accent);
+  border-color: var(--brand-accent);
+}
+
+/* --- Multiselect Picker (replaces <select>) --- */
+.multiselect-picker {
+  position: relative;
+  min-width: 170px;
+  max-width: 220px;
+}
+
+.picker-selected-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-bottom: 2px;
+}
+
+.picker-selected-pills:empty {
+  display: none;
+  margin-bottom: 0;
+}
+
+.picker-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--brand-primary);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.picker-pill-dismiss {
+  border: none;
+  background: none;
+  color: rgba(255,255,255,0.7);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+
+.picker-pill-dismiss:hover {
+  color: #fff;
+}
+
+.picker-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 6px 10px;
   border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.6);
-  font-family: inherit;
   font-size: 13px;
   color: var(--brand-accent);
-  min-width: 140px;
   cursor: pointer;
+  transition: border-color 0.15s;
+  user-select: none;
 }
 
-.filter-select:focus {
-  outline: 2px solid var(--brand-secondary);
-  outline-offset: 1px;
+.picker-trigger:hover {
+  border-color: var(--brand-secondary);
+}
+
+.picker-trigger--open {
+  border-color: var(--brand-primary);
+  box-shadow: 0 0 0 2px rgba(63, 101, 135, 0.15);
+}
+
+.picker-placeholder {
+  color: var(--brand-secondary);
+  font-size: 12px;
+}
+
+.picker-trigger--has-selection .picker-placeholder {
+  color: var(--brand-accent);
+  font-weight: 400;
+}
+
+.picker-arrow {
+  font-size: 10px;
+  color: var(--brand-secondary);
+  margin-left: 6px;
+}
+
+.picker-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  margin-top: 4px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(0, 14, 74, 0.12);
+  max-height: 220px;
+  display: flex;
+  flex-direction: column;
+}
+
+.picker-dropdown[hidden] {
+  display: none;
+}
+
+.picker-search {
+  padding: 6px 10px;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--brand-accent);
+  outline: none;
+  background: var(--brand-lighter);
+}
+
+.picker-search::placeholder {
+  color: var(--brand-secondary);
+}
+
+.picker-options {
+  overflow-y: auto;
+  flex: 1;
+  padding: 4px;
+}
+
+.picker-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.picker-option:hover {
+  background: var(--brand-lighter);
+}
+
+.picker-option--checked {
+  background: color-mix(in srgb, var(--brand-primary) 10%, transparent);
+  font-weight: 700;
+}
+
+.picker-option input[type="checkbox"] {
+  accent-color: var(--brand-primary);
+  cursor: pointer;
 }
 
 /* --- Filter Input --- */
@@ -271,7 +490,7 @@ body {
   width: 80px;
 }
 
-/* --- Multiselect --- */
+/* --- Multiselect (Region) --- */
 .multiselect-container {
   display: flex;
   flex-direction: column;
@@ -299,10 +518,16 @@ body {
   padding: 2px 4px;
   border-radius: 4px;
   cursor: pointer;
+  transition: background 0.1s;
 }
 
 .checkbox-list label:hover {
   background: var(--brand-lighter);
+}
+
+.checkbox-list label.cb-label--checked {
+  background: color-mix(in srgb, var(--brand-primary) 12%, transparent);
+  font-weight: 700;
 }
 
 /* --- Lat Range --- */
@@ -337,7 +562,7 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-top: 8px;
+  margin-top: 10px;
 }
 
 .filter-chips:empty {
@@ -347,12 +572,26 @@ body {
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 3px 10px;
+  gap: 6px;
+  padding: 4px 12px;
   border-radius: 20px;
-  background: var(--brand-light);
+  background: var(--brand-primary);
   font-size: 12px;
-  color: var(--brand-accent);
+  font-weight: 700;
+  color: #fff;
+}
+
+.chip-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  background: rgba(255,255,255,0.25);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 4px;
 }
 
 .chip-dismiss {
@@ -360,13 +599,13 @@ body {
   background: none;
   font-size: 14px;
   cursor: pointer;
-  color: var(--brand-primary);
+  color: rgba(255,255,255,0.7);
   line-height: 1;
   padding: 0 2px;
 }
 
 .chip-dismiss:hover {
-  color: #d32f2f;
+  color: #fff;
 }
 
 /* --- Buttons --- */
@@ -522,11 +761,44 @@ body {
   cursor: pointer;
   position: relative;
   font-size: 13px;
-  transition: background 0.1s;
+  transition: background 0.1s, border-color 0.15s;
+  border-left: 3px solid transparent;
 }
 
 .list-item:hover {
   background: var(--brand-lighter);
+}
+
+.list-item:hover::after {
+  content: 'Click to filter';
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 9px;
+  color: var(--brand-secondary);
+  pointer-events: none;
+  white-space: nowrap;
+  opacity: 0.7;
+}
+
+.list-item:hover .list-item-count {
+  opacity: 0;
+}
+
+/* Active/selected list item */
+.list-item--active {
+  border-left-color: var(--brand-primary);
+  background: color-mix(in srgb, var(--brand-primary) 10%, transparent);
+}
+
+.list-item--active .list-item-label {
+  font-weight: 700;
+  color: var(--brand-primary);
+}
+
+.list-item--active:hover::after {
+  content: 'Click to remove';
 }
 
 .list-item--selected {
@@ -535,11 +807,11 @@ body {
 
 .list-item-bar {
   position: absolute;
-  left: 0;
+  left: 3px;
   top: 0;
   bottom: 0;
   background: rgba(63, 101, 135, 0.08);
-  border-radius: 4px;
+  border-radius: 0 4px 4px 0;
   z-index: 0;
   transition: width 0.3s;
 }
@@ -559,6 +831,7 @@ body {
   font-weight: 700;
   color: var(--brand-primary);
   font-size: 12px;
+  transition: opacity 0.1s;
 }
 
 /* --- Data Table --- */
@@ -742,7 +1015,11 @@ body {
     flex-direction: column;
   }
 
-  .filter-controls {
+  .filter-row--controls {
     flex-direction: column;
+  }
+
+  .multiselect-picker {
+    max-width: 100%;
   }
 }

@@ -34,42 +34,88 @@
 
 <section id="filter-bar" class="filter-bar glass-card">
   <div class="filter-controls">
-    <div class="filter-group">
-      <label class="filter-label">Event Type</label>
-      <div id="event-pills" class="pill-group"></div>
-    </div>
-    <div class="filter-group">
-      <label class="filter-label">Customer Country</label>
-      <select id="customer-country-select" class="filter-select"><option value="">All</option></select>
-    </div>
-    <div class="filter-group">
-      <label class="filter-label">Location Country</label>
-      <select id="location-country-select" class="filter-select"><option value="">All</option></select>
-    </div>
-    <div class="filter-group">
-      <label class="filter-label">Region</label>
-      <div id="region-multiselect" class="multiselect-container">
-        <input type="text" id="region-search" class="filter-input" placeholder="Search regions...">
-        <div id="region-checkboxes" class="checkbox-list"></div>
+    <div class="filter-row filter-row--events">
+      <div class="filter-group filter-group--wide">
+        <div class="filter-group-header">
+          <label class="filter-label">Event Type</label>
+          <button class="filter-clear-btn" data-clear="event" hidden>&times;</button>
+        </div>
+        <div id="event-pills" class="pill-group"></div>
+        <div class="filter-hint">Click to toggle &bull; Multiple allowed</div>
       </div>
     </div>
-    <div class="filter-group">
-      <label class="filter-label">Time Range</label>
-      <div id="time-range-container" class="range-container">
-        <input type="range" id="time-min" class="range-input" step="1">
-        <input type="range" id="time-max" class="range-input" step="1">
-        <div id="time-range-label" class="range-label">—</div>
+    <div class="filter-row filter-row--controls">
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Customer Country</label>
+          <button class="filter-clear-btn" data-clear="customer_country" hidden>&times;</button>
+        </div>
+        <div id="customer-country-picker" class="multiselect-picker">
+          <div class="picker-selected-pills" id="customer-country-pills"></div>
+          <div class="picker-trigger" id="customer-country-trigger">
+            <span class="picker-placeholder">Select countries...</span>
+            <span class="picker-arrow">&#9662;</span>
+          </div>
+          <div class="picker-dropdown" id="customer-country-dropdown" hidden>
+            <input type="text" class="picker-search" id="customer-country-search" placeholder="Search countries...">
+            <div class="picker-options" id="customer-country-options"></div>
+          </div>
+        </div>
+        <div class="filter-selected-count" id="customer-country-count"></div>
       </div>
-    </div>
-    <div class="filter-group">
-      <label class="filter-label">Latitude Range</label>
-      <div class="lat-range">
-        <input type="number" id="lat-min" class="filter-input filter-input--small" placeholder="Min" step="0.1">
-        <span>–</span>
-        <input type="number" id="lat-max" class="filter-input filter-input--small" placeholder="Max" step="0.1">
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Location Country</label>
+          <button class="filter-clear-btn" data-clear="location_country" hidden>&times;</button>
+        </div>
+        <div id="location-country-picker" class="multiselect-picker">
+          <div class="picker-selected-pills" id="location-country-pills"></div>
+          <div class="picker-trigger" id="location-country-trigger">
+            <span class="picker-placeholder">Select countries...</span>
+            <span class="picker-arrow">&#9662;</span>
+          </div>
+          <div class="picker-dropdown" id="location-country-dropdown" hidden>
+            <input type="text" class="picker-search" id="location-country-search" placeholder="Search countries...">
+            <div class="picker-options" id="location-country-options"></div>
+          </div>
+        </div>
+        <div class="filter-selected-count" id="location-country-count"></div>
       </div>
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Region</label>
+          <button class="filter-clear-btn" data-clear="region" hidden>&times;</button>
+        </div>
+        <div id="region-multiselect" class="multiselect-container">
+          <input type="text" id="region-search" class="filter-input" placeholder="Search regions...">
+          <div id="region-checkboxes" class="checkbox-list"></div>
+        </div>
+        <div class="filter-selected-count" id="region-count"></div>
+      </div>
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Time Range</label>
+          <button class="filter-clear-btn" data-clear="time" hidden>&times;</button>
+        </div>
+        <div id="time-range-container" class="range-container">
+          <input type="range" id="time-min" class="range-input" step="1">
+          <input type="range" id="time-max" class="range-input" step="1">
+          <div id="time-range-label" class="range-label">—</div>
+        </div>
+      </div>
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Latitude Range</label>
+          <button class="filter-clear-btn" data-clear="latitude" hidden>&times;</button>
+        </div>
+        <div class="lat-range">
+          <input type="number" id="lat-min" class="filter-input filter-input--small" placeholder="Min" step="0.1">
+          <span>–</span>
+          <input type="number" id="lat-max" class="filter-input filter-input--small" placeholder="Max" step="0.1">
+        </div>
+      </div>
+      <button id="clear-all-btn" class="btn btn--clear">Clear All</button>
     </div>
-    <button id="clear-all-btn" class="btn btn--clear">Clear All</button>
   </div>
   <div id="filter-chips" class="filter-chips"></div>
 </section>

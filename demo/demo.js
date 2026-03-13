@@ -79,8 +79,8 @@ const state = {
   kpis: null,
   filterValues: {
     event: [],
-    customer_country: null,
-    location_country: null,
+    customer_country: [],
+    location_country: [],
     region: [],
     time: null,
     latitude: null,
@@ -109,10 +109,26 @@ function cacheDom() {
     latencyDisplay: document.getElementById('latency-display'),
     loadTime: document.getElementById('load-time'),
     eventPills: document.getElementById('event-pills'),
-    customerCountrySelect: document.getElementById('customer-country-select'),
-    locationCountrySelect: document.getElementById('location-country-select'),
+    // Country pickers
+    customerCountryPicker: document.getElementById('customer-country-picker'),
+    customerCountryTrigger: document.getElementById('customer-country-trigger'),
+    customerCountryDropdown: document.getElementById('customer-country-dropdown'),
+    customerCountrySearch: document.getElementById('customer-country-search'),
+    customerCountryOptions: document.getElementById('customer-country-options'),
+    customerCountryPills: document.getElementById('customer-country-pills'),
+    customerCountryCount: document.getElementById('customer-country-count'),
+    locationCountryPicker: document.getElementById('location-country-picker'),
+    locationCountryTrigger: document.getElementById('location-country-trigger'),
+    locationCountryDropdown: document.getElementById('location-country-dropdown'),
+    locationCountrySearch: document.getElementById('location-country-search'),
+    locationCountryOptions: document.getElementById('location-country-options'),
+    locationCountryPills: document.getElementById('location-country-pills'),
+    locationCountryCount: document.getElementById('location-country-count'),
+    // Region
     regionSearch: document.getElementById('region-search'),
     regionCheckboxes: document.getElementById('region-checkboxes'),
+    regionCount: document.getElementById('region-count'),
+    // Other
     timeMin: document.getElementById('time-min'),
     timeMax: document.getElementById('time-max'),
     timeRangeLabel: document.getElementById('time-range-label'),
@@ -181,7 +197,7 @@ function timedOp(label, fn) {
 }
 
 function formatTimestamp(val) {
-  if (val == null) return '—';
+  if (val == null) return '\u2014';
   try {
     const d = new Date(typeof val === 'number' ? val : Number(val));
     if (isNaN(d.getTime())) return String(val);
@@ -192,7 +208,7 @@ function formatTimestamp(val) {
 }
 
 function formatNumber(n) {
-  if (n == null || isNaN(n)) return '—';
+  if (n == null || isNaN(n)) return '\u2014';
   return Number(n).toLocaleString();
 }
 
@@ -204,6 +220,13 @@ function escapeHtml(str) {
   const d = document.createElement('div');
   d.textContent = str;
   return d.innerHTML;
+}
+
+/** Check if a filter value array (or null) matches a given item key */
+function isValueInFilter(filterVal, key) {
+  if (filterVal == null) return false;
+  if (Array.isArray(filterVal)) return filterVal.includes(key);
+  return filterVal === key;
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +701,8 @@ function renderAll() {
   renderTopList(dom.listPostal, state.groups.postal_code, 10, 'postal_code', dom.postalGroupSize);
   renderDataTable();
   renderFilterChips();
+  updateFilterClearButtons();
+  updateSelectedCounts();
 
   const elapsed = performance.now() - t0;
   dom.latencyDisplay.textContent = `${elapsed.toFixed(1)} ms`;
@@ -709,7 +734,6 @@ function populateFilterControls() {
     if (g.key == null || g.key === '') return;
     const btn = document.createElement('button');
     btn.className = 'pill';
-    btn.textContent = g.key;
     btn.dataset.value = g.key;
     btn.addEventListener('click', () => {
       const val = btn.dataset.value;
@@ -726,11 +750,27 @@ function populateFilterControls() {
   });
   updatePillStates();
 
-  // Customer country select
-  populateSelect(dom.customerCountrySelect, state.groups.customer_country.all(), 'customer_country');
+  // Customer country picker
+  populateMultiselectPicker(
+    dom.customerCountryOptions,
+    dom.customerCountrySearch,
+    dom.customerCountryTrigger,
+    dom.customerCountryDropdown,
+    dom.customerCountryPills,
+    state.groups.customer_country.all(),
+    'customer_country'
+  );
 
-  // Location country select
-  populateSelect(dom.locationCountrySelect, state.groups.location_country.all(), 'location_country');
+  // Location country picker
+  populateMultiselectPicker(
+    dom.locationCountryOptions,
+    dom.locationCountrySearch,
+    dom.locationCountryTrigger,
+    dom.locationCountryDropdown,
+    dom.locationCountryPills,
+    state.groups.location_country.all(),
+    'location_country'
+  );
 
   // Region checkboxes
   const regionData = state.groups.region.all();
@@ -746,6 +786,7 @@ function populateFilterControls() {
         .map(c => c.value);
       state.filterValues.region = checked;
       applyFilter('region', checked);
+      updateRegionCheckboxStyles();
     });
     label.appendChild(cb);
     label.appendChild(document.createTextNode(' ' + g.key));
@@ -768,37 +809,196 @@ function populateFilterControls() {
 
     dom.timeMin.addEventListener('input', applyTimeFilter);
     dom.timeMax.addEventListener('input', applyTimeFilter);
+
+    // Close dropdowns on click outside
+    document.addEventListener('click', (e) => {
+      // Customer country
+      if (!dom.customerCountryPicker.contains(e.target)) {
+        closePickerDropdown(dom.customerCountryDropdown, dom.customerCountryTrigger);
+      }
+      // Location country
+      if (!dom.locationCountryPicker.contains(e.target)) {
+        closePickerDropdown(dom.locationCountryDropdown, dom.locationCountryTrigger);
+      }
+    });
+
+    // Filter clear buttons
+    document.querySelectorAll('.filter-clear-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const key = btn.dataset.clear;
+        if (key && state.dimensions[key]) {
+          state.filterValues[key] = Array.isArray(state.filterValues[key]) ? [] : null;
+          applyFilter(key, null);
+          resetFilterControl(key);
+        }
+      });
+    });
   }
 
   // Time range slider (bounds may change on mode switch)
   computeTimeBoundsForSliders();
 }
 
-function populateSelect(selectEl, groupData, filterKey) {
-  // Clear existing options except first "All"
-  while (selectEl.options.length > 1) selectEl.remove(1);
+// ---------------------------------------------------------------------------
+// 15b. Multiselect Picker Logic
+// ---------------------------------------------------------------------------
+function populateMultiselectPicker(optionsEl, searchEl, triggerEl, dropdownEl, pillsEl, groupData, filterKey) {
+  optionsEl.innerHTML = '';
   groupData.forEach(g => {
     if (g.key == null || g.key === '') return;
-    const opt = document.createElement('option');
-    opt.value = g.key;
-    opt.textContent = `${g.key} (${g.value})`;
-    selectEl.appendChild(opt);
+    const div = document.createElement('div');
+    div.className = 'picker-option';
+    div.dataset.value = g.key;
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = g.key;
+    cb.checked = state.filterValues[filterKey].includes(g.key);
+
+    const span = document.createElement('span');
+    span.textContent = `${g.key} (${g.value})`;
+
+    div.appendChild(cb);
+    div.appendChild(span);
+
+    // Click on option row toggles checkbox
+    div.addEventListener('click', (e) => {
+      if (e.target !== cb) cb.checked = !cb.checked;
+      onPickerOptionChange(optionsEl, pillsEl, triggerEl, filterKey);
+    });
+
+    if (cb.checked) div.classList.add('picker-option--checked');
+    optionsEl.appendChild(div);
   });
-  // Only attach listener once
-  if (!selectEl._listenerAttached) {
-    selectEl._listenerAttached = true;
-    selectEl.addEventListener('change', () => {
-      const val = selectEl.value || null;
-      state.filterValues[filterKey] = val;
-      applyFilter(filterKey, val);
+
+  // Search filtering
+  if (!searchEl._listenerAttached) {
+    searchEl._listenerAttached = true;
+    searchEl.addEventListener('input', () => {
+      const q = searchEl.value.toLowerCase();
+      optionsEl.querySelectorAll('.picker-option').forEach(opt => {
+        opt.style.display = opt.dataset.value.toLowerCase().includes(q) ? '' : 'none';
+      });
     });
   }
+
+  // Trigger open/close
+  if (!triggerEl._listenerAttached) {
+    triggerEl._listenerAttached = true;
+    triggerEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isOpen = !dropdownEl.hidden;
+      if (isOpen) {
+        closePickerDropdown(dropdownEl, triggerEl);
+      } else {
+        dropdownEl.hidden = false;
+        triggerEl.classList.add('picker-trigger--open');
+        searchEl.value = '';
+        searchEl.dispatchEvent(new Event('input'));
+        searchEl.focus();
+      }
+    });
+  }
+
+  // Sync pills and trigger text
+  updatePickerPills(pillsEl, triggerEl, filterKey);
+}
+
+function onPickerOptionChange(optionsEl, pillsEl, triggerEl, filterKey) {
+  const checked = Array.from(optionsEl.querySelectorAll('input:checked')).map(cb => cb.value);
+  state.filterValues[filterKey] = checked;
+  applyFilter(filterKey, checked);
+
+  // Update checked styles
+  optionsEl.querySelectorAll('.picker-option').forEach(opt => {
+    const cb = opt.querySelector('input');
+    opt.classList.toggle('picker-option--checked', cb.checked);
+  });
+
+  updatePickerPills(pillsEl, triggerEl, filterKey);
+}
+
+function updatePickerPills(pillsEl, triggerEl, filterKey) {
+  const selected = state.filterValues[filterKey];
+  pillsEl.innerHTML = '';
+  if (selected.length > 0) {
+    selected.forEach(val => {
+      const pill = document.createElement('span');
+      pill.className = 'picker-pill';
+      pill.innerHTML = `${escapeHtml(val)} <button class="picker-pill-dismiss">&times;</button>`;
+      pill.querySelector('.picker-pill-dismiss').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const idx = state.filterValues[filterKey].indexOf(val);
+        if (idx >= 0) state.filterValues[filterKey].splice(idx, 1);
+        applyFilter(filterKey, state.filterValues[filterKey]);
+        // Update the checkbox in options
+        const optContainer = pillsEl.closest('.multiselect-picker').querySelector('.picker-options');
+        if (optContainer) {
+          optContainer.querySelectorAll('.picker-option').forEach(opt => {
+            const cb = opt.querySelector('input');
+            if (cb.value === val) {
+              cb.checked = false;
+              opt.classList.remove('picker-option--checked');
+            }
+          });
+        }
+        updatePickerPills(pillsEl, triggerEl, filterKey);
+      });
+      pillsEl.appendChild(pill);
+    });
+    triggerEl.classList.add('picker-trigger--has-selection');
+    triggerEl.querySelector('.picker-placeholder').textContent = `${selected.length} selected`;
+  } else {
+    triggerEl.classList.remove('picker-trigger--has-selection');
+    triggerEl.querySelector('.picker-placeholder').textContent = 'Select countries...';
+  }
+}
+
+function closePickerDropdown(dropdownEl, triggerEl) {
+  dropdownEl.hidden = true;
+  triggerEl.classList.remove('picker-trigger--open');
+}
+
+function updateRegionCheckboxStyles() {
+  dom.regionCheckboxes.querySelectorAll('label').forEach(lbl => {
+    const cb = lbl.querySelector('input');
+    lbl.classList.toggle('cb-label--checked', cb && cb.checked);
+  });
 }
 
 function updatePillStates() {
   dom.eventPills.querySelectorAll('.pill').forEach(btn => {
-    btn.classList.toggle('pill--active', state.filterValues.event.includes(btn.dataset.value));
+    const isActive = state.filterValues.event.includes(btn.dataset.value);
+    btn.classList.toggle('pill--active', isActive);
+    btn.textContent = (isActive ? '\u2713 ' : '') + btn.dataset.value;
   });
+}
+
+// ---------------------------------------------------------------------------
+// 15c. Filter clear buttons & selected counts
+// ---------------------------------------------------------------------------
+function updateFilterClearButtons() {
+  document.querySelectorAll('.filter-clear-btn').forEach(btn => {
+    const key = btn.dataset.clear;
+    if (!key) return;
+    const dim = state.dimensions[key];
+    const isActive = dim && typeof dim.hasCurrentFilter === 'function' && dim.hasCurrentFilter();
+    btn.hidden = !isActive;
+  });
+}
+
+function updateSelectedCounts() {
+  // Customer country
+  const ccCount = state.filterValues.customer_country.length;
+  dom.customerCountryCount.textContent = ccCount > 0 ? `${ccCount} selected` : '';
+
+  // Location country
+  const lcCount = state.filterValues.location_country.length;
+  dom.locationCountryCount.textContent = lcCount > 0 ? `${lcCount} selected` : '';
+
+  // Region
+  const rCount = state.filterValues.region.length;
+  dom.regionCount.textContent = rCount > 0 ? `${rCount} selected` : '';
 }
 
 function computeTimeBoundsForSliders() {
@@ -822,7 +1022,7 @@ function computeTimeBoundsForSliders() {
   dom.timeMin.max = dom.timeMax.max = maxT;
   dom.timeMin.value = minT;
   dom.timeMax.value = maxT;
-  dom.timeRangeLabel.textContent = `${formatTimestamp(minT)} — ${formatTimestamp(maxT)}`;
+  dom.timeRangeLabel.textContent = `${formatTimestamp(minT)} \u2014 ${formatTimestamp(maxT)}`;
 
 }
 
@@ -831,7 +1031,7 @@ function applyTimeFilter() {
   const hi = Number(dom.timeMax.value);
   if (lo >= hi) return;
   state.filterValues.time = [lo, hi];
-  dom.timeRangeLabel.textContent = `${formatTimestamp(lo)} — ${formatTimestamp(hi)}`;
+  dom.timeRangeLabel.textContent = `${formatTimestamp(lo)} \u2014 ${formatTimestamp(hi)}`;
   applyFilter('time', [lo, hi]);
 }
 
@@ -895,7 +1095,7 @@ function applyFilter(key, value) {
       }
     }
   } else {
-    // Single value (from dropdown)
+    // Single value
     if (isBaseline) {
       dim.filterFunction(function(v) { return v === value; });
     } else {
@@ -915,8 +1115,8 @@ function clearAllFilters() {
   }
   state.filterValues = {
     event: [],
-    customer_country: null,
-    location_country: null,
+    customer_country: [],
+    location_country: [],
     region: [],
     time: null,
     latitude: null,
@@ -954,17 +1154,22 @@ function renderFilterChips() {
     const label = FIELD_LABELS[key] || key;
     const currentFilter = typeof dim.currentFilter === 'function' ? dim.currentFilter() : null;
     let display;
+    let countBadge = '';
     if (Array.isArray(currentFilter)) {
-      display = key === 'time'
-        ? `${formatTimestamp(currentFilter[0])} — ${formatTimestamp(currentFilter[1])}`
-        : currentFilter.length + ' selected';
+      if (key === 'time') {
+        display = `${formatTimestamp(currentFilter[0])} \u2014 ${formatTimestamp(currentFilter[1])}`;
+      } else {
+        const count = currentFilter.length;
+        display = count + ' selected';
+        countBadge = `<span class="chip-count">${count}</span>`;
+      }
     } else if (currentFilter != null) {
       display = String(currentFilter);
     } else {
       display = 'active';
     }
 
-    addChip(`${label}: ${display}`, () => {
+    addChip(`${label}: ${display}`, countBadge, () => {
       state.filterValues[key] = Array.isArray(state.filterValues[key]) ? [] : null;
       applyFilter(key, null);
       resetFilterControl(key);
@@ -972,10 +1177,10 @@ function renderFilterChips() {
   }
 }
 
-function addChip(text, onDismiss) {
+function addChip(text, countBadge, onDismiss) {
   const chip = document.createElement('span');
   chip.className = 'chip';
-  chip.innerHTML = `${escapeHtml(text)} <button class="chip-dismiss">&times;</button>`;
+  chip.innerHTML = `${escapeHtml(text)} ${countBadge} <button class="chip-dismiss">&times;</button>`;
   chip.querySelector('.chip-dismiss').addEventListener('click', onDismiss);
   dom.filterChips.appendChild(chip);
 }
@@ -989,20 +1194,30 @@ function resetFilterControl(key) {
       updatePillStates();
       break;
     case 'customer_country':
-      dom.customerCountrySelect.value = '';
+      // Reset picker checkboxes
+      dom.customerCountryOptions.querySelectorAll('input').forEach(cb => cb.checked = false);
+      dom.customerCountryOptions.querySelectorAll('.picker-option').forEach(opt => opt.classList.remove('picker-option--checked'));
+      updatePickerPills(dom.customerCountryPills, dom.customerCountryTrigger, 'customer_country');
+      closePickerDropdown(dom.customerCountryDropdown, dom.customerCountryTrigger);
       break;
     case 'location_country':
-      dom.locationCountrySelect.value = '';
+      dom.locationCountryOptions.querySelectorAll('input').forEach(cb => cb.checked = false);
+      dom.locationCountryOptions.querySelectorAll('.picker-option').forEach(opt => opt.classList.remove('picker-option--checked'));
+      updatePickerPills(dom.locationCountryPills, dom.locationCountryTrigger, 'location_country');
+      closePickerDropdown(dom.locationCountryDropdown, dom.locationCountryTrigger);
       break;
     case 'region':
       dom.regionCheckboxes.querySelectorAll('input').forEach(cb => cb.checked = false);
       dom.regionSearch.value = '';
-      dom.regionCheckboxes.querySelectorAll('label').forEach(lbl => lbl.style.display = '');
+      dom.regionCheckboxes.querySelectorAll('label').forEach(lbl => {
+        lbl.style.display = '';
+        lbl.classList.remove('cb-label--checked');
+      });
       break;
     case 'time':
       dom.timeMin.value = state.timeBounds.min;
       dom.timeMax.value = state.timeBounds.max;
-      dom.timeRangeLabel.textContent = `${formatTimestamp(state.timeBounds.min)} — ${formatTimestamp(state.timeBounds.max)}`;
+      dom.timeRangeLabel.textContent = `${formatTimestamp(state.timeBounds.min)} \u2014 ${formatTimestamp(state.timeBounds.max)}`;
       break;
     case 'latitude':
       dom.latMin.value = '';
@@ -1023,11 +1238,11 @@ function renderKpis() {
     `${formatNumber(k.totalRows)} <span class="kpi-pct">(${pct}%)</span>`;
   dom.kpiLocations.querySelector('.kpi-value').textContent = formatNumber(k.uniqueLocations);
   dom.kpiLatitude.querySelector('.kpi-value').textContent =
-    k.avgLat != null ? k.avgLat.toFixed(4) : '—';
+    k.avgLat != null ? k.avgLat.toFixed(4) : '\u2014';
   dom.kpiTimespan.querySelector('.kpi-value').textContent =
     (isFiniteNumber(k.minTime) && isFiniteNumber(k.maxTime) && k.maxTime > k.minTime)
-      ? `${formatTimestamp(k.minTime)} — ${formatTimestamp(k.maxTime)}`
-      : '—';
+      ? `${formatTimestamp(k.minTime)} \u2014 ${formatTimestamp(k.maxTime)}`
+      : '\u2014';
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,10 +1429,13 @@ function renderListChart(container, group, filterKey, sizeBadge) {
 
   if (sizeBadge) sizeBadge.textContent = `${group.size()} groups`;
 
+  const filterVal = state.filterValues[filterKey];
+
   container.innerHTML = data.map(g => {
     const pct = maxVal > 0 ? ((g.value / maxVal) * 100).toFixed(1) : 0;
-    const selected = state.filterValues[filterKey] === g.key ? ' list-item--selected' : '';
-    return `<div class="list-item${selected}" data-key="${filterKey}" data-value="${escapeHtml(String(g.key))}">
+    const isActive = isValueInFilter(filterVal, g.key);
+    const activeClass = isActive ? ' list-item--active' : '';
+    return `<div class="list-item${activeClass}" data-key="${filterKey}" data-value="${escapeHtml(String(g.key))}">
       <div class="list-item-bar" style="width:${pct}%"></div>
       <span class="list-item-label">${escapeHtml(String(g.key))}</span>
       <span class="list-item-count">${formatNumber(g.value)}</span>
@@ -1234,9 +1452,13 @@ function renderTopList(container, group, k, filterKey, sizeBadge) {
 
   if (sizeBadge) sizeBadge.textContent = `${group.size()} groups`;
 
+  const filterVal = state.filterValues[filterKey];
+
   container.innerHTML = data.map(g => {
     const pct = maxVal > 0 ? ((Math.abs(g.value) / Math.abs(maxVal)) * 100).toFixed(1) : 0;
-    return `<div class="list-item" data-key="${filterKey}" data-value="${escapeHtml(String(g.key))}">
+    const isActive = isValueInFilter(filterVal, g.key);
+    const activeClass = isActive ? ' list-item--active' : '';
+    return `<div class="list-item${activeClass}" data-key="${filterKey}" data-value="${escapeHtml(String(g.key))}">
       <div class="list-item-bar" style="width:${pct}%"></div>
       <span class="list-item-label">${escapeHtml(String(g.key))}</span>
       <span class="list-item-count">${formatNumber(g.value)}</span>
@@ -1401,7 +1623,7 @@ async function init() {
     dom.addRowsBtn.addEventListener('click', onAddRows);
     dom.removeFilteredBtn.addEventListener('click', onRemoveFiltered);
 
-    // List click delegation for chart-grid (ctrl/meta for multi-select)
+    // List click delegation for chart-grid
     document.querySelector('.chart-grid').addEventListener('click', (e) => {
       const item = e.target.closest('.list-item');
       if (!item) return;
@@ -1409,33 +1631,37 @@ async function init() {
       const value = item.dataset.value;
       if (!key || !value || !state.dimensions[key]) return;
 
+      // All list filter values are now arrays
+      let current = state.filterValues[key];
+      if (!Array.isArray(current)) current = current ? [current] : [];
+
       if (e.ctrlKey || e.metaKey) {
-        // Multi-select: accumulate into filterIn
-        let current = state.filterValues[key];
-        if (!Array.isArray(current)) current = current ? [current] : [];
+        // Multi-select: toggle this value in array
         const idx = current.indexOf(value);
         if (idx >= 0) {
           current = current.filter(v => v !== value);
         } else {
           current = current.concat([value]);
         }
-        state.filterValues[key] = current.length > 0 ? current : (Array.isArray(state.filterValues[key]) ? [] : null);
-        applyFilter(key, current.length > 0 ? current : null);
       } else {
         // Single-select toggle
-        const currentVal = state.filterValues[key];
-        const isActive = currentVal === value || (Array.isArray(currentVal) && currentVal.length === 1 && currentVal[0] === value);
-        if (isActive) {
-          state.filterValues[key] = Array.isArray(state.filterValues[key]) ? [] : null;
-          applyFilter(key, null);
+        if (current.length === 1 && current[0] === value) {
+          current = [];
         } else {
-          state.filterValues[key] = Array.isArray(state.filterValues[key]) ? [value] : value;
-          applyFilter(key, Array.isArray(state.filterValues[key]) ? [value] : value);
+          current = [value];
         }
       }
-      // Sync dropdown if applicable
-      if (key === 'customer_country') dom.customerCountrySelect.value = state.filterValues[key] || '';
-      if (key === 'location_country') dom.locationCountrySelect.value = state.filterValues[key] || '';
+
+      state.filterValues[key] = current;
+      applyFilter(key, current.length > 0 ? current : null);
+
+      // Sync country picker checkboxes if applicable
+      if (key === 'customer_country') {
+        syncPickerFromState(dom.customerCountryOptions, dom.customerCountryPills, dom.customerCountryTrigger, 'customer_country');
+      }
+      if (key === 'location_country') {
+        syncPickerFromState(dom.locationCountryOptions, dom.locationCountryPills, dom.locationCountryTrigger, 'location_country');
+      }
     });
 
     // Resize ECharts on window resize
@@ -1455,6 +1681,17 @@ async function init() {
     dom.loadingOverlay.hidden = true;
     console.error(err);
   }
+}
+
+/** Sync picker checkboxes and pills from current state.filterValues */
+function syncPickerFromState(optionsEl, pillsEl, triggerEl, filterKey) {
+  const selected = state.filterValues[filterKey];
+  optionsEl.querySelectorAll('.picker-option').forEach(opt => {
+    const cb = opt.querySelector('input');
+    cb.checked = selected.includes(cb.value);
+    opt.classList.toggle('picker-option--checked', cb.checked);
+  });
+  updatePickerPills(pillsEl, triggerEl, filterKey);
 }
 
 // ---------------------------------------------------------------------------
