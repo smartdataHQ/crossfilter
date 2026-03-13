@@ -123,6 +123,9 @@ bitarray.prototype.truncate = function(n) {
 
 // Checks that all bits for the given index are 0
 bitarray.prototype.zero = function(n) {
+  if (this.subarrays === 1) {
+    return !this[0][n];
+  }
   var i, len;
   for (i = 0, len = this.subarrays; i < len; ++i) {
     if (this[i][n]) {
@@ -134,6 +137,10 @@ bitarray.prototype.zero = function(n) {
 
 // Checks that all bits for the given index are 0 except for possibly one
 bitarray.prototype.zeroExcept = function(n, offset, zero) {
+  if (this.subarrays === 1) {
+    var mask = this[0][n];
+    return !(offset === 0 ? mask & zero : mask);
+  }
   var i, len;
   for (i = 0, len = this.subarrays; i < len; ++i) {
     if (i === offset ? this[i][n] & zero : this[i][n]) {
@@ -146,6 +153,9 @@ bitarray.prototype.zeroExcept = function(n, offset, zero) {
 // Checks that all bits for the given index are 0 except for the specified mask.
 // The mask should be an array of the same size as the filter subarrays width.
 bitarray.prototype.zeroExceptMask = function(n, mask) {
+  if (this.subarrays === 1) {
+    return !(this[0][n] & mask[0]);
+  }
   var i, len;
   for (i = 0, len = this.subarrays; i < len; ++i) {
     if (this[i][n] & mask[i]) {
@@ -157,6 +167,9 @@ bitarray.prototype.zeroExceptMask = function(n, mask) {
 
 // Checks that only the specified bit is set for the given index
 bitarray.prototype.only = function(n, offset, one) {
+  if (this.subarrays === 1) {
+    return this[0][n] === (offset === 0 ? one : 0);
+  }
   var i, len;
   for (i = 0, len = this.subarrays; i < len; ++i) {
     if (this[i][n] != (i === offset ? one : 0)) {
@@ -168,6 +181,13 @@ bitarray.prototype.only = function(n, offset, one) {
 
 // Checks that only the specified bit is set for the given index except for possibly one other
 bitarray.prototype.onlyExcept = function(n, offset, zero, onlyOffset, onlyOne) {
+  if (this.subarrays === 1) {
+    var masked = this[0][n];
+    if (offset === 0) {
+      masked = (masked & zero) >>> 0;
+    }
+    return masked === (onlyOffset === 0 ? onlyOne : 0);
+  }
   var mask;
   var i, len;
   for (i = 0, len = this.subarrays; i < len; ++i) {
@@ -182,10 +202,10 @@ bitarray.prototype.onlyExcept = function(n, offset, zero, onlyOffset, onlyOne) {
 };
 
 export default {
-  array8: arrayUntyped,
-  array16: arrayUntyped,
-  array32: arrayUntyped,
-  arrayLengthen: arrayLengthenUntyped,
-  arrayWiden: arrayWidenUntyped,
+  array8: array8,
+  array16: array16,
+  array32: array32,
+  arrayLengthen: arrayLengthen,
+  arrayWiden: arrayWiden,
   bitarray: bitarray
 };
