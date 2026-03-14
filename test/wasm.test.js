@@ -67,6 +67,30 @@ describe("wasm runtime", () => {
     expect(sum).toBe(4);
   });
 
+  it("produces correct results when called repeatedly with same target values", () => {
+    var ctrl = createWasmRuntimeController({ wasm: true });
+    var codes1 = new Uint32Array([0, 1, 2, 3, 4]);
+    var codes2 = new Uint32Array([0, 1, 2, 3, 4, 5, 6]);
+
+    // Different array references, same content
+    var r1 = ctrl.findEncodedMatches(codes1, [1, 3]);
+    expect(Array.from(r1)).toEqual([1, 3]);
+
+    var r2 = ctrl.findEncodedMatches(codes2, [1, 3]);
+    expect(Array.from(r2)).toEqual([1, 3]);
+  });
+
+  it("produces correct results when targets change between calls", () => {
+    var ctrl = createWasmRuntimeController({ wasm: true });
+    var codes = new Uint32Array([0, 1, 2, 3, 4]);
+
+    var r1 = ctrl.findEncodedMatches(codes, [1, 3]);
+    expect(Array.from(r1)).toEqual([1, 3]);
+
+    var r2 = ctrl.findEncodedMatches(codes, [0, 2, 4]);
+    expect(Array.from(r2)).toEqual([0, 2, 4]);
+  });
+
   it("handles filter transitions (different targets, same codes)", () => {
     var ctrl = createWasmRuntimeController({ wasm: true });
     var codes = new Uint32Array([0, 1, 2, 3, 4]);

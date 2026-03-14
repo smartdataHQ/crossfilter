@@ -13,6 +13,15 @@ var sharedRuntimeState = {
 var SMALL_TARGET_WASM_THRESHOLD = 4;
 var MAX_WASM_MARK_BYTES = 32 * 1024 * 1024;
 
+function arraysEqual(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (var i = 0; i < a.length; ++i) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 function encodeU32(value) {
   var bytes = [];
   do {
@@ -167,6 +176,9 @@ function buildRuntime() {
   return {
     cachedCodes: null,
     cachedCodesLength: 0,
+    cachedTargets: null,
+    cachedTargetsLength: 0,
+    cachedTargetsOffset: 0,
     filterInU32: instance.exports.filterInU32,
     markFilterInU32: instance.exports.markFilterInU32,
     memory: instance.exports.memory,
@@ -178,6 +190,9 @@ function buildRuntime() {
         this.memory.grow(pagesNeeded - currentPages);
         this.cachedCodes = null;
         this.cachedCodesLength = 0;
+        this.cachedTargets = null;
+        this.cachedTargetsLength = 0;
+        this.cachedTargetsOffset = 0;
       }
 
       return this.memory.buffer;
@@ -190,6 +205,16 @@ function buildRuntime() {
       this.cachedCodes = codes;
       this.cachedCodesLength = codes.length;
     },
+    syncTargets: function(buffer, targetCodes, offset) {
+      if (arraysEqual(this.cachedTargets, targetCodes)
+          && this.cachedTargetsOffset === offset) {
+        return;
+      }
+      new Uint32Array(buffer, offset, targetCodes.length).set(targetCodes);
+      this.cachedTargets = targetCodes.slice ? targetCodes.slice() : Array.prototype.slice.call(targetCodes);
+      this.cachedTargetsLength = targetCodes.length;
+      this.cachedTargetsOffset = offset;
+    },
     matchSmall: function(codes, targetCodes) {
       var dataBytes = codes.length * 4;
       var targetBytes = targetCodes.length * 4;
@@ -198,7 +223,7 @@ function buildRuntime() {
       var buffer = this.ensureCapacity(totalBytes);
 
       this.syncCodes(buffer, codes);
-      new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
+      this.syncTargets(buffer, targetCodes, dataBytes);
 
       var count = this.filterInU32(0, codes.length, dataBytes, targetCodes.length, outPtr);
       // SAFETY: returned view is only valid until next matchSmall/matchMarked call
@@ -214,7 +239,7 @@ function buildRuntime() {
       var buffer = this.ensureCapacity(totalBytes);
 
       this.syncCodes(buffer, codes);
-      new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
+      this.syncTargets(buffer, targetCodes, dataBytes);
 
       var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
       // SAFETY: returned view is only valid until next matchSmall/matchMarked call
