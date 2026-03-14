@@ -58,14 +58,18 @@ function crossfilter() {
   var runtimeController = createWasmRuntimeController();
   var crossfilter = {
     add: add,
+    allFilteredIndexes: allFilteredIndexes,
+    batch: batch,
     remove: removeData,
     dimension: dimension,
+    getFieldValue: getFieldValue,
     groupAll: groupAll,
     size: size,
     all: all,
     allFiltered: allFiltered,
     onChange: onChange,
     isElementFiltered: isElementFiltered,
+    takeColumns: takeColumns,
     configureRuntime: runtimeController.configureRuntime,
     runtimeInfo: runtimeController.runtimeInfo
   };
@@ -76,9 +80,13 @@ function crossfilter() {
       filterListeners = [], // when the filters change
       dataListeners = [], // when data is added
       removeDataListeners = [], // when data is removed
+      resetListeners = [],
       callbacks = [],
       columnarBatches = [],
-      activeDimensionFilterCount = 0;
+      activeDimensionFilterCount = 0,
+      batchedFilterDepth = 0,
+      batchedFilterEventPending = false,
+      batchedFilterResetPending = false;
 
   filters = new xfilterArray.bitarray(0);
 
@@ -140,6 +148,60 @@ function crossfilter() {
     return activeDimensionFilterCount > 0;
   }
 
+  function registerResetListener(listener) {
+    resetListeners.push(listener);
+    return listener;
+  }
+
+  function unregisterResetListener(listener) {
+    var listenerIndex = resetListeners.indexOf(listener);
+    if (listenerIndex >= 0) {
+      resetListeners.splice(listenerIndex, 1);
+    }
+  }
+
+  function markFilterListenersDirty() {
+    if (batchedFilterResetPending) {
+      return;
+    }
+    batchedFilterResetPending = true;
+    for (var listenerIndex = 0; listenerIndex < resetListeners.length; ++listenerIndex) {
+      resetListeners[listenerIndex]();
+    }
+  }
+
+  function notifyFilterListeners(filterOne, filterOffset, added, removed) {
+    if (batchedFilterDepth > 0) {
+      batchedFilterEventPending = true;
+      markFilterListenersDirty();
+      return;
+    }
+
+    filterListeners.forEach(function(l) { l(filterOne, filterOffset, added, removed); });
+    triggerOnChange('filtered');
+  }
+
+  function flushBatchedFilterEvents() {
+    if (!batchedFilterEventPending) {
+      return;
+    }
+    batchedFilterEventPending = false;
+    batchedFilterResetPending = false;
+    triggerOnChange('filtered');
+  }
+
+  function batch(callback) {
+    batchedFilterDepth += 1;
+    try {
+      return callback();
+    } finally {
+      batchedFilterDepth -= 1;
+      if (!batchedFilterDepth) {
+        flushBatchedFilterEvents();
+      }
+    }
+  }
+
   function getRecord(rowIndex) {
     var row = data[rowIndex];
     if (row !== undefined) {
@@ -163,6 +225,29 @@ function crossfilter() {
     }
     data[rowIndex] = row;
     return row;
+  }
+
+  function getFieldValue(rowIndex, field) {
+    var row = data[rowIndex];
+    if (row !== undefined) {
+      return row ? row[field] : undefined;
+    }
+
+    if (columnarBatches.length) {
+      var batch = findColumnarBatch(rowIndex);
+      if (batch) {
+        var batchRowIndex = rowIndex - batch.start;
+        if (batch.accessors && batch.accessors[field]) {
+          return batch.accessors[field](batchRowIndex);
+        }
+        if (Object.prototype.hasOwnProperty.call(batch.columns, field)) {
+          return getColumnValue(batch.columns[field], batchRowIndex);
+        }
+      }
+    }
+
+    row = getRecord(rowIndex);
+    return row ? row[field] : undefined;
   }
 
   function materializeAllRecords() {
@@ -380,7 +465,9 @@ function crossfilter() {
       currentFilter: currentFilter,
       hasCurrentFilter: hasCurrentFilter,
       top: top,
+      topIndex: topIndex,
       bottom: bottom,
+      bottomIndex: bottomIndex,
       group: group,
       groupAll: groupAll,
       dispose: dispose,
@@ -745,9 +832,8 @@ function crossfilter() {
         lazyEncodedState.selected = normalizeLazySelectionMask(currentSelected);
         lazyEncodedState.matchIndices = nextMatches;
         if (notifyListeners) {
-          filterListeners.forEach(function(l) { l(one, offset, added, removed); });
+          notifyFilterListeners(one, offset, added, removed);
         }
-        triggerOnChange('filtered');
         return dimension;
       }
 
@@ -786,9 +872,8 @@ function crossfilter() {
       lazyEncodedState.selected = nextSelected;
       lazyEncodedState.matchIndices = nextMatches;
       if (notifyListeners) {
-        filterListeners.forEach(function(l) { l(one, offset, added, removed); });
+        notifyFilterListeners(one, offset, added, removed);
       }
-      triggerOnChange('filtered');
       return dimension;
     }
 
@@ -1107,8 +1192,7 @@ function crossfilter() {
         }
       }
 
-      filterListeners.forEach(function(l) { l(one, offset, added, removed); });
-      triggerOnChange('filtered');
+      notifyFilterListeners(one, offset, added, removed);
       return dimension;
     }
 
@@ -1773,8 +1857,7 @@ function crossfilter() {
         }
       }
 
-      filterListeners.forEach(function(l) { l(one, offset, added, removed); });
-      triggerOnChange('filtered');
+      notifyFilterListeners(one, offset, added, removed);
     }
 
     function currentFilter() {
@@ -1818,6 +1901,43 @@ function crossfilter() {
               --toSkip;
             } else {
               array.push(getRecord(j));
+              --k;
+            }
+          }
+        }
+      }
+
+      return array;
+    }
+
+    function topIndex(k, top_offset) {
+      materializeLazyEncodedState();
+
+      var array = [],
+          i = hi0,
+          j,
+          toSkip = 0;
+
+      if(top_offset && top_offset > 0) toSkip = top_offset;
+
+      while (--i >= lo0 && k > 0) {
+        if (filters.zero(j = index[i])) {
+          if(toSkip > 0) {
+            --toSkip;
+          } else {
+            array.push(j);
+            --k;
+          }
+        }
+      }
+
+      if(iterable){
+        for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
+          if(filters.zero(j = iterablesEmptyRows[i])) {
+            if(toSkip > 0) {
+              --toSkip;
+            } else {
+              array.push(j);
               --k;
             }
           }
@@ -1872,6 +1992,46 @@ function crossfilter() {
       return array;
     }
 
+    function bottomIndex(k, bottom_offset) {
+      materializeLazyEncodedState();
+
+      var array = [],
+          i,
+          j,
+          toSkip = 0;
+
+      if(bottom_offset && bottom_offset > 0) toSkip = bottom_offset;
+
+      if(iterable) {
+        for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
+          if(filters.zero(j = iterablesEmptyRows[i])) {
+            if(toSkip > 0) {
+              --toSkip;
+            } else {
+              array.push(j);
+              --k;
+            }
+          }
+        }
+      }
+
+      i = lo0;
+
+      while (i < hi0 && k > 0) {
+        if (filters.zero(j = index[i])) {
+          if(toSkip > 0) {
+            --toSkip;
+          } else {
+            array.push(j);
+            --k;
+          }
+        }
+        i++;
+      }
+
+      return array;
+    }
+
     // Adds a new group to this dimension, using the specified key function.
     function group(key) {
       if (arguments.length < 1) key = cr_identity;
@@ -1907,9 +2067,13 @@ function crossfilter() {
           reduceAdd,
           reduceRemove,
           reduceInitial,
+          reduceMode = null,
           update = cr_null,
           reset = cr_null,
           resetNeeded = true,
+          markResetNeeded = registerResetListener(function() {
+            resetNeeded = true;
+          }),
           groupAll = key === cr_null,
           n0old;
 
@@ -2085,9 +2249,16 @@ function crossfilter() {
 
             // Always add new values to groups. Only remove when another dimension has filtered them out.
             // This gives groups full information on data life-cycle without paying for no-op filter checks.
-            var rowRecord = getRecord(j);
-            g.value = add(g.value, rowRecord, true);
-            if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, rowRecord, false);
+            if (reduceMode === 'count') {
+              g.value += 1;
+              if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
+                g.value -= 1;
+              }
+            } else {
+              var rowRecord = getRecord(j);
+              g.value = add(g.value, rowRecord, true);
+              if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, rowRecord, false);
+            }
             if (++i1 >= n1) break;
             x1 = key(newValues[i1]);
           }
@@ -2258,7 +2429,11 @@ function crossfilter() {
             if (filters.zeroExcept(k = added[i], offset, zero)) {
               for (j = 0; j < groupIndex[k].length; j++) {
                 g = groups[groupIndex[k][j]];
-                g.value = reduceAdd(g.value, getRecord(k), false, j);
+                if (reduceMode === 'count') {
+                  g.value += 1;
+                } else {
+                  g.value = reduceAdd(g.value, getRecord(k), false, j);
+                }
               }
             }
           }
@@ -2268,7 +2443,11 @@ function crossfilter() {
             if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
               for (j = 0; j < groupIndex[k].length; j++) {
                 g = groups[groupIndex[k][j]];
-                g.value = reduceRemove(g.value, getRecord(k), notFilter, j);
+                if (reduceMode === 'count') {
+                  g.value -= 1;
+                } else {
+                  g.value = reduceRemove(g.value, getRecord(k), notFilter, j);
+                }
               }
             }
           }
@@ -2279,7 +2458,11 @@ function crossfilter() {
         for (i = 0, n = added.length; i < n; ++i) {
           if (filters.zeroExcept(k = added[i], offset, zero)) {
             g = groups[groupIndex[k]];
-            g.value = reduceAdd(g.value, getRecord(k), false);
+            if (reduceMode === 'count') {
+              g.value += 1;
+            } else {
+              g.value = reduceAdd(g.value, getRecord(k), false);
+            }
           }
         }
 
@@ -2287,7 +2470,11 @@ function crossfilter() {
         for (i = 0, n = removed.length; i < n; ++i) {
           if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
             g = groups[groupIndex[k]];
-            g.value = reduceRemove(g.value, getRecord(k), notFilter);
+            if (reduceMode === 'count') {
+              g.value -= 1;
+            } else {
+              g.value = reduceRemove(g.value, getRecord(k), notFilter);
+            }
           }
         }
       }
@@ -2306,14 +2493,22 @@ function crossfilter() {
         // Add the added values.
         for (i = 0, n = added.length; i < n; ++i) {
           if (filters.zeroExcept(k = added[i], offset, zero)) {
-            g.value = reduceAdd(g.value, getRecord(k), false);
+            if (reduceMode === 'count') {
+              g.value += 1;
+            } else {
+              g.value = reduceAdd(g.value, getRecord(k), false);
+            }
           }
         }
 
         // Remove the removed values.
         for (i = 0, n = removed.length; i < n; ++i) {
           if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
-            g.value = reduceRemove(g.value, getRecord(k), notFilter);
+            if (reduceMode === 'count') {
+              g.value -= 1;
+            } else {
+              g.value = reduceRemove(g.value, getRecord(k), notFilter);
+            }
           }
         }
       }
@@ -2336,10 +2531,14 @@ function crossfilter() {
         // place on other dimensions.
         if(iterable){
           for (i = 0; i < n; ++i) {
-            var iterableRecord = getRecord(i);
             for (j = 0; j < groupIndex[i].length; j++) {
               g = groups[groupIndex[i][j]];
-              g.value = reduceAdd(g.value, iterableRecord, true, j);
+              if (reduceMode === 'count') {
+                g.value += 1;
+              } else {
+                var iterableRecord = getRecord(i);
+                g.value = reduceAdd(g.value, iterableRecord, true, j);
+              }
             }
           }
           if (!applyFilteredRemovals) {
@@ -2347,10 +2546,14 @@ function crossfilter() {
           }
           for (i = 0; i < n; ++i) {
             if (!filters.zeroExcept(i, offset, zero)) {
-              iterableRecord = getRecord(i);
               for (j = 0; j < groupIndex[i].length; j++) {
                 g = groups[groupIndex[i][j]];
-                g.value = reduceRemove(g.value, iterableRecord, false, j);
+                if (reduceMode === 'count') {
+                  g.value -= 1;
+                } else {
+                  var filteredIterableRecord = getRecord(i);
+                  g.value = reduceRemove(g.value, filteredIterableRecord, false, j);
+                }
               }
             }
           }
@@ -2359,7 +2562,11 @@ function crossfilter() {
 
         for (i = 0; i < n; ++i) {
           g = groups[groupIndex[i]];
-          g.value = reduceAdd(g.value, getRecord(i), true);
+          if (reduceMode === 'count') {
+            g.value += 1;
+          } else {
+            g.value = reduceAdd(g.value, getRecord(i), true);
+          }
         }
         if (!applyFilteredRemovals) {
           return;
@@ -2367,7 +2574,11 @@ function crossfilter() {
         for (i = 0; i < n; ++i) {
           if (!filters.zeroExcept(i, offset, zero)) {
             g = groups[groupIndex[i]];
-            g.value = reduceRemove(g.value, getRecord(i), false);
+            if (reduceMode === 'count') {
+              g.value -= 1;
+            } else {
+              g.value = reduceRemove(g.value, getRecord(i), false);
+            }
           }
         }
       }
@@ -2386,7 +2597,11 @@ function crossfilter() {
         // can build an 'unfiltered' view even if there are already filters in
         // place on other dimensions.
         for (i = 0; i < n; ++i) {
-          g.value = reduceAdd(g.value, getRecord(i), true);
+          if (reduceMode === 'count') {
+            g.value += 1;
+          } else {
+            g.value = reduceAdd(g.value, getRecord(i), true);
+          }
         }
 
         if (!applyFilteredRemovals) {
@@ -2394,7 +2609,11 @@ function crossfilter() {
         }
         for (i = 0; i < n; ++i) {
           if (!filters.zeroExcept(i, offset, zero)) {
-            g.value = reduceRemove(g.value, getRecord(i), false);
+            if (reduceMode === 'count') {
+              g.value -= 1;
+            } else {
+              g.value = reduceRemove(g.value, getRecord(i), false);
+            }
           }
         }
       }
@@ -2417,13 +2636,16 @@ function crossfilter() {
         reduceAdd = add;
         reduceRemove = remove;
         reduceInitial = initial;
+        reduceMode = null;
         resetNeeded = true;
         return group;
       }
 
       // A convenience method for reducing by count.
       function reduceCount() {
-        return reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
+        reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
+        reduceMode = 'count';
+        return group;
       }
 
       // A convenience method for reducing by sum(value).
@@ -2459,6 +2681,7 @@ function crossfilter() {
         if (i >= 0) removeDataListeners.splice(i, 1);
         i = dimensionGroups.indexOf(group);
         if (i >= 0) dimensionGroups.splice(i, 1);
+        unregisterResetListener(markResetNeeded);
         return group;
       }
 
@@ -2509,7 +2732,11 @@ function crossfilter() {
         reduceAdd,
         reduceRemove,
         reduceInitial,
-        resetNeeded = true;
+        reduceMode = null,
+        resetNeeded = true,
+        markResetNeeded = registerResetListener(function() {
+          resetNeeded = true;
+        });
 
     // The group listens to the crossfilter for when any dimension changes, so
     // that it can update the reduce value. It must also listen to the parent
@@ -2529,14 +2756,21 @@ function crossfilter() {
 
       // Cycle through all the values.
       for (i = n0; i < n; ++i) {
-        var rowRecord = getRecord(i);
+        if (reduceMode === 'count') {
+          reduceValue += 1;
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue -= 1;
+          }
+        } else {
+          var rowRecord = getRecord(i);
 
-        // Add all values all the time.
-        reduceValue = reduceAdd(reduceValue, rowRecord, true);
+          // Add all values all the time.
+          reduceValue = reduceAdd(reduceValue, rowRecord, true);
 
-        // Remove the value if filtered.
-        if (applyFilteredRemovals && !filters.zero(i)) {
-          reduceValue = reduceRemove(reduceValue, rowRecord, false);
+          // Remove the value if filtered.
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue = reduceRemove(reduceValue, rowRecord, false);
+          }
         }
       }
     }
@@ -2552,14 +2786,22 @@ function crossfilter() {
       // Add the added values.
       for (i = 0, n = added.length; i < n; ++i) {
         if (filters.zero(k = added[i])) {
-          reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
+          if (reduceMode === 'count') {
+            reduceValue += 1;
+          } else {
+            reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
+          }
         }
       }
 
       // Remove the removed values.
       for (i = 0, n = removed.length; i < n; ++i) {
         if (filters.only(k = removed[i], filterOffset, filterOne)) {
-          reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
+          if (reduceMode === 'count') {
+            reduceValue -= 1;
+          } else {
+            reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
+          }
         }
       }
     }
@@ -2573,14 +2815,21 @@ function crossfilter() {
 
       // Cycle through all the values.
       for (i = 0; i < n; ++i) {
-        var rowRecord = getRecord(i);
+        if (reduceMode === 'count') {
+          reduceValue += 1;
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue -= 1;
+          }
+        } else {
+          var rowRecord = getRecord(i);
 
-        // Add all values all the time.
-        reduceValue = reduceAdd(reduceValue, rowRecord, true);
+          // Add all values all the time.
+          reduceValue = reduceAdd(reduceValue, rowRecord, true);
 
-        // Remove the value if it is filtered.
-        if (applyFilteredRemovals && !filters.zero(i)) {
-          reduceValue = reduceRemove(reduceValue, rowRecord, false);
+          // Remove the value if it is filtered.
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue = reduceRemove(reduceValue, rowRecord, false);
+          }
         }
       }
     }
@@ -2591,13 +2840,16 @@ function crossfilter() {
       reduceAdd = add;
       reduceRemove = remove;
       reduceInitial = initial;
+      reduceMode = null;
       resetNeeded = true;
       return group;
     }
 
     // A convenience method for reducing by count.
     function reduceCount() {
-      return reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
+      reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
+      reduceMode = 'count';
+      return group;
     }
 
     // A convenience method for reducing by sum(value).
@@ -2617,6 +2869,7 @@ function crossfilter() {
       if (i >= 0) filterListeners.splice(i, 1);
       i = dataListeners.indexOf(add);
       if (i >= 0) dataListeners.splice(i, 1);
+      unregisterResetListener(markResetNeeded);
       return group;
     }
 
@@ -2647,6 +2900,53 @@ function crossfilter() {
       }
 
       return array;
+  }
+
+  function allFilteredIndexes(ignore_dimensions) {
+    var array = [],
+        i = 0,
+        mask = maskForDimensions(ignore_dimensions || []);
+
+    for (i = 0; i < n; i++) {
+      if (filters.zeroExceptMask(i, mask)) {
+        array.push(i);
+      }
+    }
+
+    return array;
+  }
+
+  function takeColumns(rowIndexes, fields) {
+    var selectedFields = fields && fields.length ? fields.slice() : null;
+    var columns = {};
+    var rowCount = rowIndexes ? rowIndexes.length : 0;
+    var fieldIndex;
+    var rowIndex;
+
+    if (!selectedFields) {
+      return {
+        columns: columns,
+        fields: [],
+        length: rowCount
+      };
+    }
+
+    for (fieldIndex = 0; fieldIndex < selectedFields.length; ++fieldIndex) {
+      columns[selectedFields[fieldIndex]] = new Array(rowCount);
+    }
+
+    for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+      for (fieldIndex = 0; fieldIndex < selectedFields.length; ++fieldIndex) {
+        var field = selectedFields[fieldIndex];
+        columns[field][rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+      }
+    }
+
+    return {
+      columns: columns,
+      fields: selectedFields,
+      length: rowCount
+    };
   }
 
   function onChange(cb){

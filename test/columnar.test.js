@@ -55,6 +55,54 @@ describe("columnar helpers", () => {
     expect(cityDimension.top(2).map((row) => row.city)).toEqual(["A", "A"]);
   });
 
+  it("keeps count reducers correct on columnar sources across filters and appended batches", () => {
+    const cf = crossfilter.fromColumns({
+      city: ["A", "B", "A", "C"],
+      value: new Int32Array([1, 2, 3, 4]),
+    });
+    const cityDimension = cf.dimension("city");
+    const valueDimension = cf.dimension("value");
+    const cityGroup = cityDimension.group();
+    const totals = cf.groupAll().reduceCount();
+
+    expect(cityGroup.all()).toEqual([
+      { key: "A", value: 2 },
+      { key: "B", value: 1 },
+      { key: "C", value: 1 },
+    ]);
+    expect(totals.value()).toBe(4);
+
+    valueDimension.filterRange([2, 5]);
+    expect(cityGroup.all()).toEqual([
+      { key: "A", value: 1 },
+      { key: "B", value: 1 },
+      { key: "C", value: 1 },
+    ]);
+    expect(totals.value()).toBe(3);
+
+    cf.add(crossfilter.rowsFromColumns({
+      city: ["B", "D"],
+      value: new Int32Array([5, 6]),
+    }));
+
+    expect(cityGroup.all()).toEqual([
+      { key: "A", value: 1 },
+      { key: "B", value: 1 },
+      { key: "C", value: 1 },
+      { key: "D", value: 0 },
+    ]);
+    expect(totals.value()).toBe(3);
+
+    valueDimension.filterRange([5, 7]);
+    expect(cityGroup.all()).toEqual([
+      { key: "A", value: 0 },
+      { key: "B", value: 1 },
+      { key: "C", value: 0 },
+      { key: "D", value: 1 },
+    ]);
+    expect(totals.value()).toBe(2);
+  });
+
   it("materializes arrow-like tables without a hard dependency", () => {
     const rows = crossfilter.rowsFromArrowTable({
       numRows: 2,
@@ -185,6 +233,39 @@ describe("columnar helpers", () => {
 
     cityDimension.filterAll();
     expect(cf.allFiltered().map((row) => row.total)).toEqual([10, 20, 30, 40, 50, 60, 70]);
+  });
+
+  it("keeps large lazy wasm filterIn selections aligned with js fallback", () => {
+    const cities = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"];
+    const totals = new Int32Array(cities.length * 2);
+    const repeatedCities = [];
+
+    for (let index = 0; index < cities.length * 2; ++index) {
+      repeatedCities.push(cities[index % cities.length]);
+      totals[index] = index + 1;
+    }
+
+    const previous = crossfilter.runtimeInfo();
+    const selected = ["A", "C", "E", "G", "I", "K"];
+
+    try {
+      const cfWasm = crossfilter.fromColumns({ city: repeatedCities, total: totals });
+      const cfJs = crossfilter.fromColumns({ city: repeatedCities, total: totals });
+      const wasmDimension = cfWasm.dimension("city");
+      const jsDimension = cfJs.dimension("city");
+
+      cfWasm.configureRuntime({ wasm: true });
+      cfJs.configureRuntime({ wasm: false });
+
+      wasmDimension.filterIn(selected);
+      jsDimension.filterIn(selected);
+
+      expect(cfWasm.allFiltered().map((row) => row.total)).toEqual(
+        cfJs.allFiltered().map((row) => row.total)
+      );
+    } finally {
+      crossfilter.configureRuntime({ wasm: previous.wasmEnabled });
+    }
   });
 
   it("can disable wasm acceleration and fall back to js", () => {

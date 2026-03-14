@@ -522,7 +522,7 @@ async function maybePublishSnapshot(force) {
   snapshotTimer = now;
   publish('snapshot', {
     progress: progressPayload(progress.ready ? 'ready' : 'streaming'),
-    snapshot: runtime.snapshot()
+    snapshot: runtime.snapshot(null, runtimeConfig && runtimeConfig.snapshotGroups ? { groups: runtimeConfig.snapshotGroups } : null)
   });
 }
 async function streamBaseSourceIntoRuntime(source) {
@@ -548,7 +548,7 @@ async function streamBaseSourceIntoRuntime(source) {
     sourceProgress.batchesLoaded += 1;
     sourceProgress.rowsLoaded += projected.length;
     sourceProgress.status = 'streaming';
-    publishProgress('streaming', true);
+    publishProgress('streaming', false);
     if (progress.emitSnapshots && bufferedBatches.length) {
       var shouldFlushForSnapshot = progress.snapshotThrottleMs <= 0 || Date.now() - snapshotTimer >= progress.snapshotThrottleMs;
       if (shouldFlushForSnapshot) {
@@ -585,7 +585,7 @@ async function loadProjectedBatchesFromSource(source) {
     sourceProgress.batchesLoaded += 1;
     sourceProgress.rowsLoaded += projected.length;
     sourceProgress.status = 'streaming';
-    publishProgress('streaming', true);
+    publishProgress('streaming', false);
   }
 
   sourceProgress.status = 'ready';
@@ -630,7 +630,7 @@ async function buildLookupIndexFromSource(source) {
     sourceProgress.batchesLoaded += 1;
     sourceProgress.rowsLoaded += projected.length;
     sourceProgress.status = 'streaming';
-    publishProgress('streaming', true);
+    publishProgress('streaming', false);
   }
 
   sourceProgress.status = 'ready';
@@ -806,7 +806,8 @@ self.onmessage = async function(event) {
           dimensions: message.payload.dimensions,
           groups: message.payload.groups,
           kpis: message.payload.kpis,
-          initialFilters: message.payload.initialFilters || null
+          initialFilters: message.payload.initialFilters || null,
+          snapshotGroups: message.payload.snapshotGroups || null
         };
         runtime = null;
         startStreaming(message.payload);
@@ -815,7 +816,15 @@ self.onmessage = async function(event) {
       }
       case 'snapshot':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
-        respond(id, runtime.snapshot(message.payload.filters));
+        respond(id, runtime.snapshot(message.payload.filters, message.payload.options || null));
+        return;
+      case 'groups':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.groups(message.payload.request));
+        return;
+      case 'bounds':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.bounds(message.payload.request));
         return;
       case 'query':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
@@ -832,6 +841,10 @@ self.onmessage = async function(event) {
       case 'rows':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.rows(message.payload.query));
+        return;
+      case 'rowSets':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.rowSets(message.payload.request));
         return;
       case 'removeFiltered':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
@@ -1000,6 +1013,7 @@ export function createStreamingDashboardWorker(options) {
     initialFilters: options.initialFilters || null,
     kpis: options.kpis || [],
     progressThrottleMs: options.progressThrottleMs,
+    snapshotGroups: options.snapshotGroups || null,
     snapshotThrottleMs: options.snapshotThrottleMs,
     sources: sources,
     batchCoalesceRows: options.batchCoalesceRows,
@@ -1015,6 +1029,9 @@ export function createStreamingDashboardWorker(options) {
     return {
       append: function(records) {
         return call('append', { records: records || [] });
+      },
+      bounds: function(request) {
+        return call("bounds", { request: request || null });
       },
       dispose: function() {
         if (disposed) {
@@ -1043,6 +1060,9 @@ export function createStreamingDashboardWorker(options) {
       query: function(request) {
         return call('query', { request: request || null });
       },
+      groups: function(request) {
+        return call("groups", { request: request || null });
+      },
       removeFiltered: function(selection) {
         return call('removeFiltered', { selection: selection || 'included' });
       },
@@ -1052,11 +1072,17 @@ export function createStreamingDashboardWorker(options) {
       runtimeInfo: function() {
         return call("runtimeInfo");
       },
-      snapshot: function(filters) {
-        return call("snapshot", { filters: filters || null });
+      snapshot: function(filters, options) {
+        return call("snapshot", {
+          filters: filters || null,
+          options: options || null
+        });
       },
       rows: function(query) {
         return call("rows", { query: query || null });
+      },
+      rowSets: function(request) {
+        return call("rowSets", { request: request || null });
       },
       updateFilters: function(filters) {
         return call("updateFilters", { filters: filters || null });

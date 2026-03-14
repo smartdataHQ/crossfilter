@@ -841,6 +841,7 @@
   };
 
   var SMALL_TARGET_WASM_THRESHOLD = 4;
+  var MAX_WASM_MARK_BYTES = 32 * 1024 * 1024;
 
   function encodeU32(value) {
     var bytes = [];
@@ -869,25 +870,33 @@
 
   function createFilterModuleBytes() {
     var typeSection = encodeSection(1, [].concat(
-      encodeU32(1),
+      encodeU32(2),
       [0x60],
       encodeU32(5),
       [0x7f, 0x7f, 0x7f, 0x7f, 0x7f],
       encodeU32(1),
+      [0x7f],
+      [0x60],
+      encodeU32(6),
+      [0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f],
+      encodeU32(1),
       [0x7f]
     ));
-    var functionSection = encodeSection(3, [].concat(encodeU32(1), encodeU32(0)));
+    var functionSection = encodeSection(3, [].concat(encodeU32(2), encodeU32(0), encodeU32(1)));
     var memorySection = encodeSection(5, [].concat(encodeU32(1), [0x00], encodeU32(1)));
     var exportSection = encodeSection(7, [].concat(
-      encodeU32(2),
+      encodeU32(3),
       encodeString('memory'),
       [0x02],
       encodeU32(0),
       encodeString('filterInU32'),
       [0x00],
-      encodeU32(0)
+      encodeU32(0),
+      encodeString('markFilterInU32'),
+      [0x00],
+      encodeU32(1)
     ));
-    var body = [].concat(
+    var filterSmallBody = [].concat(
       encodeU32(1),
       encodeU32(4),
       [0x7f],
@@ -922,7 +931,55 @@
       [0x20, 0x06],
       [0x0b]
     );
-    var codeSection = encodeSection(10, [].concat(encodeU32(1), encodeU32(body.length), body));
+    var filterMarkedBody = [].concat(
+      encodeU32(1),
+      encodeU32(3),
+      [0x7f],
+      [0x41, 0x00, 0x21, 0x06],
+      [0x41, 0x00, 0x21, 0x07],
+      [0x02, 0x40],
+      [0x03, 0x40],
+      [0x20, 0x07, 0x20, 0x03, 0x49, 0x45, 0x0d, 0x01],
+      [0x20, 0x02, 0x20, 0x07, 0x41, 0x04, 0x6c, 0x6a, 0x28, 0x02, 0x00, 0x21, 0x08],
+      [0x20, 0x04, 0x20, 0x08, 0x41, 0x04, 0x6c, 0x6a, 0x41, 0x01, 0x36, 0x02, 0x00],
+      [0x20, 0x07, 0x41, 0x01, 0x6a, 0x21, 0x07],
+      [0x0c, 0x00],
+      [0x0b],
+      [0x0b],
+      [0x41, 0x00, 0x21, 0x07],
+      [0x02, 0x40],
+      [0x03, 0x40],
+      [0x20, 0x07, 0x20, 0x01, 0x49, 0x45, 0x0d, 0x01],
+      [0x20, 0x00, 0x20, 0x07, 0x41, 0x04, 0x6c, 0x6a, 0x28, 0x02, 0x00, 0x21, 0x08],
+      [0x20, 0x04, 0x20, 0x08, 0x41, 0x04, 0x6c, 0x6a, 0x28, 0x02, 0x00, 0x41, 0x00, 0x47],
+      [0x04, 0x40],
+      [0x20, 0x05, 0x20, 0x06, 0x41, 0x04, 0x6c, 0x6a, 0x20, 0x07, 0x36, 0x02, 0x00],
+      [0x20, 0x06, 0x41, 0x01, 0x6a, 0x21, 0x06],
+      [0x0b],
+      [0x20, 0x07, 0x41, 0x01, 0x6a, 0x21, 0x07],
+      [0x0c, 0x00],
+      [0x0b],
+      [0x0b],
+      [0x41, 0x00, 0x21, 0x07],
+      [0x02, 0x40],
+      [0x03, 0x40],
+      [0x20, 0x07, 0x20, 0x03, 0x49, 0x45, 0x0d, 0x01],
+      [0x20, 0x02, 0x20, 0x07, 0x41, 0x04, 0x6c, 0x6a, 0x28, 0x02, 0x00, 0x21, 0x08],
+      [0x20, 0x04, 0x20, 0x08, 0x41, 0x04, 0x6c, 0x6a, 0x41, 0x00, 0x36, 0x02, 0x00],
+      [0x20, 0x07, 0x41, 0x01, 0x6a, 0x21, 0x07],
+      [0x0c, 0x00],
+      [0x0b],
+      [0x0b],
+      [0x20, 0x06],
+      [0x0b]
+    );
+    var codeSection = encodeSection(10, [].concat(
+      encodeU32(2),
+      encodeU32(filterSmallBody.length),
+      filterSmallBody,
+      encodeU32(filterMarkedBody.length),
+      filterMarkedBody
+    ));
 
     return new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00].concat(
       typeSection,
@@ -941,6 +998,7 @@
       cachedCodes: null,
       cachedCodesLength: 0,
       filterInU32: instance.exports.filterInU32,
+      markFilterInU32: instance.exports.markFilterInU32,
       memory: instance.exports.memory,
       ensureCapacity: function(totalBytes) {
         var pagesNeeded = Math.ceil(totalBytes / 65536);
@@ -973,6 +1031,23 @@
         new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
 
         var count = this.filterInU32(0, codes.length, dataBytes, targetCodes.length, outPtr);
+        var matches = new Uint32Array(count);
+        matches.set(new Uint32Array(buffer, outPtr, count));
+        return matches;
+      },
+      matchMarked: function(codes, targetCodes, maxTargetCode) {
+        var dataBytes = codes.length * 4;
+        var targetBytes = targetCodes.length * 4;
+        var marksBytes = (maxTargetCode + 1) * 4;
+        var markPtr = dataBytes + targetBytes;
+        var outPtr = markPtr + marksBytes;
+        var totalBytes = outPtr + dataBytes;
+        var buffer = this.ensureCapacity(totalBytes);
+
+        this.syncCodes(buffer, codes);
+        new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
+
+        var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
         var matches = new Uint32Array(count);
         matches.set(new Uint32Array(buffer, outPtr, count));
         return matches;
@@ -1066,6 +1141,16 @@
     return matches.slice(0, count);
   }
 
+  function maxCodeValue(values) {
+    var maxValue = 0;
+    for (var valueIndex = 0; valueIndex < values.length; ++valueIndex) {
+      if (values[valueIndex] > maxValue) {
+        maxValue = values[valueIndex];
+      }
+    }
+    return maxValue;
+  }
+
   function createWasmRuntimeController(options) {
     var enabled = options && Object.prototype.hasOwnProperty.call(options, 'wasm')
       ? options.wasm !== false
@@ -1096,12 +1181,25 @@
       }
 
       var runtime = getSharedRuntime(enabled);
+      var maxTargetCode;
       if (runtime && targetCodes.length <= SMALL_TARGET_WASM_THRESHOLD) {
         try {
           return runtime.matchSmall(codes, targetCodes);
         } catch (error) {
           sharedRuntimeState.error = error;
           sharedRuntimeState.runtime = null;
+        }
+      }
+
+      if (runtime) {
+        maxTargetCode = maxCodeValue(targetCodes);
+        if ((maxTargetCode + 1) * 4 <= MAX_WASM_MARK_BYTES) {
+          try {
+            return runtime.matchMarked(codes, targetCodes, maxTargetCode);
+          } catch (error) {
+            sharedRuntimeState.error = error;
+            sharedRuntimeState.runtime = null;
+          }
         }
       }
 
@@ -1474,6 +1572,69 @@
     }
   }
 
+  function normalizeGroupQuery(query) {
+    if (query == null || query === true) {
+      return null;
+    }
+    if (query === false) {
+      return false;
+    }
+
+    return {
+      includeKeys: Array.isArray(query.includeKeys) && query.includeKeys.length ? query.includeKeys.slice() : null,
+      includeTotals: query.includeTotals !== false,
+      keys: Array.isArray(query.keys) && query.keys.length ? query.keys.slice() : null,
+      limit: typeof query.limit === "number" && query.limit >= 0 ? Math.floor(query.limit) : null,
+      nonEmptyKeys: query.nonEmptyKeys === true,
+      offset: typeof query.offset === "number" && query.offset >= 0 ? Math.floor(query.offset) : 0,
+      search: typeof query.search === "string" && query.search ? query.search.toLowerCase() : null,
+      sort: query.sort === "asc" || query.sort === "natural" ? query.sort : "desc",
+      sortMetric: query.sortMetric || null,
+      visibleOnly: query.visibleOnly !== false
+    };
+  }
+
+  function metricComparableValue(metric, value) {
+    if (!metric) {
+      return 0;
+    }
+
+    if (metric.op === "avg" || metric.op === "avgNonZero") {
+      return value && value.count ? value.sum / value.count : null;
+    }
+
+    return typeof value === "number" ? value : 0;
+  }
+
+  function metricHasVisibleValue(metric, value) {
+    var comparable = metricComparableValue(metric, value);
+    return comparable != null && comparable > 0;
+  }
+
+  function compareGroupKeys(left, right) {
+    if (left === right) {
+      return 0;
+    }
+    return String(left).localeCompare(String(right));
+  }
+
+  function insertSortedEntry(entries, entry, compare, maxSize) {
+    var insertIndex = entries.length;
+
+    if (maxSize != null && entries.length >= maxSize && compare(entry, entries[entries.length - 1]) >= 0) {
+      return;
+    }
+
+    while (insertIndex > 0 && compare(entry, entries[insertIndex - 1]) < 0) {
+      insertIndex -= 1;
+    }
+
+    entries.splice(insertIndex, 0, entry);
+    if (maxSize != null && entries.length > maxSize) {
+      entries.pop();
+    }
+  }
+
   function createKpiRuntime(cf, metrics) {
     var reducer = buildMetricReducer(metrics);
     var group = cf.groupAll().reduce(reducer.add, reducer.remove, reducer.initial);
@@ -1490,23 +1651,167 @@
 
   function createGroupRuntime(dimension, spec, index) {
     var metrics = normalizeMetrics(spec.metrics, spec.id || "group_" + index);
+    var metricsById = {};
+    var metricIndex;
     var reducer = buildMetricReducer(metrics);
     var groupAccessor = resolveGroupAccessor(spec);
     var group = groupAccessor ? dimension.group(groupAccessor) : dimension.group();
+    var visibleMetric = null;
+    var defaultSortMetric = null;
     group.reduce(reducer.add, reducer.remove, reducer.initial);
+
+    for (metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
+      metricsById[metrics[metricIndex].id] = metrics[metricIndex];
+      if (!visibleMetric && metrics[metricIndex].op === "count") {
+        visibleMetric = metrics[metricIndex];
+      }
+    }
+
+    if (!visibleMetric) {
+      visibleMetric = metrics[0] || null;
+    }
+    defaultSortMetric = metricsById[spec.sortMetric] || metricsById.rows || metrics[0] || null;
+
+    function finalizeEntry(entry) {
+      return {
+        key: entry.key,
+        value: reducer.finalize(entry.value)
+      };
+    }
+
+    function readAll() {
+      return group.all().map(finalizeEntry);
+    }
+
+    function matchesGroupKey(key, query, keySet, forceInclude) {
+      if (!forceInclude && query.nonEmptyKeys && (key == null || key === "")) {
+        return false;
+      }
+      if (!forceInclude && keySet && !keySet.has(key)) {
+        return false;
+      }
+      if (!forceInclude && query.search && String(key).toLowerCase().indexOf(query.search) < 0) {
+        return false;
+      }
+      return true;
+    }
+
+    function compareEntries(query, sortMetric, left, right) {
+      var diff = metricComparableValue(sortMetric, left.value[sortMetric.id]) - metricComparableValue(sortMetric, right.value[sortMetric.id]);
+      if (!Number.isFinite(diff) || diff === 0) {
+        return compareGroupKeys(left.key, right.key);
+      }
+      return query.sort === "asc" ? diff : -diff;
+    }
+
+    function readQuery(query) {
+      var normalized = normalizeGroupQuery(query);
+      var allEntries;
+      var includeKeySet;
+      var keySet;
+      var matchedEntries = [];
+      var forcedEntries = [];
+      var sortMetric = metricsById[normalized && normalized.sortMetric] || defaultSortMetric;
+      var limitWindow = null;
+      var useBoundedSort = false;
+      var compareMatchedEntries = null;
+      var entryIndex;
+      var total = 0;
+
+      if (!normalized) {
+        return readAll();
+      }
+
+      allEntries = group.all();
+      includeKeySet = normalized.includeKeys ? new Set(normalized.includeKeys) : null;
+      keySet = normalized.keys ? new Set(normalized.keys) : null;
+      limitWindow = normalized.limit == null ? null : normalized.offset + normalized.limit;
+      useBoundedSort = limitWindow != null && normalized.sort !== "natural" && !!sortMetric;
+      if (normalized.sort !== "natural" && sortMetric) {
+        compareMatchedEntries = function(left, right) {
+          return compareEntries(normalized, sortMetric, left, right);
+        };
+      }
+
+      for (entryIndex = 0; entryIndex < allEntries.length; ++entryIndex) {
+        var entry = allEntries[entryIndex];
+        var forceInclude = includeKeySet && includeKeySet.has(entry.key);
+        var visible = !normalized.visibleOnly || metricHasVisibleValue(visibleMetric, entry.value[visibleMetric.id]);
+        var matchesBaseQuery = visible && matchesGroupKey(entry.key, normalized, keySet, false);
+
+        if (matchesBaseQuery) {
+          total += 1;
+          if (useBoundedSort) {
+            insertSortedEntry(matchedEntries, entry, compareMatchedEntries, limitWindow);
+          } else {
+            matchedEntries.push(entry);
+          }
+        }
+
+        if (forceInclude) {
+          forcedEntries.push(entry);
+        }
+      }
+
+      if (normalized.sort !== "natural" && sortMetric && !useBoundedSort) {
+        matchedEntries.sort(function(left, right) {
+          return compareEntries(normalized, sortMetric, left, right);
+        });
+      }
+
+      if (normalized.sort !== "natural" && sortMetric) {
+        forcedEntries.sort(function(left, right) {
+          return compareEntries(normalized, sortMetric, left, right);
+        });
+      }
+
+      var pagedEntries = normalized.limit == null
+        ? matchedEntries.slice(normalized.offset)
+        : matchedEntries.slice(normalized.offset, normalized.offset + normalized.limit);
+      var seenKeys = new Set();
+      var mergedEntries = [];
+
+      for (entryIndex = 0; entryIndex < pagedEntries.length; ++entryIndex) {
+        mergedEntries.push(pagedEntries[entryIndex]);
+        seenKeys.add(pagedEntries[entryIndex].key);
+      }
+
+      for (entryIndex = 0; entryIndex < forcedEntries.length; ++entryIndex) {
+        if (seenKeys.has(forcedEntries[entryIndex].key)) {
+          continue;
+        }
+        mergedEntries.push(forcedEntries[entryIndex]);
+        seenKeys.add(forcedEntries[entryIndex].key);
+      }
+
+      if (normalized.sort !== "natural" && sortMetric && forcedEntries.length) {
+        mergedEntries.sort(function(left, right) {
+          return compareEntries(normalized, sortMetric, left, right);
+        });
+      }
+
+      var result = {
+        entries: mergedEntries.map(finalizeEntry),
+        limit: normalized.limit,
+        offset: normalized.offset,
+        sort: normalized.sort,
+        sortMetric: sortMetric ? sortMetric.id : null
+      };
+
+      if (normalized.includeTotals) {
+        result.total = total;
+      }
+
+      return result;
+    }
 
     return {
       dispose: function() {
         group.dispose();
       },
       id: spec.id || "group_" + index,
-      read: function() {
-        return group.all().map(function(entry) {
-          return {
-            key: entry.key,
-            value: reducer.finalize(entry.value)
-          };
-        });
+      read: function(query) {
+        return readQuery(query);
       }
     };
   }
@@ -1535,12 +1840,34 @@
     query = query || {};
 
     return {
+      columnar: query.columnar === true,
       direction: query.direction === "bottom" ? "bottom" : "top",
       fields: Array.isArray(query.fields) && query.fields.length ? query.fields.slice() : null,
       limit: typeof query.limit === "number" && query.limit >= 0 ? Math.floor(query.limit) : 50,
       offset: typeof query.offset === "number" && query.offset >= 0 ? Math.floor(query.offset) : 0,
       sortBy: query.sortBy || null
     };
+  }
+
+  function normalizeBoundsQuery(query) {
+    query = query || {};
+
+    return {
+      fields: Array.isArray(query.fields) && query.fields.length ? uniqueFields(query.fields) : []
+    };
+  }
+
+  function readColumnarFirstValue(result, field) {
+    if (!result || !result.columns || !result.length) {
+      return null;
+    }
+
+    var column = result.columns[field];
+    if (!column || !column.length) {
+      return null;
+    }
+
+    return column[0];
   }
 
   function projectRows(rows, fields) {
@@ -1555,6 +1882,34 @@
       }
       return projected;
     });
+  }
+
+  function rowIndexesToColumns(cf, rowIndexes, fields) {
+    if (typeof cf.takeColumns === "function") {
+      return cf.takeColumns(rowIndexes, fields);
+    }
+
+    var allRows = cf.all();
+    var columns = {};
+    var fieldIndex;
+    var rowIndex;
+
+    for (fieldIndex = 0; fieldIndex < fields.length; ++fieldIndex) {
+      columns[fields[fieldIndex]] = new Array(rowIndexes.length);
+    }
+
+    for (rowIndex = 0; rowIndex < rowIndexes.length; ++rowIndex) {
+      var row = allRows[rowIndexes[rowIndex]];
+      for (fieldIndex = 0; fieldIndex < fields.length; ++fieldIndex) {
+        columns[fields[fieldIndex]][rowIndex] = row ? row[fields[fieldIndex]] : undefined;
+      }
+    }
+
+    return {
+      columns: columns,
+      fields: fields ? fields.slice() : [],
+      length: rowIndexes.length
+    };
   }
 
   function ensureDimension(dimensions, dimensionFields, cf, field) {
@@ -1604,6 +1959,9 @@
     function updateFilters(filters) {
       var nextFilters = normalizeFilterState(filters);
       var seen = new Set();
+      var operations = [];
+      var clearFields = [];
+      var changedCount = 0;
 
       for (var field in nextFilters) {
         if (!dimensions[field]) {
@@ -1611,7 +1969,11 @@
         }
         seen.add(field);
         if (!sameFilter(currentFilters[field], nextFilters[field])) {
-          applyFilter(dimensions[field], nextFilters[field]);
+          operations.push({
+            dimension: dimensions[field],
+            filter: nextFilters[field]
+          });
+          changedCount += 1;
         }
       }
 
@@ -1620,19 +1982,59 @@
           continue;
         }
         if (dimensions[field]) {
-          dimensions[field].filterAll();
+          clearFields.push(field);
+          changedCount += 1;
         }
+      }
+
+      var applyOperations = function() {
+        var operationIndex;
+        for (operationIndex = 0; operationIndex < operations.length; ++operationIndex) {
+          applyFilter(operations[operationIndex].dimension, operations[operationIndex].filter);
+        }
+        for (operationIndex = 0; operationIndex < clearFields.length; ++operationIndex) {
+          dimensions[clearFields[operationIndex]].filterAll();
+        }
+      };
+
+      if (changedCount > 1 && typeof cf.batch === "function") {
+        cf.batch(applyOperations);
+      } else {
+        applyOperations();
       }
 
       currentFilters = nextFilters;
       return typeof cf.runtimeInfo === "function" ? cf.runtimeInfo() : crossfilter.runtimeInfo();
     }
 
-    function readSnapshot() {
+    function readGroups(groupQueries) {
       var groups = {};
 
-      for (var groupId in groupRuntimes) {
-        groups[groupId] = groupRuntimes[groupId].read();
+      if (!groupQueries) {
+        for (var groupId in groupRuntimes) {
+          groups[groupId] = groupRuntimes[groupId].read();
+        }
+        return groups;
+      }
+
+      for (var requestedGroupId in groupQueries) {
+        if (!groupRuntimes[requestedGroupId]) {
+          throw new Error("Unknown dashboard group: " + requestedGroupId);
+        }
+        if (groupQueries[requestedGroupId] === false) {
+          continue;
+        }
+        groups[requestedGroupId] = groupRuntimes[requestedGroupId].read(groupQueries[requestedGroupId]);
+      }
+
+      return groups;
+    }
+
+    function readSnapshot(options) {
+      var groups = {};
+
+      if (!options || options.groups !== false) {
+        groups = readGroups(options && options.groups ? options.groups : null);
       }
 
       return {
@@ -1644,7 +2046,28 @@
 
     function readRows(query) {
       var normalized = normalizeRowQuery(query);
+      var rowIndexes;
       var rows;
+
+      if (normalized.columnar) {
+        if (!normalized.fields) {
+          throw new Error("Columnar row queries require `fields`.");
+        }
+        if (normalized.sortBy) {
+          var columnDimension = ensureDimension(dimensions, dimensionFields, cf, normalized.sortBy);
+          rowIndexes = normalized.direction === "bottom" && typeof columnDimension.bottomIndex === "function"
+            ? columnDimension.bottomIndex(normalized.limit, normalized.offset)
+            : typeof columnDimension.topIndex === "function"
+              ? columnDimension.topIndex(normalized.limit, normalized.offset)
+              : null;
+        } else if (typeof cf.allFilteredIndexes === "function") {
+          rowIndexes = cf.allFilteredIndexes().slice(normalized.offset, normalized.offset + normalized.limit);
+        }
+
+        if (rowIndexes) {
+          return rowIndexesToColumns(cf, rowIndexes, normalized.fields);
+        }
+      }
 
       if (normalized.sortBy) {
         var dimension = ensureDimension(dimensions, dimensionFields, cf, normalized.sortBy);
@@ -1659,16 +2082,107 @@
       return projectRows(rows, normalized.fields);
     }
 
+    function readBounds(query) {
+      var normalized = normalizeBoundsQuery(query);
+      var bounds = {};
+      var fieldIndex;
+
+      for (fieldIndex = 0; fieldIndex < normalized.fields.length; ++fieldIndex) {
+        var field = normalized.fields[fieldIndex];
+        var dimension = ensureDimension(dimensions, dimensionFields, cf, field);
+        var lowerIndexes = typeof dimension.bottomIndex === "function" ? dimension.bottomIndex(1) : null;
+        var upperIndexes = typeof dimension.topIndex === "function" ? dimension.topIndex(1) : null;
+        var minValue = null;
+        var maxValue = null;
+
+        if (lowerIndexes && lowerIndexes.length) {
+          minValue = readColumnarFirstValue(rowIndexesToColumns(cf, [lowerIndexes[0]], [field]), field);
+        } else {
+          var lowerRows = dimension.bottom(1);
+          minValue = lowerRows.length ? lowerRows[0][field] : null;
+        }
+
+        if (upperIndexes && upperIndexes.length) {
+          maxValue = readColumnarFirstValue(rowIndexesToColumns(cf, [upperIndexes[0]], [field]), field);
+        } else {
+          var upperRows = dimension.top(1);
+          maxValue = upperRows.length ? upperRows[0][field] : null;
+        }
+
+        bounds[field] = {
+          max: maxValue == null ? null : maxValue,
+          min: minValue == null ? null : minValue
+        };
+      }
+
+      return bounds;
+    }
+
+    function readRowSets(rowSetQueries) {
+      var rowSets = {};
+
+      if (!rowSetQueries) {
+        return rowSets;
+      }
+
+      for (var rowSetId in rowSetQueries) {
+        if (rowSetQueries[rowSetId] === false) {
+          continue;
+        }
+        rowSets[rowSetId] = readRows(rowSetQueries[rowSetId]);
+      }
+
+      return rowSets;
+    }
+
     function queryRuntime(request) {
       request = request || {};
       if (request.filters) {
         updateFilters(request.filters);
       }
 
-      return {
+      var response = {
         rows: request.rows ? readRows(request.rows) : [],
-        snapshot: readSnapshot()
+        snapshot: request.snapshot === false ? null : readSnapshot(request.snapshot)
       };
+
+      if (request.groups) {
+        response.groups = readGroups(request.groups);
+      }
+
+      if (request.bounds) {
+        response.bounds = readBounds(request.bounds);
+      }
+
+      if (request.rowSets) {
+        response.rowSets = readRowSets(request.rowSets);
+      }
+
+      return response;
+    }
+
+    function queryGroups(request) {
+      request = request || {};
+      if (request.filters) {
+        updateFilters(request.filters);
+      }
+      return readGroups(request.groups || null);
+    }
+
+    function queryBounds(request) {
+      request = request || {};
+      if (request.filters) {
+        updateFilters(request.filters);
+      }
+      return readBounds(request.bounds || request);
+    }
+
+    function queryRowSets(request) {
+      request = request || {};
+      if (request.filters) {
+        updateFilters(request.filters);
+      }
+      return readRowSets(request.rowSets || request);
     }
 
     function removeFiltered(selection) {
@@ -1693,6 +2207,9 @@
       appendColumns: function(columns, columnarOptions) {
         return appendColumns(crossfilter, cf, columns, columnarOptions);
       },
+      bounds: function(request) {
+        return queryBounds(request);
+      },
       dispose: function() {
         this.reset();
         for (var groupId in groupRuntimes) {
@@ -1706,6 +2223,9 @@
       query: function(request) {
         return queryRuntime(request);
       },
+      groups: function(request) {
+        return queryGroups(request);
+      },
       removeFiltered: function(selection) {
         return removeFiltered(selection);
       },
@@ -1715,17 +2235,20 @@
       rows: function(query) {
         return readRows(query);
       },
+      rowSets: function(request) {
+        return queryRowSets(request);
+      },
       runtimeInfo: function() {
         return typeof cf.runtimeInfo === "function" ? cf.runtimeInfo() : crossfilter.runtimeInfo();
       },
       size: function() {
         return cf.size();
       },
-      snapshot: function(filters) {
+      snapshot: function(filters, snapshotOptions) {
         if (filters) {
           updateFilters(filters);
         }
-        return readSnapshot();
+        return readSnapshot(snapshotOptions);
       },
       updateFilters: updateFilters
     };
@@ -1805,7 +2328,19 @@
       "        if (!runtime) {",
       "          throw new Error('Dashboard worker is not initialized.');",
       "        }",
-      "        respond(id, runtime.snapshot(message.payload.filters));",
+      "        respond(id, runtime.snapshot(message.payload.filters, message.payload.options || null));",
+      "        return;",
+      "      case 'groups':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.groups(message.payload.request));",
+      "        return;",
+      "      case 'bounds':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.bounds(message.payload.request));",
       "        return;",
       "      case 'query':",
       "        if (!runtime) {",
@@ -1818,6 +2353,12 @@
       "          throw new Error('Dashboard worker is not initialized.');",
       "        }",
       "        respond(id, runtime.rows(message.payload.query));",
+      "        return;",
+      "      case 'rowSets':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.rowSets(message.payload.request));",
       "        return;",
       "      case 'append':",
       "        if (!runtime) {",
@@ -1978,6 +2519,9 @@
         append: function(records) {
           return call('append', { records: records || [] });
         },
+        bounds: function(request) {
+          return call("bounds", { request: request || null });
+        },
         dispose: function() {
           if (disposed) {
             return Promise.resolve();
@@ -1995,6 +2539,9 @@
         query: function(request) {
           return call('query', { request: request || null });
         },
+        groups: function(request) {
+          return call("groups", { request: request || null });
+        },
         removeFiltered: function(selection) {
           return call('removeFiltered', { selection: selection || 'included' });
         },
@@ -2004,11 +2551,17 @@
         runtimeInfo: function() {
           return call("runtimeInfo");
         },
-        snapshot: function(filters) {
-          return call("snapshot", { filters: filters || null });
+        snapshot: function(filters, options) {
+          return call("snapshot", {
+            filters: filters || null,
+            options: options || null
+          });
         },
         rows: function(query) {
           return call("rows", { query: query || null });
+        },
+        rowSets: function(request) {
+          return call("rowSets", { request: request || null });
         },
         updateFilters: function(filters) {
           return call("updateFilters", { filters: filters || null });
@@ -2333,6 +2886,26 @@ function cloneSourceProgressMap(sources) {
   }
   return clone;
 }
+async function readResponseErrorDetail(response) {
+  if (!response || typeof response.text !== 'function') {
+    return null;
+  }
+
+  try {
+    var text = await response.text();
+    if (!text) {
+      return null;
+    }
+    try {
+      var parsed = JSON.parse(text);
+      return parsed && (parsed.error || parsed.message) ? String(parsed.error || parsed.message) : text;
+    } catch (_) {
+      return text;
+    }
+  } catch (_) {
+    return null;
+  }
+}
 function releaseAbortControllers() {
   for (var controllerIndex = 0; controllerIndex < abortControllers.length; ++controllerIndex) {
     try {
@@ -2495,7 +3068,8 @@ async function getSourceInput(source) {
     }
     var response = await fetch(source.dataUrl, fetchInit);
     if (!response.ok) {
-      throw new Error('Failed to fetch Arrow stream for ' + source.id + ': ' + response.status + ' ' + response.statusText);
+      var responseErrorDetail = await readResponseErrorDetail(response);
+      throw new Error('Failed to fetch Arrow stream for ' + source.id + ': ' + response.status + ' ' + response.statusText + (responseErrorDetail ? ' — ' + responseErrorDetail : ''));
     }
     var headerValue = response.headers && response.headers.get ? response.headers.get('content-length') : null;
     sourceProgress.response = response.headers && response.headers.get ? {
@@ -2526,7 +3100,7 @@ async function maybePublishSnapshot(force) {
   snapshotTimer = now;
   publish('snapshot', {
     progress: progressPayload(progress.ready ? 'ready' : 'streaming'),
-    snapshot: runtime.snapshot()
+    snapshot: runtime.snapshot(null, runtimeConfig && runtimeConfig.snapshotGroups ? { groups: runtimeConfig.snapshotGroups } : null)
   });
 }
 async function streamBaseSourceIntoRuntime(source) {
@@ -2552,7 +3126,7 @@ async function streamBaseSourceIntoRuntime(source) {
     sourceProgress.batchesLoaded += 1;
     sourceProgress.rowsLoaded += projected.length;
     sourceProgress.status = 'streaming';
-    publishProgress('streaming', true);
+    publishProgress('streaming', false);
     if (progress.emitSnapshots && bufferedBatches.length) {
       var shouldFlushForSnapshot = progress.snapshotThrottleMs <= 0 || Date.now() - snapshotTimer >= progress.snapshotThrottleMs;
       if (shouldFlushForSnapshot) {
@@ -2589,7 +3163,7 @@ async function loadProjectedBatchesFromSource(source) {
     sourceProgress.batchesLoaded += 1;
     sourceProgress.rowsLoaded += projected.length;
     sourceProgress.status = 'streaming';
-    publishProgress('streaming', true);
+    publishProgress('streaming', false);
   }
 
   sourceProgress.status = 'ready';
@@ -2634,7 +3208,7 @@ async function buildLookupIndexFromSource(source) {
     sourceProgress.batchesLoaded += 1;
     sourceProgress.rowsLoaded += projected.length;
     sourceProgress.status = 'streaming';
-    publishProgress('streaming', true);
+    publishProgress('streaming', false);
   }
 
   sourceProgress.status = 'ready';
@@ -2810,7 +3384,8 @@ self.onmessage = async function(event) {
           dimensions: message.payload.dimensions,
           groups: message.payload.groups,
           kpis: message.payload.kpis,
-          initialFilters: message.payload.initialFilters || null
+          initialFilters: message.payload.initialFilters || null,
+          snapshotGroups: message.payload.snapshotGroups || null
         };
         runtime = null;
         startStreaming(message.payload);
@@ -2819,7 +3394,15 @@ self.onmessage = async function(event) {
       }
       case 'snapshot':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
-        respond(id, runtime.snapshot(message.payload.filters));
+        respond(id, runtime.snapshot(message.payload.filters, message.payload.options || null));
+        return;
+      case 'groups':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.groups(message.payload.request));
+        return;
+      case 'bounds':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.bounds(message.payload.request));
         return;
       case 'query':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
@@ -2836,6 +3419,10 @@ self.onmessage = async function(event) {
       case 'rows':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.rows(message.payload.query));
+        return;
+      case 'rowSets':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.rowSets(message.payload.request));
         return;
       case 'removeFiltered':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
@@ -3004,6 +3591,7 @@ self.onmessage = async function(event) {
       initialFilters: options.initialFilters || null,
       kpis: options.kpis || [],
       progressThrottleMs: options.progressThrottleMs,
+      snapshotGroups: options.snapshotGroups || null,
       snapshotThrottleMs: options.snapshotThrottleMs,
       sources: sources,
       batchCoalesceRows: options.batchCoalesceRows,
@@ -3019,6 +3607,9 @@ self.onmessage = async function(event) {
       return {
         append: function(records) {
           return call('append', { records: records || [] });
+        },
+        bounds: function(request) {
+          return call("bounds", { request: request || null });
         },
         dispose: function() {
           if (disposed) {
@@ -3047,6 +3638,9 @@ self.onmessage = async function(event) {
         query: function(request) {
           return call('query', { request: request || null });
         },
+        groups: function(request) {
+          return call("groups", { request: request || null });
+        },
         removeFiltered: function(selection) {
           return call('removeFiltered', { selection: selection || 'included' });
         },
@@ -3056,11 +3650,17 @@ self.onmessage = async function(event) {
         runtimeInfo: function() {
           return call("runtimeInfo");
         },
-        snapshot: function(filters) {
-          return call("snapshot", { filters: filters || null });
+        snapshot: function(filters, options) {
+          return call("snapshot", {
+            filters: filters || null,
+            options: options || null
+          });
         },
         rows: function(query) {
           return call("rows", { query: query || null });
+        },
+        rowSets: function(request) {
+          return call("rowSets", { request: request || null });
         },
         updateFilters: function(filters) {
           return call("updateFilters", { filters: filters || null });
@@ -3106,14 +3706,18 @@ self.onmessage = async function(event) {
     var runtimeController = createWasmRuntimeController();
     var crossfilter = {
       add: add,
+      allFilteredIndexes: allFilteredIndexes,
+      batch: batch,
       remove: removeData,
       dimension: dimension,
+      getFieldValue: getFieldValue,
       groupAll: groupAll,
       size: size,
       all: all,
       allFiltered: allFiltered,
       onChange: onChange,
       isElementFiltered: isElementFiltered,
+      takeColumns: takeColumns,
       configureRuntime: runtimeController.configureRuntime,
       runtimeInfo: runtimeController.runtimeInfo
     };
@@ -3124,9 +3728,13 @@ self.onmessage = async function(event) {
         filterListeners = [], // when the filters change
         dataListeners = [], // when data is added
         removeDataListeners = [], // when data is removed
+        resetListeners = [],
         callbacks = [],
         columnarBatches = [],
-        activeDimensionFilterCount = 0;
+        activeDimensionFilterCount = 0,
+        batchedFilterDepth = 0,
+        batchedFilterEventPending = false,
+        batchedFilterResetPending = false;
 
     filters = new xfilterArray.bitarray(0);
 
@@ -3188,6 +3796,60 @@ self.onmessage = async function(event) {
       return activeDimensionFilterCount > 0;
     }
 
+    function registerResetListener(listener) {
+      resetListeners.push(listener);
+      return listener;
+    }
+
+    function unregisterResetListener(listener) {
+      var listenerIndex = resetListeners.indexOf(listener);
+      if (listenerIndex >= 0) {
+        resetListeners.splice(listenerIndex, 1);
+      }
+    }
+
+    function markFilterListenersDirty() {
+      if (batchedFilterResetPending) {
+        return;
+      }
+      batchedFilterResetPending = true;
+      for (var listenerIndex = 0; listenerIndex < resetListeners.length; ++listenerIndex) {
+        resetListeners[listenerIndex]();
+      }
+    }
+
+    function notifyFilterListeners(filterOne, filterOffset, added, removed) {
+      if (batchedFilterDepth > 0) {
+        batchedFilterEventPending = true;
+        markFilterListenersDirty();
+        return;
+      }
+
+      filterListeners.forEach(function(l) { l(filterOne, filterOffset, added, removed); });
+      triggerOnChange('filtered');
+    }
+
+    function flushBatchedFilterEvents() {
+      if (!batchedFilterEventPending) {
+        return;
+      }
+      batchedFilterEventPending = false;
+      batchedFilterResetPending = false;
+      triggerOnChange('filtered');
+    }
+
+    function batch(callback) {
+      batchedFilterDepth += 1;
+      try {
+        return callback();
+      } finally {
+        batchedFilterDepth -= 1;
+        if (!batchedFilterDepth) {
+          flushBatchedFilterEvents();
+        }
+      }
+    }
+
     function getRecord(rowIndex) {
       var row = data[rowIndex];
       if (row !== undefined) {
@@ -3211,6 +3873,29 @@ self.onmessage = async function(event) {
       }
       data[rowIndex] = row;
       return row;
+    }
+
+    function getFieldValue(rowIndex, field) {
+      var row = data[rowIndex];
+      if (row !== undefined) {
+        return row ? row[field] : undefined;
+      }
+
+      if (columnarBatches.length) {
+        var batch = findColumnarBatch(rowIndex);
+        if (batch) {
+          var batchRowIndex = rowIndex - batch.start;
+          if (batch.accessors && batch.accessors[field]) {
+            return batch.accessors[field](batchRowIndex);
+          }
+          if (Object.prototype.hasOwnProperty.call(batch.columns, field)) {
+            return getColumnValue(batch.columns[field], batchRowIndex);
+          }
+        }
+      }
+
+      row = getRecord(rowIndex);
+      return row ? row[field] : undefined;
     }
 
     function materializeAllRecords() {
@@ -3428,7 +4113,9 @@ self.onmessage = async function(event) {
         currentFilter: currentFilter,
         hasCurrentFilter: hasCurrentFilter,
         top: top,
+        topIndex: topIndex,
         bottom: bottom,
+        bottomIndex: bottomIndex,
         group: group,
         groupAll: groupAll,
         dispose: dispose,
@@ -3793,9 +4480,8 @@ self.onmessage = async function(event) {
           lazyEncodedState.selected = normalizeLazySelectionMask(currentSelected);
           lazyEncodedState.matchIndices = nextMatches;
           if (notifyListeners) {
-            filterListeners.forEach(function(l) { l(one, offset, added, removed); });
+            notifyFilterListeners(one, offset, added, removed);
           }
-          triggerOnChange('filtered');
           return dimension;
         }
 
@@ -3834,9 +4520,8 @@ self.onmessage = async function(event) {
         lazyEncodedState.selected = nextSelected;
         lazyEncodedState.matchIndices = nextMatches;
         if (notifyListeners) {
-          filterListeners.forEach(function(l) { l(one, offset, added, removed); });
+          notifyFilterListeners(one, offset, added, removed);
         }
-        triggerOnChange('filtered');
         return dimension;
       }
 
@@ -4154,8 +4839,7 @@ self.onmessage = async function(event) {
           }
         }
 
-        filterListeners.forEach(function(l) { l(one, offset, added, removed); });
-        triggerOnChange('filtered');
+        notifyFilterListeners(one, offset, added, removed);
         return dimension;
       }
 
@@ -4820,8 +5504,7 @@ self.onmessage = async function(event) {
           }
         }
 
-        filterListeners.forEach(function(l) { l(one, offset, added, removed); });
-        triggerOnChange('filtered');
+        notifyFilterListeners(one, offset, added, removed);
       }
 
       function currentFilter() {
@@ -4865,6 +5548,43 @@ self.onmessage = async function(event) {
                 --toSkip;
               } else {
                 array.push(getRecord(j));
+                --k;
+              }
+            }
+          }
+        }
+
+        return array;
+      }
+
+      function topIndex(k, top_offset) {
+        materializeLazyEncodedState();
+
+        var array = [],
+            i = hi0,
+            j,
+            toSkip = 0;
+
+        if(top_offset && top_offset > 0) toSkip = top_offset;
+
+        while (--i >= lo0 && k > 0) {
+          if (filters.zero(j = index[i])) {
+            if(toSkip > 0) {
+              --toSkip;
+            } else {
+              array.push(j);
+              --k;
+            }
+          }
+        }
+
+        if(iterable){
+          for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
+            if(filters.zero(j = iterablesEmptyRows[i])) {
+              if(toSkip > 0) {
+                --toSkip;
+              } else {
+                array.push(j);
                 --k;
               }
             }
@@ -4919,6 +5639,46 @@ self.onmessage = async function(event) {
         return array;
       }
 
+      function bottomIndex(k, bottom_offset) {
+        materializeLazyEncodedState();
+
+        var array = [],
+            i,
+            j,
+            toSkip = 0;
+
+        if(bottom_offset && bottom_offset > 0) toSkip = bottom_offset;
+
+        if(iterable) {
+          for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
+            if(filters.zero(j = iterablesEmptyRows[i])) {
+              if(toSkip > 0) {
+                --toSkip;
+              } else {
+                array.push(j);
+                --k;
+              }
+            }
+          }
+        }
+
+        i = lo0;
+
+        while (i < hi0 && k > 0) {
+          if (filters.zero(j = index[i])) {
+            if(toSkip > 0) {
+              --toSkip;
+            } else {
+              array.push(j);
+              --k;
+            }
+          }
+          i++;
+        }
+
+        return array;
+      }
+
       // Adds a new group to this dimension, using the specified key function.
       function group(key) {
         if (arguments.length < 1) key = cr_identity;
@@ -4954,9 +5714,13 @@ self.onmessage = async function(event) {
             reduceAdd,
             reduceRemove,
             reduceInitial,
+            reduceMode = null,
             update = cr_null,
             reset = cr_null,
             resetNeeded = true,
+            markResetNeeded = registerResetListener(function() {
+              resetNeeded = true;
+            }),
             groupAll = key === cr_null,
             n0old;
 
@@ -5132,9 +5896,16 @@ self.onmessage = async function(event) {
 
               // Always add new values to groups. Only remove when another dimension has filtered them out.
               // This gives groups full information on data life-cycle without paying for no-op filter checks.
-              var rowRecord = getRecord(j);
-              g.value = add(g.value, rowRecord, true);
-              if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, rowRecord, false);
+              if (reduceMode === 'count') {
+                g.value += 1;
+                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
+                  g.value -= 1;
+                }
+              } else {
+                var rowRecord = getRecord(j);
+                g.value = add(g.value, rowRecord, true);
+                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, rowRecord, false);
+              }
               if (++i1 >= n1) break;
               x1 = key(newValues[i1]);
             }
@@ -5305,7 +6076,11 @@ self.onmessage = async function(event) {
               if (filters.zeroExcept(k = added[i], offset, zero)) {
                 for (j = 0; j < groupIndex[k].length; j++) {
                   g = groups[groupIndex[k][j]];
-                  g.value = reduceAdd(g.value, getRecord(k), false, j);
+                  if (reduceMode === 'count') {
+                    g.value += 1;
+                  } else {
+                    g.value = reduceAdd(g.value, getRecord(k), false, j);
+                  }
                 }
               }
             }
@@ -5315,7 +6090,11 @@ self.onmessage = async function(event) {
               if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
                 for (j = 0; j < groupIndex[k].length; j++) {
                   g = groups[groupIndex[k][j]];
-                  g.value = reduceRemove(g.value, getRecord(k), notFilter, j);
+                  if (reduceMode === 'count') {
+                    g.value -= 1;
+                  } else {
+                    g.value = reduceRemove(g.value, getRecord(k), notFilter, j);
+                  }
                 }
               }
             }
@@ -5326,7 +6105,11 @@ self.onmessage = async function(event) {
           for (i = 0, n = added.length; i < n; ++i) {
             if (filters.zeroExcept(k = added[i], offset, zero)) {
               g = groups[groupIndex[k]];
-              g.value = reduceAdd(g.value, getRecord(k), false);
+              if (reduceMode === 'count') {
+                g.value += 1;
+              } else {
+                g.value = reduceAdd(g.value, getRecord(k), false);
+              }
             }
           }
 
@@ -5334,7 +6117,11 @@ self.onmessage = async function(event) {
           for (i = 0, n = removed.length; i < n; ++i) {
             if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
               g = groups[groupIndex[k]];
-              g.value = reduceRemove(g.value, getRecord(k), notFilter);
+              if (reduceMode === 'count') {
+                g.value -= 1;
+              } else {
+                g.value = reduceRemove(g.value, getRecord(k), notFilter);
+              }
             }
           }
         }
@@ -5353,14 +6140,22 @@ self.onmessage = async function(event) {
           // Add the added values.
           for (i = 0, n = added.length; i < n; ++i) {
             if (filters.zeroExcept(k = added[i], offset, zero)) {
-              g.value = reduceAdd(g.value, getRecord(k), false);
+              if (reduceMode === 'count') {
+                g.value += 1;
+              } else {
+                g.value = reduceAdd(g.value, getRecord(k), false);
+              }
             }
           }
 
           // Remove the removed values.
           for (i = 0, n = removed.length; i < n; ++i) {
             if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
-              g.value = reduceRemove(g.value, getRecord(k), notFilter);
+              if (reduceMode === 'count') {
+                g.value -= 1;
+              } else {
+                g.value = reduceRemove(g.value, getRecord(k), notFilter);
+              }
             }
           }
         }
@@ -5383,10 +6178,14 @@ self.onmessage = async function(event) {
           // place on other dimensions.
           if(iterable){
             for (i = 0; i < n; ++i) {
-              var iterableRecord = getRecord(i);
               for (j = 0; j < groupIndex[i].length; j++) {
                 g = groups[groupIndex[i][j]];
-                g.value = reduceAdd(g.value, iterableRecord, true, j);
+                if (reduceMode === 'count') {
+                  g.value += 1;
+                } else {
+                  var iterableRecord = getRecord(i);
+                  g.value = reduceAdd(g.value, iterableRecord, true, j);
+                }
               }
             }
             if (!applyFilteredRemovals) {
@@ -5394,10 +6193,14 @@ self.onmessage = async function(event) {
             }
             for (i = 0; i < n; ++i) {
               if (!filters.zeroExcept(i, offset, zero)) {
-                iterableRecord = getRecord(i);
                 for (j = 0; j < groupIndex[i].length; j++) {
                   g = groups[groupIndex[i][j]];
-                  g.value = reduceRemove(g.value, iterableRecord, false, j);
+                  if (reduceMode === 'count') {
+                    g.value -= 1;
+                  } else {
+                    var filteredIterableRecord = getRecord(i);
+                    g.value = reduceRemove(g.value, filteredIterableRecord, false, j);
+                  }
                 }
               }
             }
@@ -5406,7 +6209,11 @@ self.onmessage = async function(event) {
 
           for (i = 0; i < n; ++i) {
             g = groups[groupIndex[i]];
-            g.value = reduceAdd(g.value, getRecord(i), true);
+            if (reduceMode === 'count') {
+              g.value += 1;
+            } else {
+              g.value = reduceAdd(g.value, getRecord(i), true);
+            }
           }
           if (!applyFilteredRemovals) {
             return;
@@ -5414,7 +6221,11 @@ self.onmessage = async function(event) {
           for (i = 0; i < n; ++i) {
             if (!filters.zeroExcept(i, offset, zero)) {
               g = groups[groupIndex[i]];
-              g.value = reduceRemove(g.value, getRecord(i), false);
+              if (reduceMode === 'count') {
+                g.value -= 1;
+              } else {
+                g.value = reduceRemove(g.value, getRecord(i), false);
+              }
             }
           }
         }
@@ -5433,7 +6244,11 @@ self.onmessage = async function(event) {
           // can build an 'unfiltered' view even if there are already filters in
           // place on other dimensions.
           for (i = 0; i < n; ++i) {
-            g.value = reduceAdd(g.value, getRecord(i), true);
+            if (reduceMode === 'count') {
+              g.value += 1;
+            } else {
+              g.value = reduceAdd(g.value, getRecord(i), true);
+            }
           }
 
           if (!applyFilteredRemovals) {
@@ -5441,7 +6256,11 @@ self.onmessage = async function(event) {
           }
           for (i = 0; i < n; ++i) {
             if (!filters.zeroExcept(i, offset, zero)) {
-              g.value = reduceRemove(g.value, getRecord(i), false);
+              if (reduceMode === 'count') {
+                g.value -= 1;
+              } else {
+                g.value = reduceRemove(g.value, getRecord(i), false);
+              }
             }
           }
         }
@@ -5464,13 +6283,16 @@ self.onmessage = async function(event) {
           reduceAdd = add;
           reduceRemove = remove;
           reduceInitial = initial;
+          reduceMode = null;
           resetNeeded = true;
           return group;
         }
 
         // A convenience method for reducing by count.
         function reduceCount() {
-          return reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
+          reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
+          reduceMode = 'count';
+          return group;
         }
 
         // A convenience method for reducing by sum(value).
@@ -5506,6 +6328,7 @@ self.onmessage = async function(event) {
           if (i >= 0) removeDataListeners.splice(i, 1);
           i = dimensionGroups.indexOf(group);
           if (i >= 0) dimensionGroups.splice(i, 1);
+          unregisterResetListener(markResetNeeded);
           return group;
         }
 
@@ -5556,7 +6379,11 @@ self.onmessage = async function(event) {
           reduceAdd,
           reduceRemove,
           reduceInitial,
-          resetNeeded = true;
+          reduceMode = null,
+          resetNeeded = true,
+          markResetNeeded = registerResetListener(function() {
+            resetNeeded = true;
+          });
 
       // The group listens to the crossfilter for when any dimension changes, so
       // that it can update the reduce value. It must also listen to the parent
@@ -5576,14 +6403,21 @@ self.onmessage = async function(event) {
 
         // Cycle through all the values.
         for (i = n0; i < n; ++i) {
-          var rowRecord = getRecord(i);
+          if (reduceMode === 'count') {
+            reduceValue += 1;
+            if (applyFilteredRemovals && !filters.zero(i)) {
+              reduceValue -= 1;
+            }
+          } else {
+            var rowRecord = getRecord(i);
 
-          // Add all values all the time.
-          reduceValue = reduceAdd(reduceValue, rowRecord, true);
+            // Add all values all the time.
+            reduceValue = reduceAdd(reduceValue, rowRecord, true);
 
-          // Remove the value if filtered.
-          if (applyFilteredRemovals && !filters.zero(i)) {
-            reduceValue = reduceRemove(reduceValue, rowRecord, false);
+            // Remove the value if filtered.
+            if (applyFilteredRemovals && !filters.zero(i)) {
+              reduceValue = reduceRemove(reduceValue, rowRecord, false);
+            }
           }
         }
       }
@@ -5599,14 +6433,22 @@ self.onmessage = async function(event) {
         // Add the added values.
         for (i = 0, n = added.length; i < n; ++i) {
           if (filters.zero(k = added[i])) {
-            reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
+            if (reduceMode === 'count') {
+              reduceValue += 1;
+            } else {
+              reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
+            }
           }
         }
 
         // Remove the removed values.
         for (i = 0, n = removed.length; i < n; ++i) {
           if (filters.only(k = removed[i], filterOffset, filterOne)) {
-            reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
+            if (reduceMode === 'count') {
+              reduceValue -= 1;
+            } else {
+              reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
+            }
           }
         }
       }
@@ -5620,14 +6462,21 @@ self.onmessage = async function(event) {
 
         // Cycle through all the values.
         for (i = 0; i < n; ++i) {
-          var rowRecord = getRecord(i);
+          if (reduceMode === 'count') {
+            reduceValue += 1;
+            if (applyFilteredRemovals && !filters.zero(i)) {
+              reduceValue -= 1;
+            }
+          } else {
+            var rowRecord = getRecord(i);
 
-          // Add all values all the time.
-          reduceValue = reduceAdd(reduceValue, rowRecord, true);
+            // Add all values all the time.
+            reduceValue = reduceAdd(reduceValue, rowRecord, true);
 
-          // Remove the value if it is filtered.
-          if (applyFilteredRemovals && !filters.zero(i)) {
-            reduceValue = reduceRemove(reduceValue, rowRecord, false);
+            // Remove the value if it is filtered.
+            if (applyFilteredRemovals && !filters.zero(i)) {
+              reduceValue = reduceRemove(reduceValue, rowRecord, false);
+            }
           }
         }
       }
@@ -5638,13 +6487,16 @@ self.onmessage = async function(event) {
         reduceAdd = add;
         reduceRemove = remove;
         reduceInitial = initial;
+        reduceMode = null;
         resetNeeded = true;
         return group;
       }
 
       // A convenience method for reducing by count.
       function reduceCount() {
-        return reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
+        reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
+        reduceMode = 'count';
+        return group;
       }
 
       // A convenience method for reducing by sum(value).
@@ -5664,6 +6516,7 @@ self.onmessage = async function(event) {
         if (i >= 0) filterListeners.splice(i, 1);
         i = dataListeners.indexOf(add);
         if (i >= 0) dataListeners.splice(i, 1);
+        unregisterResetListener(markResetNeeded);
         return group;
       }
 
@@ -5694,6 +6547,53 @@ self.onmessage = async function(event) {
         }
 
         return array;
+    }
+
+    function allFilteredIndexes(ignore_dimensions) {
+      var array = [],
+          i = 0,
+          mask = maskForDimensions(ignore_dimensions || []);
+
+      for (i = 0; i < n; i++) {
+        if (filters.zeroExceptMask(i, mask)) {
+          array.push(i);
+        }
+      }
+
+      return array;
+    }
+
+    function takeColumns(rowIndexes, fields) {
+      var selectedFields = fields && fields.length ? fields.slice() : null;
+      var columns = {};
+      var rowCount = rowIndexes ? rowIndexes.length : 0;
+      var fieldIndex;
+      var rowIndex;
+
+      if (!selectedFields) {
+        return {
+          columns: columns,
+          fields: [],
+          length: rowCount
+        };
+      }
+
+      for (fieldIndex = 0; fieldIndex < selectedFields.length; ++fieldIndex) {
+        columns[selectedFields[fieldIndex]] = new Array(rowCount);
+      }
+
+      for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+        for (fieldIndex = 0; fieldIndex < selectedFields.length; ++fieldIndex) {
+          var field = selectedFields[fieldIndex];
+          columns[field][rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+        }
+      }
+
+      return {
+        columns: columns,
+        fields: selectedFields,
+        length: rowCount
+      };
     }
 
     function onChange(cb){
