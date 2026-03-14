@@ -10,6 +10,19 @@ function isArrayIndex(prop) {
   return String(index) === prop && index >= 0 && Number.isInteger(index);
 }
 
+export function getColumnAccessor(column) {
+  if (column == null) {
+    return function() { return undefined; };
+  }
+  if (typeof column.get === "function") {
+    return function(index) { return column.get(index); };
+  }
+  if (typeof column.at === "function") {
+    return function(index) { return column.at(index); };
+  }
+  return function(index) { return column[index]; };
+}
+
 export function getColumnValue(column, index) {
   if (column == null) {
     return undefined;
@@ -87,24 +100,45 @@ export function getColumnarBatch(records) {
 }
 
 export function materializeColumnarRow(batch, index) {
-  var cached = batch.rows[index];
-  if (cached !== undefined || index in batch.rows) {
-    return cached;
+  if (batch.materialized[index]) {
+    return batch.rows[index];
   }
 
   var row;
   if (typeof batch.rowFactory === "function") {
-    row = batch.rowFactory(index, batch.columns, batch.fields);
+    row = batch.rowFactory(index, batch.columns, batch.fields, batch.accessors);
   } else {
     row = {};
     for (var fieldIndex = 0; fieldIndex < batch.fields.length; ++fieldIndex) {
-      var field = batch.fields[fieldIndex];
-      row[field] = getColumnValue(batch.columns[field], index);
+      row[batch.fields[fieldIndex]] = batch.accessors[fieldIndex](index);
     }
   }
 
   batch.rows[index] = row;
+  batch.materialized[index] = 1;
   return row;
+}
+
+function createDefaultRowFactory(fields, accessors) {
+  var fieldCount = fields.length;
+
+  return function(index) {
+    var row = {},
+        fieldIndex = 0;
+
+    for (; fieldIndex + 3 < fieldCount; fieldIndex += 4) {
+      row[fields[fieldIndex]] = accessors[fieldIndex](index);
+      row[fields[fieldIndex + 1]] = accessors[fieldIndex + 1](index);
+      row[fields[fieldIndex + 2]] = accessors[fieldIndex + 2](index);
+      row[fields[fieldIndex + 3]] = accessors[fieldIndex + 3](index);
+    }
+
+    for (; fieldIndex < fieldCount; ++fieldIndex) {
+      row[fields[fieldIndex]] = accessors[fieldIndex](index);
+    }
+
+    return row;
+  };
 }
 
 export function rowsFromColumns(columns, options) {
@@ -113,12 +147,25 @@ export function rowsFromColumns(columns, options) {
   var fields = inferFields(columns, options.fields);
   var length = inferLength(columns, fields, options.length);
   var transformedColumns = maybeTransformColumns(columns, fields, length, options.transforms);
+  var accessors = new Array(fields.length);
+  var accessorsByField = {};
+
+  for (var accessorIndex = 0; accessorIndex < fields.length; ++accessorIndex) {
+    accessors[accessorIndex] = getColumnAccessor(transformedColumns[fields[accessorIndex]]);
+    accessorsByField[fields[accessorIndex]] = accessors[accessorIndex];
+  }
+
   var rows = new Array(length);
   var batch = {
+    accessors: accessors,
+    accessorsByField: accessorsByField,
     columns: transformedColumns,
     fields: fields,
     length: length,
-    rowFactory: typeof options.rowFactory === "function" ? options.rowFactory : null,
+    materialized: new Uint8Array(length),
+    rowFactory: typeof options.rowFactory === "function"
+      ? options.rowFactory
+      : createDefaultRowFactory(fields, accessors),
     rows: rows
   };
 

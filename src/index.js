@@ -9,6 +9,7 @@ import bisect from './bisect.js';
 import permute from './permute.js';
 import xfilterReduce from './reduce.js';
 import result from './result.js';
+import { compareNaturalOrder, isNaturallyOrderable } from './natural-order.js';
 import {
   getColumnValue,
   getColumnarBatch,
@@ -16,6 +17,14 @@ import {
   rowsFromColumns,
   rowsFromArrowTable
 } from './columnar.js';
+import {
+  configureWasmRuntime,
+  createWasmRuntimeController,
+  getWasmRuntimeInfo
+} from './wasm.js';
+import { createDashboardRuntime as createDashboardRuntimeHelper } from './dashboard.js';
+import { createDashboardWorker as createDashboardWorkerHelper } from './dashboard-worker.js';
+import { createStreamingDashboardWorker as createStreamingDashboardWorkerHelper } from './dashboard-stream-worker.js';
 
 // constants
 var REMOVED_INDEX = -1;
@@ -32,9 +41,21 @@ crossfilter.rowsFromArrowTable = rowsFromArrowTable;
 crossfilter.fromArrowTable = function(table, options) {
   return crossfilter(rowsFromArrowTable(table, options));
 };
+crossfilter.configureRuntime = configureWasmRuntime;
+crossfilter.runtimeInfo = getWasmRuntimeInfo;
+crossfilter.createDashboardRuntime = function(options) {
+  return createDashboardRuntimeHelper(crossfilter, options);
+};
+crossfilter.createDashboardWorker = function(options) {
+  return createDashboardWorkerHelper(options);
+};
+crossfilter.createStreamingDashboardWorker = function(options) {
+  return createStreamingDashboardWorkerHelper(options);
+};
 export default crossfilter;
 
 function crossfilter() {
+  var runtimeController = createWasmRuntimeController();
   var crossfilter = {
     add: add,
     remove: removeData,
@@ -44,7 +65,9 @@ function crossfilter() {
     all: all,
     allFiltered: allFiltered,
     onChange: onChange,
-    isElementFiltered: isElementFiltered
+    isElementFiltered: isElementFiltered,
+    configureRuntime: runtimeController.configureRuntime,
+    runtimeInfo: runtimeController.runtimeInfo
   };
 
   var data = [], // the records
@@ -54,7 +77,8 @@ function crossfilter() {
       dataListeners = [], // when data is added
       removeDataListeners = [], // when data is removed
       callbacks = [],
-      columnarBatches = [];
+      columnarBatches = [],
+      activeDimensionFilterCount = 0;
 
   filters = new xfilterArray.bitarray(0);
 
@@ -83,6 +107,7 @@ function crossfilter() {
 
     columnarBatches.push({
       batch: batch,
+      accessors: batch.accessorsByField,
       columns: batch.columns,
       start: n0,
       end: n0 + n1
@@ -90,6 +115,13 @@ function crossfilter() {
   }
 
   function findColumnarBatch(rowIndex) {
+    if (columnarBatches.length === 1) {
+      var onlyBatch = columnarBatches[0];
+      return rowIndex >= onlyBatch.start && rowIndex < onlyBatch.end
+        ? onlyBatch
+        : null;
+    }
+
     var lo = 0,
         hi = columnarBatches.length;
 
@@ -104,18 +136,31 @@ function crossfilter() {
     return null;
   }
 
+  function hasAnyActiveDimensionFilters() {
+    return activeDimensionFilterCount > 0;
+  }
+
   function getRecord(rowIndex) {
     var row = data[rowIndex];
-    if (row !== undefined || rowIndex in data) {
+    if (row !== undefined) {
       return row;
+    }
+
+    if (!columnarBatches.length) {
+      return rowIndex in data ? row : undefined;
     }
 
     var batch = findColumnarBatch(rowIndex);
     if (!batch) {
-      return row;
+      return rowIndex in data ? row : undefined;
     }
 
-    row = materializeColumnarRow(batch.batch, rowIndex - batch.start);
+    var batchRowIndex = rowIndex - batch.start;
+    if (batch.batch.materialized && batch.batch.materialized[batchRowIndex]) {
+      row = batch.batch.rows[batchRowIndex];
+    } else {
+      row = materializeColumnarRow(batch.batch, batchRowIndex);
+    }
     data[rowIndex] = row;
     return row;
   }
@@ -173,9 +218,14 @@ function crossfilter() {
 
       var segmentStart = Math.max(cursor, batch.start),
           segmentEnd = Math.min(batch.end, end),
+          accessor = batch.accessors && batch.accessors[field],
           column = batch.columns[field];
 
-      if (column != null) {
+      if (accessor) {
+        for (var valueIndex = segmentStart; valueIndex < segmentEnd; ++valueIndex) {
+          values[targetOffset++] = accessor(valueIndex - batch.start);
+        }
+      } else if (column != null) {
         for (var valueIndex = segmentStart; valueIndex < segmentEnd; ++valueIndex) {
           values[targetOffset++] = getColumnValue(column, valueIndex - batch.start);
         }
@@ -191,6 +241,41 @@ function crossfilter() {
     }
 
     return values;
+  }
+
+  function findSingleColumnAccessorSegment(field, start, count) {
+    if (!count || !columnarBatches.length) {
+      return null;
+    }
+
+    var end = start + count;
+
+    for (var batchIndex = 0; batchIndex < columnarBatches.length; ++batchIndex) {
+      var batch = columnarBatches[batchIndex];
+
+      if (batch.end <= start) {
+        continue;
+      }
+
+      if (batch.start > start) {
+        return null;
+      }
+
+      if (batch.end < end) {
+        return null;
+      }
+
+      if (!batch.accessors || !batch.accessors[field]) {
+        return null;
+      }
+
+      return {
+        accessor: batch.accessors[field],
+        offset: start - batch.start
+      };
+    }
+
+    return null;
   }
 
   // Adds the specified new records to this crossfilter.
@@ -317,8 +402,8 @@ function crossfilter() {
         iterablesEmptyRows = [],
         sortRange = function(n) {
           return cr_range(n).sort(function(A, B) {
-            var a = newValues[A], b = newValues[B];
-            return a < b ? -1 : a > b ? 1 : A - B;
+            var order = compareNaturalOrder(newValues[A], newValues[B]);
+            return order || A - B;
           });
         },
         refilter = xfilterFilter.filterAll, // for recomputing filter
@@ -328,6 +413,7 @@ function crossfilter() {
         filterMode = 'all',
         filterInValues = null,
         exactRangeCache = new Map(),
+        lazyEncodedState = null,
         indexListeners = [], // when data is added
         dimensionGroups = [],
         lo0 = 0,
@@ -337,10 +423,573 @@ function crossfilter() {
 
     function normalizeExactFilterValues(filterValues) {
       var uniqueValues = Array.from(new Set(filterValues));
-      uniqueValues.sort(function(a, b) {
-        return a < b ? -1 : a > b ? 1 : 0;
-      });
+      uniqueValues.sort(compareNaturalOrder);
       return uniqueValues;
+    }
+
+    function isLazyEncodedValue(valueToEncode) {
+      var valueType = typeof valueToEncode;
+      return valueToEncode == null
+        || valueType === 'string'
+        || valueType === 'number'
+        || valueType === 'boolean'
+        || valueType === 'bigint';
+    }
+
+    function createLazyEncodedState(sourceValues) {
+      if (!accessorPath || iterable || !runtimeController.canUseWasmScan()) {
+        return null;
+      }
+
+      var codes = new Uint32Array(sourceValues.length),
+          valueToCode = new Map(),
+          codeToValue = [undefined],
+          i,
+          valueToEncode,
+          code;
+
+      for (i = 0; i < sourceValues.length; ++i) {
+        valueToEncode = sourceValues[i];
+        if (!isLazyEncodedValue(valueToEncode)) {
+          return null;
+        }
+        if (!valueToCode.has(valueToEncode)) {
+          code = codeToValue.length;
+          valueToCode.set(valueToEncode, code);
+          codeToValue.push(valueToEncode);
+        }
+        codes[i] = valueToCode.get(valueToEncode);
+      }
+
+      return {
+        codeCounts: buildCodeCounts(codes, codeToValue.length),
+        codeToValue: codeToValue,
+        codes: codes,
+        matchIndices: null,
+        selected: null,
+        selectionMarkVersion: 1,
+        selectionMarks: new Uint32Array(codeToValue.length),
+        valueToCode: valueToCode
+      };
+    }
+
+    function createLazyEncodedStateFromAccessor(accessor, offset, length) {
+      if (!accessorPath || iterable || !runtimeController.canUseWasmScan()) {
+        return null;
+      }
+
+      var codes = new Uint32Array(length),
+          valueToCode = new Map(),
+          codeToValue = [undefined],
+          i,
+          valueToEncode,
+          code;
+
+      for (i = 0; i < length; ++i) {
+        valueToEncode = accessor(offset + i);
+        if (!isLazyEncodedValue(valueToEncode)) {
+          return null;
+        }
+        if (!valueToCode.has(valueToEncode)) {
+          code = codeToValue.length;
+          valueToCode.set(valueToEncode, code);
+          codeToValue.push(valueToEncode);
+        }
+        codes[i] = valueToCode.get(valueToEncode);
+      }
+
+      return {
+        codeCounts: buildCodeCounts(codes, codeToValue.length),
+        codeToValue: codeToValue,
+        codes: codes,
+        matchIndices: null,
+        selected: null,
+        selectionMarkVersion: 1,
+        selectionMarks: new Uint32Array(codeToValue.length),
+        valueToCode: valueToCode
+      };
+    }
+
+    function ensureLazySelectionMarksSize(size) {
+      if (lazyEncodedState.selectionMarks.length >= size) {
+        return;
+      }
+
+      var nextMarks = new Uint32Array(size);
+      nextMarks.set(lazyEncodedState.selectionMarks);
+      lazyEncodedState.selectionMarks = nextMarks;
+    }
+
+    function appendLazyEncodedValues(sourceValues) {
+      if (!lazyEncodedState) {
+        return null;
+      }
+
+      var existingCodes = lazyEncodedState.codes,
+          appendedCodes = new Uint32Array(sourceValues.length),
+          nextCodes = new Uint32Array(existingCodes.length + sourceValues.length),
+          i,
+          valueToEncode,
+          code;
+
+      nextCodes.set(existingCodes);
+
+      for (i = 0; i < sourceValues.length; ++i) {
+        valueToEncode = sourceValues[i];
+        if (!isLazyEncodedValue(valueToEncode)) {
+          return null;
+        }
+        if (!lazyEncodedState.valueToCode.has(valueToEncode)) {
+          code = lazyEncodedState.codeToValue.length;
+          lazyEncodedState.valueToCode.set(valueToEncode, code);
+          lazyEncodedState.codeToValue.push(valueToEncode);
+        }
+        appendedCodes[i] = lazyEncodedState.valueToCode.get(valueToEncode);
+        nextCodes[existingCodes.length + i] = appendedCodes[i];
+      }
+
+      lazyEncodedState.codes = nextCodes;
+      lazyEncodedState.codeCounts = buildCodeCounts(nextCodes, lazyEncodedState.codeToValue.length);
+      ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
+      return appendedCodes;
+    }
+
+    function appendLazyEncodedValuesFromAccessor(accessor, offset, length) {
+      if (!lazyEncodedState) {
+        return null;
+      }
+
+      var existingCodes = lazyEncodedState.codes,
+          appendedCodes = new Uint32Array(length),
+          nextCodes = new Uint32Array(existingCodes.length + length),
+          i,
+          valueToEncode,
+          code;
+
+      nextCodes.set(existingCodes);
+
+      for (i = 0; i < length; ++i) {
+        valueToEncode = accessor(offset + i);
+        if (!isLazyEncodedValue(valueToEncode)) {
+          return null;
+        }
+        if (!lazyEncodedState.valueToCode.has(valueToEncode)) {
+          code = lazyEncodedState.codeToValue.length;
+          lazyEncodedState.valueToCode.set(valueToEncode, code);
+          lazyEncodedState.codeToValue.push(valueToEncode);
+        }
+        appendedCodes[i] = lazyEncodedState.valueToCode.get(valueToEncode);
+        nextCodes[existingCodes.length + i] = appendedCodes[i];
+      }
+
+      lazyEncodedState.codes = nextCodes;
+      lazyEncodedState.codeCounts = buildCodeCounts(nextCodes, lazyEncodedState.codeToValue.length);
+      ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
+      return appendedCodes;
+    }
+
+    function buildCodeCounts(codes, size) {
+      var codeCounts = new Uint32Array(size);
+      for (var codeIndex = 0; codeIndex < codes.length; ++codeIndex) {
+        ++codeCounts[codes[codeIndex]];
+      }
+      return codeCounts;
+    }
+
+    function lazyCodesSelectAllRows(targetCodes) {
+      if (!lazyEncodedState || !targetCodes || !targetCodes.length) {
+        return false;
+      }
+
+      var selectedCount = 0;
+      for (var codeIndex = 0; codeIndex < targetCodes.length; ++codeIndex) {
+        selectedCount += lazyEncodedState.codeCounts[targetCodes[codeIndex]] || 0;
+      }
+      return selectedCount === n;
+    }
+
+    function normalizeLazySelectionMask(selection) {
+      if (!selection) {
+        return null;
+      }
+
+      for (var i = 0; i < selection.length; ++i) {
+        if (!selection[i]) {
+          return selection;
+        }
+      }
+
+      return null;
+    }
+
+    function normalizeLazyMatchIndices(matches) {
+      if (!matches || matches.length === n) {
+        return null;
+      }
+      return matches;
+    }
+
+    function createLazySelectionFromMatches(matches) {
+      if (!matches || matches.length === n) {
+        return null;
+      }
+
+      var selection = new Uint8Array(n);
+      for (var i = 0; i < matches.length; ++i) {
+        selection[matches[i]] = 1;
+      }
+      return selection;
+    }
+
+    function ensureLazySelection(currentMatches, currentSelected) {
+      return currentSelected || createLazySelectionFromMatches(currentMatches);
+    }
+
+    function encodeLazyFilterValues(filterValues) {
+      if (!lazyEncodedState) {
+        return null;
+      }
+
+      var encodedValues = new Uint32Array(filterValues.length),
+          count = 0,
+          i,
+          markVersion,
+          selectionMarks,
+          valueToEncode,
+          code;
+
+      ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
+      selectionMarks = lazyEncodedState.selectionMarks;
+      if (lazyEncodedState.selectionMarkVersion === 0xffffffff) {
+        selectionMarks.fill(0);
+        lazyEncodedState.selectionMarkVersion = 1;
+      }
+      markVersion = lazyEncodedState.selectionMarkVersion++;
+
+      for (i = 0; i < filterValues.length; ++i) {
+        valueToEncode = filterValues[i];
+        if (!isLazyEncodedValue(valueToEncode)) {
+          return null;
+        }
+        code = lazyEncodedState.valueToCode.get(valueToEncode);
+        if (code === undefined || selectionMarks[code] === markVersion) {
+          continue;
+        }
+        selectionMarks[code] = markVersion;
+        encodedValues[count++] = code;
+      }
+
+      return encodedValues.slice(0, count);
+    }
+
+    function applyLazySelectionState(nextMatches) {
+      var notifyListeners = filterListeners.length > 0,
+          added = notifyListeners ? [] : null,
+          removed = notifyListeners ? [] : null,
+          currentSelected = lazyEncodedState.selected,
+          currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
+          currentIndex,
+          nextIndex,
+          currentValue,
+          nextValue,
+          i,
+          isSelected,
+          nextSelected,
+          wasSelected;
+
+      nextMatches = normalizeLazyMatchIndices(nextMatches);
+
+      if (!currentMatches && !nextMatches) {
+        lazyEncodedState.selected = null;
+        lazyEncodedState.matchIndices = null;
+        return dimension;
+      }
+
+      if (currentMatches && nextMatches) {
+        currentSelected = ensureLazySelection(currentMatches, currentSelected);
+        currentIndex = 0;
+        nextIndex = 0;
+
+        while (currentIndex < currentMatches.length || nextIndex < nextMatches.length) {
+          currentValue = currentIndex < currentMatches.length ? currentMatches[currentIndex] : n;
+          nextValue = nextIndex < nextMatches.length ? nextMatches[nextIndex] : n;
+
+          if (currentValue === nextValue) {
+            ++currentIndex;
+            ++nextIndex;
+            continue;
+          }
+
+          if (currentValue < nextValue) {
+            if (!(filters[offset][currentValue] & one)) {
+              filters[offset][currentValue] |= one;
+            }
+            currentSelected[currentValue] = 0;
+            if (notifyListeners) {
+              removed.push(currentValue);
+            }
+            ++currentIndex;
+            continue;
+          }
+
+          if (filters[offset][nextValue] & one) {
+            filters[offset][nextValue] &= zero;
+          }
+          currentSelected[nextValue] = 1;
+          if (notifyListeners) {
+            added.push(nextValue);
+          }
+          ++nextIndex;
+        }
+
+        lazyEncodedState.selected = normalizeLazySelectionMask(currentSelected);
+        lazyEncodedState.matchIndices = nextMatches;
+        if (notifyListeners) {
+          filterListeners.forEach(function(l) { l(one, offset, added, removed); });
+        }
+        triggerOnChange('filtered');
+        return dimension;
+      }
+
+      nextSelected = createLazySelectionFromMatches(nextMatches);
+      currentSelected = ensureLazySelection(currentMatches, currentSelected);
+
+      if (!currentSelected && !nextSelected) {
+        lazyEncodedState.selected = null;
+        lazyEncodedState.matchIndices = null;
+        return dimension;
+      }
+
+      for (i = 0; i < n; ++i) {
+        wasSelected = currentSelected ? currentSelected[i] === 1 : true;
+        isSelected = nextSelected ? nextSelected[i] === 1 : true;
+        if (wasSelected === isSelected) {
+          continue;
+        }
+        if (isSelected) {
+          if (filters[offset][i] & one) {
+            filters[offset][i] &= zero;
+          }
+          if (notifyListeners) {
+            added.push(i);
+          }
+        } else {
+          if (!(filters[offset][i] & one)) {
+            filters[offset][i] |= one;
+          }
+          if (notifyListeners) {
+            removed.push(i);
+          }
+        }
+      }
+
+      lazyEncodedState.selected = nextSelected;
+      lazyEncodedState.matchIndices = nextMatches;
+      if (notifyListeners) {
+        filterListeners.forEach(function(l) { l(one, offset, added, removed); });
+      }
+      triggerOnChange('filtered');
+      return dimension;
+    }
+
+    function applyLazyEncodedFilter(targetCodes, nextMode) {
+      var matches;
+
+      if (lazyCodesSelectAllRows(targetCodes)) {
+        filterMode = nextMode;
+        lo0 = 0;
+        hi0 = 0;
+        return applyLazySelectionState(null);
+      }
+
+      matches = runtimeController.findEncodedMatches(lazyEncodedState.codes, targetCodes);
+
+      filterMode = nextMode;
+      lo0 = 0;
+      hi0 = 0;
+
+      return applyLazySelectionState(matches);
+    }
+
+    function resolveLazyTargetCodes() {
+      if (!lazyEncodedState || !filterValuePresent || filterMode === 'all') {
+        return new Uint32Array(0);
+      }
+
+      if (filterMode === 'in') {
+        return encodeLazyFilterValues(filterInValues || []);
+      }
+
+      return encodeLazyFilterValues([filterValue]);
+    }
+
+    function concatLazyMatchIndices(currentMatches, appendedMatches) {
+      if (!currentMatches || !currentMatches.length) {
+        return appendedMatches;
+      }
+      if (!appendedMatches || !appendedMatches.length) {
+        return currentMatches;
+      }
+
+      var nextMatches = new Uint32Array(currentMatches.length + appendedMatches.length);
+      nextMatches.set(currentMatches);
+      nextMatches.set(appendedMatches, currentMatches.length);
+      return nextMatches;
+    }
+
+    function applyLazyFilterToNewRows(n0, appendedCodes) {
+      var currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
+          currentSelected,
+          nextMatches,
+          nextSelected,
+          matches,
+          i,
+          rowIndex,
+          targetCodes;
+
+      if (!currentMatches) {
+        return;
+      }
+
+      targetCodes = resolveLazyTargetCodes();
+      if (!targetCodes) {
+        materializeLazyEncodedState();
+        return;
+      }
+
+      currentSelected = ensureLazySelection(currentMatches, lazyEncodedState.selected);
+      nextSelected = new Uint8Array(n);
+      nextSelected.set(currentSelected);
+      matches = runtimeController.findEncodedMatches(appendedCodes, targetCodes);
+      nextMatches = new Uint32Array(matches.length);
+
+      for (i = 0; i < matches.length; ++i) {
+        rowIndex = n0 + matches[i];
+        nextSelected[rowIndex] = 1;
+        nextMatches[i] = rowIndex;
+      }
+
+      for (rowIndex = n0; rowIndex < n; ++rowIndex) {
+        if (!nextSelected[rowIndex]) {
+          filters[offset][rowIndex] |= one;
+        }
+      }
+
+      lazyEncodedState.matchIndices = normalizeLazyMatchIndices(concatLazyMatchIndices(currentMatches, nextMatches));
+      lazyEncodedState.selected = normalizeLazySelectionMask(nextSelected);
+    }
+
+    function compactLazyEncodedState(reIndex) {
+      var currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
+          nextLength = 0,
+          i,
+          nextCodes,
+          nextMatchCount = 0,
+          nextMatchIndices = currentMatches ? new Uint32Array(currentMatches.length) : null,
+          nextSelected = lazyEncodedState.selected ? new Uint8Array(reIndex.length) : null,
+          rowIndex;
+
+      for (i = 0; i < reIndex.length; ++i) {
+        if (reIndex[i] !== REMOVED_INDEX) {
+          ++nextLength;
+        }
+      }
+
+      nextCodes = new Uint32Array(nextLength);
+      if (nextSelected) {
+        nextSelected = new Uint8Array(nextLength);
+      }
+
+      for (i = 0, rowIndex = 0; i < reIndex.length; ++i) {
+        if (reIndex[i] === REMOVED_INDEX) {
+          continue;
+        }
+        nextCodes[rowIndex] = lazyEncodedState.codes[i];
+        if (nextSelected && lazyEncodedState.selected[i]) {
+          nextSelected[rowIndex] = 1;
+        }
+        ++rowIndex;
+      }
+
+      if (nextMatchIndices) {
+        for (i = 0; i < currentMatches.length; ++i) {
+          rowIndex = reIndex[currentMatches[i]];
+          if (rowIndex === REMOVED_INDEX) {
+            continue;
+          }
+          nextMatchIndices[nextMatchCount++] = rowIndex;
+        }
+        nextMatchIndices = normalizeLazyMatchIndices(nextMatchIndices.slice(0, nextMatchCount));
+      }
+
+      lazyEncodedState.codes = nextCodes;
+      lazyEncodedState.matchIndices = nextMatchIndices;
+      lazyEncodedState.selected = normalizeLazySelectionMask(nextSelected);
+      lo0 = 0;
+      hi0 = 0;
+    }
+
+    function materializeLazyEncodedState() {
+      if (!lazyEncodedState || values) {
+        return;
+      }
+
+      var materializedValues = new Array(lazyEncodedState.codes.length),
+          bounds,
+          i,
+          ranges;
+
+      for (i = 0; i < materializedValues.length; ++i) {
+        materializedValues[i] = lazyEncodedState.codeToValue[lazyEncodedState.codes[i]];
+      }
+
+      newValues = materializedValues;
+      newIndex = sortRange(materializedValues.length);
+      values = permute(newValues, newIndex);
+      index = newIndex;
+      newValues = newIndex = null;
+      exactRangeCache.clear();
+
+      if (filterMode === 'in') {
+        ranges = exactRanges(filterInValues || []);
+        lo0 = ranges.length ? ranges[0][0] : 0;
+        hi0 = ranges.length ? ranges[ranges.length - 1][1] : 0;
+      } else {
+        bounds = refilter(values);
+        lo0 = bounds[0];
+        hi0 = bounds[1];
+      }
+
+      lazyEncodedState = null;
+    }
+
+    function hasLazyEncodedGroupingSupport() {
+      if (!lazyEncodedState || values || iterable) {
+        return false;
+      }
+
+      for (var code = 1; code < lazyEncodedState.codeToValue.length; ++code) {
+        var encodedValue = lazyEncodedState.codeToValue[code];
+        if (encodedValue === undefined || !(encodedValue >= encodedValue)) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    function setFilterValuePresent(nextPresent) {
+      var currentPresent = filterValuePresent === true;
+      nextPresent = !!nextPresent;
+      if (currentPresent === nextPresent) {
+        return;
+      }
+      activeDimensionFilterCount += nextPresent ? 1 : -1;
+      filterValuePresent = nextPresent;
+    }
+
+    function hasOtherActiveDimensionFilters() {
+      return activeDimensionFilterCount > (filterValuePresent ? 1 : 0);
     }
 
     function getExactRange(value) {
@@ -552,15 +1201,57 @@ function crossfilter() {
     // This function is responsible for updating filters, values, and index.
     function preAdd(newData, n0, n1) {
       var newIterablesIndexCount,
-          sourceValues = accessorPath ? extractColumnValues(accessorPath, n0, n1) : null,
+          sourceValues = null,
+          columnAccessorSegment = accessorPath && !iterable && runtimeController.canUseWasmScan()
+            ? findSingleColumnAccessorSegment(accessorPath, n0, n1)
+            : null,
           useStoredRecords = !accessorPath && newData === data && columnarBatches.length,
           newIterablesIndexFilterStatus;
+
+      function ensureSourceValues() {
+        if (!accessorPath) {
+          return null;
+        }
+        if (!sourceValues) {
+          sourceValues = extractColumnValues(accessorPath, n0, n1);
+        }
+        return sourceValues;
+      }
 
       function getSourceRecord(localIndex) {
         return useStoredRecords ? getRecord(n0 + localIndex) : newData[localIndex];
       }
 
+      if (!iterable && accessorPath) {
+        if (lazyEncodedState && !values && indexListeners.length) {
+          materializeLazyEncodedState();
+        }
+
+        if (!n0 && !values) {
+          lazyEncodedState = columnAccessorSegment
+            ? createLazyEncodedStateFromAccessor(columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+            : createLazyEncodedState(ensureSourceValues());
+          if (lazyEncodedState) {
+            lo0 = 0;
+            hi0 = 0;
+            return;
+          }
+        } else if (lazyEncodedState && !values) {
+          var appendedCodes = columnAccessorSegment
+            ? appendLazyEncodedValuesFromAccessor(columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+            : appendLazyEncodedValues(ensureSourceValues());
+          if (appendedCodes) {
+            applyLazyFilterToNewRows(n0, appendedCodes);
+            lo0 = 0;
+            hi0 = 0;
+            return;
+          }
+          materializeLazyEncodedState();
+        }
+      }
+
       if (iterable){
+        sourceValues = ensureSourceValues();
         // Count all the values
         t = 0;
         j = 0;
@@ -606,6 +1297,7 @@ function crossfilter() {
 
       } else{
         // Permute new values into natural order using a standard sorted index.
+        sourceValues = ensureSourceValues();
         if (sourceValues) {
           newValues = sourceValues;
         } else if (useStoredRecords) {
@@ -712,7 +1404,7 @@ function crossfilter() {
       // Merge the old and new sorted values, and old and new index.
       var index5 = 0;
       for (; i0 < n0 && i1 < n1; ++index5) {
-        if (oldValues[i0] < newValues[i1]) {
+        if (compareNaturalOrder(oldValues[i0], newValues[i1]) < 0) {
           values[index5] = oldValues[i0];
           if(iterable) iterablesIndexFilterStatus[index5] = oldIterablesIndexFilterStatus[i0];
           index[index5] = oldIndex[i0++];
@@ -749,6 +1441,11 @@ function crossfilter() {
     }
 
     function removeData(reIndex) {
+      if (lazyEncodedState && !values) {
+        compactLazyEncodedState(reIndex);
+        return;
+      }
+
       if (iterable) {
         for (var i0 = 0, i1 = 0; i0 < iterablesEmptyRows.length; i0++) {
           if (reIndex[iterablesEmptyRows[i0]] !== REMOVED_INDEX) {
@@ -873,14 +1570,44 @@ function crossfilter() {
 
     // Filters this dimension to select the exact value.
     function filterExact(value) {
+      if (lazyEncodedState && !values) {
+        var exactCodes = encodeLazyFilterValues([value]);
+        if (exactCodes) {
+          filterValue = value;
+          setFilterValuePresent(true);
+          refilter = xfilterFilter.filterExact(bisect, value);
+          refilterFunction = null;
+          filterInValues = null;
+          return applyLazyEncodedFilter(exactCodes, 'bounds');
+        }
+        materializeLazyEncodedState();
+      }
+
       filterValue = value;
-      filterValuePresent = true;
+      setFilterValuePresent(true);
       refilter = xfilterFilter.filterExact(bisect, value);
       var range = getExactRange(value);
       return filterIndexBounds(range || [0, 0], false, 'bounds');
     }
 
     function filterIn(valuesToSelect) {
+      if (lazyEncodedState && !values) {
+        var lazyExactFilterValues = normalizeExactFilterValues(valuesToSelect),
+            lazyEncodedValues = encodeLazyFilterValues(lazyExactFilterValues);
+
+        if (lazyEncodedValues) {
+          filterValue = valuesToSelect;
+          setFilterValuePresent(true);
+          refilter = xfilterFilter.filterAll;
+          refilterFunction = null;
+          filterMode = 'in';
+          filterInValues = lazyExactFilterValues;
+          return applyLazyEncodedFilter(lazyEncodedValues, 'in');
+        }
+
+        materializeLazyEncodedState();
+      }
+
       var exactFilterValues = normalizeExactFilterValues(valuesToSelect),
           nextRanges = exactRanges(exactFilterValues),
           previousRanges = resolveCurrentRanges(),
@@ -888,7 +1615,7 @@ function crossfilter() {
           predicate = function(d) { return selectedValues.has(d); };
 
       filterValue = valuesToSelect;
-      filterValuePresent = true;
+      setFilterValuePresent(true);
       refilter = xfilterFilter.filterAll;
       refilterFunction = predicate;
       filterMode = 'in';
@@ -907,15 +1634,28 @@ function crossfilter() {
     // Filters this dimension to select the specified range [lo, hi].
     // The lower bound is inclusive, and the upper bound is exclusive.
     function filterRange(range) {
+      if (lazyEncodedState && !values) {
+        materializeLazyEncodedState();
+      }
+
       filterValue = range;
-      filterValuePresent = true;
+      setFilterValuePresent(true);
       return filterIndexBounds((refilter = xfilterFilter.filterRange(bisect, range))(values), false, 'bounds');
     }
 
     // Clears any filters on this dimension.
     function filterAll() {
+      if (lazyEncodedState && !values) {
+        filterValue = undefined;
+        setFilterValuePresent(false);
+        refilter = xfilterFilter.filterAll;
+        refilterFunction = null;
+        filterInValues = null;
+        return applyLazySelectionState(null);
+      }
+
       filterValue = undefined;
-      filterValuePresent = false;
+      setFilterValuePresent(false);
       refilter = xfilterFilter.filterAll;
 
       return filterIndexBounds((refilter = xfilterFilter.filterAll)(values), true, 'all');
@@ -923,8 +1663,12 @@ function crossfilter() {
 
     // Filters this dimension using an arbitrary function.
     function filterFunction(f) {
+      if (lazyEncodedState && !values) {
+        materializeLazyEncodedState();
+      }
+
       filterValue = f;
-      filterValuePresent = true;
+      setFilterValuePresent(true);
 
       refilterFunction = f;
       refilter = xfilterFilter.filterAll;
@@ -1044,6 +1788,8 @@ function crossfilter() {
     // Returns the top K selected records based on this dimension's order.
     // Note: observes this dimension's filter, unlike group and groupAll.
     function top(k, top_offset) {
+      materializeLazyEncodedState();
+
       var array = [],
           i = hi0,
           j,
@@ -1084,6 +1830,8 @@ function crossfilter() {
     // Returns the bottom K selected records based on this dimension's order.
     // Note: observes this dimension's filter, unlike group and groupAll.
     function bottom(k, bottom_offset) {
+      materializeLazyEncodedState();
+
       var array = [],
           i,
           j,
@@ -1126,6 +1874,13 @@ function crossfilter() {
 
     // Adds a new group to this dimension, using the specified key function.
     function group(key) {
+      if (arguments.length < 1) key = cr_identity;
+
+      var useLazyEncodedGrouping = key === cr_identity && hasLazyEncodedGroupingSupport();
+      if (!useLazyEncodedGrouping) {
+        materializeLazyEncodedState();
+      }
+
       var group = {
         top: top,
         all: all,
@@ -1158,8 +1913,6 @@ function crossfilter() {
           groupAll = key === cr_null,
           n0old;
 
-      if (arguments.length < 1) key = cr_identity;
-
       // The group listens to the crossfilter for when any dimension changes, so
       // that it can update the associated reduce values. It must also listen to
       // the parent dimension for when data is added, and compute new keys.
@@ -1173,6 +1926,80 @@ function crossfilter() {
       // Incorporates the specified new values into this group.
       // This function is responsible for updating groups and groupIndex.
       function add(newValues, newIndex, n0, n1) {
+
+        if (useLazyEncodedGrouping && lazyEncodedState && !values) {
+          var codeToValue = lazyEncodedState.codeToValue,
+              codes = lazyEncodedState.codes,
+              sortedCodes = [],
+              codeToGroup,
+              initialValue = resetNeeded ? cr_null : reduceInitial,
+              rowIndex,
+              encodedCode,
+              sortIndex;
+
+          groups = [];
+          k = 0;
+
+          for (var code = 1; code < codeToValue.length; ++code) {
+            if (!isNaturallyOrderable(codeToValue[code])) {
+              continue;
+            }
+            sortedCodes.push(code);
+          }
+
+          sortedCodes.sort(function(a, b) {
+            var valueA = codeToValue[a],
+                valueB = codeToValue[b];
+            var order = compareNaturalOrder(valueA, valueB);
+            return order || a - b;
+          });
+
+          if (!sortedCodes.length && groupAll) {
+            k = 1;
+            groups = [{key: null, value: initialValue()}];
+            groupIndex = null;
+          } else {
+            while (sortedCodes.length > groupCapacity) {
+              groupWidth <<= 1;
+              groupCapacity = capacity(groupWidth);
+            }
+
+            codeToGroup = new Array(codeToValue.length);
+
+            for (sortIndex = 0; sortIndex < sortedCodes.length; ++sortIndex) {
+              encodedCode = sortedCodes[sortIndex];
+              groups[sortIndex] = {key: codeToValue[encodedCode], value: initialValue()};
+              codeToGroup[encodedCode] = sortIndex;
+            }
+
+            k = groups.length;
+            groupIndex = k > 1 ? cr_index(n, groupCapacity) : null;
+
+            if (groupIndex) {
+              for (rowIndex = 0; rowIndex < n; ++rowIndex) {
+                groupIndex[rowIndex] = codeToGroup[codes[rowIndex]];
+              }
+            }
+          }
+
+          resetNeeded = true;
+
+          var listenerIndex = filterListeners.indexOf(update);
+          if (k > 1) {
+            update = updateMany;
+            reset = resetMany;
+          } else if (k === 1) {
+            update = updateOne;
+            reset = resetOne;
+            groupIndex = null;
+          } else {
+            update = cr_null;
+            reset = cr_null;
+            groupIndex = null;
+          }
+          filterListeners[listenerIndex] = update;
+          return;
+        }
 
         if(iterable) {
           n0old = n0
@@ -1214,14 +2041,14 @@ function crossfilter() {
         if (k0) x0 = (g0 = oldGroups[0]).key;
 
         // Find the first new key (x1), skipping NaN keys.
-        while (i1 < n1 && !((x1 = key(newValues[i1])) >= x1)) ++i1;
+        while (i1 < n1 && !isNaturallyOrderable(x1 = key(newValues[i1]))) ++i1;
 
         // While new keys remain…
         while (i1 < n1) {
 
           // Determine the lesser of the two current keys; new and old.
           // If there are no old keys remaining, then always add the new key.
-          if (g0 && x0 <= x1) {
+          if (g0 && compareNaturalOrder(x0, x1) <= 0) {
             g = g0, x = x0;
 
             // Record the new index of the old group.
@@ -1240,7 +2067,7 @@ function crossfilter() {
           // Add any selected records belonging to the added group, while
           // advancing the new key and populating the associated group index.
 
-          while (x1 <= x) {
+          while (compareNaturalOrder(x1, x) <= 0) {
             j = newIndex[i1] + (iterable ? n0old : n0)
 
 
@@ -1256,10 +2083,11 @@ function crossfilter() {
               groupIndex[j] = k;
             }
 
-            // Always add new values to groups. Only remove when not in filter.
-            // This gives groups full information on data life-cycle.
-            g.value = add(g.value, getRecord(j), true);
-            if (!filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, getRecord(j), false);
+            // Always add new values to groups. Only remove when another dimension has filtered them out.
+            // This gives groups full information on data life-cycle without paying for no-op filter checks.
+            var rowRecord = getRecord(j);
+            g.value = add(g.value, rowRecord, true);
+            if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, rowRecord, false);
             if (++i1 >= n1) break;
             x1 = key(newValues[i1]);
           }
@@ -1495,7 +2323,8 @@ function crossfilter() {
       function resetMany() {
         var i,
             j,
-            g;
+            g,
+            applyFilteredRemovals = hasOtherActiveDimensionFilters();
 
         // Reset all group values.
         for (i = 0; i < k; ++i) {
@@ -1507,16 +2336,21 @@ function crossfilter() {
         // place on other dimensions.
         if(iterable){
           for (i = 0; i < n; ++i) {
+            var iterableRecord = getRecord(i);
             for (j = 0; j < groupIndex[i].length; j++) {
               g = groups[groupIndex[i][j]];
-              g.value = reduceAdd(g.value, getRecord(i), true, j);
+              g.value = reduceAdd(g.value, iterableRecord, true, j);
             }
+          }
+          if (!applyFilteredRemovals) {
+            return;
           }
           for (i = 0; i < n; ++i) {
             if (!filters.zeroExcept(i, offset, zero)) {
+              iterableRecord = getRecord(i);
               for (j = 0; j < groupIndex[i].length; j++) {
                 g = groups[groupIndex[i][j]];
-                g.value = reduceRemove(g.value, getRecord(i), false, j);
+                g.value = reduceRemove(g.value, iterableRecord, false, j);
               }
             }
           }
@@ -1526,6 +2360,9 @@ function crossfilter() {
         for (i = 0; i < n; ++i) {
           g = groups[groupIndex[i]];
           g.value = reduceAdd(g.value, getRecord(i), true);
+        }
+        if (!applyFilteredRemovals) {
+          return;
         }
         for (i = 0; i < n; ++i) {
           if (!filters.zeroExcept(i, offset, zero)) {
@@ -1539,6 +2376,7 @@ function crossfilter() {
       // This function is only used when the cardinality is 1.
       function resetOne() {
         var i,
+            applyFilteredRemovals = hasOtherActiveDimensionFilters(),
             g = groups[0];
 
         // Reset the singleton group values.
@@ -1551,6 +2389,9 @@ function crossfilter() {
           g.value = reduceAdd(g.value, getRecord(i), true);
         }
 
+        if (!applyFilteredRemovals) {
+          return;
+        }
         for (i = 0; i < n; ++i) {
           if (!filters.zeroExcept(i, offset, zero)) {
             g.value = reduceRemove(g.value, getRecord(i), false);
@@ -1681,19 +2522,21 @@ function crossfilter() {
 
     // Incorporates the specified new values into this group.
     function add(newData, n0) {
-      var i;
+      var i,
+          applyFilteredRemovals = hasAnyActiveDimensionFilters();
 
       if (resetNeeded) return;
 
       // Cycle through all the values.
       for (i = n0; i < n; ++i) {
+        var rowRecord = getRecord(i);
 
         // Add all values all the time.
-        reduceValue = reduceAdd(reduceValue, getRecord(i), true);
+        reduceValue = reduceAdd(reduceValue, rowRecord, true);
 
         // Remove the value if filtered.
-        if (!filters.zero(i)) {
-          reduceValue = reduceRemove(reduceValue, getRecord(i), false);
+        if (applyFilteredRemovals && !filters.zero(i)) {
+          reduceValue = reduceRemove(reduceValue, rowRecord, false);
         }
       }
     }
@@ -1723,19 +2566,21 @@ function crossfilter() {
 
     // Recomputes the group reduce value from scratch.
     function reset() {
-      var i;
+      var i,
+          applyFilteredRemovals = hasAnyActiveDimensionFilters();
 
       reduceValue = reduceInitial();
 
       // Cycle through all the values.
       for (i = 0; i < n; ++i) {
+        var rowRecord = getRecord(i);
 
         // Add all values all the time.
-        reduceValue = reduceAdd(reduceValue, getRecord(i), true);
+        reduceValue = reduceAdd(reduceValue, rowRecord, true);
 
         // Remove the value if it is filtered.
-        if (!filters.zero(i)) {
-          reduceValue = reduceRemove(reduceValue, getRecord(i), false);
+        if (applyFilteredRemovals && !filters.zero(i)) {
+          reduceValue = reduceRemove(reduceValue, rowRecord, false);
         }
       }
     }

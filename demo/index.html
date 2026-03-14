@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crossfilter2 Interactive Demo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="demo.css">
+</head>
+<body>
+
+<div id="error-banner" class="error-banner" hidden></div>
+
+<header id="header" class="header">
+  <div class="header-left">
+    <h1 class="header-title">Crossfilter2 <span class="header-subtitle">Interactive Demo</span></h1>
+  </div>
+  <div class="header-center">
+    <div id="source-selector" class="mode-selector source-selector">
+      <button data-source="file" class="mode-btn mode-btn--active">Local File</button>
+      <button data-source="live" class="mode-btn">Live API</button>
+    </div>
+    <div id="mode-selector" class="mode-selector">
+      <button class="mode-btn mode-btn--active" type="button" title="Arrow IPC is streamed into the worker runtime">Streaming Arrow</button>
+      <button class="mode-btn mode-btn--active" type="button" title="Filters, groups, and KPI reducers stay off the main thread">Worker Runtime</button>
+      <button class="mode-btn mode-btn--active" type="button" title="Dense encoded discrete filters use the WASM path when supported">WASM Filters</button>
+    </div>
+  </div>
+  <div class="header-right">
+    <span id="runtime-badge" class="badge">—</span>
+    <span id="stream-status" class="badge badge--status">Worker: starting</span>
+    <span id="latency-display" class="badge badge--latency">— ms</span>
+    <span id="load-time" class="badge">Load: — ms</span>
+  </div>
+</header>
+
+<section id="filter-bar" class="filter-bar glass-card">
+  <div class="filter-controls">
+    <div class="filter-row filter-row--events">
+      <div class="filter-group filter-group--wide">
+        <div class="filter-group-header">
+          <label class="filter-label">Event Type</label>
+          <button class="filter-clear-btn" data-clear="event" hidden>&times;</button>
+        </div>
+        <div id="event-pills" class="pill-group"></div>
+        <div class="filter-hint">Click to toggle &bull; Multiple allowed</div>
+      </div>
+    </div>
+    <div class="filter-row filter-row--controls">
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Customer Country</label>
+          <button class="filter-clear-btn" data-clear="customer_country" hidden>&times;</button>
+        </div>
+        <div id="customer-country-picker" class="multiselect-picker">
+          <div class="picker-selected-pills" id="customer-country-pills"></div>
+          <div class="picker-trigger" id="customer-country-trigger">
+            <span class="picker-placeholder">Select countries...</span>
+            <span class="picker-arrow">&#9662;</span>
+          </div>
+          <div class="picker-dropdown" id="customer-country-dropdown" hidden>
+            <input type="text" class="picker-search" id="customer-country-search" placeholder="Search countries...">
+            <div class="picker-options" id="customer-country-options"></div>
+          </div>
+        </div>
+        <div class="filter-selected-count" id="customer-country-count"></div>
+      </div>
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Location Country</label>
+          <button class="filter-clear-btn" data-clear="location_country" hidden>&times;</button>
+        </div>
+        <div id="location-country-picker" class="multiselect-picker">
+          <div class="picker-selected-pills" id="location-country-pills"></div>
+          <div class="picker-trigger" id="location-country-trigger">
+            <span class="picker-placeholder">Select countries...</span>
+            <span class="picker-arrow">&#9662;</span>
+          </div>
+          <div class="picker-dropdown" id="location-country-dropdown" hidden>
+            <input type="text" class="picker-search" id="location-country-search" placeholder="Search countries...">
+            <div class="picker-options" id="location-country-options"></div>
+          </div>
+        </div>
+        <div class="filter-selected-count" id="location-country-count"></div>
+      </div>
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Region</label>
+          <button class="filter-clear-btn" data-clear="region" hidden>&times;</button>
+        </div>
+        <div id="region-multiselect" class="multiselect-container">
+          <input type="text" id="region-search" class="filter-input" placeholder="Search regions...">
+          <div id="region-checkboxes" class="checkbox-list"></div>
+        </div>
+        <div class="filter-selected-count" id="region-count"></div>
+      </div>
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Time Range</label>
+          <button class="filter-clear-btn" data-clear="time" hidden>&times;</button>
+        </div>
+        <div id="time-range-container" class="range-container">
+          <input type="range" id="time-min" class="range-input" step="1">
+          <input type="range" id="time-max" class="range-input" step="1">
+          <div id="time-range-label" class="range-label">—</div>
+        </div>
+      </div>
+      <div class="filter-group">
+        <div class="filter-group-header">
+          <label class="filter-label">Latitude Range</label>
+          <button class="filter-clear-btn" data-clear="latitude" hidden>&times;</button>
+        </div>
+        <div class="lat-range">
+          <input type="number" id="lat-min" class="filter-input filter-input--small" placeholder="Min" step="0.1">
+          <span>–</span>
+          <input type="number" id="lat-max" class="filter-input filter-input--small" placeholder="Max" step="0.1">
+        </div>
+      </div>
+      <button id="clear-all-btn" class="btn btn--clear">Clear All</button>
+    </div>
+  </div>
+  <div id="filter-chips" class="filter-chips"></div>
+</section>
+
+<section id="kpi-row" class="kpi-row">
+  <div id="kpi-total" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Total Events</div></div>
+  <div id="kpi-locations" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Unique Locations</div></div>
+  <div id="kpi-latitude" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Avg Latitude</div></div>
+  <div id="kpi-timespan" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Time Span</div></div>
+</section>
+
+<section class="glass-card chart-card timeline-section">
+  <div class="chart-header">
+    Events over Time
+    <span class="group-size-badge" id="time-granularity-badge"></span>
+    <div id="granularity-selector" class="granularity-selector">
+      <button data-gran="minute" class="gran-btn">Minute</button>
+      <button data-gran="hour" class="gran-btn">Hour</button>
+      <button data-gran="day" class="gran-btn">Day</button>
+      <button data-gran="week" class="gran-btn">Week</button>
+      <button data-gran="month" class="gran-btn">Month</button>
+    </div>
+  </div>
+  <div id="chart-timeline" class="chart-container chart-container--timeline"></div>
+</section>
+
+<section class="chart-grid">
+  <div class="chart-col">
+    <div class="glass-card chart-card"><div class="chart-header">Events by Type <span class="group-size-badge" id="event-group-size"></span></div><div id="chart-event" class="chart-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Customer Country <span class="group-size-badge" id="cc-group-size"></span></div><div id="list-customer-country" class="list-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Location Country <span class="group-size-badge" id="lc-group-size"></span></div><div id="list-location-country" class="list-container"></div></div>
+  </div>
+  <div class="chart-col">
+    <div class="glass-card chart-card"><div class="chart-header">By Region <span class="group-size-badge" id="region-group-size"></span></div><div id="chart-region" class="chart-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Division <span class="group-size-badge" id="division-group-size"></span></div><div id="chart-division" class="chart-container"></div></div>
+  </div>
+  <div class="chart-col">
+    <div class="glass-card chart-card"><div class="chart-header">By Municipality (Top 20) <span class="group-size-badge" id="muni-group-size"></span></div><div id="list-municipality" class="list-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Locality (<span id="locality-sort-label">Least Frequent</span>) <button id="locality-sort-toggle" class="btn" style="font-size:11px;padding:2px 8px;margin-left:6px">Toggle</button> <span class="group-size-badge" id="loc-group-size"></span></div><div id="list-locality" class="list-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">Top Postal Codes <span class="group-size-badge" id="postal-group-size"></span></div><div id="list-postal" class="list-container"></div></div>
+  </div>
+</section>
+
+<section class="glass-card table-section">
+  <div class="table-header">
+    <span class="chart-header">Data Table</span>
+    <div class="table-controls">
+      <button id="table-sort-toggle" class="btn btn--small">Showing: Most Recent</button>
+      <span id="table-row-count" class="table-row-count"></span>
+    </div>
+  </div>
+  <div class="table-scroll">
+    <table id="data-table" class="data-table">
+      <thead><tr id="table-head"></tr></thead>
+      <tbody id="table-body"></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="demo-controls">
+  <div class="demo-buttons">
+    <button id="add-rows-btn" class="btn">Add 1000 Rows</button>
+    <button id="remove-filtered-btn" class="btn btn--danger">Remove Excluded</button>
+  </div>
+  <div class="glass-card log-card">
+    <div class="chart-header">Performance Log</div>
+    <pre id="perf-log" class="perf-log"></pre>
+  </div>
+  <details id="query-details" class="glass-card log-card" style="display:none">
+    <summary class="chart-header" style="cursor:pointer;user-select:none">Cube.dev Query</summary>
+    <pre id="query-display" class="perf-log" style="white-space:pre-wrap;word-break:break-all"></pre>
+  </details>
+</section>
+
+<div id="loading-overlay" class="loading-overlay">
+  <div class="loading-spinner"></div>
+  <div class="loading-text">Loading data...</div>
+</div>
+
+<script src="../crossfilter.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<script type="module" src="demo.js"></script>
+
+</body>
+</html>

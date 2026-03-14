@@ -335,6 +335,138 @@
   const h = heapselect_by(cr_identity);
   h.by = heapselect_by; // assign the raw function to the export as well
 
+  function primitiveValue(value) {
+    if (value == null || typeof value !== 'object') {
+      return value;
+    }
+
+    if (typeof value.valueOf === 'function') {
+      var primitive = value.valueOf();
+      if (primitive !== value) {
+        return primitive;
+      }
+    }
+
+    if (typeof value.toString === 'function') {
+      var text = value.toString();
+      if (text !== value) {
+        return text;
+      }
+    }
+
+    return value;
+  }
+
+  function typeRank(value) {
+    if (value === null) {
+      return 0;
+    }
+
+    switch (typeof value) {
+      case 'boolean':
+        return 1;
+      case 'number':
+        return 2;
+      case 'bigint':
+        return 3;
+      case 'string':
+        return 4;
+      case 'symbol':
+        return 5;
+      case 'undefined':
+        return 6;
+      default:
+        return 7;
+    }
+  }
+
+  function equivalentByNaturalCoercion(left, right) {
+    if (typeof left === 'symbol' || typeof right === 'symbol') {
+      return false;
+    }
+
+    var numericLeft = Number(left),
+        numericRight = Number(right);
+
+    return numericLeft === numericRight && numericLeft === numericLeft;
+  }
+
+  function compareNaturalOrder(left, right) {
+    var a = primitiveValue(left),
+        b = primitiveValue(right),
+        rankA,
+        rankB,
+        descA,
+        descB,
+        textA,
+        textB;
+
+    if (Object.is(a, b) || a === b) {
+      return 0;
+    }
+
+    if (typeof a !== 'symbol' && typeof b !== 'symbol') {
+      if (a < b) {
+        return -1;
+      }
+      if (a > b) {
+        return 1;
+      }
+      if (equivalentByNaturalCoercion(a, b)) {
+        return 0;
+      }
+    }
+
+    rankA = typeRank(a);
+    rankB = typeRank(b);
+
+    if (rankA !== rankB) {
+      return rankA - rankB;
+    }
+
+    if (rankA === 5) {
+      descA = a.description;
+      descB = b.description;
+      if (descA === descB) {
+        return 0;
+      }
+      if (descA == null) {
+        return -1;
+      }
+      if (descB == null) {
+        return 1;
+      }
+      return descA < descB ? -1 : 1;
+    }
+
+    textA = String(a);
+    textB = String(b);
+    if (textA < textB) {
+      return -1;
+    }
+    if (textA > textB) {
+      return 1;
+    }
+
+    return 0;
+  }
+
+  function isNaturallyOrderable(value) {
+    var normalized = primitiveValue(value);
+
+    if (normalized === null) {
+      return true;
+    }
+    if (normalized === undefined) {
+      return false;
+    }
+    if (typeof normalized === 'number') {
+      return normalized === normalized;
+    }
+
+    return true;
+  }
+
   function bisect_by(f) {
 
     // Locate the insertion point for x in a to maintain sorted order. The
@@ -350,7 +482,7 @@
     function bisectLeft(a, x, lo, hi) {
       while (lo < hi) {
         var mid = lo + hi >>> 1;
-        if (f(a[mid]) < x) lo = mid + 1;
+        if (compareNaturalOrder(f(a[mid]), x) < 0) lo = mid + 1;
         else hi = mid;
       }
       return lo;
@@ -365,7 +497,7 @@
     function bisectRight(a, x, lo, hi) {
       while (lo < hi) {
         var mid = lo + hi >>> 1;
-        if (x < f(a[mid])) hi = mid;
+        if (compareNaturalOrder(x, f(a[mid])) < 0) hi = mid;
         else lo = mid + 1;
       }
       return lo;
@@ -449,6 +581,19 @@
     return String(index) === prop && index >= 0 && Number.isInteger(index);
   }
 
+  function getColumnAccessor(column) {
+    if (column == null) {
+      return function() { return undefined; };
+    }
+    if (typeof column.get === "function") {
+      return function(index) { return column.get(index); };
+    }
+    if (typeof column.at === "function") {
+      return function(index) { return column.at(index); };
+    }
+    return function(index) { return column[index]; };
+  }
+
   function getColumnValue(column, index) {
     if (column == null) {
       return undefined;
@@ -526,24 +671,45 @@
   }
 
   function materializeColumnarRow(batch, index) {
-    var cached = batch.rows[index];
-    if (cached !== undefined || index in batch.rows) {
-      return cached;
+    if (batch.materialized[index]) {
+      return batch.rows[index];
     }
 
     var row;
     if (typeof batch.rowFactory === "function") {
-      row = batch.rowFactory(index, batch.columns, batch.fields);
+      row = batch.rowFactory(index, batch.columns, batch.fields, batch.accessors);
     } else {
       row = {};
       for (var fieldIndex = 0; fieldIndex < batch.fields.length; ++fieldIndex) {
-        var field = batch.fields[fieldIndex];
-        row[field] = getColumnValue(batch.columns[field], index);
+        row[batch.fields[fieldIndex]] = batch.accessors[fieldIndex](index);
       }
     }
 
     batch.rows[index] = row;
+    batch.materialized[index] = 1;
     return row;
+  }
+
+  function createDefaultRowFactory(fields, accessors) {
+    var fieldCount = fields.length;
+
+    return function(index) {
+      var row = {},
+          fieldIndex = 0;
+
+      for (; fieldIndex + 3 < fieldCount; fieldIndex += 4) {
+        row[fields[fieldIndex]] = accessors[fieldIndex](index);
+        row[fields[fieldIndex + 1]] = accessors[fieldIndex + 1](index);
+        row[fields[fieldIndex + 2]] = accessors[fieldIndex + 2](index);
+        row[fields[fieldIndex + 3]] = accessors[fieldIndex + 3](index);
+      }
+
+      for (; fieldIndex < fieldCount; ++fieldIndex) {
+        row[fields[fieldIndex]] = accessors[fieldIndex](index);
+      }
+
+      return row;
+    };
   }
 
   function rowsFromColumns(columns, options) {
@@ -552,12 +718,25 @@
     var fields = inferFields(columns, options.fields);
     var length = inferLength(columns, fields, options.length);
     var transformedColumns = maybeTransformColumns(columns, fields, length, options.transforms);
+    var accessors = new Array(fields.length);
+    var accessorsByField = {};
+
+    for (var accessorIndex = 0; accessorIndex < fields.length; ++accessorIndex) {
+      accessors[accessorIndex] = getColumnAccessor(transformedColumns[fields[accessorIndex]]);
+      accessorsByField[fields[accessorIndex]] = accessors[accessorIndex];
+    }
+
     var rows = new Array(length);
     var batch = {
+      accessors: accessors,
+      accessorsByField: accessorsByField,
       columns: transformedColumns,
       fields: fields,
       length: length,
-      rowFactory: typeof options.rowFactory === "function" ? options.rowFactory : null,
+      materialized: new Uint8Array(length),
+      rowFactory: typeof options.rowFactory === "function"
+        ? options.rowFactory
+        : createDefaultRowFactory(fields, accessors),
       rows: rows
     };
 
@@ -649,6 +828,2253 @@
     });
   }
 
+  var defaultRuntimeOptions = {
+    wasm: true
+  };
+
+  var sharedRuntimeState = {
+    error: null,
+    runtime: null,
+    supported: typeof WebAssembly !== 'undefined'
+      && typeof WebAssembly.Module === 'function'
+      && typeof WebAssembly.Instance === 'function'
+  };
+
+  var SMALL_TARGET_WASM_THRESHOLD = 4;
+
+  function encodeU32(value) {
+    var bytes = [];
+    do {
+      var byte = value & 0x7f;
+      value >>>= 7;
+      if (value) {
+        byte |= 0x80;
+      }
+      bytes.push(byte);
+    } while (value);
+    return bytes;
+  }
+
+  function encodeString(value) {
+    var bytes = [];
+    for (var i = 0; i < value.length; ++i) {
+      bytes.push(value.charCodeAt(i));
+    }
+    return encodeU32(bytes.length).concat(bytes);
+  }
+
+  function encodeSection(id, payload) {
+    return [id].concat(encodeU32(payload.length), payload);
+  }
+
+  function createFilterModuleBytes() {
+    var typeSection = encodeSection(1, [].concat(
+      encodeU32(1),
+      [0x60],
+      encodeU32(5),
+      [0x7f, 0x7f, 0x7f, 0x7f, 0x7f],
+      encodeU32(1),
+      [0x7f]
+    ));
+    var functionSection = encodeSection(3, [].concat(encodeU32(1), encodeU32(0)));
+    var memorySection = encodeSection(5, [].concat(encodeU32(1), [0x00], encodeU32(1)));
+    var exportSection = encodeSection(7, [].concat(
+      encodeU32(2),
+      encodeString('memory'),
+      [0x02],
+      encodeU32(0),
+      encodeString('filterInU32'),
+      [0x00],
+      encodeU32(0)
+    ));
+    var body = [].concat(
+      encodeU32(1),
+      encodeU32(4),
+      [0x7f],
+      [0x41, 0x00, 0x21, 0x05],
+      [0x41, 0x00, 0x21, 0x06],
+      [0x02, 0x40],
+      [0x03, 0x40],
+      [0x20, 0x05, 0x20, 0x01, 0x49, 0x45, 0x0d, 0x01],
+      [0x20, 0x00, 0x20, 0x05, 0x41, 0x04, 0x6c, 0x6a, 0x28, 0x02, 0x00, 0x21, 0x07],
+      [0x41, 0x00, 0x21, 0x08],
+      [0x02, 0x40],
+      [0x03, 0x40],
+      [0x20, 0x08, 0x20, 0x03, 0x49, 0x45, 0x0d, 0x01],
+      [0x20, 0x07],
+      [0x20, 0x02, 0x20, 0x08, 0x41, 0x04, 0x6c, 0x6a, 0x28, 0x02, 0x00],
+      [0x46],
+      [0x04, 0x40],
+      [0x20, 0x04, 0x20, 0x06, 0x41, 0x04, 0x6c, 0x6a],
+      [0x20, 0x05],
+      [0x36, 0x02, 0x00],
+      [0x20, 0x06, 0x41, 0x01, 0x6a, 0x21, 0x06],
+      [0x0c, 0x02],
+      [0x0b],
+      [0x20, 0x08, 0x41, 0x01, 0x6a, 0x21, 0x08],
+      [0x0c, 0x00],
+      [0x0b],
+      [0x0b],
+      [0x20, 0x05, 0x41, 0x01, 0x6a, 0x21, 0x05],
+      [0x0c, 0x00],
+      [0x0b],
+      [0x0b],
+      [0x20, 0x06],
+      [0x0b]
+    );
+    var codeSection = encodeSection(10, [].concat(encodeU32(1), encodeU32(body.length), body));
+
+    return new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00].concat(
+      typeSection,
+      functionSection,
+      memorySection,
+      exportSection,
+      codeSection
+    ));
+  }
+
+  function buildRuntime() {
+    var module = new WebAssembly.Module(createFilterModuleBytes());
+    var instance = new WebAssembly.Instance(module, {});
+
+    return {
+      cachedCodes: null,
+      cachedCodesLength: 0,
+      filterInU32: instance.exports.filterInU32,
+      memory: instance.exports.memory,
+      ensureCapacity: function(totalBytes) {
+        var pagesNeeded = Math.ceil(totalBytes / 65536);
+        var currentPages = this.memory.buffer.byteLength / 65536;
+
+        if (pagesNeeded > currentPages) {
+          this.memory.grow(pagesNeeded - currentPages);
+          this.cachedCodes = null;
+          this.cachedCodesLength = 0;
+        }
+
+        return this.memory.buffer;
+      },
+      syncCodes: function(buffer, codes) {
+        if (this.cachedCodes === codes && this.cachedCodesLength === codes.length) {
+          return;
+        }
+        new Uint32Array(buffer, 0, codes.length).set(codes);
+        this.cachedCodes = codes;
+        this.cachedCodesLength = codes.length;
+      },
+      matchSmall: function(codes, targetCodes) {
+        var dataBytes = codes.length * 4;
+        var targetBytes = targetCodes.length * 4;
+        var outPtr = dataBytes + targetBytes;
+        var totalBytes = outPtr + dataBytes;
+        var buffer = this.ensureCapacity(totalBytes);
+
+        this.syncCodes(buffer, codes);
+        new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
+
+        var count = this.filterInU32(0, codes.length, dataBytes, targetCodes.length, outPtr);
+        var matches = new Uint32Array(count);
+        matches.set(new Uint32Array(buffer, outPtr, count));
+        return matches;
+      }
+    };
+  }
+
+  function getSharedRuntime(enabled) {
+    if (!sharedRuntimeState.supported || !enabled) {
+      return null;
+    }
+
+    if (!sharedRuntimeState.runtime) {
+      try {
+        sharedRuntimeState.runtime = buildRuntime();
+        sharedRuntimeState.error = null;
+      } catch (error) {
+        sharedRuntimeState.error = error;
+        sharedRuntimeState.runtime = null;
+      }
+    }
+
+    return sharedRuntimeState.runtime;
+  }
+
+  function currentRuntimeInfo(enabled) {
+    return {
+      active: sharedRuntimeState.runtime && enabled ? 'wasm' : 'js',
+      lastError: sharedRuntimeState.error ? String(sharedRuntimeState.error.message || sharedRuntimeState.error) : null,
+      wasmEnabled: enabled !== false,
+      wasmSupported: sharedRuntimeState.supported
+    };
+  }
+
+  function ensureDenseLookupCapacity(state, size) {
+    if (state.marks.length >= size) {
+      return;
+    }
+
+    var nextSize = state.marks.length || 16;
+    while (nextSize < size) {
+      nextSize <<= 1;
+    }
+
+    var nextMarks = new Uint32Array(nextSize);
+    nextMarks.set(state.marks);
+    state.marks = nextMarks;
+  }
+
+  function denseLookupMatches(codes, targetCodes, state) {
+    var matches = new Uint32Array(codes.length);
+    var count = 0;
+    var i;
+
+    if (targetCodes.length === 1) {
+      var targetCode = targetCodes[0];
+      for (i = 0; i < codes.length; ++i) {
+        if (codes[i] === targetCode) {
+          matches[count++] = i;
+        }
+      }
+      return matches.slice(0, count);
+    }
+
+    var maxTargetCode = 0;
+    for (i = 0; i < targetCodes.length; ++i) {
+      if (targetCodes[i] > maxTargetCode) {
+        maxTargetCode = targetCodes[i];
+      }
+    }
+
+    ensureDenseLookupCapacity(state, maxTargetCode + 1);
+    if (state.version === 0xffffffff) {
+      state.marks.fill(0);
+      state.version = 1;
+    }
+
+    var version = state.version++;
+    var marks = state.marks;
+
+    for (i = 0; i < targetCodes.length; ++i) {
+      marks[targetCodes[i]] = version;
+    }
+
+    for (i = 0; i < codes.length; ++i) {
+      if (marks[codes[i]] === version) {
+        matches[count++] = i;
+      }
+    }
+
+    return matches.slice(0, count);
+  }
+
+  function createWasmRuntimeController(options) {
+    var enabled = options && Object.prototype.hasOwnProperty.call(options, 'wasm')
+      ? options.wasm !== false
+      : defaultRuntimeOptions.wasm !== false;
+    var denseLookupState = {
+      marks: new Uint32Array(0),
+      version: 1
+    };
+
+    function configureRuntime(nextOptions) {
+      if (nextOptions && Object.prototype.hasOwnProperty.call(nextOptions, 'wasm')) {
+        enabled = nextOptions.wasm !== false;
+      }
+      return currentRuntimeInfo(enabled);
+    }
+
+    function runtimeInfo() {
+      return currentRuntimeInfo(enabled);
+    }
+
+    function canUseWasmScan() {
+      return !!getSharedRuntime(enabled);
+    }
+
+    function findMatches(codes, targetCodes) {
+      if (!targetCodes.length) {
+        return new Uint32Array(0);
+      }
+
+      var runtime = getSharedRuntime(enabled);
+      if (runtime && targetCodes.length <= SMALL_TARGET_WASM_THRESHOLD) {
+        try {
+          return runtime.matchSmall(codes, targetCodes);
+        } catch (error) {
+          sharedRuntimeState.error = error;
+          sharedRuntimeState.runtime = null;
+        }
+      }
+
+      return denseLookupMatches(codes, targetCodes, denseLookupState);
+    }
+
+    return {
+      canUseWasmScan: canUseWasmScan,
+      configureRuntime: configureRuntime,
+      findEncodedMatches: findMatches,
+      runtimeInfo: runtimeInfo
+    };
+  }
+
+  var defaultRuntimeController = createWasmRuntimeController();
+
+  function configureWasmRuntime(options) {
+    if (options && Object.prototype.hasOwnProperty.call(options, 'wasm')) {
+      defaultRuntimeOptions.wasm = options.wasm !== false;
+    }
+    return defaultRuntimeController.configureRuntime(options);
+  }
+
+  function getWasmRuntimeInfo() {
+    return defaultRuntimeController.runtimeInfo();
+  }
+
+  function isFiniteNumber(value) {
+    return typeof value === "number" && Number.isFinite(value);
+  }
+
+  function uniqueFields(values) {
+    var seen = new Set(),
+        result = [];
+
+    for (var i = 0; i < values.length; ++i) {
+      if (!values[i] || seen.has(values[i])) {
+        continue;
+      }
+      seen.add(values[i]);
+      result.push(values[i]);
+    }
+
+    return result;
+  }
+
+  var TIME_BUCKET_MS = {
+    minute: 60000,
+    hour: 3600000,
+    day: 86400000
+  };
+
+  function normalizeMetrics(metrics, prefix) {
+    var normalized = (metrics && metrics.length ? metrics : [{ op: "count" }]).map(function(metric, metricIndex) {
+      var id = metric.id || prefix + "_" + metricIndex;
+      if (metric.op !== "count" && !metric.field) {
+        throw new Error("Dashboard metric `" + id + "` requires a field.");
+      }
+      if (metric.op !== "count" && metric.op !== "sum" && metric.op !== "avg" && metric.op !== "avgNonZero") {
+        throw new Error("Unsupported dashboard metric op: " + metric.op);
+      }
+
+      return {
+        field: metric.field,
+        id: id,
+        op: metric.op || "count"
+      };
+    });
+
+    return normalized;
+  }
+
+  function normalizeTimeBucketValue(value) {
+    if (value == null) {
+      return null;
+    }
+
+    if (value instanceof Date) {
+      return value.getTime();
+    }
+
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? value : null;
+    }
+
+    var numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+
+    var parsed = new Date(value).getTime();
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function bucketTimestampValue(value, granularity) {
+    var numeric = normalizeTimeBucketValue(value);
+    if (numeric == null) {
+      return null;
+    }
+
+    if (granularity === "month") {
+      var monthDate = new Date(numeric);
+      return Date.UTC(monthDate.getUTCFullYear(), monthDate.getUTCMonth(), 1);
+    }
+
+    if (granularity === "week") {
+      var weekDate = new Date(numeric);
+      var day = weekDate.getUTCDay();
+      var monday = new Date(Date.UTC(
+        weekDate.getUTCFullYear(),
+        weekDate.getUTCMonth(),
+        weekDate.getUTCDate() - ((day + 6) % 7)
+      ));
+      return monday.getTime();
+    }
+
+    var step = TIME_BUCKET_MS[granularity];
+    if (!step) {
+      throw new Error("Unsupported dashboard time bucket granularity: " + granularity);
+    }
+
+    return Math.floor(numeric / step) * step;
+  }
+
+  function resolveGroupAccessor(spec) {
+    if (!spec || !spec.bucket) {
+      return null;
+    }
+
+    if (spec.bucket.type !== "timeBucket") {
+      throw new Error("Unsupported dashboard group bucket type: " + spec.bucket.type);
+    }
+
+    var granularity = spec.bucket.granularity || "day";
+    return function(value) {
+      return bucketTimestampValue(value, granularity);
+    };
+  }
+
+  function buildMetricReducer(metrics) {
+    function initial() {
+      var state = {};
+
+      for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
+        var metric = metrics[metricIndex];
+        if (metric.op === "avg" || metric.op === "avgNonZero") {
+          state[metric.id] = { count: 0, sum: 0 };
+        } else {
+          state[metric.id] = 0;
+        }
+      }
+
+      Object.defineProperties(state, {
+        __cache: {
+          configurable: true,
+          enumerable: false,
+          value: null,
+          writable: true
+        },
+        __cacheVersion: {
+          configurable: true,
+          enumerable: false,
+          value: -1,
+          writable: true
+        },
+        __version: {
+          configurable: true,
+          enumerable: false,
+          value: 0,
+          writable: true
+        }
+      });
+
+      return state;
+    }
+
+    function add(state, row) {
+      for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
+        var metric = metrics[metricIndex];
+        var value;
+
+        switch (metric.op) {
+          case "count":
+            state[metric.id] += 1;
+            break;
+          case "sum":
+            value = row[metric.field];
+            if (isFiniteNumber(value)) {
+              state[metric.id] += value;
+            }
+            break;
+          case "avg":
+            value = row[metric.field];
+            if (isFiniteNumber(value)) {
+              state[metric.id].sum += value;
+              state[metric.id].count += 1;
+            }
+            break;
+          case "avgNonZero":
+            value = row[metric.field];
+            if (isFiniteNumber(value) && value !== 0) {
+              state[metric.id].sum += value;
+              state[metric.id].count += 1;
+            }
+            break;
+        }
+      }
+
+      state.__version += 1;
+      return state;
+    }
+
+    function remove(state, row) {
+      for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
+        var metric = metrics[metricIndex];
+        var value;
+
+        switch (metric.op) {
+          case "count":
+            state[metric.id] -= 1;
+            break;
+          case "sum":
+            value = row[metric.field];
+            if (isFiniteNumber(value)) {
+              state[metric.id] -= value;
+            }
+            break;
+          case "avg":
+            value = row[metric.field];
+            if (isFiniteNumber(value)) {
+              state[metric.id].sum -= value;
+              state[metric.id].count -= 1;
+            }
+            break;
+          case "avgNonZero":
+            value = row[metric.field];
+            if (isFiniteNumber(value) && value !== 0) {
+              state[metric.id].sum -= value;
+              state[metric.id].count -= 1;
+            }
+            break;
+        }
+      }
+
+      state.__version += 1;
+      return state;
+    }
+
+    function finalize(state) {
+      if (state.__cacheVersion === state.__version && state.__cache) {
+        return state.__cache;
+      }
+
+      var result = {};
+
+      for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
+        var metric = metrics[metricIndex];
+        var value = state[metric.id];
+
+        if (metric.op === "avg" || metric.op === "avgNonZero") {
+          result[metric.id] = value.count ? value.sum / value.count : null;
+        } else {
+          result[metric.id] = value;
+        }
+      }
+
+      state.__cache = result;
+      state.__cacheVersion = state.__version;
+      return result;
+    }
+
+    return {
+      add: add,
+      finalize: finalize,
+      initial: initial,
+      remove: remove
+    };
+  }
+
+  function normalizeFilter(filter) {
+    if (!filter || filter.type === "all") {
+      return null;
+    }
+
+    if (filter.type === "exact") {
+      return {
+        type: "exact",
+        value: filter.value
+      };
+    }
+
+    if (filter.type === "in") {
+      return {
+        type: "in",
+        values: Array.isArray(filter.values) ? filter.values.slice() : []
+      };
+    }
+
+    if (filter.type === "range") {
+      return {
+        range: Array.isArray(filter.range) ? filter.range.slice() : [],
+        type: "range"
+      };
+    }
+
+    throw new Error("Unsupported dashboard filter type: " + filter.type);
+  }
+
+  function normalizeFilterState(filters) {
+    var normalized = {};
+
+    if (!filters) {
+      return normalized;
+    }
+
+    for (var field in filters) {
+      normalized[field] = normalizeFilter(filters[field]);
+    }
+
+    return normalized;
+  }
+
+  function sameFilter(left, right) {
+    if (left === right) {
+      return true;
+    }
+    if (!left || !right) {
+      return !left && !right;
+    }
+    if (left.type !== right.type) {
+      return false;
+    }
+
+    if (left.type === "exact") {
+      return left.value === right.value;
+    }
+
+    var leftValues = left.type === "range" ? left.range : left.values;
+    var rightValues = right.type === "range" ? right.range : right.values;
+
+    if (!leftValues || !rightValues || leftValues.length !== rightValues.length) {
+      return false;
+    }
+
+    for (var valueIndex = 0; valueIndex < leftValues.length; ++valueIndex) {
+      if (leftValues[valueIndex] !== rightValues[valueIndex]) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  function applyFilter(dimension, filter) {
+    if (!filter) {
+      dimension.filterAll();
+      return;
+    }
+
+    switch (filter.type) {
+      case "exact":
+        dimension.filterExact(filter.value);
+        return;
+      case "in":
+        dimension.filterIn(filter.values);
+        return;
+      case "range":
+        dimension.filterRange(filter.range);
+        return;
+    }
+  }
+
+  function createKpiRuntime(cf, metrics) {
+    var reducer = buildMetricReducer(metrics);
+    var group = cf.groupAll().reduce(reducer.add, reducer.remove, reducer.initial);
+
+    return {
+      dispose: function() {
+        group.dispose();
+      },
+      read: function() {
+        return reducer.finalize(group.value());
+      }
+    };
+  }
+
+  function createGroupRuntime(dimension, spec, index) {
+    var metrics = normalizeMetrics(spec.metrics, spec.id || "group_" + index);
+    var reducer = buildMetricReducer(metrics);
+    var groupAccessor = resolveGroupAccessor(spec);
+    var group = groupAccessor ? dimension.group(groupAccessor) : dimension.group();
+    group.reduce(reducer.add, reducer.remove, reducer.initial);
+
+    return {
+      dispose: function() {
+        group.dispose();
+      },
+      id: spec.id || "group_" + index,
+      read: function() {
+        return group.all().map(function(entry) {
+          return {
+            key: entry.key,
+            value: reducer.finalize(entry.value)
+          };
+        });
+      }
+    };
+  }
+
+  function createCrossfilterInstance(crossfilter, options) {
+    if (options.table) {
+      return crossfilter.fromArrowTable(options.table, options.columnarOptions);
+    }
+    if (options.columns) {
+      return crossfilter.fromColumns(options.columns, options.columnarOptions);
+    }
+    return crossfilter(options.records || []);
+  }
+
+  function appendColumns(crossfilter, cf, columns, options) {
+    cf.add(crossfilter.rowsFromColumns(columns || {}, options || {}));
+    return cf.size();
+  }
+
+  function appendArrowTable(crossfilter, cf, table, options) {
+    cf.add(crossfilter.rowsFromArrowTable(table, options || {}));
+    return cf.size();
+  }
+
+  function normalizeRowQuery(query) {
+    query = query || {};
+
+    return {
+      direction: query.direction === "bottom" ? "bottom" : "top",
+      fields: Array.isArray(query.fields) && query.fields.length ? query.fields.slice() : null,
+      limit: typeof query.limit === "number" && query.limit >= 0 ? Math.floor(query.limit) : 50,
+      offset: typeof query.offset === "number" && query.offset >= 0 ? Math.floor(query.offset) : 0,
+      sortBy: query.sortBy || null
+    };
+  }
+
+  function projectRows(rows, fields) {
+    if (!fields) {
+      return rows.slice();
+    }
+
+    return rows.map(function(row) {
+      var projected = {};
+      for (var fieldIndex = 0; fieldIndex < fields.length; ++fieldIndex) {
+        projected[fields[fieldIndex]] = row[fields[fieldIndex]];
+      }
+      return projected;
+    });
+  }
+
+  function ensureDimension(dimensions, dimensionFields, cf, field) {
+    if (!dimensions[field]) {
+      dimensions[field] = cf.dimension(field);
+      dimensionFields.push(field);
+    }
+    return dimensions[field];
+  }
+
+  function createDashboardRuntime(crossfilter, options) {
+    options = options || {};
+
+    var sourceCount = (options.table ? 1 : 0) + (options.columns ? 1 : 0) + (options.records ? 1 : 0);
+    if (sourceCount > 1) {
+      throw new Error("createDashboardRuntime expects at most one of `table`, `columns` or `records`.");
+    }
+
+    var cf = createCrossfilterInstance(crossfilter, options);
+
+    if (typeof cf.configureRuntime === "function") {
+      cf.configureRuntime({ wasm: options.wasm !== false });
+    } else {
+      crossfilter.configureRuntime({ wasm: options.wasm !== false });
+    }
+
+    var groupSpecs = options.groups || [];
+    var dimensionFields = uniqueFields((options.dimensions || []).concat(groupSpecs.map(function(group) {
+      return group.field;
+    })));
+    var dimensions = {};
+    var currentFilters = {};
+    var groupRuntimes = {};
+    var kpiRuntime = createKpiRuntime(cf, normalizeMetrics(options.kpis, "kpi"));
+
+    for (var fieldIndex = 0; fieldIndex < dimensionFields.length; ++fieldIndex) {
+      dimensions[dimensionFields[fieldIndex]] = cf.dimension(dimensionFields[fieldIndex]);
+    }
+
+    for (var groupIndex = 0; groupIndex < groupSpecs.length; ++groupIndex) {
+      var groupSpec = groupSpecs[groupIndex];
+      var groupDimension = ensureDimension(dimensions, dimensionFields, cf, groupSpec.field);
+      var groupRuntime = createGroupRuntime(groupDimension, groupSpec, groupIndex);
+      groupRuntimes[groupRuntime.id] = groupRuntime;
+    }
+
+    function updateFilters(filters) {
+      var nextFilters = normalizeFilterState(filters);
+      var seen = new Set();
+
+      for (var field in nextFilters) {
+        if (!dimensions[field]) {
+          throw new Error("Unknown dashboard filter dimension: " + field);
+        }
+        seen.add(field);
+        if (!sameFilter(currentFilters[field], nextFilters[field])) {
+          applyFilter(dimensions[field], nextFilters[field]);
+        }
+      }
+
+      for (field in currentFilters) {
+        if (seen.has(field)) {
+          continue;
+        }
+        if (dimensions[field]) {
+          dimensions[field].filterAll();
+        }
+      }
+
+      currentFilters = nextFilters;
+      return typeof cf.runtimeInfo === "function" ? cf.runtimeInfo() : crossfilter.runtimeInfo();
+    }
+
+    function readSnapshot() {
+      var groups = {};
+
+      for (var groupId in groupRuntimes) {
+        groups[groupId] = groupRuntimes[groupId].read();
+      }
+
+      return {
+        groups: groups,
+        kpis: kpiRuntime.read(),
+        runtime: typeof cf.runtimeInfo === "function" ? cf.runtimeInfo() : crossfilter.runtimeInfo()
+      };
+    }
+
+    function readRows(query) {
+      var normalized = normalizeRowQuery(query);
+      var rows;
+
+      if (normalized.sortBy) {
+        var dimension = ensureDimension(dimensions, dimensionFields, cf, normalized.sortBy);
+        rows = normalized.direction === "bottom"
+          ? dimension.bottom(normalized.limit, normalized.offset)
+          : dimension.top(normalized.limit, normalized.offset);
+      } else {
+        var allRows = typeof cf.allFiltered === "function" ? cf.allFiltered() : cf.all();
+        rows = allRows.slice(normalized.offset, normalized.offset + normalized.limit);
+      }
+
+      return projectRows(rows, normalized.fields);
+    }
+
+    function queryRuntime(request) {
+      request = request || {};
+      if (request.filters) {
+        updateFilters(request.filters);
+      }
+
+      return {
+        rows: request.rows ? readRows(request.rows) : [],
+        snapshot: readSnapshot()
+      };
+    }
+
+    function removeFiltered(selection) {
+      if (selection === "excluded") {
+        cf.remove(function(_, index) {
+          return typeof cf.isElementFiltered === "function" ? !cf.isElementFiltered(index) : false;
+        });
+      } else {
+        cf.remove();
+      }
+      return cf.size();
+    }
+
+    return {
+      append: function(records) {
+        cf.add(records || []);
+        return cf.size();
+      },
+      appendArrowTable: function(table, columnarOptions) {
+        return appendArrowTable(crossfilter, cf, table, columnarOptions);
+      },
+      appendColumns: function(columns, columnarOptions) {
+        return appendColumns(crossfilter, cf, columns, columnarOptions);
+      },
+      dispose: function() {
+        this.reset();
+        for (var groupId in groupRuntimes) {
+          groupRuntimes[groupId].dispose();
+        }
+        kpiRuntime.dispose();
+        for (var dimensionIndex = 0; dimensionIndex < dimensionFields.length; ++dimensionIndex) {
+          dimensions[dimensionFields[dimensionIndex]].dispose();
+        }
+      },
+      query: function(request) {
+        return queryRuntime(request);
+      },
+      removeFiltered: function(selection) {
+        return removeFiltered(selection);
+      },
+      reset: function() {
+        return updateFilters({});
+      },
+      rows: function(query) {
+        return readRows(query);
+      },
+      runtimeInfo: function() {
+        return typeof cf.runtimeInfo === "function" ? cf.runtimeInfo() : crossfilter.runtimeInfo();
+      },
+      size: function() {
+        return cf.size();
+      },
+      snapshot: function(filters) {
+        if (filters) {
+          updateFilters(filters);
+        }
+        return readSnapshot();
+      },
+      updateFilters: updateFilters
+    };
+  }
+
+  function resolveArrowBuffer$1(source) {
+    if (source instanceof ArrayBuffer) {
+      return source;
+    }
+
+    if (ArrayBuffer.isView(source)) {
+      var view = source;
+      if (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
+        return view.buffer;
+      }
+      return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+    }
+
+    throw new Error("createDashboardWorker expects `arrowBuffer` to be an ArrayBuffer or typed array view.");
+  }
+
+  function resolveAssetUrl$1(url) {
+    if (typeof URL === "function" && typeof location !== "undefined" && location && location.href) {
+      return new URL(url, location.href).toString();
+    }
+    return url;
+  }
+
+  function createWorkerSource$1(crossfilterUrl, arrowUrl) {
+    return [
+      "'use strict';",
+      "importScripts(" + JSON.stringify(crossfilterUrl) + ", " + JSON.stringify(arrowUrl) + ");",
+      "var runtime = null;",
+      "function getTableFromIPC(module) {",
+      "  return module && (module.tableFromIPC || (module.default && module.default.tableFromIPC)) || null;",
+      "}",
+      "function respond(id, payload) {",
+      "  self.postMessage({ id: id, ok: true, payload: payload });",
+      "}",
+      "function fail(id, error) {",
+      "  self.postMessage({ id: id, ok: false, error: {",
+      "    message: String(error && error.message || error),",
+      "    stack: error && error.stack ? String(error.stack) : null",
+      "  } });",
+      "}",
+      "self.onmessage = async function(event) {",
+      "  var message = event.data || {};",
+      "  var id = message.id;",
+      "  try {",
+      "    switch (message.type) {",
+      "      case 'init': {",
+      "        var arrow = self.Arrow;",
+      "        var tableFromIPC = getTableFromIPC(arrow);",
+      "        if (!tableFromIPC) {",
+      "          throw new Error('Apache Arrow tableFromIPC is not available in the worker.');",
+      "        }",
+      "        var tableSource = null;",
+      "        if (message.payload.dataUrl) {",
+      "          tableSource = fetch(message.payload.dataUrl, message.payload.dataFetchInit || undefined);",
+      "        } else if (message.payload.arrowBuffer) {",
+      "          tableSource = new Uint8Array(message.payload.arrowBuffer);",
+      "        } else {",
+      "          throw new Error('Dashboard worker init requires `dataUrl` or `arrowBuffer`.');",
+      "        }",
+      "        var table = await tableFromIPC(tableSource);",
+      "        runtime = self.crossfilter.createDashboardRuntime({",
+      "          table: table,",
+      "          wasm: message.payload.wasm,",
+      "          dimensions: message.payload.dimensions,",
+      "          groups: message.payload.groups,",
+      "          kpis: message.payload.kpis",
+      "        });",
+      "        respond(id, { runtime: runtime.runtimeInfo() });",
+      "        return;",
+      "      }",
+      "      case 'snapshot':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.snapshot(message.payload.filters));",
+      "        return;",
+      "      case 'query':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.query(message.payload.request));",
+      "        return;",
+      "      case 'rows':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.rows(message.payload.query));",
+      "        return;",
+      "      case 'append':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.append(message.payload.records || []));",
+      "        return;",
+      "      case 'removeFiltered':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.removeFiltered(message.payload.selection));",
+      "        return;",
+      "      case 'updateFilters':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.updateFilters(message.payload.filters));",
+      "        return;",
+      "      case 'reset':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.reset());",
+      "        return;",
+      "      case 'runtimeInfo':",
+      "        if (!runtime) {",
+      "          throw new Error('Dashboard worker is not initialized.');",
+      "        }",
+      "        respond(id, runtime.runtimeInfo());",
+      "        return;",
+      "      case 'dispose':",
+      "        if (runtime) {",
+      "          runtime.dispose();",
+      "          runtime = null;",
+      "        }",
+      "        respond(id, null);",
+      "        self.close();",
+      "        return;",
+      "      default:",
+      "        throw new Error('Unknown dashboard worker message: ' + message.type);",
+      "    }",
+      "  } catch (error) {",
+      "    fail(id, error);",
+      "  }",
+      "};"
+    ].join("\n");
+  }
+
+  function createDashboardWorker(options) {
+    options = options || {};
+
+    if (!!options.arrowBuffer === !!options.dataUrl) {
+      throw new Error("createDashboardWorker expects exactly one of `arrowBuffer` or `dataUrl`.");
+    }
+
+    var workerFactory = options.workerFactory,
+        workerUrl = null;
+
+    if (!workerFactory) {
+      if (typeof Worker === "undefined") {
+        throw new Error("Workers are not available in this environment.");
+      }
+      if (!options.crossfilterUrl || !(options.arrowRuntimeUrl || options.arrowUrl)) {
+        throw new Error("createDashboardWorker requires `crossfilterUrl` and `arrowRuntimeUrl` unless `workerFactory` is provided.");
+      }
+
+      var resolvedCrossfilterUrl = resolveAssetUrl$1(options.crossfilterUrl),
+          resolvedArrowUrl = resolveAssetUrl$1(options.arrowRuntimeUrl || options.arrowUrl);
+
+      workerFactory = function() {
+        workerUrl = URL.createObjectURL(new Blob([
+          createWorkerSource$1(resolvedCrossfilterUrl, resolvedArrowUrl)
+        ], { type: "text/javascript" }));
+        return new Worker(workerUrl);
+      };
+    }
+
+    var worker = workerFactory();
+    var nextId = 1;
+    var pending = new Map();
+    var disposed = false;
+
+    function cleanupWorker() {
+      if (workerUrl) {
+        URL.revokeObjectURL(workerUrl);
+        workerUrl = null;
+      }
+    }
+
+    function rejectPending(error) {
+      pending.forEach(function(entry) {
+        entry.reject(error);
+      });
+      pending.clear();
+    }
+
+    function call(type, payload, transfer) {
+      if (disposed) {
+        return Promise.reject(new Error("Dashboard worker has already been disposed."));
+      }
+
+      var id = nextId++;
+      return new Promise(function(resolve, reject) {
+        pending.set(id, { reject: reject, resolve: resolve });
+        worker.postMessage({
+          id: id,
+          payload: payload || null,
+          type: type
+        }, transfer || []);
+      });
+    }
+
+    worker.addEventListener("message", function(event) {
+      var message = event.data || {};
+      var entry = pending.get(message.id);
+      if (!entry) {
+        return;
+      }
+
+      pending.delete(message.id);
+
+      if (message.ok) {
+        entry.resolve(message.payload);
+        return;
+      }
+
+      var error = new Error(message.error && message.error.message || "Dashboard worker request failed.");
+      if (message.error && message.error.stack) {
+        error.stack = message.error.stack;
+      }
+      entry.reject(error);
+    });
+
+    worker.addEventListener("error", function(event) {
+      var error = event.error || new Error(event.message || "Dashboard worker failed.");
+      rejectPending(error);
+      cleanupWorker();
+    });
+
+    var transfer = [],
+        payload = {
+          dataFetchInit: options.dataFetchInit || null,
+          dataUrl: options.dataUrl ? resolveAssetUrl$1(options.dataUrl) : null,
+          dimensions: options.dimensions || [],
+          groups: options.groups || [],
+          kpis: options.kpis || [],
+          wasm: options.wasm !== false
+        };
+
+    if (options.arrowBuffer) {
+      payload.arrowBuffer = resolveArrowBuffer$1(options.arrowBuffer);
+      transfer.push(payload.arrowBuffer);
+    }
+
+    return call("init", payload, transfer).then(function(initPayload) {
+      return {
+        append: function(records) {
+          return call('append', { records: records || [] });
+        },
+        dispose: function() {
+          if (disposed) {
+            return Promise.resolve();
+          }
+          return call("dispose").catch(function(error) {
+            worker.terminate();
+            cleanupWorker();
+            throw error;
+          }).finally(function() {
+            disposed = true;
+            worker.terminate();
+            cleanupWorker();
+          });
+        },
+        query: function(request) {
+          return call('query', { request: request || null });
+        },
+        removeFiltered: function(selection) {
+          return call('removeFiltered', { selection: selection || 'included' });
+        },
+        reset: function() {
+          return call("reset");
+        },
+        runtimeInfo: function() {
+          return call("runtimeInfo");
+        },
+        snapshot: function(filters) {
+          return call("snapshot", { filters: filters || null });
+        },
+        rows: function(query) {
+          return call("rows", { query: query || null });
+        },
+        updateFilters: function(filters) {
+          return call("updateFilters", { filters: filters || null });
+        },
+        workerRuntime: initPayload.runtime
+      };
+    }).catch(function(error) {
+      disposed = true;
+      worker.terminate();
+      cleanupWorker();
+      throw error;
+    });
+  }
+
+  function resolveArrowBuffer(source) {
+    if (source instanceof ArrayBuffer) {
+      return source;
+    }
+
+    if (ArrayBuffer.isView(source)) {
+      var view = source;
+      if (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
+        return view.buffer;
+      }
+      return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+    }
+
+    throw new Error("createStreamingDashboardWorker expects `arrowBuffer` to be an ArrayBuffer or typed array view.");
+  }
+
+  function resolveAssetUrl(url) {
+    if (typeof URL === "function" && typeof location !== "undefined" && location && location.href) {
+      return new URL(url, location.href).toString();
+    }
+    return url;
+  }
+
+  function normalizeStreamingSource(source, index, defaultFetchInit, transfer) {
+    if (!source || typeof source !== "object") {
+      throw new Error("Streaming dashboard source at index " + index + " must be an object.");
+    }
+
+    var id = source.id || "source_" + index;
+    var hasArrowBuffer = source.arrowBuffer != null;
+    var hasDataUrl = !!source.dataUrl;
+
+    if (hasArrowBuffer === hasDataUrl) {
+      throw new Error("Streaming dashboard source `" + id + "` expects exactly one of `arrowBuffer` or `dataUrl`.");
+    }
+
+    var normalized = {
+      dataFetchInit: source.dataFetchInit || defaultFetchInit || null,
+      dataUrl: source.dataUrl ? resolveAssetUrl(source.dataUrl) : null,
+      id: id,
+      lookup: source.lookup || null,
+      projection: source.projection || null,
+      role: source.role || null
+    };
+
+    if (hasArrowBuffer) {
+      normalized.arrowBuffer = resolveArrowBuffer(source.arrowBuffer);
+      transfer.push(normalized.arrowBuffer);
+    }
+
+    return normalized;
+  }
+
+  function resolveStreamingSources(options, transfer) {
+    if (!Array.isArray(options.sources) || !options.sources.length) {
+      return null;
+    }
+
+    var sources = options.sources.map(function(source, index) {
+      return normalizeStreamingSource(source, index, options.dataFetchInit || null, transfer);
+    });
+    var baseCount = 0;
+
+    for (var sourceIndex = 0; sourceIndex < sources.length; ++sourceIndex) {
+      var source = sources[sourceIndex];
+      if (!source.role) {
+        source.role = sourceIndex === 0 ? "base" : "lookup";
+      }
+      if (source.role === "base") {
+        baseCount += 1;
+        if (source.lookup) {
+          throw new Error("Streaming dashboard source `" + source.id + "` cannot declare `lookup` when role is `base`.");
+        }
+        continue;
+      }
+      if (source.role !== "lookup") {
+        throw new Error("Streaming dashboard source `" + source.id + "` has unsupported role `" + source.role + "`.");
+      }
+      if (!source.lookup || !Array.isArray(source.lookup.keyFields) || !source.lookup.keyFields.length || !Array.isArray(source.lookup.valueFields) || !source.lookup.valueFields.length) {
+        throw new Error("Streaming dashboard lookup source `" + source.id + "` requires non-empty `lookup.keyFields` and `lookup.valueFields`.");
+      }
+    }
+
+    if (baseCount !== 1) {
+      throw new Error("Streaming dashboard worker expects exactly one base source.");
+    }
+
+    return sources;
+  }
+
+  function createWorkerSource(crossfilterUrl, arrowUrl) {
+    return `
+'use strict';
+importScripts(${JSON.stringify(crossfilterUrl)}, ${JSON.stringify(arrowUrl)});
+var runtime = null;
+var runtimeConfig = null;
+var abortControllers = [];
+var progress = null;
+var progressTimer = 0;
+var snapshotTimer = 0;
+function getRecordBatchReader(module) {
+  return module && (module.RecordBatchReader || (module.default && module.default.RecordBatchReader)) || null;
+}
+function getFieldNames(table) {
+  if (table && table.schema && Array.isArray(table.schema.fields)) {
+    return table.schema.fields.map(function(field) { return field.name; });
+  }
+  if (table && Array.isArray(table.columnNames)) {
+    return table.columnNames.slice();
+  }
+  return [];
+}
+function getColumn(table, name, index) {
+  if (!table) return undefined;
+  if (typeof table.getChild === 'function') {
+    var child = table.getChild(name);
+    if (child != null) return child;
+  }
+  if (typeof table.getColumn === 'function') {
+    var column = table.getColumn(name);
+    if (column != null) return column;
+  }
+  if (typeof table.getChildAt === 'function') {
+    return table.getChildAt(index);
+  }
+  return table[name];
+}
+function getValue(column, index) {
+  if (column == null) return undefined;
+  if (typeof column.get === 'function') return column.get(index);
+  if (typeof column.at === 'function') return column.at(index);
+  return column[index];
+}
+function allocateMergedColumn(column, length) {
+  if (ArrayBuffer.isView(column) && typeof column.constructor === 'function' && typeof column.BYTES_PER_ELEMENT === 'number') {
+    return new column.constructor(length);
+  }
+  return new Array(length);
+}
+function copyColumnValues(target, targetOffset, source, length) {
+  if (ArrayBuffer.isView(target) && ArrayBuffer.isView(source) && source.constructor === target.constructor && typeof source.length === 'number') {
+    target.set(source, targetOffset);
+    return;
+  }
+  for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
+    target[targetOffset + rowIndex] = getValue(source, rowIndex);
+  }
+}
+function mergeProjectedBatches(batches) {
+  if (!batches.length) {
+    return null;
+  }
+  if (batches.length === 1) {
+    return batches[0];
+  }
+
+  var fields = batches[0].fields.slice();
+  var totalLength = 0;
+  var columns = {};
+
+  for (var batchIndex = 0; batchIndex < batches.length; ++batchIndex) {
+    totalLength += batches[batchIndex].length;
+  }
+
+  for (var fieldIndex = 0; fieldIndex < fields.length; ++fieldIndex) {
+    columns[fields[fieldIndex]] = allocateMergedColumn(batches[0].columns[fields[fieldIndex]], totalLength);
+  }
+
+  var offset = 0;
+  for (batchIndex = 0; batchIndex < batches.length; ++batchIndex) {
+    var batch = batches[batchIndex];
+    for (fieldIndex = 0; fieldIndex < fields.length; ++fieldIndex) {
+      var field = fields[fieldIndex];
+      copyColumnValues(columns[field], offset, batch.columns[field], batch.length);
+    }
+    offset += batch.length;
+  }
+
+  return {
+    columns: columns,
+    fields: fields,
+    length: totalLength
+  };
+}
+function flushBufferedRuntimeBatches(bufferedBatches) {
+  if (!runtime || !bufferedBatches.length) {
+    return;
+  }
+  var merged = mergeProjectedBatches(bufferedBatches);
+  runtime.appendColumns(merged.columns, {
+    fields: merged.fields,
+    length: merged.length
+  });
+  bufferedBatches.length = 0;
+}
+function normalizeTimestampValue(value) {
+  if (typeof value === 'string') {
+    var parsed = new Date(value).getTime();
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  if (typeof value === 'number') {
+    return value < 1e12 ? value * 1000 : value;
+  }
+  var numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return numeric < 1e12 ? numeric * 1000 : numeric;
+  }
+  return 0;
+}
+function respond(id, payload) {
+  self.postMessage({ id: id, ok: true, payload: payload });
+}
+function fail(id, error) {
+  self.postMessage({ id: id, ok: false, error: {
+    message: String(error && error.message || error),
+    stack: error && error.stack ? String(error.stack) : null
+  } });
+}
+function publish(eventType, payload) {
+  self.postMessage({ eventType: eventType, payload: payload });
+}
+function getProjectionFieldName(projection, inputName) {
+  return projection && projection.rename && projection.rename[inputName] || inputName;
+}
+function getProjectionTransform(projection, inputName, outputName) {
+  if (!projection || !projection.transforms) {
+    return null;
+  }
+  return projection.transforms[outputName] || projection.transforms[inputName] || null;
+}
+function projectBatch(batch, projection) {
+  var actualFields = getFieldNames(batch);
+  var inputFields = projection && Array.isArray(projection.fields) && projection.fields.length
+    ? projection.fields.slice()
+    : actualFields.slice();
+  var fieldIndexes = {};
+  var projectedFields = [];
+  var columns = {};
+  var length = batch && typeof batch.numRows === 'number' ? batch.numRows : 0;
+
+  for (var actualIndex = 0; actualIndex < actualFields.length; ++actualIndex) {
+    fieldIndexes[actualFields[actualIndex]] = actualIndex;
+  }
+
+  for (var fieldIndex = 0; fieldIndex < inputFields.length; ++fieldIndex) {
+    var inputName = inputFields[fieldIndex];
+    var outputName = getProjectionFieldName(projection, inputName);
+    var inputIndex = Object.prototype.hasOwnProperty.call(fieldIndexes, inputName)
+      ? fieldIndexes[inputName]
+      : fieldIndex;
+    var sourceColumn = getColumn(batch, inputName, inputIndex);
+    var transform = getProjectionTransform(projection, inputName, outputName);
+
+    if (!Object.prototype.hasOwnProperty.call(columns, outputName)) {
+      projectedFields.push(outputName);
+    }
+
+    if (transform === 'timestampMs') {
+      var values = new Float64Array(length);
+      for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
+        values[rowIndex] = normalizeTimestampValue(getValue(sourceColumn, rowIndex));
+      }
+      columns[outputName] = values;
+    } else {
+      columns[outputName] = sourceColumn;
+    }
+  }
+
+  return {
+    columns: columns,
+    fields: projectedFields,
+    length: length
+  };
+}
+function buildLookupKey(columns, keyFields, rowIndex) {
+  var parts = new Array(keyFields.length);
+  for (var fieldIndex = 0; fieldIndex < keyFields.length; ++fieldIndex) {
+    var value = getValue(columns[keyFields[fieldIndex]], rowIndex);
+    parts[fieldIndex] = value == null ? '' : String(value);
+  }
+  return parts.join('|');
+}
+function createSourceProgress(source) {
+  return {
+    batchesLoaded: 0,
+    bytesLoaded: 0,
+    response: null,
+    rowsLoaded: 0,
+    status: 'idle',
+    totalBytes: null
+  };
+}
+function cloneSourceProgressMap(sources) {
+  var clone = {};
+  for (var sourceId in sources) {
+    var source = sources[sourceId];
+    clone[sourceId] = {
+      batchesLoaded: source.batchesLoaded,
+      bytesLoaded: source.bytesLoaded,
+      response: source.response ? Object.assign({}, source.response) : null,
+      rowsLoaded: source.rowsLoaded,
+      status: source.status,
+      totalBytes: source.totalBytes
+    };
+  }
+  return clone;
+}
+function releaseAbortControllers() {
+  for (var controllerIndex = 0; controllerIndex < abortControllers.length; ++controllerIndex) {
+    try {
+      abortControllers[controllerIndex].abort();
+    } catch (_) {}
+  }
+  abortControllers = [];
+}
+function ensureRuntimeFromColumns(batchSpec) {
+  if (runtime) {
+    return;
+  }
+  runtime = self.crossfilter.createDashboardRuntime({
+    columnarOptions: {
+      fields: batchSpec.fields,
+      length: batchSpec.length
+    },
+    columns: batchSpec.columns,
+    wasm: runtimeConfig.wasm,
+    dimensions: runtimeConfig.dimensions,
+    groups: runtimeConfig.groups,
+    kpis: runtimeConfig.kpis
+  });
+  if (runtimeConfig.initialFilters) {
+    runtime.updateFilters(runtimeConfig.initialFilters);
+  }
+}
+function ensureEmptyRuntime() {
+  if (runtime) {
+    return;
+  }
+  runtime = self.crossfilter.createDashboardRuntime({
+    records: [],
+    wasm: runtimeConfig.wasm,
+    dimensions: runtimeConfig.dimensions,
+    groups: runtimeConfig.groups,
+    kpis: runtimeConfig.kpis
+  });
+  if (runtimeConfig.initialFilters) {
+    runtime.updateFilters(runtimeConfig.initialFilters);
+  }
+}
+function progressPayload(status, extra) {
+  var sources = progress && progress.sources ? progress.sources : {};
+  var batchesLoaded = 0;
+  var bytesLoaded = 0;
+  var rowsLoaded = 0;
+  var totalBytes = 0;
+  var hasKnownTotals = true;
+  var hasSources = false;
+  var baseRuntimeInfo = self.crossfilter.runtimeInfo();
+  var payload = {
+    batchesLoaded: 0,
+    bytesLoaded: 0,
+    fetch: {
+      bytesLoaded: 0,
+      totalBytes: null,
+      percent: null,
+      complete: false
+    },
+    load: {
+      batchesLoaded: 0,
+      rowsLoaded: 0,
+      complete: !!(progress && progress.ready)
+    },
+    rowsLoaded: 0,
+    runtime: runtime ? runtime.runtimeInfo() : {
+      active: 'js',
+      lastError: baseRuntimeInfo.lastError,
+      wasmEnabled: runtimeConfig ? runtimeConfig.wasm !== false : baseRuntimeInfo.wasmEnabled,
+      wasmSupported: baseRuntimeInfo.wasmSupported
+    },
+    sources: cloneSourceProgressMap(sources),
+    status: status,
+    totalBytes: null
+  };
+
+  for (var sourceId in sources) {
+    var source = sources[sourceId];
+    hasSources = true;
+    batchesLoaded += source.batchesLoaded || 0;
+    bytesLoaded += source.bytesLoaded || 0;
+    rowsLoaded += source.rowsLoaded || 0;
+    if (source.totalBytes == null) {
+      hasKnownTotals = false;
+    } else {
+      totalBytes += source.totalBytes;
+    }
+  }
+
+  payload.batchesLoaded = batchesLoaded;
+  payload.bytesLoaded = bytesLoaded;
+  payload.rowsLoaded = rowsLoaded;
+  payload.load = {
+    batchesLoaded: batchesLoaded,
+    rowsLoaded: rowsLoaded,
+    complete: !!(progress && progress.ready)
+  };
+  payload.totalBytes = hasSources && hasKnownTotals ? totalBytes : null;
+  payload.fetch = {
+    bytesLoaded: bytesLoaded,
+    totalBytes: payload.totalBytes,
+    percent: payload.totalBytes > 0 ? Math.min(1, bytesLoaded / payload.totalBytes) : null,
+    complete: status === 'ready' || status === 'aborted' || status === 'error' || (payload.totalBytes != null && bytesLoaded >= payload.totalBytes)
+  };
+
+  if (extra) {
+    for (var key in extra) {
+      payload[key] = extra[key];
+    }
+  }
+
+  return payload;
+}
+function publishProgress(status, force, extra) {
+  var now = Date.now();
+  if (!force && progress && progress.progressThrottleMs > 0 && now - progressTimer < progress.progressThrottleMs) {
+    return;
+  }
+  progressTimer = now;
+  publish('progress', progressPayload(status, extra));
+}
+async function* responseChunks(sourceId, response) {
+  var sourceProgress = progress.sources[sourceId];
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    var buffer = await response.arrayBuffer();
+    sourceProgress.bytesLoaded = buffer.byteLength;
+    sourceProgress.status = 'downloading';
+    publishProgress('downloading', true);
+    yield new Uint8Array(buffer);
+    return;
+  }
+  var reader = response.body.getReader();
+  try {
+    while (true) {
+      var chunk = await reader.read();
+      if (chunk.done) {
+        return;
+      }
+      var value = chunk.value;
+      sourceProgress.bytesLoaded += value.byteLength || value.length || 0;
+      sourceProgress.status = 'downloading';
+      publishProgress('downloading', false);
+      yield value;
+    }
+  } finally {
+    if (reader.releaseLock) reader.releaseLock();
+  }
+}
+async function getSourceInput(source) {
+  var sourceProgress = progress.sources[source.id];
+  if (source.dataUrl) {
+    sourceProgress.status = 'requesting';
+    publishProgress('starting', true);
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var fetchInit = source.dataFetchInit || {};
+    if (controller) {
+      fetchInit = Object.assign({}, fetchInit, { signal: controller.signal });
+      abortControllers.push(controller);
+    }
+    var response = await fetch(source.dataUrl, fetchInit);
+    if (!response.ok) {
+      throw new Error('Failed to fetch Arrow stream for ' + source.id + ': ' + response.status + ' ' + response.statusText);
+    }
+    var headerValue = response.headers && response.headers.get ? response.headers.get('content-length') : null;
+    sourceProgress.response = response.headers && response.headers.get ? {
+      arrowFieldMapping: response.headers.get('x-synmetrix-arrow-field-mapping') || null,
+      arrowFieldMappingEncoding: response.headers.get('x-synmetrix-arrow-field-mapping-encoding') || null,
+      contentDisposition: response.headers.get('content-disposition') || null,
+      contentType: response.headers.get('content-type') || null
+    } : null;
+    sourceProgress.totalBytes = headerValue == null ? null : Number(headerValue);
+    sourceProgress.status = 'downloading';
+    publishProgress('downloading', true);
+    return responseChunks(source.id, response);
+  }
+  sourceProgress.totalBytes = source.arrowBuffer.byteLength || null;
+  sourceProgress.bytesLoaded = sourceProgress.totalBytes || 0;
+  sourceProgress.status = 'downloading';
+  publishProgress('downloading', true);
+  return new Uint8Array(source.arrowBuffer);
+}
+async function maybePublishSnapshot(force) {
+  if (!progress || !progress.emitSnapshots || !runtime) {
+    return;
+  }
+  var now = Date.now();
+  if (!force && progress.snapshotThrottleMs > 0 && now - snapshotTimer < progress.snapshotThrottleMs) {
+    return;
+  }
+  snapshotTimer = now;
+  publish('snapshot', {
+    progress: progressPayload(progress.ready ? 'ready' : 'streaming'),
+    snapshot: runtime.snapshot()
+  });
+}
+async function streamBaseSourceIntoRuntime(source) {
+  var arrow = self.Arrow;
+  var RecordBatchReader = getRecordBatchReader(arrow);
+  var sourceProgress = progress.sources[source.id];
+  var reader = await RecordBatchReader.from(await getSourceInput(source));
+  var bufferedBatches = [];
+  var bufferedRows = 0;
+
+  for await (var batch of reader) {
+    var projected = projectBatch(batch, source.projection);
+    if (!runtime) {
+      ensureRuntimeFromColumns(projected);
+    } else {
+      bufferedBatches.push(projected);
+      bufferedRows += projected.length;
+      if (bufferedRows >= runtimeConfig.batchCoalesceRows) {
+        flushBufferedRuntimeBatches(bufferedBatches);
+        bufferedRows = 0;
+      }
+    }
+    sourceProgress.batchesLoaded += 1;
+    sourceProgress.rowsLoaded += projected.length;
+    sourceProgress.status = 'streaming';
+    publishProgress('streaming', true);
+    if (progress.emitSnapshots && bufferedBatches.length) {
+      var shouldFlushForSnapshot = progress.snapshotThrottleMs <= 0 || Date.now() - snapshotTimer >= progress.snapshotThrottleMs;
+      if (shouldFlushForSnapshot) {
+        flushBufferedRuntimeBatches(bufferedBatches);
+        bufferedRows = 0;
+      }
+    }
+    await maybePublishSnapshot(false);
+  }
+
+  if (bufferedBatches.length) {
+    flushBufferedRuntimeBatches(bufferedBatches);
+  }
+
+  sourceProgress.status = 'ready';
+  publishProgress('streaming', true);
+}
+async function loadProjectedBatchesFromSource(source) {
+  var arrow = self.Arrow;
+  var RecordBatchReader = getRecordBatchReader(arrow);
+  var sourceProgress = progress.sources[source.id];
+  var reader = await RecordBatchReader.from(await getSourceInput(source));
+  var batches = [];
+  var fields = [];
+  var rowCount = 0;
+
+  for await (var batch of reader) {
+    var projected = projectBatch(batch, source.projection);
+    batches.push(projected);
+    if (!fields.length) {
+      fields = projected.fields.slice();
+    }
+    rowCount += projected.length;
+    sourceProgress.batchesLoaded += 1;
+    sourceProgress.rowsLoaded += projected.length;
+    sourceProgress.status = 'streaming';
+    publishProgress('streaming', true);
+  }
+
+  sourceProgress.status = 'ready';
+  publishProgress('streaming', true);
+  return {
+    batches: batches,
+    fields: fields,
+    rowCount: rowCount,
+    sourceId: source.id
+  };
+}
+async function buildLookupIndexFromSource(source) {
+  var arrow = self.Arrow;
+  var RecordBatchReader = getRecordBatchReader(arrow);
+  var sourceProgress = progress.sources[source.id];
+  var reader = await RecordBatchReader.from(await getSourceInput(source));
+  var index = new Map();
+  var valueFields = source.lookup.valueFields.slice();
+  var valueKinds = new Array(valueFields.length);
+
+  for await (var batch of reader) {
+    var projected = projectBatch(batch, source.projection);
+
+    for (var rowIndex = 0; rowIndex < projected.length; ++rowIndex) {
+      var key = buildLookupKey(projected.columns, source.lookup.keyFields, rowIndex);
+      if (index.has(key)) {
+        continue;
+      }
+      var values = new Array(valueFields.length);
+      for (var valueIndex = 0; valueIndex < valueFields.length; ++valueIndex) {
+        var fieldValue = getValue(projected.columns[valueFields[valueIndex]], rowIndex);
+        values[valueIndex] = fieldValue;
+        if (valueKinds[valueIndex] !== 'generic' && typeof fieldValue === 'number' && Number.isFinite(fieldValue)) {
+          valueKinds[valueIndex] = 'number';
+        } else if (fieldValue != null && (typeof fieldValue !== 'number' || !Number.isFinite(fieldValue))) {
+          valueKinds[valueIndex] = 'generic';
+        }
+      }
+      index.set(key, values);
+    }
+
+    sourceProgress.batchesLoaded += 1;
+    sourceProgress.rowsLoaded += projected.length;
+    sourceProgress.status = 'streaming';
+    publishProgress('streaming', true);
+  }
+
+  sourceProgress.status = 'ready';
+  publishProgress('streaming', true);
+  return {
+    id: source.id,
+    index: index,
+    keyFields: source.lookup.keyFields.slice(),
+    valueFields: valueFields,
+    valueKinds: valueKinds.map(function(kind) {
+      return kind === 'number' ? 'number' : 'generic';
+    })
+  };
+}
+function allocateLookupColumn(length, kind) {
+  if (kind === 'number') {
+    var numeric = new Float64Array(length);
+    numeric.fill(NaN);
+    return numeric;
+  }
+  return new Array(length);
+}
+function applyLookupIndexes(baseBatches, lookupResults) {
+  for (var batchIndex = 0; batchIndex < baseBatches.length; ++batchIndex) {
+    var batch = baseBatches[batchIndex];
+
+    for (var lookupIndex = 0; lookupIndex < lookupResults.length; ++lookupIndex) {
+      var lookup = lookupResults[lookupIndex];
+      var columnsByField = {};
+
+      for (var valueFieldIndex = 0; valueFieldIndex < lookup.valueFields.length; ++valueFieldIndex) {
+        var valueField = lookup.valueFields[valueFieldIndex];
+        columnsByField[valueField] = allocateLookupColumn(batch.length, lookup.valueKinds[valueFieldIndex]);
+        if (batch.fields.indexOf(valueField) < 0) {
+          batch.fields.push(valueField);
+        }
+      }
+
+      for (var rowIndex = 0; rowIndex < batch.length; ++rowIndex) {
+        var values = lookup.index.get(buildLookupKey(batch.columns, lookup.keyFields, rowIndex));
+        if (!values) {
+          continue;
+        }
+        for (var fieldIndex = 0; fieldIndex < lookup.valueFields.length; ++fieldIndex) {
+          columnsByField[lookup.valueFields[fieldIndex]][rowIndex] = values[fieldIndex];
+        }
+      }
+
+      for (fieldIndex = 0; fieldIndex < lookup.valueFields.length; ++fieldIndex) {
+        batch.columns[lookup.valueFields[fieldIndex]] = columnsByField[lookup.valueFields[fieldIndex]];
+      }
+    }
+  }
+}
+function buildRuntimeFromBatches(batches) {
+  if (!batches.length) {
+    ensureEmptyRuntime();
+    return;
+  }
+
+  ensureRuntimeFromColumns(batches[0]);
+  if (batches.length === 1) {
+    return;
+  }
+
+  var bufferedBatches = [];
+  var bufferedRows = 0;
+
+  for (var batchIndex = 1; batchIndex < batches.length; ++batchIndex) {
+    bufferedBatches.push(batches[batchIndex]);
+    bufferedRows += batches[batchIndex].length;
+    if (bufferedRows >= runtimeConfig.batchCoalesceRows) {
+      flushBufferedRuntimeBatches(bufferedBatches);
+      bufferedRows = 0;
+    }
+  }
+
+  if (bufferedBatches.length) {
+    flushBufferedRuntimeBatches(bufferedBatches);
+  }
+}
+async function startStreaming(payload) {
+  var arrow = self.Arrow;
+  var RecordBatchReader = getRecordBatchReader(arrow);
+  if (!RecordBatchReader || !RecordBatchReader.from) {
+    throw new Error('Apache Arrow RecordBatchReader is not available in the worker.');
+  }
+
+  var sources = payload.sources && payload.sources.length
+    ? payload.sources.slice()
+    : [{
+        arrowBuffer: payload.arrowBuffer || null,
+        dataFetchInit: payload.dataFetchInit || null,
+        dataUrl: payload.dataUrl || null,
+        id: 'source_0',
+        lookup: null,
+        projection: null,
+        role: 'base'
+      }];
+
+  progress = {
+    emitSnapshots: payload.emitSnapshots === true,
+    progressThrottleMs: typeof payload.progressThrottleMs === 'number' ? payload.progressThrottleMs : 100,
+    ready: false,
+    snapshotThrottleMs: typeof payload.snapshotThrottleMs === 'number' ? payload.snapshotThrottleMs : 250,
+    sources: {}
+  };
+
+  progressTimer = 0;
+  snapshotTimer = 0;
+  abortControllers = [];
+
+  for (var sourceIndex = 0; sourceIndex < sources.length; ++sourceIndex) {
+    progress.sources[sources[sourceIndex].id] = createSourceProgress(sources[sourceIndex]);
+  }
+
+  publishProgress('starting', true);
+
+  try {
+    if (sources.length === 1 && sources[0].role === 'base') {
+      await streamBaseSourceIntoRuntime(sources[0]);
+    } else {
+      var baseSource = null;
+      var lookupSources = [];
+
+      for (sourceIndex = 0; sourceIndex < sources.length; ++sourceIndex) {
+        if (sources[sourceIndex].role === 'base') {
+          baseSource = sources[sourceIndex];
+        } else {
+          lookupSources.push(sources[sourceIndex]);
+        }
+      }
+
+      var results = await Promise.all([loadProjectedBatchesFromSource(baseSource)].concat(lookupSources.map(function(source) {
+        return buildLookupIndexFromSource(source);
+      })));
+      var baseResult = results[0];
+      var lookupResults = results.slice(1);
+
+      publishProgress('joining', true);
+      applyLookupIndexes(baseResult.batches, lookupResults);
+      publishProgress('building', true);
+      buildRuntimeFromBatches(baseResult.batches);
+    }
+
+    ensureEmptyRuntime();
+    progress.ready = true;
+    publishProgress('ready', true);
+    await maybePublishSnapshot(true);
+    publish('ready', progressPayload('ready'));
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      publishProgress('aborted', true);
+      return;
+    }
+    publish('error', Object.assign(progressPayload('error'), {
+      message: String(error && error.message || error),
+      stack: error && error.stack ? String(error.stack) : null
+    }));
+  }
+}
+self.onmessage = async function(event) {
+  var message = event.data || {};
+  var id = message.id;
+  try {
+    switch (message.type) {
+      case 'initStreaming': {
+        runtimeConfig = {
+          batchCoalesceRows: typeof message.payload.batchCoalesceRows === 'number' && message.payload.batchCoalesceRows > 0
+            ? Math.floor(message.payload.batchCoalesceRows)
+            : 65536,
+          wasm: message.payload.wasm,
+          dimensions: message.payload.dimensions,
+          groups: message.payload.groups,
+          kpis: message.payload.kpis,
+          initialFilters: message.payload.initialFilters || null
+        };
+        runtime = null;
+        startStreaming(message.payload);
+        respond(id, { runtime: null });
+        return;
+      }
+      case 'snapshot':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.snapshot(message.payload.filters));
+        return;
+      case 'query':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.query(message.payload.request));
+        return;
+      case 'append':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.append(message.payload.records || []));
+        return;
+      case 'updateFilters':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.updateFilters(message.payload.filters));
+        return;
+      case 'rows':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.rows(message.payload.query));
+        return;
+      case 'removeFiltered':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.removeFiltered(message.payload.selection));
+        return;
+      case 'reset':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.reset());
+        return;
+      case 'runtimeInfo':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.runtimeInfo());
+        return;
+      case 'dispose':
+        releaseAbortControllers();
+        if (runtime) {
+          runtime.dispose();
+          runtime = null;
+        }
+        runtimeConfig = null;
+        respond(id, null);
+        self.close();
+        return;
+      default:
+        throw new Error('Unknown streaming dashboard worker message: ' + message.type);
+    }
+  } catch (error) {
+    fail(id, error);
+  }
+};
+`;
+  }
+
+  function createStreamingDashboardWorker(options) {
+    options = options || {};
+
+    var hasSources = Array.isArray(options.sources) && options.sources.length > 0;
+    var modeCount = (options.arrowBuffer ? 1 : 0) + (options.dataUrl ? 1 : 0) + (hasSources ? 1 : 0);
+
+    if (modeCount !== 1) {
+      throw new Error("createStreamingDashboardWorker expects exactly one of `arrowBuffer`, `dataUrl` or `sources`.");
+    }
+
+    var workerFactory = options.workerFactory,
+        workerUrl = null;
+
+    if (!workerFactory) {
+      if (typeof Worker === "undefined") {
+        throw new Error("Workers are not available in this environment.");
+      }
+      if (!options.crossfilterUrl || !(options.arrowRuntimeUrl || options.arrowUrl)) {
+        throw new Error("createStreamingDashboardWorker requires `crossfilterUrl` and `arrowRuntimeUrl` unless `workerFactory` is provided.");
+      }
+
+      var resolvedCrossfilterUrl = resolveAssetUrl(options.crossfilterUrl),
+          resolvedArrowUrl = resolveAssetUrl(options.arrowRuntimeUrl || options.arrowUrl);
+
+      workerFactory = function() {
+        workerUrl = URL.createObjectURL(new Blob([
+          createWorkerSource(resolvedCrossfilterUrl, resolvedArrowUrl)
+        ], { type: "text/javascript" }));
+        return new Worker(workerUrl);
+      };
+    }
+
+    var worker = workerFactory();
+    var nextId = 1;
+    var pending = new Map();
+    var listeners = {
+      error: new Set(),
+      progress: new Set(),
+      ready: new Set(),
+      snapshot: new Set()
+    };
+    var disposed = false;
+    var readyResolve;
+    var readyReject;
+    var ready = new Promise(function(resolve, reject) {
+      readyResolve = resolve;
+      readyReject = reject;
+    });
+
+    function cleanupWorker() {
+      if (workerUrl) {
+        URL.revokeObjectURL(workerUrl);
+        workerUrl = null;
+      }
+    }
+
+    function rejectPending(error) {
+      pending.forEach(function(entry) {
+        entry.reject(error);
+      });
+      pending.clear();
+    }
+
+    function emit(eventType, payload) {
+      listeners[eventType].forEach(function(listener) {
+        listener(payload);
+      });
+    }
+
+    function call(type, payload, transfer) {
+      if (disposed) {
+        return Promise.reject(new Error("Streaming dashboard worker has already been disposed."));
+      }
+
+      var id = nextId++;
+      return new Promise(function(resolve, reject) {
+        pending.set(id, { resolve: resolve, reject: reject });
+        worker.postMessage({
+          id: id,
+          payload: payload || null,
+          type: type
+        }, transfer || []);
+      });
+    }
+
+    worker.addEventListener("message", function(event) {
+      var message = event.data || {};
+
+      if (message.eventType) {
+        emit(message.eventType, message.payload);
+        if (message.eventType === "ready") {
+          readyResolve(message.payload);
+        } else if (message.eventType === "error") {
+          readyReject(new Error(message.payload && message.payload.message || "Streaming dashboard worker failed."));
+        }
+        return;
+      }
+
+      var entry = pending.get(message.id);
+      if (!entry) {
+        return;
+      }
+
+      pending.delete(message.id);
+
+      if (message.ok) {
+        entry.resolve(message.payload);
+        return;
+      }
+
+      var error = new Error(message.error && message.error.message || "Streaming dashboard worker request failed.");
+      if (message.error && message.error.stack) {
+        error.stack = message.error.stack;
+      }
+      entry.reject(error);
+    });
+
+    worker.addEventListener("error", function(event) {
+      var error = event.error || new Error(event.message || "Streaming dashboard worker failed.");
+      rejectPending(error);
+      readyReject(error);
+      cleanupWorker();
+    });
+
+    var transfer = [];
+    var sources = resolveStreamingSources(options, transfer);
+    var payload = {
+      dataFetchInit: options.dataFetchInit || null,
+      dataUrl: sources ? null : options.dataUrl ? resolveAssetUrl(options.dataUrl) : null,
+      dimensions: options.dimensions || [],
+      emitSnapshots: options.emitSnapshots === true,
+      groups: options.groups || [],
+      initialFilters: options.initialFilters || null,
+      kpis: options.kpis || [],
+      progressThrottleMs: options.progressThrottleMs,
+      snapshotThrottleMs: options.snapshotThrottleMs,
+      sources: sources,
+      batchCoalesceRows: options.batchCoalesceRows,
+      wasm: options.wasm !== false
+    };
+
+    if (!sources && options.arrowBuffer) {
+      payload.arrowBuffer = resolveArrowBuffer(options.arrowBuffer);
+      transfer.push(payload.arrowBuffer);
+    }
+
+    return call("initStreaming", payload, transfer).then(function(initPayload) {
+      return {
+        append: function(records) {
+          return call('append', { records: records || [] });
+        },
+        dispose: function() {
+          if (disposed) {
+            return Promise.resolve();
+          }
+          return call("dispose").catch(function(error) {
+            worker.terminate();
+            cleanupWorker();
+            throw error;
+          }).finally(function() {
+            disposed = true;
+            worker.terminate();
+            cleanupWorker();
+          });
+        },
+        on: function(eventType, listener) {
+          if (!listeners[eventType]) {
+            throw new Error("Unsupported streaming dashboard event: " + eventType);
+          }
+          listeners[eventType].add(listener);
+          return function() {
+            listeners[eventType].delete(listener);
+          };
+        },
+        ready: ready,
+        query: function(request) {
+          return call('query', { request: request || null });
+        },
+        removeFiltered: function(selection) {
+          return call('removeFiltered', { selection: selection || 'included' });
+        },
+        reset: function() {
+          return call("reset");
+        },
+        runtimeInfo: function() {
+          return call("runtimeInfo");
+        },
+        snapshot: function(filters) {
+          return call("snapshot", { filters: filters || null });
+        },
+        rows: function(query) {
+          return call("rows", { query: query || null });
+        },
+        updateFilters: function(filters) {
+          return call("updateFilters", { filters: filters || null });
+        },
+        workerRuntime: initPayload.runtime
+      };
+    }).catch(function(error) {
+      disposed = true;
+      worker.terminate();
+      cleanupWorker();
+      throw error;
+    });
+  }
+
   // constants
   var REMOVED_INDEX = -1;
 
@@ -664,8 +3090,20 @@
   crossfilter.fromArrowTable = function(table, options) {
     return crossfilter(rowsFromArrowTable(table, options));
   };
+  crossfilter.configureRuntime = configureWasmRuntime;
+  crossfilter.runtimeInfo = getWasmRuntimeInfo;
+  crossfilter.createDashboardRuntime = function(options) {
+    return createDashboardRuntime(crossfilter, options);
+  };
+  crossfilter.createDashboardWorker = function(options) {
+    return createDashboardWorker(options);
+  };
+  crossfilter.createStreamingDashboardWorker = function(options) {
+    return createStreamingDashboardWorker(options);
+  };
 
   function crossfilter() {
+    var runtimeController = createWasmRuntimeController();
     var crossfilter = {
       add: add,
       remove: removeData,
@@ -675,7 +3113,9 @@
       all: all,
       allFiltered: allFiltered,
       onChange: onChange,
-      isElementFiltered: isElementFiltered
+      isElementFiltered: isElementFiltered,
+      configureRuntime: runtimeController.configureRuntime,
+      runtimeInfo: runtimeController.runtimeInfo
     };
 
     var data = [], // the records
@@ -685,7 +3125,8 @@
         dataListeners = [], // when data is added
         removeDataListeners = [], // when data is removed
         callbacks = [],
-        columnarBatches = [];
+        columnarBatches = [],
+        activeDimensionFilterCount = 0;
 
     filters = new xfilterArray.bitarray(0);
 
@@ -714,6 +3155,7 @@
 
       columnarBatches.push({
         batch: batch,
+        accessors: batch.accessorsByField,
         columns: batch.columns,
         start: n0,
         end: n0 + n1
@@ -721,6 +3163,13 @@
     }
 
     function findColumnarBatch(rowIndex) {
+      if (columnarBatches.length === 1) {
+        var onlyBatch = columnarBatches[0];
+        return rowIndex >= onlyBatch.start && rowIndex < onlyBatch.end
+          ? onlyBatch
+          : null;
+      }
+
       var lo = 0,
           hi = columnarBatches.length;
 
@@ -735,18 +3184,31 @@
       return null;
     }
 
+    function hasAnyActiveDimensionFilters() {
+      return activeDimensionFilterCount > 0;
+    }
+
     function getRecord(rowIndex) {
       var row = data[rowIndex];
-      if (row !== undefined || rowIndex in data) {
+      if (row !== undefined) {
         return row;
+      }
+
+      if (!columnarBatches.length) {
+        return rowIndex in data ? row : undefined;
       }
 
       var batch = findColumnarBatch(rowIndex);
       if (!batch) {
-        return row;
+        return rowIndex in data ? row : undefined;
       }
 
-      row = materializeColumnarRow(batch.batch, rowIndex - batch.start);
+      var batchRowIndex = rowIndex - batch.start;
+      if (batch.batch.materialized && batch.batch.materialized[batchRowIndex]) {
+        row = batch.batch.rows[batchRowIndex];
+      } else {
+        row = materializeColumnarRow(batch.batch, batchRowIndex);
+      }
       data[rowIndex] = row;
       return row;
     }
@@ -804,9 +3266,14 @@
 
         var segmentStart = Math.max(cursor, batch.start),
             segmentEnd = Math.min(batch.end, end),
+            accessor = batch.accessors && batch.accessors[field],
             column = batch.columns[field];
 
-        if (column != null) {
+        if (accessor) {
+          for (var valueIndex = segmentStart; valueIndex < segmentEnd; ++valueIndex) {
+            values[targetOffset++] = accessor(valueIndex - batch.start);
+          }
+        } else if (column != null) {
           for (var valueIndex = segmentStart; valueIndex < segmentEnd; ++valueIndex) {
             values[targetOffset++] = getColumnValue(column, valueIndex - batch.start);
           }
@@ -822,6 +3289,41 @@
       }
 
       return values;
+    }
+
+    function findSingleColumnAccessorSegment(field, start, count) {
+      if (!count || !columnarBatches.length) {
+        return null;
+      }
+
+      var end = start + count;
+
+      for (var batchIndex = 0; batchIndex < columnarBatches.length; ++batchIndex) {
+        var batch = columnarBatches[batchIndex];
+
+        if (batch.end <= start) {
+          continue;
+        }
+
+        if (batch.start > start) {
+          return null;
+        }
+
+        if (batch.end < end) {
+          return null;
+        }
+
+        if (!batch.accessors || !batch.accessors[field]) {
+          return null;
+        }
+
+        return {
+          accessor: batch.accessors[field],
+          offset: start - batch.start
+        };
+      }
+
+      return null;
     }
 
     // Adds the specified new records to this crossfilter.
@@ -948,8 +3450,8 @@
           iterablesEmptyRows = [],
           sortRange = function(n) {
             return cr_range(n).sort(function(A, B) {
-              var a = newValues[A], b = newValues[B];
-              return a < b ? -1 : a > b ? 1 : A - B;
+              var order = compareNaturalOrder(newValues[A], newValues[B]);
+              return order || A - B;
             });
           },
           refilter = xfilterFilter.filterAll, // for recomputing filter
@@ -959,6 +3461,7 @@
           filterMode = 'all',
           filterInValues = null,
           exactRangeCache = new Map(),
+          lazyEncodedState = null,
           indexListeners = [], // when data is added
           dimensionGroups = [],
           lo0 = 0,
@@ -968,10 +3471,573 @@
 
       function normalizeExactFilterValues(filterValues) {
         var uniqueValues = Array.from(new Set(filterValues));
-        uniqueValues.sort(function(a, b) {
-          return a < b ? -1 : a > b ? 1 : 0;
-        });
+        uniqueValues.sort(compareNaturalOrder);
         return uniqueValues;
+      }
+
+      function isLazyEncodedValue(valueToEncode) {
+        var valueType = typeof valueToEncode;
+        return valueToEncode == null
+          || valueType === 'string'
+          || valueType === 'number'
+          || valueType === 'boolean'
+          || valueType === 'bigint';
+      }
+
+      function createLazyEncodedState(sourceValues) {
+        if (!accessorPath || iterable || !runtimeController.canUseWasmScan()) {
+          return null;
+        }
+
+        var codes = new Uint32Array(sourceValues.length),
+            valueToCode = new Map(),
+            codeToValue = [undefined],
+            i,
+            valueToEncode,
+            code;
+
+        for (i = 0; i < sourceValues.length; ++i) {
+          valueToEncode = sourceValues[i];
+          if (!isLazyEncodedValue(valueToEncode)) {
+            return null;
+          }
+          if (!valueToCode.has(valueToEncode)) {
+            code = codeToValue.length;
+            valueToCode.set(valueToEncode, code);
+            codeToValue.push(valueToEncode);
+          }
+          codes[i] = valueToCode.get(valueToEncode);
+        }
+
+        return {
+          codeCounts: buildCodeCounts(codes, codeToValue.length),
+          codeToValue: codeToValue,
+          codes: codes,
+          matchIndices: null,
+          selected: null,
+          selectionMarkVersion: 1,
+          selectionMarks: new Uint32Array(codeToValue.length),
+          valueToCode: valueToCode
+        };
+      }
+
+      function createLazyEncodedStateFromAccessor(accessor, offset, length) {
+        if (!accessorPath || iterable || !runtimeController.canUseWasmScan()) {
+          return null;
+        }
+
+        var codes = new Uint32Array(length),
+            valueToCode = new Map(),
+            codeToValue = [undefined],
+            i,
+            valueToEncode,
+            code;
+
+        for (i = 0; i < length; ++i) {
+          valueToEncode = accessor(offset + i);
+          if (!isLazyEncodedValue(valueToEncode)) {
+            return null;
+          }
+          if (!valueToCode.has(valueToEncode)) {
+            code = codeToValue.length;
+            valueToCode.set(valueToEncode, code);
+            codeToValue.push(valueToEncode);
+          }
+          codes[i] = valueToCode.get(valueToEncode);
+        }
+
+        return {
+          codeCounts: buildCodeCounts(codes, codeToValue.length),
+          codeToValue: codeToValue,
+          codes: codes,
+          matchIndices: null,
+          selected: null,
+          selectionMarkVersion: 1,
+          selectionMarks: new Uint32Array(codeToValue.length),
+          valueToCode: valueToCode
+        };
+      }
+
+      function ensureLazySelectionMarksSize(size) {
+        if (lazyEncodedState.selectionMarks.length >= size) {
+          return;
+        }
+
+        var nextMarks = new Uint32Array(size);
+        nextMarks.set(lazyEncodedState.selectionMarks);
+        lazyEncodedState.selectionMarks = nextMarks;
+      }
+
+      function appendLazyEncodedValues(sourceValues) {
+        if (!lazyEncodedState) {
+          return null;
+        }
+
+        var existingCodes = lazyEncodedState.codes,
+            appendedCodes = new Uint32Array(sourceValues.length),
+            nextCodes = new Uint32Array(existingCodes.length + sourceValues.length),
+            i,
+            valueToEncode,
+            code;
+
+        nextCodes.set(existingCodes);
+
+        for (i = 0; i < sourceValues.length; ++i) {
+          valueToEncode = sourceValues[i];
+          if (!isLazyEncodedValue(valueToEncode)) {
+            return null;
+          }
+          if (!lazyEncodedState.valueToCode.has(valueToEncode)) {
+            code = lazyEncodedState.codeToValue.length;
+            lazyEncodedState.valueToCode.set(valueToEncode, code);
+            lazyEncodedState.codeToValue.push(valueToEncode);
+          }
+          appendedCodes[i] = lazyEncodedState.valueToCode.get(valueToEncode);
+          nextCodes[existingCodes.length + i] = appendedCodes[i];
+        }
+
+        lazyEncodedState.codes = nextCodes;
+        lazyEncodedState.codeCounts = buildCodeCounts(nextCodes, lazyEncodedState.codeToValue.length);
+        ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
+        return appendedCodes;
+      }
+
+      function appendLazyEncodedValuesFromAccessor(accessor, offset, length) {
+        if (!lazyEncodedState) {
+          return null;
+        }
+
+        var existingCodes = lazyEncodedState.codes,
+            appendedCodes = new Uint32Array(length),
+            nextCodes = new Uint32Array(existingCodes.length + length),
+            i,
+            valueToEncode,
+            code;
+
+        nextCodes.set(existingCodes);
+
+        for (i = 0; i < length; ++i) {
+          valueToEncode = accessor(offset + i);
+          if (!isLazyEncodedValue(valueToEncode)) {
+            return null;
+          }
+          if (!lazyEncodedState.valueToCode.has(valueToEncode)) {
+            code = lazyEncodedState.codeToValue.length;
+            lazyEncodedState.valueToCode.set(valueToEncode, code);
+            lazyEncodedState.codeToValue.push(valueToEncode);
+          }
+          appendedCodes[i] = lazyEncodedState.valueToCode.get(valueToEncode);
+          nextCodes[existingCodes.length + i] = appendedCodes[i];
+        }
+
+        lazyEncodedState.codes = nextCodes;
+        lazyEncodedState.codeCounts = buildCodeCounts(nextCodes, lazyEncodedState.codeToValue.length);
+        ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
+        return appendedCodes;
+      }
+
+      function buildCodeCounts(codes, size) {
+        var codeCounts = new Uint32Array(size);
+        for (var codeIndex = 0; codeIndex < codes.length; ++codeIndex) {
+          ++codeCounts[codes[codeIndex]];
+        }
+        return codeCounts;
+      }
+
+      function lazyCodesSelectAllRows(targetCodes) {
+        if (!lazyEncodedState || !targetCodes || !targetCodes.length) {
+          return false;
+        }
+
+        var selectedCount = 0;
+        for (var codeIndex = 0; codeIndex < targetCodes.length; ++codeIndex) {
+          selectedCount += lazyEncodedState.codeCounts[targetCodes[codeIndex]] || 0;
+        }
+        return selectedCount === n;
+      }
+
+      function normalizeLazySelectionMask(selection) {
+        if (!selection) {
+          return null;
+        }
+
+        for (var i = 0; i < selection.length; ++i) {
+          if (!selection[i]) {
+            return selection;
+          }
+        }
+
+        return null;
+      }
+
+      function normalizeLazyMatchIndices(matches) {
+        if (!matches || matches.length === n) {
+          return null;
+        }
+        return matches;
+      }
+
+      function createLazySelectionFromMatches(matches) {
+        if (!matches || matches.length === n) {
+          return null;
+        }
+
+        var selection = new Uint8Array(n);
+        for (var i = 0; i < matches.length; ++i) {
+          selection[matches[i]] = 1;
+        }
+        return selection;
+      }
+
+      function ensureLazySelection(currentMatches, currentSelected) {
+        return currentSelected || createLazySelectionFromMatches(currentMatches);
+      }
+
+      function encodeLazyFilterValues(filterValues) {
+        if (!lazyEncodedState) {
+          return null;
+        }
+
+        var encodedValues = new Uint32Array(filterValues.length),
+            count = 0,
+            i,
+            markVersion,
+            selectionMarks,
+            valueToEncode,
+            code;
+
+        ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
+        selectionMarks = lazyEncodedState.selectionMarks;
+        if (lazyEncodedState.selectionMarkVersion === 0xffffffff) {
+          selectionMarks.fill(0);
+          lazyEncodedState.selectionMarkVersion = 1;
+        }
+        markVersion = lazyEncodedState.selectionMarkVersion++;
+
+        for (i = 0; i < filterValues.length; ++i) {
+          valueToEncode = filterValues[i];
+          if (!isLazyEncodedValue(valueToEncode)) {
+            return null;
+          }
+          code = lazyEncodedState.valueToCode.get(valueToEncode);
+          if (code === undefined || selectionMarks[code] === markVersion) {
+            continue;
+          }
+          selectionMarks[code] = markVersion;
+          encodedValues[count++] = code;
+        }
+
+        return encodedValues.slice(0, count);
+      }
+
+      function applyLazySelectionState(nextMatches) {
+        var notifyListeners = filterListeners.length > 0,
+            added = notifyListeners ? [] : null,
+            removed = notifyListeners ? [] : null,
+            currentSelected = lazyEncodedState.selected,
+            currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
+            currentIndex,
+            nextIndex,
+            currentValue,
+            nextValue,
+            i,
+            isSelected,
+            nextSelected,
+            wasSelected;
+
+        nextMatches = normalizeLazyMatchIndices(nextMatches);
+
+        if (!currentMatches && !nextMatches) {
+          lazyEncodedState.selected = null;
+          lazyEncodedState.matchIndices = null;
+          return dimension;
+        }
+
+        if (currentMatches && nextMatches) {
+          currentSelected = ensureLazySelection(currentMatches, currentSelected);
+          currentIndex = 0;
+          nextIndex = 0;
+
+          while (currentIndex < currentMatches.length || nextIndex < nextMatches.length) {
+            currentValue = currentIndex < currentMatches.length ? currentMatches[currentIndex] : n;
+            nextValue = nextIndex < nextMatches.length ? nextMatches[nextIndex] : n;
+
+            if (currentValue === nextValue) {
+              ++currentIndex;
+              ++nextIndex;
+              continue;
+            }
+
+            if (currentValue < nextValue) {
+              if (!(filters[offset][currentValue] & one)) {
+                filters[offset][currentValue] |= one;
+              }
+              currentSelected[currentValue] = 0;
+              if (notifyListeners) {
+                removed.push(currentValue);
+              }
+              ++currentIndex;
+              continue;
+            }
+
+            if (filters[offset][nextValue] & one) {
+              filters[offset][nextValue] &= zero;
+            }
+            currentSelected[nextValue] = 1;
+            if (notifyListeners) {
+              added.push(nextValue);
+            }
+            ++nextIndex;
+          }
+
+          lazyEncodedState.selected = normalizeLazySelectionMask(currentSelected);
+          lazyEncodedState.matchIndices = nextMatches;
+          if (notifyListeners) {
+            filterListeners.forEach(function(l) { l(one, offset, added, removed); });
+          }
+          triggerOnChange('filtered');
+          return dimension;
+        }
+
+        nextSelected = createLazySelectionFromMatches(nextMatches);
+        currentSelected = ensureLazySelection(currentMatches, currentSelected);
+
+        if (!currentSelected && !nextSelected) {
+          lazyEncodedState.selected = null;
+          lazyEncodedState.matchIndices = null;
+          return dimension;
+        }
+
+        for (i = 0; i < n; ++i) {
+          wasSelected = currentSelected ? currentSelected[i] === 1 : true;
+          isSelected = nextSelected ? nextSelected[i] === 1 : true;
+          if (wasSelected === isSelected) {
+            continue;
+          }
+          if (isSelected) {
+            if (filters[offset][i] & one) {
+              filters[offset][i] &= zero;
+            }
+            if (notifyListeners) {
+              added.push(i);
+            }
+          } else {
+            if (!(filters[offset][i] & one)) {
+              filters[offset][i] |= one;
+            }
+            if (notifyListeners) {
+              removed.push(i);
+            }
+          }
+        }
+
+        lazyEncodedState.selected = nextSelected;
+        lazyEncodedState.matchIndices = nextMatches;
+        if (notifyListeners) {
+          filterListeners.forEach(function(l) { l(one, offset, added, removed); });
+        }
+        triggerOnChange('filtered');
+        return dimension;
+      }
+
+      function applyLazyEncodedFilter(targetCodes, nextMode) {
+        var matches;
+
+        if (lazyCodesSelectAllRows(targetCodes)) {
+          filterMode = nextMode;
+          lo0 = 0;
+          hi0 = 0;
+          return applyLazySelectionState(null);
+        }
+
+        matches = runtimeController.findEncodedMatches(lazyEncodedState.codes, targetCodes);
+
+        filterMode = nextMode;
+        lo0 = 0;
+        hi0 = 0;
+
+        return applyLazySelectionState(matches);
+      }
+
+      function resolveLazyTargetCodes() {
+        if (!lazyEncodedState || !filterValuePresent || filterMode === 'all') {
+          return new Uint32Array(0);
+        }
+
+        if (filterMode === 'in') {
+          return encodeLazyFilterValues(filterInValues || []);
+        }
+
+        return encodeLazyFilterValues([filterValue]);
+      }
+
+      function concatLazyMatchIndices(currentMatches, appendedMatches) {
+        if (!currentMatches || !currentMatches.length) {
+          return appendedMatches;
+        }
+        if (!appendedMatches || !appendedMatches.length) {
+          return currentMatches;
+        }
+
+        var nextMatches = new Uint32Array(currentMatches.length + appendedMatches.length);
+        nextMatches.set(currentMatches);
+        nextMatches.set(appendedMatches, currentMatches.length);
+        return nextMatches;
+      }
+
+      function applyLazyFilterToNewRows(n0, appendedCodes) {
+        var currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
+            currentSelected,
+            nextMatches,
+            nextSelected,
+            matches,
+            i,
+            rowIndex,
+            targetCodes;
+
+        if (!currentMatches) {
+          return;
+        }
+
+        targetCodes = resolveLazyTargetCodes();
+        if (!targetCodes) {
+          materializeLazyEncodedState();
+          return;
+        }
+
+        currentSelected = ensureLazySelection(currentMatches, lazyEncodedState.selected);
+        nextSelected = new Uint8Array(n);
+        nextSelected.set(currentSelected);
+        matches = runtimeController.findEncodedMatches(appendedCodes, targetCodes);
+        nextMatches = new Uint32Array(matches.length);
+
+        for (i = 0; i < matches.length; ++i) {
+          rowIndex = n0 + matches[i];
+          nextSelected[rowIndex] = 1;
+          nextMatches[i] = rowIndex;
+        }
+
+        for (rowIndex = n0; rowIndex < n; ++rowIndex) {
+          if (!nextSelected[rowIndex]) {
+            filters[offset][rowIndex] |= one;
+          }
+        }
+
+        lazyEncodedState.matchIndices = normalizeLazyMatchIndices(concatLazyMatchIndices(currentMatches, nextMatches));
+        lazyEncodedState.selected = normalizeLazySelectionMask(nextSelected);
+      }
+
+      function compactLazyEncodedState(reIndex) {
+        var currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
+            nextLength = 0,
+            i,
+            nextCodes,
+            nextMatchCount = 0,
+            nextMatchIndices = currentMatches ? new Uint32Array(currentMatches.length) : null,
+            nextSelected = lazyEncodedState.selected ? new Uint8Array(reIndex.length) : null,
+            rowIndex;
+
+        for (i = 0; i < reIndex.length; ++i) {
+          if (reIndex[i] !== REMOVED_INDEX) {
+            ++nextLength;
+          }
+        }
+
+        nextCodes = new Uint32Array(nextLength);
+        if (nextSelected) {
+          nextSelected = new Uint8Array(nextLength);
+        }
+
+        for (i = 0, rowIndex = 0; i < reIndex.length; ++i) {
+          if (reIndex[i] === REMOVED_INDEX) {
+            continue;
+          }
+          nextCodes[rowIndex] = lazyEncodedState.codes[i];
+          if (nextSelected && lazyEncodedState.selected[i]) {
+            nextSelected[rowIndex] = 1;
+          }
+          ++rowIndex;
+        }
+
+        if (nextMatchIndices) {
+          for (i = 0; i < currentMatches.length; ++i) {
+            rowIndex = reIndex[currentMatches[i]];
+            if (rowIndex === REMOVED_INDEX) {
+              continue;
+            }
+            nextMatchIndices[nextMatchCount++] = rowIndex;
+          }
+          nextMatchIndices = normalizeLazyMatchIndices(nextMatchIndices.slice(0, nextMatchCount));
+        }
+
+        lazyEncodedState.codes = nextCodes;
+        lazyEncodedState.matchIndices = nextMatchIndices;
+        lazyEncodedState.selected = normalizeLazySelectionMask(nextSelected);
+        lo0 = 0;
+        hi0 = 0;
+      }
+
+      function materializeLazyEncodedState() {
+        if (!lazyEncodedState || values) {
+          return;
+        }
+
+        var materializedValues = new Array(lazyEncodedState.codes.length),
+            bounds,
+            i,
+            ranges;
+
+        for (i = 0; i < materializedValues.length; ++i) {
+          materializedValues[i] = lazyEncodedState.codeToValue[lazyEncodedState.codes[i]];
+        }
+
+        newValues = materializedValues;
+        newIndex = sortRange(materializedValues.length);
+        values = permute(newValues, newIndex);
+        index = newIndex;
+        newValues = newIndex = null;
+        exactRangeCache.clear();
+
+        if (filterMode === 'in') {
+          ranges = exactRanges(filterInValues || []);
+          lo0 = ranges.length ? ranges[0][0] : 0;
+          hi0 = ranges.length ? ranges[ranges.length - 1][1] : 0;
+        } else {
+          bounds = refilter(values);
+          lo0 = bounds[0];
+          hi0 = bounds[1];
+        }
+
+        lazyEncodedState = null;
+      }
+
+      function hasLazyEncodedGroupingSupport() {
+        if (!lazyEncodedState || values || iterable) {
+          return false;
+        }
+
+        for (var code = 1; code < lazyEncodedState.codeToValue.length; ++code) {
+          var encodedValue = lazyEncodedState.codeToValue[code];
+          if (encodedValue === undefined || !(encodedValue >= encodedValue)) {
+            return false;
+          }
+        }
+
+        return true;
+      }
+
+      function setFilterValuePresent(nextPresent) {
+        var currentPresent = filterValuePresent === true;
+        nextPresent = !!nextPresent;
+        if (currentPresent === nextPresent) {
+          return;
+        }
+        activeDimensionFilterCount += nextPresent ? 1 : -1;
+        filterValuePresent = nextPresent;
+      }
+
+      function hasOtherActiveDimensionFilters() {
+        return activeDimensionFilterCount > (filterValuePresent ? 1 : 0);
       }
 
       function getExactRange(value) {
@@ -1182,15 +4248,57 @@
       // This function is responsible for updating filters, values, and index.
       function preAdd(newData, n0, n1) {
         var newIterablesIndexCount,
-            sourceValues = accessorPath ? extractColumnValues(accessorPath, n0, n1) : null,
+            sourceValues = null,
+            columnAccessorSegment = accessorPath && !iterable && runtimeController.canUseWasmScan()
+              ? findSingleColumnAccessorSegment(accessorPath, n0, n1)
+              : null,
             useStoredRecords = !accessorPath && newData === data && columnarBatches.length,
             newIterablesIndexFilterStatus;
+
+        function ensureSourceValues() {
+          if (!accessorPath) {
+            return null;
+          }
+          if (!sourceValues) {
+            sourceValues = extractColumnValues(accessorPath, n0, n1);
+          }
+          return sourceValues;
+        }
 
         function getSourceRecord(localIndex) {
           return useStoredRecords ? getRecord(n0 + localIndex) : newData[localIndex];
         }
 
+        if (!iterable && accessorPath) {
+          if (lazyEncodedState && !values && indexListeners.length) {
+            materializeLazyEncodedState();
+          }
+
+          if (!n0 && !values) {
+            lazyEncodedState = columnAccessorSegment
+              ? createLazyEncodedStateFromAccessor(columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+              : createLazyEncodedState(ensureSourceValues());
+            if (lazyEncodedState) {
+              lo0 = 0;
+              hi0 = 0;
+              return;
+            }
+          } else if (lazyEncodedState && !values) {
+            var appendedCodes = columnAccessorSegment
+              ? appendLazyEncodedValuesFromAccessor(columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+              : appendLazyEncodedValues(ensureSourceValues());
+            if (appendedCodes) {
+              applyLazyFilterToNewRows(n0, appendedCodes);
+              lo0 = 0;
+              hi0 = 0;
+              return;
+            }
+            materializeLazyEncodedState();
+          }
+        }
+
         if (iterable){
+          sourceValues = ensureSourceValues();
           // Count all the values
           t = 0;
           j = 0;
@@ -1236,6 +4344,7 @@
 
         } else {
           // Permute new values into natural order using a standard sorted index.
+          sourceValues = ensureSourceValues();
           if (sourceValues) {
             newValues = sourceValues;
           } else if (useStoredRecords) {
@@ -1342,7 +4451,7 @@
         // Merge the old and new sorted values, and old and new index.
         var index5 = 0;
         for (; i0 < n0 && i1 < n1; ++index5) {
-          if (oldValues[i0] < newValues[i1]) {
+          if (compareNaturalOrder(oldValues[i0], newValues[i1]) < 0) {
             values[index5] = oldValues[i0];
             if(iterable) iterablesIndexFilterStatus[index5] = oldIterablesIndexFilterStatus[i0];
             index[index5] = oldIndex[i0++];
@@ -1379,6 +4488,11 @@
       }
 
       function removeData(reIndex) {
+        if (lazyEncodedState && !values) {
+          compactLazyEncodedState(reIndex);
+          return;
+        }
+
         if (iterable) {
           for (var i0 = 0, i1 = 0; i0 < iterablesEmptyRows.length; i0++) {
             if (reIndex[iterablesEmptyRows[i0]] !== REMOVED_INDEX) {
@@ -1503,14 +4617,44 @@
 
       // Filters this dimension to select the exact value.
       function filterExact(value) {
+        if (lazyEncodedState && !values) {
+          var exactCodes = encodeLazyFilterValues([value]);
+          if (exactCodes) {
+            filterValue = value;
+            setFilterValuePresent(true);
+            refilter = xfilterFilter.filterExact(bisect, value);
+            refilterFunction = null;
+            filterInValues = null;
+            return applyLazyEncodedFilter(exactCodes, 'bounds');
+          }
+          materializeLazyEncodedState();
+        }
+
         filterValue = value;
-        filterValuePresent = true;
+        setFilterValuePresent(true);
         refilter = xfilterFilter.filterExact(bisect, value);
         var range = getExactRange(value);
         return filterIndexBounds(range || [0, 0], false, 'bounds');
       }
 
       function filterIn(valuesToSelect) {
+        if (lazyEncodedState && !values) {
+          var lazyExactFilterValues = normalizeExactFilterValues(valuesToSelect),
+              lazyEncodedValues = encodeLazyFilterValues(lazyExactFilterValues);
+
+          if (lazyEncodedValues) {
+            filterValue = valuesToSelect;
+            setFilterValuePresent(true);
+            refilter = xfilterFilter.filterAll;
+            refilterFunction = null;
+            filterMode = 'in';
+            filterInValues = lazyExactFilterValues;
+            return applyLazyEncodedFilter(lazyEncodedValues, 'in');
+          }
+
+          materializeLazyEncodedState();
+        }
+
         var exactFilterValues = normalizeExactFilterValues(valuesToSelect),
             nextRanges = exactRanges(exactFilterValues),
             previousRanges = resolveCurrentRanges(),
@@ -1518,7 +4662,7 @@
             predicate = function(d) { return selectedValues.has(d); };
 
         filterValue = valuesToSelect;
-        filterValuePresent = true;
+        setFilterValuePresent(true);
         refilter = xfilterFilter.filterAll;
         refilterFunction = predicate;
         filterMode = 'in';
@@ -1537,15 +4681,28 @@
       // Filters this dimension to select the specified range [lo, hi].
       // The lower bound is inclusive, and the upper bound is exclusive.
       function filterRange(range) {
+        if (lazyEncodedState && !values) {
+          materializeLazyEncodedState();
+        }
+
         filterValue = range;
-        filterValuePresent = true;
+        setFilterValuePresent(true);
         return filterIndexBounds((refilter = xfilterFilter.filterRange(bisect, range))(values), false, 'bounds');
       }
 
       // Clears any filters on this dimension.
       function filterAll() {
+        if (lazyEncodedState && !values) {
+          filterValue = undefined;
+          setFilterValuePresent(false);
+          refilter = xfilterFilter.filterAll;
+          refilterFunction = null;
+          filterInValues = null;
+          return applyLazySelectionState(null);
+        }
+
         filterValue = undefined;
-        filterValuePresent = false;
+        setFilterValuePresent(false);
         refilter = xfilterFilter.filterAll;
 
         return filterIndexBounds((refilter = xfilterFilter.filterAll)(values), true, 'all');
@@ -1553,8 +4710,12 @@
 
       // Filters this dimension using an arbitrary function.
       function filterFunction(f) {
+        if (lazyEncodedState && !values) {
+          materializeLazyEncodedState();
+        }
+
         filterValue = f;
-        filterValuePresent = true;
+        setFilterValuePresent(true);
 
         refilterFunction = f;
         refilter = xfilterFilter.filterAll;
@@ -1674,6 +4835,8 @@
       // Returns the top K selected records based on this dimension's order.
       // Note: observes this dimension's filter, unlike group and groupAll.
       function top(k, top_offset) {
+        materializeLazyEncodedState();
+
         var array = [],
             i = hi0,
             j,
@@ -1714,6 +4877,8 @@
       // Returns the bottom K selected records based on this dimension's order.
       // Note: observes this dimension's filter, unlike group and groupAll.
       function bottom(k, bottom_offset) {
+        materializeLazyEncodedState();
+
         var array = [],
             i,
             j,
@@ -1756,6 +4921,13 @@
 
       // Adds a new group to this dimension, using the specified key function.
       function group(key) {
+        if (arguments.length < 1) key = cr_identity;
+
+        var useLazyEncodedGrouping = key === cr_identity && hasLazyEncodedGroupingSupport();
+        if (!useLazyEncodedGrouping) {
+          materializeLazyEncodedState();
+        }
+
         var group = {
           top: top,
           all: all,
@@ -1788,8 +4960,6 @@
             groupAll = key === cr_null,
             n0old;
 
-        if (arguments.length < 1) key = cr_identity;
-
         // The group listens to the crossfilter for when any dimension changes, so
         // that it can update the associated reduce values. It must also listen to
         // the parent dimension for when data is added, and compute new keys.
@@ -1803,6 +4973,80 @@
         // Incorporates the specified new values into this group.
         // This function is responsible for updating groups and groupIndex.
         function add(newValues, newIndex, n0, n1) {
+
+          if (useLazyEncodedGrouping && lazyEncodedState && !values) {
+            var codeToValue = lazyEncodedState.codeToValue,
+                codes = lazyEncodedState.codes,
+                sortedCodes = [],
+                codeToGroup,
+                initialValue = resetNeeded ? cr_null : reduceInitial,
+                rowIndex,
+                encodedCode,
+                sortIndex;
+
+            groups = [];
+            k = 0;
+
+            for (var code = 1; code < codeToValue.length; ++code) {
+              if (!isNaturallyOrderable(codeToValue[code])) {
+                continue;
+              }
+              sortedCodes.push(code);
+            }
+
+            sortedCodes.sort(function(a, b) {
+              var valueA = codeToValue[a],
+                  valueB = codeToValue[b];
+              var order = compareNaturalOrder(valueA, valueB);
+              return order || a - b;
+            });
+
+            if (!sortedCodes.length && groupAll) {
+              k = 1;
+              groups = [{key: null, value: initialValue()}];
+              groupIndex = null;
+            } else {
+              while (sortedCodes.length > groupCapacity) {
+                groupWidth <<= 1;
+                groupCapacity = capacity(groupWidth);
+              }
+
+              codeToGroup = new Array(codeToValue.length);
+
+              for (sortIndex = 0; sortIndex < sortedCodes.length; ++sortIndex) {
+                encodedCode = sortedCodes[sortIndex];
+                groups[sortIndex] = {key: codeToValue[encodedCode], value: initialValue()};
+                codeToGroup[encodedCode] = sortIndex;
+              }
+
+              k = groups.length;
+              groupIndex = k > 1 ? cr_index(n, groupCapacity) : null;
+
+              if (groupIndex) {
+                for (rowIndex = 0; rowIndex < n; ++rowIndex) {
+                  groupIndex[rowIndex] = codeToGroup[codes[rowIndex]];
+                }
+              }
+            }
+
+            resetNeeded = true;
+
+            var listenerIndex = filterListeners.indexOf(update);
+            if (k > 1) {
+              update = updateMany;
+              reset = resetMany;
+            } else if (k === 1) {
+              update = updateOne;
+              reset = resetOne;
+              groupIndex = null;
+            } else {
+              update = cr_null;
+              reset = cr_null;
+              groupIndex = null;
+            }
+            filterListeners[listenerIndex] = update;
+            return;
+          }
 
           if(iterable) {
             n0old = n0;
@@ -1844,14 +5088,14 @@
           if (k0) x0 = (g0 = oldGroups[0]).key;
 
           // Find the first new key (x1), skipping NaN keys.
-          while (i1 < n1 && !((x1 = key(newValues[i1])) >= x1)) ++i1;
+          while (i1 < n1 && !isNaturallyOrderable(x1 = key(newValues[i1]))) ++i1;
 
           // While new keys remain…
           while (i1 < n1) {
 
             // Determine the lesser of the two current keys; new and old.
             // If there are no old keys remaining, then always add the new key.
-            if (g0 && x0 <= x1) {
+            if (g0 && compareNaturalOrder(x0, x1) <= 0) {
               g = g0, x = x0;
 
               // Record the new index of the old group.
@@ -1870,7 +5114,7 @@
             // Add any selected records belonging to the added group, while
             // advancing the new key and populating the associated group index.
 
-            while (x1 <= x) {
+            while (compareNaturalOrder(x1, x) <= 0) {
               j = newIndex[i1] + (iterable ? n0old : n0);
 
 
@@ -1886,10 +5130,11 @@
                 groupIndex[j] = k;
               }
 
-              // Always add new values to groups. Only remove when not in filter.
-              // This gives groups full information on data life-cycle.
-              g.value = add(g.value, getRecord(j), true);
-              if (!filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, getRecord(j), false);
+              // Always add new values to groups. Only remove when another dimension has filtered them out.
+              // This gives groups full information on data life-cycle without paying for no-op filter checks.
+              var rowRecord = getRecord(j);
+              g.value = add(g.value, rowRecord, true);
+              if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, rowRecord, false);
               if (++i1 >= n1) break;
               x1 = key(newValues[i1]);
             }
@@ -2125,7 +5370,8 @@
         function resetMany() {
           var i,
               j,
-              g;
+              g,
+              applyFilteredRemovals = hasOtherActiveDimensionFilters();
 
           // Reset all group values.
           for (i = 0; i < k; ++i) {
@@ -2137,16 +5383,21 @@
           // place on other dimensions.
           if(iterable){
             for (i = 0; i < n; ++i) {
+              var iterableRecord = getRecord(i);
               for (j = 0; j < groupIndex[i].length; j++) {
                 g = groups[groupIndex[i][j]];
-                g.value = reduceAdd(g.value, getRecord(i), true, j);
+                g.value = reduceAdd(g.value, iterableRecord, true, j);
               }
+            }
+            if (!applyFilteredRemovals) {
+              return;
             }
             for (i = 0; i < n; ++i) {
               if (!filters.zeroExcept(i, offset, zero)) {
+                iterableRecord = getRecord(i);
                 for (j = 0; j < groupIndex[i].length; j++) {
                   g = groups[groupIndex[i][j]];
-                  g.value = reduceRemove(g.value, getRecord(i), false, j);
+                  g.value = reduceRemove(g.value, iterableRecord, false, j);
                 }
               }
             }
@@ -2156,6 +5407,9 @@
           for (i = 0; i < n; ++i) {
             g = groups[groupIndex[i]];
             g.value = reduceAdd(g.value, getRecord(i), true);
+          }
+          if (!applyFilteredRemovals) {
+            return;
           }
           for (i = 0; i < n; ++i) {
             if (!filters.zeroExcept(i, offset, zero)) {
@@ -2169,6 +5423,7 @@
         // This function is only used when the cardinality is 1.
         function resetOne() {
           var i,
+              applyFilteredRemovals = hasOtherActiveDimensionFilters(),
               g = groups[0];
 
           // Reset the singleton group values.
@@ -2181,6 +5436,9 @@
             g.value = reduceAdd(g.value, getRecord(i), true);
           }
 
+          if (!applyFilteredRemovals) {
+            return;
+          }
           for (i = 0; i < n; ++i) {
             if (!filters.zeroExcept(i, offset, zero)) {
               g.value = reduceRemove(g.value, getRecord(i), false);
@@ -2311,19 +5569,21 @@
 
       // Incorporates the specified new values into this group.
       function add(newData, n0) {
-        var i;
+        var i,
+            applyFilteredRemovals = hasAnyActiveDimensionFilters();
 
         if (resetNeeded) return;
 
         // Cycle through all the values.
         for (i = n0; i < n; ++i) {
+          var rowRecord = getRecord(i);
 
           // Add all values all the time.
-          reduceValue = reduceAdd(reduceValue, getRecord(i), true);
+          reduceValue = reduceAdd(reduceValue, rowRecord, true);
 
           // Remove the value if filtered.
-          if (!filters.zero(i)) {
-            reduceValue = reduceRemove(reduceValue, getRecord(i), false);
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue = reduceRemove(reduceValue, rowRecord, false);
           }
         }
       }
@@ -2353,19 +5613,21 @@
 
       // Recomputes the group reduce value from scratch.
       function reset() {
-        var i;
+        var i,
+            applyFilteredRemovals = hasAnyActiveDimensionFilters();
 
         reduceValue = reduceInitial();
 
         // Cycle through all the values.
         for (i = 0; i < n; ++i) {
+          var rowRecord = getRecord(i);
 
           // Add all values all the time.
-          reduceValue = reduceAdd(reduceValue, getRecord(i), true);
+          reduceValue = reduceAdd(reduceValue, rowRecord, true);
 
           // Remove the value if it is filtered.
-          if (!filters.zero(i)) {
-            reduceValue = reduceRemove(reduceValue, getRecord(i), false);
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue = reduceRemove(reduceValue, rowRecord, false);
           }
         }
       }
