@@ -42,15 +42,17 @@ function cubeTimeDotField(granularity) {
 const CUBE_DIMENSIONS_LIVE = [
   'semantic_events.event',
   'semantic_events.dimensions_customer_country',
-  'semantic_events.location_country',
   'semantic_events.location_region',
   'semantic_events.location_division',
   'semantic_events.location_municipality',
   'semantic_events.location_locality',
   'semantic_events.location_postal_code',
 ];
+const CUBE_MEASURES_LIVE = ['semantic_events.count'];
+const COUNT_METRIC_ID = 'count';
 
 const FIELDS = {
+  count: 'semantic_events__count',
   customer_country: 'semantic_events__dimensions_customer_country',
   event: 'semantic_events__event',
   latitude: 'semantic_events__location_latitude',
@@ -67,6 +69,7 @@ const FIELDS = {
 };
 
 const FIELD_LABELS = {
+  count: 'Count',
   customer_country: 'Customer Country',
   event: 'Event',
   latitude: 'Latitude',
@@ -88,7 +91,6 @@ const TABLE_FIELDS = [
   FIELDS.event,
   FIELDS.customer_country,
   FIELDS.location_label,
-  FIELDS.location_country,
   FIELDS.region,
   FIELDS.division,
   FIELDS.municipality,
@@ -103,7 +105,6 @@ const TABLE_FIELDS = [
 const LIVE_TABLE_FIELDS = [
   FIELDS.event,
   FIELDS.customer_country,
-  FIELDS.location_country,
   FIELDS.region,
   FIELDS.division,
   FIELDS.municipality,
@@ -125,7 +126,6 @@ const GROUP_IDS = {
   divisions: 'divisions',
   events: 'events',
   localities: 'localities',
-  locationCountries: 'locationCountries',
   municipalities: 'municipalities',
   postalCodes: 'postalCodes',
   regions: 'regions',
@@ -135,7 +135,6 @@ const GROUP_IDS = {
 const FILTERABLE_FIELDS = [
   FIELDS.event,
   FIELDS.customer_country,
-  FIELDS.location_country,
   FIELDS.region,
   FIELDS.division,
   FIELDS.municipality,
@@ -147,7 +146,6 @@ const FILTERABLE_FIELDS = [
 
 const GROUP_FILTER_FIELDS = {
   [GROUP_IDS.customerCountries]: FIELDS.customer_country,
-  [GROUP_IDS.locationCountries]: FIELDS.location_country,
   [GROUP_IDS.regions]: FIELDS.region,
   [GROUP_IDS.divisions]: FIELDS.division,
   [GROUP_IDS.events]: FIELDS.event,
@@ -158,13 +156,13 @@ const GROUP_FILTER_FIELDS = {
 
 const GROUP_OPTION_LIMITS = {
   [GROUP_IDS.customerCountries]: 160,
-  [GROUP_IDS.locationCountries]: 160,
   [GROUP_IDS.regions]: 180,
 };
 
 const state = {
   baseTimeBounds: null,
   controlGroups: {},
+  currentLoadedCount: 0,
   currentRows: [],
   currentRowCount: 0,
   currentSnapshot: null,
@@ -204,7 +202,6 @@ const state = {
     division: null,
     event: null,
     locality: null,
-    locationCountry: null,
     municipality: null,
     postal: null,
     region: null,
@@ -221,7 +218,6 @@ function createEmptyFilterState() {
     [FIELDS.event]: [],
     [FIELDS.latitude]: null,
     [FIELDS.locality]: [],
-    [FIELDS.location_country]: [],
     [FIELDS.municipality]: [],
     [FIELDS.postal_code]: [],
     [FIELDS.region]: [],
@@ -236,7 +232,6 @@ function cacheDom() {
     chartCustomerCountry: document.getElementById('chart-customer-country'),
     chartEvent: document.getElementById('chart-event'),
     chartLocality: document.getElementById('chart-locality'),
-    chartLocationCountry: document.getElementById('chart-location-country'),
     chartMunicipality: document.getElementById('chart-municipality'),
     chartPostal: document.getElementById('chart-postal'),
     chartRegion: document.getElementById('chart-region'),
@@ -259,24 +254,16 @@ function cacheDom() {
     filterChips: document.getElementById('filter-chips'),
     granularityButtons: Array.from(document.querySelectorAll('#granularity-selector .gran-btn')),
     headerSubtitle: document.querySelector('.header-subtitle'),
-    kpiLatitude: document.getElementById('kpi-latitude'),
     kpiLocations: document.getElementById('kpi-locations'),
+    kpiRows: document.getElementById('kpi-rows'),
     kpiTimespan: document.getElementById('kpi-timespan'),
     kpiTotal: document.getElementById('kpi-total'),
     latencyDisplay: document.getElementById('latency-display'),
     loadTime: document.getElementById('load-time'),
     loadingOverlay: document.getElementById('loading-overlay'),
     loadingText: document.querySelector('.loading-text'),
-    lcGroupSize: document.getElementById('lc-group-size'),
     localitySortLabel: document.getElementById('locality-sort-label'),
     localitySortToggle: document.getElementById('locality-sort-toggle'),
-    locationCountryCount: document.getElementById('location-country-count'),
-    locationCountryDropdown: document.getElementById('location-country-dropdown'),
-    locationCountryOptions: document.getElementById('location-country-options'),
-    locationCountryPills: document.getElementById('location-country-pills'),
-    locationCountryPicker: document.getElementById('location-country-picker'),
-    locationCountrySearch: document.getElementById('location-country-search'),
-    locationCountryTrigger: document.getElementById('location-country-trigger'),
     modeSelector: document.getElementById('mode-selector'),
     locGroupSize: document.getElementById('loc-group-size'),
     muniGroupSize: document.getElementById('muni-group-size'),
@@ -472,6 +459,25 @@ function formatTimestamp(value, granularityId) {
   }
 }
 
+function normalizeCountValue(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function metricCountValue(metrics) {
+  if (!metrics) {
+    return 0;
+  }
+  if (metrics[COUNT_METRIC_ID] != null) {
+    return normalizeCountValue(metrics[COUNT_METRIC_ID]);
+  }
+  return 0;
+}
+
+function groupEntryCount(entry) {
+  return entry && entry.value ? metricCountValue(entry.value) : 0;
+}
+
 function getGranularityMeta(granularityId) {
   return TIME_GRANULARITIES.find((item) => item.id === granularityId) || TIME_GRANULARITIES[TIME_GRANULARITIES.length - 1];
 }
@@ -588,12 +594,27 @@ function getActiveTableFields() {
   return state.dataSource === 'live' ? LIVE_TABLE_FIELDS : TABLE_FIELDS;
 }
 
+function getActiveTableQueryFields() {
+  const fields = getActiveTableFields().slice();
+  if (!fields.includes(FIELDS.count)) {
+    fields.push(FIELDS.count);
+  }
+  return fields;
+}
+
+function createCountMetric() {
+  return {
+    field: FIELDS.count,
+    id: COUNT_METRIC_ID,
+    op: 'sum',
+  };
+}
+
 function getActiveRuntimeDimensions() {
   return supportsLatitudeFeatures()
     ? [
       FIELDS.event,
       FIELDS.customer_country,
-      FIELDS.location_country,
       FIELDS.region,
       FIELDS.division,
       FIELDS.municipality,
@@ -605,7 +626,6 @@ function getActiveRuntimeDimensions() {
     : [
       FIELDS.event,
       FIELDS.customer_country,
-      FIELDS.location_country,
       FIELDS.region,
       FIELDS.division,
       FIELDS.municipality,
@@ -616,14 +636,9 @@ function getActiveRuntimeDimensions() {
 }
 
 function getActiveKpiSpecs() {
-  return supportsLatitudeFeatures()
-    ? [
-      { id: 'rows', op: 'count' },
-      { field: FIELDS.latitude, id: 'avgLatitude', op: 'avgNonZero' },
-    ]
-    : [
-      { id: 'rows', op: 'count' },
-    ];
+  return [
+    createCountMetric(),
+  ];
 }
 
 function formatStreamStatus(progress) {
@@ -745,21 +760,20 @@ function buildGroupSpecs(options) {
   const timelineGranularities = options && Array.isArray(options.timelineGranularities) && options.timelineGranularities.length
     ? options.timelineGranularities
     : TIME_GRANULARITIES.map((granularity) => granularity.id);
-  const rowMetric = [{ id: 'rows', op: 'count' }];
+  const countMetric = [createCountMetric()];
   return [
-    { field: FIELDS.event, id: GROUP_IDS.events, metrics: rowMetric },
-    { field: FIELDS.customer_country, id: GROUP_IDS.customerCountries, metrics: rowMetric },
-    { field: FIELDS.location_country, id: GROUP_IDS.locationCountries, metrics: rowMetric },
-    { field: FIELDS.region, id: GROUP_IDS.regions, metrics: rowMetric },
-    { field: FIELDS.division, id: GROUP_IDS.divisions, metrics: rowMetric },
-    { field: FIELDS.municipality, id: GROUP_IDS.municipalities, metrics: rowMetric },
-    { field: FIELDS.locality, id: GROUP_IDS.localities, metrics: rowMetric },
-    { field: FIELDS.postal_code, id: GROUP_IDS.postalCodes, metrics: rowMetric },
+    { field: FIELDS.event, id: GROUP_IDS.events, metrics: countMetric },
+    { field: FIELDS.customer_country, id: GROUP_IDS.customerCountries, metrics: countMetric },
+    { field: FIELDS.region, id: GROUP_IDS.regions, metrics: countMetric },
+    { field: FIELDS.division, id: GROUP_IDS.divisions, metrics: countMetric },
+    { field: FIELDS.municipality, id: GROUP_IDS.municipalities, metrics: countMetric },
+    { field: FIELDS.locality, id: GROUP_IDS.localities, metrics: countMetric },
+    { field: FIELDS.postal_code, id: GROUP_IDS.postalCodes, metrics: countMetric },
   ].concat(timelineGranularities.map((granularityId) => ({
     bucket: { type: 'timeBucket', granularity: granularityId },
     field: FIELDS.time,
     id: GROUP_IDS.timelines[granularityId],
-    metrics: rowMetric,
+    metrics: countMetric,
   })));
 }
 
@@ -794,6 +808,7 @@ function buildLiveSources() {
       dimensions: CUBE_DIMENSIONS_LIVE,
       filters: [poiFilter],
       limit: 1000000,
+      measures: CUBE_MEASURES_LIVE,
       timeDimensions: [{ dimension: CUBE_TIME_DIMENSION, granularity: granularity }],
       timezone: 'UTC',
     },
@@ -812,6 +827,8 @@ function buildLiveSources() {
         id: 'primary',
         projection: {
           rename: {
+            'semantic_events.count': FIELDS.count,
+            semantic_events__count: FIELDS.count,
             [cubeTimeField(granularity)]: FIELDS.time,
             [cubeTimeField('minute')]: FIELDS.time,
             [cubeTimeField('hour')]: FIELDS.time,
@@ -820,6 +837,7 @@ function buildLiveSources() {
             [cubeTimeField('month')]: FIELDS.time,
           },
           transforms: {
+            [FIELDS.count]: 'number',
             [FIELDS.time]: 'timestampMs',
           },
         },
@@ -849,10 +867,12 @@ function buildWorkerOptions() {
       dataUrl: ARROW_FILE,
       id: 'local',
       projection: {
+        extraFields: [FIELDS.count],
         rename: {
           [cubeTimeField('minute')]: FIELDS.time,
         },
         transforms: {
+          [FIELDS.count]: 'constantOne',
           [FIELDS.time]: 'timestampMs',
         },
       },
@@ -874,7 +894,7 @@ function buildSnapshotGroupQueries() {
       limit: 25,
       nonEmptyKeys: true,
       sort: 'desc',
-      sortMetric: 'rows',
+      sortMetric: COUNT_METRIC_ID,
     },
     [GROUP_IDS.divisions]: {
       includeKeys: selectedGroupKeys(GROUP_IDS.divisions),
@@ -882,7 +902,7 @@ function buildSnapshotGroupQueries() {
       limit: 20,
       nonEmptyKeys: true,
       sort: 'desc',
-      sortMetric: 'rows',
+      sortMetric: COUNT_METRIC_ID,
     },
     [GROUP_IDS.events]: {
       includeKeys: selectedGroupKeys(GROUP_IDS.events),
@@ -890,7 +910,7 @@ function buildSnapshotGroupQueries() {
       limit: 20,
       nonEmptyKeys: true,
       sort: 'desc',
-      sortMetric: 'rows',
+      sortMetric: COUNT_METRIC_ID,
     },
     [GROUP_IDS.localities]: {
       includeKeys: selectedGroupKeys(GROUP_IDS.localities),
@@ -898,15 +918,7 @@ function buildSnapshotGroupQueries() {
       limit: 20,
       nonEmptyKeys: true,
       sort: state.localitySort === 'least' ? 'asc' : 'desc',
-      sortMetric: 'rows',
-    },
-    [GROUP_IDS.locationCountries]: {
-      includeKeys: selectedGroupKeys(GROUP_IDS.locationCountries),
-      includeTotals: true,
-      limit: 25,
-      nonEmptyKeys: true,
-      sort: 'desc',
-      sortMetric: 'rows',
+      sortMetric: COUNT_METRIC_ID,
     },
     [GROUP_IDS.municipalities]: {
       includeKeys: selectedGroupKeys(GROUP_IDS.municipalities),
@@ -914,7 +926,7 @@ function buildSnapshotGroupQueries() {
       limit: 20,
       nonEmptyKeys: true,
       sort: 'desc',
-      sortMetric: 'rows',
+      sortMetric: COUNT_METRIC_ID,
     },
     [GROUP_IDS.postalCodes]: {
       includeKeys: selectedGroupKeys(GROUP_IDS.postalCodes),
@@ -922,7 +934,7 @@ function buildSnapshotGroupQueries() {
       limit: 20,
       nonEmptyKeys: true,
       sort: 'desc',
-      sortMetric: 'rows',
+      sortMetric: COUNT_METRIC_ID,
     },
     [GROUP_IDS.regions]: {
       includeKeys: selectedGroupKeys(GROUP_IDS.regions),
@@ -930,13 +942,13 @@ function buildSnapshotGroupQueries() {
       limit: GROUP_OPTION_LIMITS[GROUP_IDS.regions],
       nonEmptyKeys: true,
       sort: 'desc',
-      sortMetric: 'rows',
+      sortMetric: COUNT_METRIC_ID,
     },
     [GROUP_IDS.timelines[state.timeGranularity]]: {
       includeTotals: true,
       nonEmptyKeys: true,
       sort: 'natural',
-      sortMetric: 'rows',
+      sortMetric: COUNT_METRIC_ID,
     },
   };
 }
@@ -949,7 +961,7 @@ function buildOptionGroupQuery(groupId, search) {
     nonEmptyKeys: true,
     search: search ? search.trim() : '',
     sort: 'desc',
-    sortMetric: 'rows',
+    sortMetric: COUNT_METRIC_ID,
   };
 }
 
@@ -965,11 +977,11 @@ function getTimeGroupEntries(snapshot) {
     return [];
   }
   const groupId = GROUP_IDS.timelines[state.timeGranularity];
-  return groupEntries(snapshot.groups[groupId]).filter((entry) => entry.key != null && entry.value && entry.value.rows > 0);
+  return groupEntries(snapshot.groups[groupId]).filter((entry) => entry.key != null && groupEntryCount(entry) > 0);
 }
 
 function isVisibleGroupEntry(entry) {
-  return entry && entry.key != null && entry.key !== '' && entry.value && entry.value.rows > 0;
+  return entry && entry.key != null && entry.key !== '' && groupEntryCount(entry) > 0;
 }
 
 function countVisibleGroupRows(groupResult) {
@@ -995,7 +1007,7 @@ function sortedGroupRows(groupResult, options) {
   }
   const filtered = entries.filter(isVisibleGroupEntry);
   filtered.sort((left, right) => {
-    const diff = left.value.rows - right.value.rows;
+    const diff = groupEntryCount(left) - groupEntryCount(right);
     if (diff !== 0) {
       return sort === 'asc' ? diff : -diff;
     }
@@ -1017,14 +1029,13 @@ function updateRuntimeBadge(runtimeInfo) {
 
 function renderKpis(snapshot) {
   const regions = countVisibleGroupRows(snapshot.groups[GROUP_IDS.regions]);
-  const rows = snapshot.kpis.rows;
+  const totalCount = metricCountValue(snapshot.kpis);
+  const rowCount = typeof snapshot.rowCount === 'number' ? snapshot.rowCount : null;
   const timeRange = Array.isArray(state.filters[FIELDS.time]) ? state.filters[FIELDS.time] : state.baseTimeBounds;
 
-  setKpiCard(dom.kpiTotal, formatNumber(rows), 'Rows');
+  setKpiCard(dom.kpiTotal, formatNumber(totalCount), 'Total Count');
   setKpiCard(dom.kpiLocations, formatNumber(regions), 'Visible Regions');
-  if (supportsLatitudeFeatures()) {
-    setKpiCard(dom.kpiLatitude, formatFloat(snapshot.kpis.avgLatitude, 3), 'Avg Latitude');
-  }
+  setKpiCard(dom.kpiRows, formatNumber(rowCount), 'Row Numbers');
   setKpiCard(dom.kpiTimespan, timeRange ? currentTimeRangeLabel() : '—', 'Time Window');
 }
 
@@ -1070,11 +1081,11 @@ function formatHorizontalBarTooltip(params) {
   }
 
   const row = point.data || point.value || {};
-  const value = typeof row === 'object' && row && row.rows != null
-    ? row.rows
+  const value = typeof row === 'object' && row && row.count != null
+    ? row.count
     : (typeof point.value === 'object' && point.value && point.value.value != null ? point.value.value : point.value);
   const label = typeof row === 'object' && row && row.fullName != null ? row.fullName : point.name;
-  return `${label}<br><strong>${formatNumber(value)} rows</strong>`;
+  return `${label}<br><strong>${formatNumber(value)} count</strong>`;
 }
 
 function initHorizontalBarChart(chart) {
@@ -1160,7 +1171,7 @@ function initHorizontalBarChart(chart) {
         fontFamily: 'IBM Plex Sans, sans-serif',
         fontSize: 10,
         fontWeight: 600,
-        formatter: (params) => formatCompactNumber(params.data && params.data.rows),
+        formatter: (params) => formatCompactNumber(params.data && params.data.count),
       },
       universalTransition: true,
     }],
@@ -1267,11 +1278,11 @@ function createRankedSeriesData(entries, activeValues) {
 
   return entries.map((entry) => ({
     active: activeSet.has(entry.key),
+    count: groupEntryCount(entry),
     fullName: String(entry.key),
     key: entry.key,
     name: truncateHorizontalBarLabel(entry.key),
-    rows: entry.value.rows,
-    value: entry.value.rows,
+    value: groupEntryCount(entry),
     itemStyle: {
       color: activeSet.has(entry.key) ? CHART_COLOR_ACTIVE : CHART_COLOR_BASE,
     },
@@ -1291,7 +1302,7 @@ function renderRankedChart(chartKey, element, entries, filterField, activeValues
     series: [{
       data: seriesData,
       label: {
-        formatter: (params) => formatCompactNumber(params.data && params.data.rows),
+        formatter: (params) => formatCompactNumber(params.data && params.data.count),
       },
     }],
   });
@@ -1316,9 +1327,10 @@ function renderTimelineChart(snapshot) {
     },
     series: [{
       data: entries.map((entry) => ({
+        count: groupEntryCount(entry),
         key: entry.key,
         name: formatTimestamp(entry.key, state.timeGranularity),
-        value: entry.value.rows,
+        value: groupEntryCount(entry),
       })),
     }],
   });
@@ -1331,7 +1343,6 @@ function renderTimelineChart(snapshot) {
 
 function updateGroupBadges(snapshot) {
   dom.ccGroupSize.textContent = `${countVisibleGroupRows(snapshot.groups[GROUP_IDS.customerCountries])}`;
-  dom.lcGroupSize.textContent = `${countVisibleGroupRows(snapshot.groups[GROUP_IDS.locationCountries])}`;
   dom.regionGroupSize.textContent = `${countVisibleGroupRows(snapshot.groups[GROUP_IDS.regions])}`;
   dom.divisionGroupSize.textContent = `${countVisibleGroupRows(snapshot.groups[GROUP_IDS.divisions])}`;
   dom.muniGroupSize.textContent = `${countVisibleGroupRows(snapshot.groups[GROUP_IDS.municipalities])}`;
@@ -1343,7 +1354,6 @@ function renderCharts(snapshot) {
   renderRankedChart('event', dom.chartEvent, snapshot.groups[GROUP_IDS.events], FIELDS.event, state.filters[FIELDS.event] || [], dom.eventGroupSize, { limit: 10, sort: 'desc' });
   renderTimelineChart(snapshot);
   renderRankedChart('customerCountry', dom.chartCustomerCountry, snapshot.groups[GROUP_IDS.customerCountries], FIELDS.customer_country, state.filters[FIELDS.customer_country] || [], dom.ccGroupSize, { limit: 12, sort: 'desc' });
-  renderRankedChart('locationCountry', dom.chartLocationCountry, snapshot.groups[GROUP_IDS.locationCountries], FIELDS.location_country, state.filters[FIELDS.location_country] || [], dom.lcGroupSize, { limit: 8, sort: 'desc' });
   renderRankedChart('region', dom.chartRegion, snapshot.groups[GROUP_IDS.regions], FIELDS.region, state.filters[FIELDS.region] || [], dom.regionGroupSize, { limit: 8, sort: 'desc' });
   renderRankedChart('division', dom.chartDivision, snapshot.groups[GROUP_IDS.divisions], FIELDS.division, state.filters[FIELDS.division] || [], dom.divisionGroupSize, { limit: 8, sort: 'desc' });
   renderRankedChart('municipality', dom.chartMunicipality, snapshot.groups[GROUP_IDS.municipalities], FIELDS.municipality, state.filters[FIELDS.municipality] || [], dom.muniGroupSize, { limit: 12, sort: 'desc' });
@@ -1431,9 +1441,6 @@ function updateDataSourceUi() {
   if (dom.latitudeFilterGroup) {
     dom.latitudeFilterGroup.hidden = !showLatitude;
   }
-  if (dom.kpiLatitude) {
-    dom.kpiLatitude.hidden = !showLatitude;
-  }
 }
 
 function renderPickerOptions(container, searchInput, filterField, entries) {
@@ -1452,7 +1459,7 @@ function renderPickerOptions(container, searchInput, filterField, entries) {
     checkbox.dataset.filterValue = String(entry.key);
 
     const text = document.createElement('span');
-    text.textContent = `${entry.key} (${formatNumber(entry.value.rows)})`;
+    text.textContent = `${entry.key} (${formatNumber(groupEntryCount(entry))})`;
 
     option.appendChild(checkbox);
     option.appendChild(text);
@@ -1501,7 +1508,7 @@ function renderRegionOptions(entries) {
     checkbox.dataset.filterField = FIELDS.region;
     checkbox.dataset.filterValue = String(entry.key);
     label.appendChild(checkbox);
-    label.appendChild(document.createTextNode(` ${entry.key} (${formatNumber(entry.value.rows)})`));
+    label.appendChild(document.createTextNode(` ${entry.key} (${formatNumber(groupEntryCount(entry))})`));
     fragment.appendChild(label);
   }
 
@@ -1527,9 +1534,7 @@ async function refreshControlGroup(groupId) {
 
   const search = groupId === GROUP_IDS.customerCountries
     ? dom.customerCountrySearch.value
-    : groupId === GROUP_IDS.locationCountries
-      ? dom.locationCountrySearch.value
-      : dom.regionSearch.value;
+    : dom.regionSearch.value;
   const request = {
     groups: {
       [groupId]: buildOptionGroupQuery(groupId, search),
@@ -1542,10 +1547,6 @@ async function refreshControlGroup(groupId) {
     state.controlGroups[groupId] = cached.value;
     if (groupId === GROUP_IDS.customerCountries) {
       renderPickerOptions(dom.customerCountryOptions, dom.customerCountrySearch, FIELDS.customer_country, state.controlGroups[groupId]);
-      return;
-    }
-    if (groupId === GROUP_IDS.locationCountries) {
-      renderPickerOptions(dom.locationCountryOptions, dom.locationCountrySearch, FIELDS.location_country, state.controlGroups[groupId]);
       return;
     }
     renderRegionOptions(state.controlGroups[groupId]);
@@ -1576,10 +1577,6 @@ async function refreshControlGroup(groupId) {
 
     if (groupId === GROUP_IDS.customerCountries) {
       renderPickerOptions(dom.customerCountryOptions, dom.customerCountrySearch, FIELDS.customer_country, state.controlGroups[groupId]);
-      return;
-    }
-    if (groupId === GROUP_IDS.locationCountries) {
-      renderPickerOptions(dom.locationCountryOptions, dom.locationCountrySearch, FIELDS.location_country, state.controlGroups[groupId]);
       return;
     }
     renderRegionOptions(state.controlGroups[groupId]);
@@ -1620,20 +1617,6 @@ function renderFilterControls(snapshot) {
     dom.customerCountryOptions.replaceChildren();
   }
 
-  renderSelectedPills(dom.locationCountryPills, dom.locationCountryTrigger, FIELDS.location_country, 'Select countries...');
-  dom.locationCountryCount.textContent = `${(state.filters[FIELDS.location_country] || []).length} selected`;
-  if (isPickerQueryActive(dom.locationCountryDropdown, dom.locationCountrySearch)) {
-    renderPickerOptions(
-      dom.locationCountryOptions,
-      dom.locationCountrySearch,
-      FIELDS.location_country,
-      state.controlGroups[GROUP_IDS.locationCountries] || snapshot.groups[GROUP_IDS.locationCountries]
-    );
-    scheduleControlGroupRefresh(GROUP_IDS.locationCountries, 80);
-  } else {
-    dom.locationCountryOptions.replaceChildren();
-  }
-
   if (!regionSearchActive) {
     state.controlGroups[GROUP_IDS.regions] = null;
   }
@@ -1650,7 +1633,7 @@ function renderFilterControls(snapshot) {
     button.type = 'button';
     button.dataset.filterField = FIELDS.event;
     button.dataset.filterValue = String(entry.key);
-    button.textContent = `${entry.key} (${formatNumber(entry.value.rows)})`;
+    button.textContent = `${entry.key} (${formatNumber(groupEntryCount(entry))})`;
     button.classList.toggle('pill--active', (state.filters[FIELDS.event] || []).includes(entry.key));
     eventFragment.appendChild(button);
   });
@@ -1672,7 +1655,7 @@ function renderFilterControls(snapshot) {
 
 function updateTableRowCount() {
   dom.tableRowCount.textContent = state.currentSnapshot
-    ? `${formatNumber(state.currentRowCount)} of ${formatNumber(state.currentSnapshot.kpis.rows)} loaded`
+    ? `${formatNumber(state.currentLoadedCount)} of ${formatNumber(metricCountValue(state.currentSnapshot.kpis))} count loaded`
     : '—';
 }
 
@@ -1723,6 +1706,29 @@ function rowCountFromResult(result) {
     return result.length;
   }
   return Array.isArray(result) ? result.length : 0;
+}
+
+function countSumFromResult(result) {
+  let total = 0;
+  if (isColumnarRowResult(result)) {
+    const column = result.columns && result.columns[FIELDS.count];
+    if (!column) {
+      return 0;
+    }
+    for (let rowIndex = 0; rowIndex < result.length; ++rowIndex) {
+      total += normalizeCountValue(column[rowIndex]);
+    }
+    return total;
+  }
+
+  if (!Array.isArray(result)) {
+    return 0;
+  }
+
+  for (const row of result) {
+    total += normalizeCountValue(row && row[FIELDS.count]);
+  }
+  return total;
 }
 
 function appendTableResult(result) {
@@ -1892,7 +1898,7 @@ async function readBaseTimeBounds(runtime, filters) {
 }
 
 async function loadSeedRows(runtime) {
-  const fields = getActiveTableFields();
+  const fields = getActiveTableQueryFields();
   return withTemporaryFilters(runtime, {}, async () => {
     const rowSets = typeof runtime.rowSets === 'function'
       ? await runtime.rowSets({
@@ -1912,7 +1918,7 @@ async function loadSeedRows(runtime) {
 
 function generateSyntheticRows(count) {
   const sourceRows = state.seedRows;
-  const fields = getActiveTableFields();
+  const fields = getActiveTableQueryFields();
   if (!sourceRows.length) {
     return [];
   }
@@ -1925,6 +1931,7 @@ function generateSyntheticRows(count) {
     for (const field of fields) {
       row[field] = source[field];
     }
+    row[FIELDS.count] = 1;
 
     const timestamp = Number(row[FIELDS.time]);
     if (Number.isFinite(timestamp)) {
@@ -2003,7 +2010,7 @@ async function refreshRows(replace) {
     return null;
   }
 
-  const fields = getActiveTableFields();
+  const fields = getActiveTableQueryFields();
   state.tableLoading = true;
   const rowsResult = await state.runtime.rows({
     columnar: true,
@@ -2014,11 +2021,14 @@ async function refreshRows(replace) {
     sortBy: FIELDS.time,
   });
   const rowCount = rowCountFromResult(rowsResult);
+  const countTotal = countSumFromResult(rowsResult);
 
   if (replace) {
+    state.currentLoadedCount = countTotal;
     state.currentRowCount = rowCount;
     state.tableOffset = rowCount;
   } else {
+    state.currentLoadedCount += countTotal;
     state.currentRowCount += rowCount;
     state.tableOffset += rowCount;
   }
@@ -2033,12 +2043,13 @@ async function refreshView(resetTable) {
       return;
     }
 
-    const fields = getActiveTableFields();
+    const fields = getActiveTableQueryFields();
     const requestId = ++state.latestRequestId;
     const filters = buildDashboardFilters();
     const startedAt = performance.now();
     state.tableLoading = true;
     if (resetTable) {
+      state.currentLoadedCount = 0;
       state.currentRowCount = 0;
       state.tableOffset = 0;
       dom.tableScroll.scrollTop = 0;
@@ -2046,6 +2057,7 @@ async function refreshView(resetTable) {
 
     const result = await state.runtime.query({
       filters,
+      rowCount: true,
       snapshot: {
         groups: buildSnapshotGroupQueries(),
       },
@@ -2062,7 +2074,12 @@ async function refreshView(resetTable) {
       return;
     }
 
+    if (result.snapshot) {
+      result.snapshot.rowCount = result.rowCount;
+    }
+
     const rowCount = rowCountFromResult(result.rows);
+    const countTotal = countSumFromResult(result.rows);
     if (resetTable) {
       state.currentRowCount = 0;
       state.tableOffset = rowCount;
@@ -2072,6 +2089,7 @@ async function refreshView(resetTable) {
     }
     state.controlGroups = {};
     appendTableResult(result.rows);
+    state.currentLoadedCount += countTotal;
     state.currentRowCount += rowCount;
     state.tableHasMore = rowCount === TABLE_PAGE_SIZE;
     state.tableLoading = false;
@@ -2125,12 +2143,13 @@ function attachRuntimeListeners(runtime, loadToken) {
 }
 
 async function loadSource() {
-  const fields = getActiveTableFields();
+  const fields = getActiveTableQueryFields();
   const loadToken = ++state.loadToken;
   hideError();
   updateDataSourceUi();
   state.currentSnapshot = null;
   state.controlGroups = {};
+  state.currentLoadedCount = 0;
   state.currentRowCount = 0;
   state.baseTimeBounds = null;
   state.firstSnapshotMs = null;
@@ -2187,6 +2206,7 @@ async function loadSource() {
     readBaseTimeBounds(runtime, {}),
     runtime.query({
       filters: buildDashboardFilters(),
+      rowCount: true,
       snapshot: {
         groups: buildSnapshotGroupQueries(),
       },
@@ -2201,6 +2221,10 @@ async function loadSource() {
     }),
   ]);
   state.baseTimeBounds = baseTimeBounds;
+  if (initialResult.snapshot) {
+    initialResult.snapshot.rowCount = initialResult.rowCount;
+  }
+  state.currentLoadedCount = countSumFromResult(initialResult.rows);
   state.currentRowCount = rowCountFromResult(initialResult.rows);
   state.tableOffset = state.currentRowCount;
   state.tableHasMore = state.currentRowCount === TABLE_PAGE_SIZE;
@@ -2388,19 +2412,6 @@ function attachControlListeners() {
     }
     scheduleControlGroupRefresh(GROUP_IDS.customerCountries, 80);
   });
-  dom.locationCountrySearch.addEventListener('input', () => {
-    if (!(dom.locationCountrySearch.value || '').trim()) {
-      state.controlGroups[GROUP_IDS.locationCountries] = null;
-      if (state.currentSnapshot) {
-        renderPickerOptions(dom.locationCountryOptions, dom.locationCountrySearch, FIELDS.location_country, state.currentSnapshot.groups[GROUP_IDS.locationCountries]);
-      }
-    }
-    if (state.currentSnapshot && (!state.runtime || typeof state.runtime.groups !== 'function')) {
-      renderPickerOptions(dom.locationCountryOptions, dom.locationCountrySearch, FIELDS.location_country, state.currentSnapshot.groups[GROUP_IDS.locationCountries]);
-      return;
-    }
-    scheduleControlGroupRefresh(GROUP_IDS.locationCountries, 80);
-  });
 
   dom.eventPills.addEventListener('click', (event) => {
     const button = event.target.closest('.pill[data-filter-field]');
@@ -2411,7 +2422,7 @@ function attachControlListeners() {
     scheduleRefresh(true);
   });
 
-  [dom.customerCountryOptions, dom.locationCountryOptions, dom.regionCheckboxes].forEach((container) => {
+  [dom.customerCountryOptions, dom.regionCheckboxes].forEach((container) => {
     container.addEventListener('change', (event) => {
       const input = event.target;
       if (!input || input.tagName !== 'INPUT' || !input.dataset.filterField) {
@@ -2422,7 +2433,7 @@ function attachControlListeners() {
     });
   });
 
-  [dom.customerCountryPills, dom.locationCountryPills].forEach((container) => {
+  [dom.customerCountryPills].forEach((container) => {
     container.addEventListener('click', (event) => {
       const button = event.target.closest('.picker-pill-dismiss');
       if (!button) {
@@ -2446,23 +2457,10 @@ function attachControlListeners() {
       scheduleControlGroupRefresh(GROUP_IDS.customerCountries, 0);
     }
   });
-  dom.locationCountryTrigger.addEventListener('click', () => {
-    const willOpen = dom.locationCountryDropdown.hidden;
-    togglePicker(dom.locationCountryDropdown, dom.locationCountryTrigger);
-    if (willOpen) {
-      if (state.currentSnapshot) {
-        renderPickerOptions(dom.locationCountryOptions, dom.locationCountrySearch, FIELDS.location_country, state.currentSnapshot.groups[GROUP_IDS.locationCountries]);
-      }
-      scheduleControlGroupRefresh(GROUP_IDS.locationCountries, 0);
-    }
-  });
 
   document.addEventListener('click', (event) => {
     if (!dom.customerCountryPicker.contains(event.target)) {
       closePicker(dom.customerCountryDropdown, dom.customerCountryTrigger);
-    }
-    if (!dom.locationCountryPicker.contains(event.target)) {
-      closePicker(dom.locationCountryDropdown, dom.locationCountryTrigger);
     }
   });
 
@@ -2543,9 +2541,9 @@ function initStaticUi() {
     dom.headerSubtitle.textContent = 'Interactive Demo';
   }
   updateProgressBadge(null);
-  setKpiCard(dom.kpiTotal, '—', 'Rows');
+  setKpiCard(dom.kpiTotal, '—', 'Total Count');
   setKpiCard(dom.kpiLocations, '—', 'Visible Regions');
-  setKpiCard(dom.kpiLatitude, '—', 'Avg Latitude');
+  setKpiCard(dom.kpiRows, '—', 'Row Numbers');
   setKpiCard(dom.kpiTimespan, '—', 'Time Window');
   updateDataSourceUi();
   renderTableHeader();

@@ -79,24 +79,6 @@
           </div>
           <div class="filter-group">
             <div class="filter-group-header">
-              <label class="filter-label">Location Country</label>
-              <button class="filter-clear-btn" data-clear="location_country" hidden>&times;</button>
-            </div>
-            <div id="location-country-picker" class="multiselect-picker">
-              <div class="picker-selected-pills" id="location-country-pills"></div>
-              <div class="picker-trigger" id="location-country-trigger">
-                <span class="picker-placeholder">Select countries...</span>
-                <span class="picker-arrow">&#9662;</span>
-              </div>
-              <div class="picker-dropdown" id="location-country-dropdown" hidden>
-                <input type="text" class="picker-search" id="location-country-search" placeholder="Search countries...">
-                <div class="picker-options" id="location-country-options"></div>
-              </div>
-            </div>
-            <div class="filter-selected-count" id="location-country-count"></div>
-          </div>
-          <div class="filter-group">
-            <div class="filter-group-header">
               <label class="filter-label">Region</label>
               <button class="filter-clear-btn" data-clear="region" hidden>&times;</button>
             </div>
@@ -163,17 +145,10 @@
 
   <main class="dashboard-stage">
     <section class="hero-panel glass-card">
-      <div class="hero-copy">
-        <p class="eyebrow">Streaming dashboard</p>
-        <h2 class="hero-title">Every view crossfilters instantly without pushing work back onto the main thread.</h2>
-        <p class="hero-description">
-          The demo showcases shaped worker queries, batched filters, Arrow-backed data access, and synchronized ECharts views wired directly to the crossfilter runtime.
-        </p>
-      </div>
       <section id="kpi-row" class="kpi-row">
-        <div id="kpi-total" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Total Events</div></div>
+        <div id="kpi-total" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Total Count</div></div>
         <div id="kpi-locations" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Unique Locations</div></div>
-        <div id="kpi-latitude" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Avg Latitude</div></div>
+        <div id="kpi-rows" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Row Numbers</div></div>
         <div id="kpi-timespan" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Time Span</div></div>
       </section>
     </section>
@@ -204,10 +179,6 @@
       <div class="glass-card chart-card chart-card--ranked">
         <div class="chart-header"><span class="chart-title">Customer Countries</span> <span class="group-size-badge" id="cc-group-size"></span></div>
         <div id="chart-customer-country" class="chart-container chart-container--ranked"></div>
-      </div>
-      <div class="glass-card chart-card chart-card--ranked">
-        <div class="chart-header"><span class="chart-title">Location Countries</span> <span class="group-size-badge" id="lc-group-size"></span></div>
-        <div id="chart-location-country" class="chart-container chart-container--ranked"></div>
       </div>
       <div class="glass-card chart-card chart-card--ranked">
         <div class="chart-header"><span class="chart-title">Regions</span> <span class="group-size-badge" id="region-group-size"></span></div>
