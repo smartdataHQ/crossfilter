@@ -92,10 +92,17 @@ function serveStatic(req, res) {
     }
     const ext = path.extname(filePath).toLowerCase();
     const mime = MIME[ext] || 'application/octet-stream';
+    const authConfig = getProxyAuthConfig(req);
     res.writeHead(200, {
       'Content-Type': mime,
       'Content-Length': stat.size,
+      'X-Crossfilter-Demo-Proxy': '1',
+      'X-Crossfilter-Live-Configured': authConfig.token && authConfig.datasourceId && authConfig.branchId ? '1' : '0',
     });
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
     fs.createReadStream(filePath).pipe(res);
   });
 }
@@ -162,6 +169,16 @@ function proxyCube(req, res) {
   });
 }
 
+function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(statusCode, {
+    'Access-Control-Allow-Origin': '*',
+    'Content-Length': Buffer.byteLength(body),
+    'Content-Type': 'application/json',
+  });
+  res.end(body);
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -170,6 +187,16 @@ const server = http.createServer((req, res) => {
       'Access-Control-Allow-Headers': 'Authorization, Content-Type, x-hasura-branch-id, x-hasura-datasource-id',
     });
     res.end();
+    return;
+  }
+
+  if (req.url === '/api/cube/info' && req.method === 'GET') {
+    const authConfig = getProxyAuthConfig(req);
+    sendJson(res, 200, {
+      configured: !!(authConfig.token && authConfig.datasourceId && authConfig.branchId),
+      cubeApi: CUBE_API,
+      proxy: true,
+    });
     return;
   }
 

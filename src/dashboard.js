@@ -111,6 +111,14 @@ function resolveGroupAccessor(spec) {
 }
 
 function buildMetricReducer(metrics) {
+  var metricSpec = metrics.map(function(metric) {
+    return {
+      field: metric.field || null,
+      id: metric.id,
+      op: metric.op
+    };
+  });
+
   function initial() {
     var state = {};
 
@@ -241,6 +249,10 @@ function buildMetricReducer(metrics) {
     state.__cacheVersion = state.__version;
     return result;
   }
+
+  add._xfilterMetricSpec = metricSpec;
+  remove._xfilterMetricSpec = metricSpec;
+  initial._xfilterMetricSpec = metricSpec;
 
   return {
     add: add,
@@ -429,6 +441,7 @@ function createGroupRuntime(dimension, spec, index) {
   var group = groupAccessor ? dimension.group(groupAccessor) : dimension.group();
   var visibleMetric = null;
   var defaultSortMetric = null;
+  var orderedMetricId = null;
   group.reduce(reducer.add, reducer.remove, reducer.initial);
 
   for (metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
@@ -475,6 +488,94 @@ function createGroupRuntime(dimension, spec, index) {
     return query.sort === "asc" ? diff : -diff;
   }
 
+  function topComparableValue(sortMetric, entry) {
+    var comparable = metricComparableValue(sortMetric, entry.value[sortMetric.id]);
+    return comparable == null ? Number.NEGATIVE_INFINITY : comparable;
+  }
+
+  function ensureTopOrder(sortMetric) {
+    if (!sortMetric || typeof group.order !== "function" || typeof group.top !== "function") {
+      return false;
+    }
+    if (orderedMetricId === sortMetric.id) {
+      return true;
+    }
+    group.order(function(value) {
+      var comparable = metricComparableValue(sortMetric, value[sortMetric.id]);
+      return comparable == null ? Number.NEGATIVE_INFINITY : comparable;
+    });
+    orderedMetricId = sortMetric.id;
+    return true;
+  }
+
+  function canUseTopQuery(normalized, sortMetric) {
+    return !!(
+      normalized
+      && normalized.sort === "desc"
+      && sortMetric
+      && normalized.includeTotals === false
+      && !normalized.includeKeys
+      && !normalized.keys
+      && !normalized.search
+      && typeof group.size === "function"
+      && ensureTopOrder(sortMetric)
+    );
+  }
+
+  function readTopQuery(normalized, sortMetric) {
+    var limitWindow = normalized.limit == null ? null : normalized.offset + normalized.limit;
+    var groupSize = group.size();
+    var requested = limitWindow == null
+      ? groupSize
+      : Math.min(groupSize, Math.max(limitWindow + 1, 32));
+    var rawEntries;
+    var filteredEntries;
+
+    do {
+      rawEntries = group.top(requested);
+      filteredEntries = [];
+
+      for (var rawIndex = 0; rawIndex < rawEntries.length; ++rawIndex) {
+        var rawEntry = rawEntries[rawIndex];
+        var visible = !normalized.visibleOnly || metricHasVisibleValue(visibleMetric, rawEntry.value[visibleMetric.id]);
+        if (visible && matchesGroupKey(rawEntry.key, normalized, null, false)) {
+          filteredEntries.push(rawEntry);
+        }
+      }
+
+      filteredEntries.sort(function(left, right) {
+        return compareEntries(normalized, sortMetric, left, right);
+      });
+
+      if (limitWindow == null || requested >= groupSize) {
+        break;
+      }
+
+      var shouldExpand = filteredEntries.length < limitWindow;
+      if (!shouldExpand) {
+        var boundaryEntry = filteredEntries[limitWindow - 1];
+        shouldExpand = !!boundaryEntry
+          && topComparableValue(sortMetric, rawEntries[rawEntries.length - 1]) >= topComparableValue(sortMetric, boundaryEntry);
+      }
+
+      if (!shouldExpand) {
+        break;
+      }
+
+      requested = Math.min(groupSize, Math.max(requested + 32, requested * 2));
+    } while (true);
+
+    return {
+      entries: (normalized.limit == null
+        ? filteredEntries.slice(normalized.offset)
+        : filteredEntries.slice(normalized.offset, normalized.offset + normalized.limit)).map(finalizeEntry),
+      limit: normalized.limit,
+      offset: normalized.offset,
+      sort: normalized.sort,
+      sortMetric: sortMetric ? sortMetric.id : null
+    };
+  }
+
   function readQuery(query) {
     var normalized = normalizeGroupQuery(query);
     var allEntries;
@@ -491,6 +592,10 @@ function createGroupRuntime(dimension, spec, index) {
 
     if (!normalized) {
       return readAll();
+    }
+
+    if (canUseTopQuery(normalized, sortMetric)) {
+      return readTopQuery(normalized, sortMetric);
     }
 
     allEntries = group.all();

@@ -1,3 +1,19 @@
+import {
+  HORIZONTAL_BAR_AXIS_LABEL_WIDTH,
+  resolveHorizontalBarChartHeight,
+  truncateHorizontalBarLabel,
+} from './chart-utils.js';
+import {
+  getDemoEChartsThemeName,
+  registerDemoEChartsTheme,
+} from './echarts-theme.js';
+import {
+  parseDemoPreferences,
+  sanitizeStoredGranularity,
+  serializeDemoPreferences,
+  shouldFallbackToLocalFromLiveErrorMessage,
+} from './source-utils.js';
+
 const crossfilter = globalThis.crossfilter;
 
 if (!crossfilter) {
@@ -11,6 +27,8 @@ const WORKER_ASSETS = {
   arrowRuntimeUrl: '../node_modules/apache-arrow/Arrow.es2015.min.js',
   crossfilterUrl: '../crossfilter.js',
 };
+const DEMO_PREFERENCES_KEY = 'crossfilter-demo-preferences-v1';
+const LIVE_UNAVAILABLE_SESSION_KEY = 'crossfilter-demo-live-unavailable-v1';
 
 const CUBE_TIME_DIMENSION = 'semantic_events.timestamp';
 
@@ -21,19 +39,15 @@ function cubeTimeField(granularity) {
 function cubeTimeDotField(granularity) {
   return 'semantic_events.timestamp.' + granularity;
 }
-const CUBE_DIMENSIONS_PRIMARY = [
+const CUBE_DIMENSIONS_LIVE = [
   'semantic_events.event',
   'semantic_events.dimensions_customer_country',
-  'semantic_events.location_label',
   'semantic_events.location_country',
   'semantic_events.location_region',
   'semantic_events.location_division',
   'semantic_events.location_municipality',
   'semantic_events.location_locality',
   'semantic_events.location_postal_code',
-  'semantic_events.location_postal_name',
-  'semantic_events.location_code',
-  'semantic_events.location_latitude',
 ];
 
 const FIELDS = {
@@ -83,6 +97,18 @@ const TABLE_FIELDS = [
   FIELDS.postal_name,
   FIELDS.location_code,
   FIELDS.latitude,
+  FIELDS.time,
+];
+
+const LIVE_TABLE_FIELDS = [
+  FIELDS.event,
+  FIELDS.customer_country,
+  FIELDS.location_country,
+  FIELDS.region,
+  FIELDS.division,
+  FIELDS.municipality,
+  FIELDS.locality,
+  FIELDS.postal_code,
   FIELDS.time,
 ];
 
@@ -145,10 +171,13 @@ const state = {
   dataSource: 'live',
   filterControlsRafId: 0,
   firstSnapshotMs: null,
+  groupQueryCache: {},
+  groupQueryInflight: {},
   groupQueryTimers: {},
   groupQueryTokens: {},
   lastInteractionMs: null,
   latestRequestId: 0,
+  liveApiAvailable: null,
   loadStartedAt: 0,
   loadToken: 0,
   localitySort: 'least',
@@ -171,8 +200,13 @@ const state = {
   timeGranularity: 'month',
   filters: createEmptyFilterState(),
   charts: {
+    customerCountry: null,
     division: null,
     event: null,
+    locality: null,
+    locationCountry: null,
+    municipality: null,
+    postal: null,
     region: null,
     timeline: null,
   },
@@ -199,7 +233,12 @@ function cacheDom() {
   dom = {
     addRowsBtn: document.getElementById('add-rows-btn'),
     chartDivision: document.getElementById('chart-division'),
+    chartCustomerCountry: document.getElementById('chart-customer-country'),
     chartEvent: document.getElementById('chart-event'),
+    chartLocality: document.getElementById('chart-locality'),
+    chartLocationCountry: document.getElementById('chart-location-country'),
+    chartMunicipality: document.getElementById('chart-municipality'),
+    chartPostal: document.getElementById('chart-postal'),
     chartRegion: document.getElementById('chart-region'),
     chartTimeline: document.getElementById('chart-timeline'),
     chartGrid: document.querySelector('.chart-grid'),
@@ -225,11 +264,6 @@ function cacheDom() {
     kpiTimespan: document.getElementById('kpi-timespan'),
     kpiTotal: document.getElementById('kpi-total'),
     latencyDisplay: document.getElementById('latency-display'),
-    listCustomerCountry: document.getElementById('list-customer-country'),
-    listLocationCountry: document.getElementById('list-location-country'),
-    listLocality: document.getElementById('list-locality'),
-    listMunicipality: document.getElementById('list-municipality'),
-    listPostal: document.getElementById('list-postal'),
     loadTime: document.getElementById('load-time'),
     loadingOverlay: document.getElementById('loading-overlay'),
     loadingText: document.querySelector('.loading-text'),
@@ -269,7 +303,81 @@ function cacheDom() {
     timeRangeLabel: document.getElementById('time-range-label'),
     latMax: document.getElementById('lat-max'),
     latMin: document.getElementById('lat-min'),
+    latitudeFilterGroup: document.getElementById('latitude-filter-group'),
   };
+}
+
+function readStoredDemoPreferences() {
+  if (!globalThis.localStorage) {
+    return {};
+  }
+
+  return parseDemoPreferences(globalThis.localStorage.getItem(DEMO_PREFERENCES_KEY));
+}
+
+function applyStoredDemoPreferences() {
+  const stored = readStoredDemoPreferences();
+  const allowedGranularities = TIME_GRANULARITIES.map((item) => item.id);
+  const storedGranularity = sanitizeStoredGranularity(stored.timeGranularity, allowedGranularities);
+
+  if (storedGranularity) {
+    state.timeGranularity = storedGranularity;
+  }
+  if (stored.localitySort === 'most' || stored.localitySort === 'least') {
+    state.localitySort = stored.localitySort;
+  }
+  if (stored.tableSort === 'bottom' || stored.tableSort === 'top') {
+    state.tableSort = stored.tableSort;
+  }
+}
+
+function persistDemoPreferences() {
+  if (!globalThis.localStorage) {
+    return;
+  }
+
+  globalThis.localStorage.setItem(DEMO_PREFERENCES_KEY, serializeDemoPreferences({
+    localitySort: state.localitySort,
+    tableSort: state.tableSort,
+    timeGranularity: state.timeGranularity,
+  }));
+}
+
+function readSessionLiveUnavailable() {
+  if (!globalThis.sessionStorage) {
+    return false;
+  }
+  return globalThis.sessionStorage.getItem(LIVE_UNAVAILABLE_SESSION_KEY) === '1';
+}
+
+function writeSessionLiveUnavailable(value) {
+  if (!globalThis.sessionStorage) {
+    return;
+  }
+  if (value) {
+    globalThis.sessionStorage.setItem(LIVE_UNAVAILABLE_SESSION_KEY, '1');
+  } else {
+    globalThis.sessionStorage.removeItem(LIVE_UNAVAILABLE_SESSION_KEY);
+  }
+}
+
+function renderSourceButtons() {
+  dom.sourceButtons.forEach((button) => {
+    const source = button.dataset.source;
+    const isLiveButton = source === 'live';
+    button.classList.toggle('mode-btn--active', source === state.dataSource);
+    button.classList.toggle('mode-btn--disabled', false);
+    button.title = isLiveButton && state.liveApiAvailable === false
+      ? 'Live API mode hit `/api/cube` unsuccessfully in this session. Reload after restoring the proxy/backend to retry the server path.'
+      : (isLiveButton ? 'Live API mode uses the local `/api/cube` proxy when available.' : '');
+  });
+}
+
+async function hydrateInitialDataSource() {
+  applyStoredDemoPreferences();
+  state.liveApiAvailable = readSessionLiveUnavailable() ? false : null;
+  state.dataSource = state.liveApiAvailable === false ? 'file' : 'live';
+  persistDemoPreferences();
 }
 
 function appendLog(message) {
@@ -310,6 +418,16 @@ function formatNumber(value) {
     return '—';
   }
   return Number(value).toLocaleString();
+}
+
+function formatCompactNumber(value) {
+  if (value == null || Number.isNaN(Number(value))) {
+    return '—';
+  }
+  return new Intl.NumberFormat('en', {
+    maximumFractionDigits: 1,
+    notation: 'compact',
+  }).format(Number(value));
 }
 
 function formatFloat(value, digits) {
@@ -376,6 +494,9 @@ function buildDashboardFilters() {
   const filters = {};
 
   for (const field of FILTERABLE_FIELDS) {
+    if (field === FIELDS.latitude && !supportsLatitudeFeatures()) {
+      continue;
+    }
     const value = state.filters[field];
     if (Array.isArray(value) && value.length) {
       filters[field] = { type: 'in', values: value.slice() };
@@ -393,7 +514,7 @@ function buildDashboardFilters() {
   if (Array.isArray(state.filters[FIELDS.time]) && state.filters[FIELDS.time].length === 2) {
     filters[FIELDS.time] = { type: 'range', range: state.filters[FIELDS.time].slice() };
   }
-  if (Array.isArray(state.filters[FIELDS.latitude]) && state.filters[FIELDS.latitude].length === 2) {
+  if (supportsLatitudeFeatures() && Array.isArray(state.filters[FIELDS.latitude]) && state.filters[FIELDS.latitude].length === 2) {
     filters[FIELDS.latitude] = { type: 'range', range: state.filters[FIELDS.latitude].slice() };
   }
 
@@ -457,6 +578,52 @@ function formatProgress(progress) {
 function fieldLabel(field) {
   const key = FIELD_KEY_BY_NAME[field];
   return key ? FIELD_LABELS[key] : field;
+}
+
+function supportsLatitudeFeatures() {
+  return state.dataSource !== 'live';
+}
+
+function getActiveTableFields() {
+  return state.dataSource === 'live' ? LIVE_TABLE_FIELDS : TABLE_FIELDS;
+}
+
+function getActiveRuntimeDimensions() {
+  return supportsLatitudeFeatures()
+    ? [
+      FIELDS.event,
+      FIELDS.customer_country,
+      FIELDS.location_country,
+      FIELDS.region,
+      FIELDS.division,
+      FIELDS.municipality,
+      FIELDS.locality,
+      FIELDS.postal_code,
+      FIELDS.time,
+      FIELDS.latitude,
+    ]
+    : [
+      FIELDS.event,
+      FIELDS.customer_country,
+      FIELDS.location_country,
+      FIELDS.region,
+      FIELDS.division,
+      FIELDS.municipality,
+      FIELDS.locality,
+      FIELDS.postal_code,
+      FIELDS.time,
+    ];
+}
+
+function getActiveKpiSpecs() {
+  return supportsLatitudeFeatures()
+    ? [
+      { id: 'rows', op: 'count' },
+      { field: FIELDS.latitude, id: 'avgLatitude', op: 'avgNonZero' },
+    ]
+    : [
+      { id: 'rows', op: 'count' },
+    ];
 }
 
 function formatStreamStatus(progress) {
@@ -597,18 +764,7 @@ function buildGroupSpecs(options) {
 }
 
 function buildRuntimeDimensions() {
-  return [
-    FIELDS.event,
-    FIELDS.customer_country,
-    FIELDS.location_country,
-    FIELDS.region,
-    FIELDS.division,
-    FIELDS.municipality,
-    FIELDS.locality,
-    FIELDS.postal_code,
-    FIELDS.time,
-    FIELDS.latitude,
-  ];
+  return getActiveRuntimeDimensions();
 }
 
 function buildCommonWorkerOptions() {
@@ -616,10 +772,7 @@ function buildCommonWorkerOptions() {
     batchCoalesceRows: 65536,
     dimensions: buildRuntimeDimensions(),
     emitSnapshots: true,
-    kpis: [
-      { id: 'rows', op: 'count' },
-      { field: FIELDS.latitude, id: 'avgLatitude', op: 'avgNonZero' },
-    ],
+    kpis: getActiveKpiSpecs(),
     progressThrottleMs: 100,
     snapshotThrottleMs: 300,
     wasm: true,
@@ -638,7 +791,7 @@ function buildLiveSources() {
   var primaryQuery = {
     format: 'arrow',
     query: {
-      dimensions: CUBE_DIMENSIONS_PRIMARY,
+      dimensions: CUBE_DIMENSIONS_LIVE,
       filters: [poiFilter],
       limit: 1000000,
       timeDimensions: [{ dimension: CUBE_TIME_DIMENSION, granularity: granularity }],
@@ -774,7 +927,7 @@ function buildSnapshotGroupQueries() {
     [GROUP_IDS.regions]: {
       includeKeys: selectedGroupKeys(GROUP_IDS.regions),
       includeTotals: true,
-      limit: 20,
+      limit: GROUP_OPTION_LIMITS[GROUP_IDS.regions],
       nonEmptyKeys: true,
       sort: 'desc',
       sortMetric: 'rows',
@@ -864,13 +1017,14 @@ function updateRuntimeBadge(runtimeInfo) {
 
 function renderKpis(snapshot) {
   const regions = countVisibleGroupRows(snapshot.groups[GROUP_IDS.regions]);
-  const avgLatitude = snapshot.kpis.avgLatitude;
   const rows = snapshot.kpis.rows;
   const timeRange = Array.isArray(state.filters[FIELDS.time]) ? state.filters[FIELDS.time] : state.baseTimeBounds;
 
   setKpiCard(dom.kpiTotal, formatNumber(rows), 'Rows');
   setKpiCard(dom.kpiLocations, formatNumber(regions), 'Visible Regions');
-  setKpiCard(dom.kpiLatitude, formatFloat(avgLatitude, 3), 'Avg Latitude');
+  if (supportsLatitudeFeatures()) {
+    setKpiCard(dom.kpiLatitude, formatFloat(snapshot.kpis.avgLatitude, 3), 'Avg Latitude');
+  }
   setKpiCard(dom.kpiTimespan, timeRange ? currentTimeRangeLabel() : '—', 'Time Window');
 }
 
@@ -878,32 +1032,225 @@ function ensureChart(existing, element, initialize) {
   if (existing) {
     return existing;
   }
-  const chart = echarts.init(element);
+  registerDemoEChartsTheme(echarts);
+  const chart = echarts.init(element, getDemoEChartsThemeName(), {
+    renderer: 'canvas',
+    useDirtyRect: true,
+  });
   if (initialize) {
     initialize(chart);
   }
   return chart;
 }
 
+const CHART_COLOR_ACTIVE = '#163f73';
+const CHART_COLOR_BASE = '#0b7285';
+const CHART_COLOR_SOFT = '#d96f32';
+const CHART_COLOR_GRID = 'rgba(22, 47, 67, 0.08)';
+const CHART_COLOR_SUBTLE = 'rgba(22, 47, 67, 0.14)';
+
+function syncHorizontalBarChartHeight(element, chart, itemCount) {
+  const height = resolveHorizontalBarChartHeight(itemCount);
+  const nextHeight = `${height}px`;
+
+  if (element.style.height === nextHeight) {
+    return;
+  }
+
+  element.style.height = nextHeight;
+  if (chart && typeof chart.resize === 'function') {
+    chart.resize();
+  }
+}
+
+function formatHorizontalBarTooltip(params) {
+  const point = Array.isArray(params) ? params[0] : params;
+  if (!point) {
+    return '';
+  }
+
+  const row = point.data || point.value || {};
+  const value = typeof row === 'object' && row && row.rows != null
+    ? row.rows
+    : (typeof point.value === 'object' && point.value && point.value.value != null ? point.value.value : point.value);
+  const label = typeof row === 'object' && row && row.fullName != null ? row.fullName : point.name;
+  return `${label}<br><strong>${formatNumber(value)} rows</strong>`;
+}
+
 function initHorizontalBarChart(chart) {
   chart.setOption({
-    animation: false,
-    grid: { left: 140, right: 20, top: 10, bottom: 20 },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-    xAxis: { type: 'value' },
-    yAxis: { type: 'category', data: [] },
-    series: [{ type: 'bar', data: [] }],
+    animation: true,
+    animationDuration: 320,
+    animationDurationUpdate: 260,
+    animationEasingUpdate: 'cubicOut',
+    grid: {
+      left: HORIZONTAL_BAR_AXIS_LABEL_WIDTH + 18,
+      right: 60,
+      top: 18,
+      bottom: 24,
+    },
+    tooltip: {
+      trigger: 'item',
+      confine: true,
+      formatter: formatHorizontalBarTooltip,
+    },
+    xAxis: {
+      type: 'value',
+      minInterval: 1,
+      axisLine: {
+        show: false,
+      },
+      axisTick: {
+        show: false,
+      },
+      splitLine: {
+        lineStyle: {
+          color: CHART_COLOR_GRID,
+        },
+      },
+      axisLabel: {
+        formatter: formatCompactNumber,
+        margin: 10,
+      },
+    },
+    yAxis: {
+      type: 'category',
+      inverse: true,
+      data: [],
+      axisLine: {
+        show: false,
+      },
+      axisTick: {
+        show: false,
+      },
+      axisLabel: {
+        width: HORIZONTAL_BAR_AXIS_LABEL_WIDTH,
+        interval: 0,
+        margin: 12,
+        lineHeight: 16,
+        color: '#17314d',
+        fontSize: 11,
+      },
+    },
+    series: [{
+      type: 'bar',
+      data: [],
+      barMaxWidth: 24,
+      barMinHeight: 8,
+      barCategoryGap: '34%',
+      showBackground: true,
+      backgroundStyle: {
+        color: 'rgba(22, 47, 67, 0.04)',
+        borderRadius: [0, 8, 8, 0],
+      },
+      itemStyle: { borderRadius: [0, 8, 8, 0] },
+      emphasis: {
+        focus: 'self',
+        itemStyle: {
+          shadowBlur: 14,
+          shadowColor: 'rgba(11, 114, 133, 0.18)',
+        },
+      },
+      label: {
+        show: true,
+        position: 'right',
+        distance: 10,
+        align: 'left',
+        color: '#17314d',
+        fontFamily: 'IBM Plex Sans, sans-serif',
+        fontSize: 10,
+        fontWeight: 600,
+        formatter: (params) => formatCompactNumber(params.data && params.data.rows),
+      },
+      universalTransition: true,
+    }],
   });
 }
 
 function initTimelineChart(chart) {
   chart.setOption({
-    animation: false,
-    grid: { left: 50, right: 20, top: 20, bottom: 60 },
-    tooltip: { trigger: 'axis' },
-    xAxis: { type: 'category', data: [], axisLabel: { rotate: 40 } },
-    yAxis: { type: 'value' },
-    series: [{ type: 'line', data: [], smooth: false, symbol: 'none', areaStyle: { opacity: 0.1 } }],
+    animation: true,
+    animationDuration: 380,
+    animationDurationUpdate: 260,
+    animationEasingUpdate: 'quarticOut',
+    grid: { left: 26, right: 24, top: 22, bottom: 54, containLabel: true },
+    tooltip: {
+      trigger: 'axis',
+      confine: true,
+      valueFormatter: (value) => formatNumber(value),
+    },
+    xAxis: {
+      type: 'category',
+      boundaryGap: false,
+      data: [],
+      axisLabel: {
+        rotate: 32,
+        hideOverlap: true,
+      },
+      axisPointer: {
+        snap: true,
+      },
+    },
+    yAxis: {
+      type: 'value',
+      minInterval: 1,
+      splitLine: {
+        lineStyle: {
+          color: CHART_COLOR_GRID,
+        },
+      },
+      axisLabel: {
+        formatter: formatCompactNumber,
+      },
+    },
+    dataZoom: [{
+      type: 'inside',
+      filterMode: 'none',
+      moveOnMouseMove: true,
+      zoomOnMouseWheel: true,
+    }, {
+      type: 'slider',
+      height: 14,
+      bottom: 6,
+      brushSelect: false,
+      fillerColor: 'rgba(11, 114, 133, 0.12)',
+      borderColor: 'transparent',
+      backgroundColor: 'rgba(22, 47, 67, 0.06)',
+      handleStyle: {
+        color: '#ffffff',
+        borderColor: CHART_COLOR_SOFT,
+      },
+      moveHandleStyle: {
+        color: CHART_COLOR_SOFT,
+      },
+    }],
+    series: [{
+      type: 'line',
+      data: [],
+      smooth: 0.24,
+      symbol: 'circle',
+      symbolSize: 6,
+      sampling: 'lttb',
+      lineStyle: {
+        color: CHART_COLOR_SOFT,
+        width: 3,
+      },
+      itemStyle: {
+        color: '#ffffff',
+        borderColor: CHART_COLOR_SOFT,
+        borderWidth: 2,
+      },
+      areaStyle: {
+        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          { offset: 0, color: 'rgba(217, 111, 50, 0.28)' },
+          { offset: 1, color: 'rgba(217, 111, 50, 0.02)' },
+        ]),
+      },
+      emphasis: {
+        focus: 'series',
+      },
+      universalTransition: true,
+    }],
   });
 }
 
@@ -915,91 +1262,71 @@ function ensureChartClickHandler(chart, marker, handler) {
   chart.on('click', handler);
 }
 
-function renderEventChart(snapshot) {
-  const data = sortedGroupRows(snapshot.groups[GROUP_IDS.events], { limit: 20, sort: 'desc' });
-  const categories = data.map((entry) => entry.key);
-  const values = data.map((entry) => entry.value.rows);
-  state.charts.event = ensureChart(state.charts.event, dom.chartEvent, initHorizontalBarChart);
+function createRankedSeriesData(entries, activeValues) {
+  const activeSet = new Set(activeValues || []);
 
-  state.charts.event.setOption({
-    yAxis: { data: categories },
+  return entries.map((entry) => ({
+    active: activeSet.has(entry.key),
+    fullName: String(entry.key),
+    key: entry.key,
+    name: truncateHorizontalBarLabel(entry.key),
+    rows: entry.value.rows,
+    value: entry.value.rows,
+    itemStyle: {
+      color: activeSet.has(entry.key) ? CHART_COLOR_ACTIVE : CHART_COLOR_BASE,
+    },
+  }));
+}
+
+function renderRankedChart(chartKey, element, entries, filterField, activeValues, badgeEl, options) {
+  const data = sortedGroupRows(entries, options);
+  const seriesData = createRankedSeriesData(data, activeValues);
+
+  syncHorizontalBarChartHeight(element, state.charts[chartKey], data.length);
+  state.charts[chartKey] = ensureChart(state.charts[chartKey], element, initHorizontalBarChart);
+  state.charts[chartKey].setOption({
+    yAxis: {
+      data: seriesData.map((entry) => entry.name),
+    },
     series: [{
-      data: data.map((entry) => ({
-        itemStyle: { color: (state.filters[FIELDS.event] || []).includes(entry.key) ? '#000e4a' : '#3f6587' },
-        value: entry.value.rows,
-      })),
+      data: seriesData,
+      label: {
+        formatter: (params) => formatCompactNumber(params.data && params.data.rows),
+      },
     }],
   });
 
-  dom.eventGroupSize.textContent = `${categories.length}`;
+  badgeEl.textContent = `${countVisibleGroupRows(entries)}`;
+
+  ensureChartClickHandler(state.charts[chartKey], `__filter_${filterField}`, (params) => {
+    if (!params || !params.data || params.data.key == null) {
+      return;
+    }
+    toggleArrayFilterValue(filterField, params.data.key);
+    scheduleRefresh(true);
+  });
 }
 
 function renderTimelineChart(snapshot) {
   const entries = getTimeGroupEntries(snapshot).slice().sort((left, right) => Number(left.key) - Number(right.key));
-  const categories = entries.map((entry) => formatTimestamp(entry.key, state.timeGranularity));
-  const values = entries.map((entry) => entry.value.rows);
   state.charts.timeline = ensureChart(state.charts.timeline, dom.chartTimeline, initTimelineChart);
   state.charts.timeline.setOption({
-    xAxis: { data: categories, axisLabel: { rotate: 40 } },
-    series: [{ data: values }],
+    xAxis: {
+      data: entries.map((entry) => formatTimestamp(entry.key, state.timeGranularity)),
+    },
+    series: [{
+      data: entries.map((entry) => ({
+        key: entry.key,
+        name: formatTimestamp(entry.key, state.timeGranularity),
+        value: entry.value.rows,
+      })),
+    }],
   });
   var granLabel = getGranularityMeta(state.timeGranularity).label;
   var badgeText = state.serverGranularity
     ? granLabel + ' (server) • ' + entries.length
     : granLabel + ' • ' + entries.length;
   dom.timeGranularityBadge.textContent = badgeText;
-}
-
-function renderBarChart(chartKey, element, entries, activeValues, badgeEl) {
-  const data = sortedGroupRows(entries, { limit: 20, sort: 'desc' });
-  const categories = data.map((entry) => entry.key);
-  state.charts[chartKey] = ensureChart(state.charts[chartKey], element, initHorizontalBarChart);
-  state.charts[chartKey].setOption({
-    yAxis: { data: categories },
-    series: [{
-      data: data.map((entry) => ({
-        itemStyle: { color: activeValues.includes(entry.key) ? '#000e4a' : '#3f6587' },
-        value: entry.value.rows,
-      })),
-    }],
-  });
-  badgeEl.textContent = `${categories.length}`;
-}
-
-function renderList(container, entries, filterField, options) {
-  const data = sortedGroupRows(entries, options);
-  const maxValue = data.length ? Math.max.apply(null, data.map((entry) => entry.value.rows)) : 0;
-  const fragment = document.createDocumentFragment();
-
-  for (const entry of data) {
-    const item = document.createElement('button');
-    item.className = 'list-item';
-    item.type = 'button';
-    item.dataset.key = filterField;
-    item.dataset.value = String(entry.key);
-    if ((state.filters[filterField] || []).includes(entry.key)) {
-      item.classList.add('list-item--active');
-    }
-
-    const bar = document.createElement('div');
-    bar.className = 'list-item-bar';
-    bar.style.width = maxValue > 0 ? `${(entry.value.rows / maxValue) * 100}%` : '0%';
-
-    const label = document.createElement('span');
-    label.className = 'list-item-label';
-    label.textContent = String(entry.key);
-
-    const count = document.createElement('span');
-    count.className = 'list-item-count';
-    count.textContent = formatNumber(entry.value.rows);
-
-    item.appendChild(bar);
-    item.appendChild(label);
-    item.appendChild(count);
-    fragment.appendChild(item);
-  }
-
-  container.replaceChildren(fragment);
 }
 
 function updateGroupBadges(snapshot) {
@@ -1013,38 +1340,16 @@ function updateGroupBadges(snapshot) {
 }
 
 function renderCharts(snapshot) {
-  renderEventChart(snapshot);
+  renderRankedChart('event', dom.chartEvent, snapshot.groups[GROUP_IDS.events], FIELDS.event, state.filters[FIELDS.event] || [], dom.eventGroupSize, { limit: 10, sort: 'desc' });
   renderTimelineChart(snapshot);
-  renderBarChart('region', dom.chartRegion, snapshot.groups[GROUP_IDS.regions], state.filters[FIELDS.region] || [], dom.regionGroupSize);
-  renderBarChart('division', dom.chartDivision, snapshot.groups[GROUP_IDS.divisions], state.filters[FIELDS.division] || [], dom.divisionGroupSize);
-  renderList(dom.listCustomerCountry, snapshot.groups[GROUP_IDS.customerCountries], FIELDS.customer_country, { limit: 25, sort: 'desc' });
-  renderList(dom.listLocationCountry, snapshot.groups[GROUP_IDS.locationCountries], FIELDS.location_country, { limit: 25, sort: 'desc' });
-  renderList(dom.listMunicipality, snapshot.groups[GROUP_IDS.municipalities], FIELDS.municipality, { limit: 20, sort: 'desc' });
-  renderList(dom.listLocality, snapshot.groups[GROUP_IDS.localities], FIELDS.locality, { limit: 20, sort: state.localitySort === 'least' ? 'asc' : 'desc' });
-  renderList(dom.listPostal, snapshot.groups[GROUP_IDS.postalCodes], FIELDS.postal_code, { limit: 20, sort: 'desc' });
+  renderRankedChart('customerCountry', dom.chartCustomerCountry, snapshot.groups[GROUP_IDS.customerCountries], FIELDS.customer_country, state.filters[FIELDS.customer_country] || [], dom.ccGroupSize, { limit: 12, sort: 'desc' });
+  renderRankedChart('locationCountry', dom.chartLocationCountry, snapshot.groups[GROUP_IDS.locationCountries], FIELDS.location_country, state.filters[FIELDS.location_country] || [], dom.lcGroupSize, { limit: 8, sort: 'desc' });
+  renderRankedChart('region', dom.chartRegion, snapshot.groups[GROUP_IDS.regions], FIELDS.region, state.filters[FIELDS.region] || [], dom.regionGroupSize, { limit: 8, sort: 'desc' });
+  renderRankedChart('division', dom.chartDivision, snapshot.groups[GROUP_IDS.divisions], FIELDS.division, state.filters[FIELDS.division] || [], dom.divisionGroupSize, { limit: 8, sort: 'desc' });
+  renderRankedChart('municipality', dom.chartMunicipality, snapshot.groups[GROUP_IDS.municipalities], FIELDS.municipality, state.filters[FIELDS.municipality] || [], dom.muniGroupSize, { limit: 12, sort: 'desc' });
+  renderRankedChart('locality', dom.chartLocality, snapshot.groups[GROUP_IDS.localities], FIELDS.locality, state.filters[FIELDS.locality] || [], dom.locGroupSize, { limit: 12, sort: state.localitySort === 'least' ? 'asc' : 'desc' });
+  renderRankedChart('postal', dom.chartPostal, snapshot.groups[GROUP_IDS.postalCodes], FIELDS.postal_code, state.filters[FIELDS.postal_code] || [], dom.postalGroupSize, { limit: 12, sort: 'desc' });
   updateGroupBadges(snapshot);
-
-  ensureChartClickHandler(state.charts.event, '__filterHandler', (params) => {
-    if (!params || params.name == null) {
-      return;
-    }
-    toggleArrayFilterValue(FIELDS.event, params.name);
-    scheduleRefresh(true);
-  });
-  ensureChartClickHandler(state.charts.region, '__filterHandler', (params) => {
-    if (!params || params.name == null) {
-      return;
-    }
-    toggleArrayFilterValue(FIELDS.region, params.name);
-    scheduleRefresh(true);
-  });
-  ensureChartClickHandler(state.charts.division, '__filterHandler', (params) => {
-    if (!params || params.name == null) {
-      return;
-    }
-    toggleArrayFilterValue(FIELDS.division, params.name);
-    scheduleRefresh(true);
-  });
   ensureChartClickHandler(state.charts.timeline, '__filterHandler', (params) => {
     const entries = getTimeGroupEntries(state.currentSnapshot).slice().sort((left, right) => Number(left.key) - Number(right.key));
     const entry = entries[params.dataIndex];
@@ -1121,9 +1426,20 @@ function syncLatitudeControls() {
   dom.latMax.value = selected[1] == null ? '' : String(selected[1]);
 }
 
+function updateDataSourceUi() {
+  const showLatitude = supportsLatitudeFeatures();
+  if (dom.latitudeFilterGroup) {
+    dom.latitudeFilterGroup.hidden = !showLatitude;
+  }
+  if (dom.kpiLatitude) {
+    dom.kpiLatitude.hidden = !showLatitude;
+  }
+}
+
 function renderPickerOptions(container, searchInput, filterField, entries) {
   const search = (searchInput.value || '').trim().toLowerCase();
   const fragment = document.createDocumentFragment();
+  const selectedValues = new Set(state.filters[filterField] || []);
   const data = sortedGroupRows(entries, { limit: Infinity, sort: 'desc' }).filter((entry) => String(entry.key).toLowerCase().includes(search));
 
   for (const entry of data) {
@@ -1131,7 +1447,7 @@ function renderPickerOptions(container, searchInput, filterField, entries) {
     option.className = 'picker-option';
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
-    checkbox.checked = (state.filters[filterField] || []).includes(entry.key);
+    checkbox.checked = selectedValues.has(entry.key);
     checkbox.dataset.filterField = filterField;
     checkbox.dataset.filterValue = String(entry.key);
 
@@ -1174,13 +1490,14 @@ function renderSelectedPills(container, trigger, filterField, placeholder) {
 function renderRegionOptions(entries) {
   const search = (dom.regionSearch.value || '').trim().toLowerCase();
   const fragment = document.createDocumentFragment();
+  const selectedValues = new Set(state.filters[FIELDS.region] || []);
   const data = sortedGroupRows(entries, { limit: Infinity, sort: 'desc' }).filter((entry) => String(entry.key).toLowerCase().includes(search));
 
   for (const entry of data) {
     const label = document.createElement('label');
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
-    checkbox.checked = (state.filters[FIELDS.region] || []).includes(entry.key);
+    checkbox.checked = selectedValues.has(entry.key);
     checkbox.dataset.filterField = FIELDS.region;
     checkbox.dataset.filterValue = String(entry.key);
     label.appendChild(checkbox);
@@ -1195,32 +1512,67 @@ function isPickerQueryActive(dropdown, searchInput) {
   return !dropdown.hidden || !!(searchInput.value || '').trim();
 }
 
+function buildControlGroupRequestKey(groupId, request) {
+  return JSON.stringify({
+    filters: buildDashboardFilters(),
+    groupId,
+    request,
+  });
+}
+
 async function refreshControlGroup(groupId) {
   if (!state.runtime || !state.ready || typeof state.runtime.groups !== 'function') {
     return;
   }
 
-  const token = (state.groupQueryTokens[groupId] || 0) + 1;
   const search = groupId === GROUP_IDS.customerCountries
     ? dom.customerCountrySearch.value
     : groupId === GROUP_IDS.locationCountries
       ? dom.locationCountrySearch.value
       : dom.regionSearch.value;
+  const request = {
+    groups: {
+      [groupId]: buildOptionGroupQuery(groupId, search),
+    },
+  };
+  const requestKey = buildControlGroupRequestKey(groupId, request.groups[groupId]);
+  const cached = state.groupQueryCache[groupId];
 
+  if (cached && cached.key === requestKey) {
+    state.controlGroups[groupId] = cached.value;
+    if (groupId === GROUP_IDS.customerCountries) {
+      renderPickerOptions(dom.customerCountryOptions, dom.customerCountrySearch, FIELDS.customer_country, state.controlGroups[groupId]);
+      return;
+    }
+    if (groupId === GROUP_IDS.locationCountries) {
+      renderPickerOptions(dom.locationCountryOptions, dom.locationCountrySearch, FIELDS.location_country, state.controlGroups[groupId]);
+      return;
+    }
+    renderRegionOptions(state.controlGroups[groupId]);
+    return;
+  }
+
+  if (state.groupQueryInflight[groupId] === requestKey) {
+    return;
+  }
+
+  const token = (state.groupQueryTokens[groupId] || 0) + 1;
   state.groupQueryTokens[groupId] = token;
+  state.groupQueryInflight[groupId] = requestKey;
 
   try {
-    const groups = await state.runtime.groups({
-      groups: {
-        [groupId]: buildOptionGroupQuery(groupId, search),
-      },
-    });
+    const groups = await state.runtime.groups(request);
 
-    if (state.groupQueryTokens[groupId] !== token) {
+    if (state.groupQueryTokens[groupId] !== token || state.groupQueryInflight[groupId] !== requestKey) {
       return;
     }
 
     state.controlGroups[groupId] = groups[groupId] || null;
+    state.groupQueryCache[groupId] = {
+      key: requestKey,
+      value: state.controlGroups[groupId],
+    };
+    state.groupQueryInflight[groupId] = null;
 
     if (groupId === GROUP_IDS.customerCountries) {
       renderPickerOptions(dom.customerCountryOptions, dom.customerCountrySearch, FIELDS.customer_country, state.controlGroups[groupId]);
@@ -1232,6 +1584,9 @@ async function refreshControlGroup(groupId) {
     }
     renderRegionOptions(state.controlGroups[groupId]);
   } catch (error) {
+    if (state.groupQueryInflight[groupId] === requestKey) {
+      state.groupQueryInflight[groupId] = null;
+    }
     if (state.runtime) {
       appendLog(`Control query failed for ${groupId}: ${error.message || error}`);
     }
@@ -1249,6 +1604,8 @@ function scheduleControlGroupRefresh(groupId, delayMs) {
 }
 
 function renderFilterControls(snapshot) {
+  const regionSearchActive = !!(dom.regionSearch.value || '').trim();
+
   renderSelectedPills(dom.customerCountryPills, dom.customerCountryTrigger, FIELDS.customer_country, 'Select countries...');
   dom.customerCountryCount.textContent = `${(state.filters[FIELDS.customer_country] || []).length} selected`;
   if (isPickerQueryActive(dom.customerCountryDropdown, dom.customerCountrySearch)) {
@@ -1277,9 +1634,14 @@ function renderFilterControls(snapshot) {
     dom.locationCountryOptions.replaceChildren();
   }
 
+  if (!regionSearchActive) {
+    state.controlGroups[GROUP_IDS.regions] = null;
+  }
   renderRegionOptions(state.controlGroups[GROUP_IDS.regions] || snapshot.groups[GROUP_IDS.regions]);
   dom.regionCount.textContent = `${(state.filters[FIELDS.region] || []).length} selected`;
-  scheduleControlGroupRefresh(GROUP_IDS.regions, 80);
+  if (regionSearchActive) {
+    scheduleControlGroupRefresh(GROUP_IDS.regions, 80);
+  }
 
   const eventFragment = document.createDocumentFragment();
   sortedGroupRows(snapshot.groups[GROUP_IDS.events], { limit: 20, sort: 'desc' }).forEach((entry) => {
@@ -1295,7 +1657,11 @@ function renderFilterControls(snapshot) {
   dom.eventPills.replaceChildren(eventFragment);
 
   syncTimeControls();
-  syncLatitudeControls();
+  if (supportsLatitudeFeatures()) {
+    syncLatitudeControls();
+  } else {
+    state.filters[FIELDS.latitude] = null;
+  }
 
   dom.clearButtons.forEach((button) => {
     const clearKey = button.dataset.clear;
@@ -1322,7 +1688,7 @@ function formatTableCellValue(field, value) {
 
 function createTableRow(row) {
   const tr = document.createElement('tr');
-  for (const field of TABLE_FIELDS) {
+  for (const field of getActiveTableFields()) {
     const td = document.createElement('td');
     td.textContent = formatTableCellValue(field, row[field]);
     tr.appendChild(td);
@@ -1332,7 +1698,7 @@ function createTableRow(row) {
 
 function createTableRowFromColumns(columns, rowIndex) {
   const tr = document.createElement('tr');
-  for (const field of TABLE_FIELDS) {
+  for (const field of getActiveTableFields()) {
     const td = document.createElement('td');
     const column = columns[field];
     td.textContent = formatTableCellValue(field, column ? column[rowIndex] : undefined);
@@ -1403,7 +1769,7 @@ function renderTable() {
 
 function renderTableHeader() {
   const fragment = document.createDocumentFragment();
-  for (const field of TABLE_FIELDS) {
+  for (const field of getActiveTableFields()) {
     const th = document.createElement('th');
     th.textContent = fieldLabel(field);
     fragment.appendChild(th);
@@ -1482,6 +1848,8 @@ async function disposeRuntime() {
     state.groupQueryTimers[groupId] = 0;
   });
   state.controlGroups = {};
+  state.groupQueryCache = {};
+  state.groupQueryInflight = {};
 
   if (state.runtime) {
     try {
@@ -1494,6 +1862,8 @@ async function disposeRuntime() {
   state.runtime = null;
   state.ready = false;
   state.seedRows = [];
+  state.groupQueryCache = {};
+  state.groupQueryInflight = {};
   state.groupQueryTokens = {};
   updateDemoButtons();
 }
@@ -1522,16 +1892,17 @@ async function readBaseTimeBounds(runtime, filters) {
 }
 
 async function loadSeedRows(runtime) {
+  const fields = getActiveTableFields();
   return withTemporaryFilters(runtime, {}, async () => {
     const rowSets = typeof runtime.rowSets === 'function'
       ? await runtime.rowSets({
-          latest: { columnar: true, fields: TABLE_FIELDS, limit: 500, sortBy: FIELDS.time },
-          oldest: { columnar: true, direction: 'bottom', fields: TABLE_FIELDS, limit: 500, sortBy: FIELDS.time },
+          latest: { columnar: true, fields, limit: 500, sortBy: FIELDS.time },
+          oldest: { columnar: true, direction: 'bottom', fields, limit: 500, sortBy: FIELDS.time },
         })
       : (await runtime.query({
           rowSets: {
-            latest: { columnar: true, fields: TABLE_FIELDS, limit: 500, sortBy: FIELDS.time },
-            oldest: { columnar: true, direction: 'bottom', fields: TABLE_FIELDS, limit: 500, sortBy: FIELDS.time },
+            latest: { columnar: true, fields, limit: 500, sortBy: FIELDS.time },
+            oldest: { columnar: true, direction: 'bottom', fields, limit: 500, sortBy: FIELDS.time },
           },
           snapshot: false,
         })).rowSets;
@@ -1541,6 +1912,7 @@ async function loadSeedRows(runtime) {
 
 function generateSyntheticRows(count) {
   const sourceRows = state.seedRows;
+  const fields = getActiveTableFields();
   if (!sourceRows.length) {
     return [];
   }
@@ -1550,7 +1922,7 @@ function generateSyntheticRows(count) {
     const source = sourceRows[Math.floor(Math.random() * sourceRows.length)];
     const row = {};
 
-    for (const field of TABLE_FIELDS) {
+    for (const field of fields) {
       row[field] = source[field];
     }
 
@@ -1631,11 +2003,12 @@ async function refreshRows(replace) {
     return null;
   }
 
+  const fields = getActiveTableFields();
   state.tableLoading = true;
   const rowsResult = await state.runtime.rows({
     columnar: true,
     direction: state.tableSort === 'bottom' ? 'bottom' : 'top',
-    fields: TABLE_FIELDS,
+    fields,
     limit: TABLE_PAGE_SIZE,
     offset: replace ? 0 : state.tableOffset,
     sortBy: FIELDS.time,
@@ -1660,6 +2033,7 @@ async function refreshView(resetTable) {
       return;
     }
 
+    const fields = getActiveTableFields();
     const requestId = ++state.latestRequestId;
     const filters = buildDashboardFilters();
     const startedAt = performance.now();
@@ -1678,7 +2052,7 @@ async function refreshView(resetTable) {
       rows: {
         columnar: true,
         direction: state.tableSort === 'bottom' ? 'bottom' : 'top',
-        fields: TABLE_FIELDS,
+        fields,
         limit: TABLE_PAGE_SIZE,
         offset: resetTable ? 0 : state.tableOffset,
         sortBy: FIELDS.time,
@@ -1751,8 +2125,10 @@ function attachRuntimeListeners(runtime, loadToken) {
 }
 
 async function loadSource() {
+  const fields = getActiveTableFields();
   const loadToken = ++state.loadToken;
   hideError();
+  updateDataSourceUi();
   state.currentSnapshot = null;
   state.controlGroups = {};
   state.currentRowCount = 0;
@@ -1766,6 +2142,7 @@ async function loadSource() {
   state.tableHasMore = false;
   state.tableOffset = 0;
   state.lastInteractionMs = null;
+  renderTableHeader();
   dom.tableBody.replaceChildren();
   dom.latencyDisplay.textContent = '— ms';
   setLoading(true, 'Starting streaming worker...');
@@ -1793,6 +2170,10 @@ async function loadSource() {
   state.progress = readyPayload;
   state.ready = true;
   state.serverGranularity = state.dataSource === 'live' ? state.timeGranularity : null;
+  if (state.dataSource === 'live') {
+    state.liveApiAvailable = true;
+    writeSessionLiveUnavailable(false);
+  }
   updateProgressBadge(readyPayload);
   dom.loadTime.textContent = `Load: ${(performance.now() - loadStartedAt).toFixed(0)} ms`;
   appendLog(`Worker ready in ${(performance.now() - loadStartedAt).toFixed(1)} ms`);
@@ -1812,7 +2193,7 @@ async function loadSource() {
       rows: {
         columnar: true,
         direction: state.tableSort === 'bottom' ? 'bottom' : 'top',
-        fields: TABLE_FIELDS,
+        fields,
         limit: TABLE_PAGE_SIZE,
         offset: 0,
         sortBy: FIELDS.time,
@@ -1830,6 +2211,37 @@ async function loadSource() {
   setLoading(false);
   renderSnapshot(initialResult.snapshot, { deferControls: true, skipTable: true });
   updateTableRowCount();
+}
+
+async function handleLoadFailure(error, label) {
+  const message = error && error.message ? error.message : String(error);
+
+  if (state.dataSource === 'live' && shouldFallbackToLocalFromLiveErrorMessage(message)) {
+    state.liveApiAvailable = false;
+    writeSessionLiveUnavailable(true);
+    state.dataSource = 'file';
+    state.filters[FIELDS.latitude] = null;
+    renderSourceButtons();
+    updateDataSourceUi();
+    renderTableHeader();
+    persistDemoPreferences();
+    appendLog('Live API unavailable on this server. Falling back to the bundled Arrow file.');
+
+    try {
+      await loadSource();
+      return;
+    } catch (fallbackError) {
+      const fallbackMessage = fallbackError && fallbackError.message ? fallbackError.message : String(fallbackError);
+      showError(fallbackMessage);
+      appendLog(`Fallback load failed: ${fallbackMessage}`);
+      setLoading(false);
+      return;
+    }
+  }
+
+  showError(message);
+  appendLog(`${label}: ${message}`);
+  setLoading(false);
 }
 
 function clearAllFilters() {
@@ -1898,24 +2310,31 @@ function attachControlListeners() {
         return;
       }
       state.dataSource = nextSource;
+      if (nextSource === 'live') {
+        state.liveApiAvailable = null;
+        writeSessionLiveUnavailable(false);
+      } else {
+        state.filters[FIELDS.latitude] = null;
+      }
       state.filters = createEmptyFilterState();
-      dom.sourceButtons.forEach((item) => item.classList.toggle('mode-btn--active', item === button));
-      loadSource().catch((error) => {
-        showError(error.message || String(error));
-        appendLog(`Load failed: ${error.message || error}`);
-        setLoading(false);
-      });
+      renderSourceButtons();
+      updateDataSourceUi();
+      renderTableHeader();
+      persistDemoPreferences();
+      loadSource().catch((error) => handleLoadFailure(error, 'Load failed'));
     });
   });
 
   dom.tableSortToggle.addEventListener('click', () => {
     state.tableSort = state.tableSort === 'top' ? 'bottom' : 'top';
     dom.tableSortToggle.textContent = state.tableSort === 'top' ? 'Showing: Most Recent' : 'Showing: Oldest';
+    persistDemoPreferences();
     scheduleRefresh(true);
   });
 
   dom.localitySortToggle.addEventListener('click', () => {
     state.localitySort = state.localitySort === 'least' ? 'most' : 'least';
+    persistDemoPreferences();
     scheduleRefresh(true);
   });
 
@@ -1932,9 +2351,24 @@ function attachControlListeners() {
   }
   dom.timeMin.addEventListener('change', applyTimeRangeFromControls);
   dom.timeMax.addEventListener('change', applyTimeRangeFromControls);
-  dom.latMin.addEventListener('change', applyLatitudeRangeFromControls);
-  dom.latMax.addEventListener('change', applyLatitudeRangeFromControls);
+  dom.latMin.addEventListener('change', () => {
+    if (supportsLatitudeFeatures()) {
+      applyLatitudeRangeFromControls();
+    }
+  });
+  dom.latMax.addEventListener('change', () => {
+    if (supportsLatitudeFeatures()) {
+      applyLatitudeRangeFromControls();
+    }
+  });
   dom.regionSearch.addEventListener('input', () => {
+    if (!(dom.regionSearch.value || '').trim()) {
+      state.controlGroups[GROUP_IDS.regions] = null;
+      if (state.currentSnapshot) {
+        renderRegionOptions(state.currentSnapshot.groups[GROUP_IDS.regions]);
+      }
+      return;
+    }
     if (state.currentSnapshot && (!state.runtime || typeof state.runtime.groups !== 'function')) {
       renderRegionOptions(state.currentSnapshot.groups[GROUP_IDS.regions]);
       return;
@@ -1942,6 +2376,12 @@ function attachControlListeners() {
     scheduleControlGroupRefresh(GROUP_IDS.regions, 80);
   });
   dom.customerCountrySearch.addEventListener('input', () => {
+    if (!(dom.customerCountrySearch.value || '').trim()) {
+      state.controlGroups[GROUP_IDS.customerCountries] = null;
+      if (state.currentSnapshot) {
+        renderPickerOptions(dom.customerCountryOptions, dom.customerCountrySearch, FIELDS.customer_country, state.currentSnapshot.groups[GROUP_IDS.customerCountries]);
+      }
+    }
     if (state.currentSnapshot && (!state.runtime || typeof state.runtime.groups !== 'function')) {
       renderPickerOptions(dom.customerCountryOptions, dom.customerCountrySearch, FIELDS.customer_country, state.currentSnapshot.groups[GROUP_IDS.customerCountries]);
       return;
@@ -1949,6 +2389,12 @@ function attachControlListeners() {
     scheduleControlGroupRefresh(GROUP_IDS.customerCountries, 80);
   });
   dom.locationCountrySearch.addEventListener('input', () => {
+    if (!(dom.locationCountrySearch.value || '').trim()) {
+      state.controlGroups[GROUP_IDS.locationCountries] = null;
+      if (state.currentSnapshot) {
+        renderPickerOptions(dom.locationCountryOptions, dom.locationCountrySearch, FIELDS.location_country, state.currentSnapshot.groups[GROUP_IDS.locationCountries]);
+      }
+    }
     if (state.currentSnapshot && (!state.runtime || typeof state.runtime.groups !== 'function')) {
       renderPickerOptions(dom.locationCountryOptions, dom.locationCountrySearch, FIELDS.location_country, state.currentSnapshot.groups[GROUP_IDS.locationCountries]);
       return;
@@ -1989,22 +2435,6 @@ function attachControlListeners() {
       scheduleRefresh(true);
     });
   });
-
-  if (dom.chartGrid) {
-    dom.chartGrid.addEventListener('click', (event) => {
-      const item = event.target.closest('.list-item');
-      if (!item) {
-        return;
-      }
-      const field = item.dataset.key;
-      const value = item.dataset.value;
-      if (!field || value == null) {
-        return;
-      }
-      toggleArrayFilterValue(field, value);
-      scheduleRefresh(true);
-    });
-  }
 
   dom.customerCountryTrigger.addEventListener('click', () => {
     const willOpen = dom.customerCountryDropdown.hidden;
@@ -2067,11 +2497,10 @@ function attachControlListeners() {
         return;
       }
       state.timeGranularity = nextGran;
+      persistDemoPreferences();
       if (state.dataSource === 'live' && nextGran !== state.serverGranularity) {
         loadSource().catch(function (error) {
-          showError(error.message || String(error));
-          appendLog('Granularity reload failed: ' + (error.message || error));
-          setLoading(false);
+          handleLoadFailure(error, 'Granularity reload failed');
         });
       } else if (state.currentSnapshot) {
         scheduleRefresh(true);
@@ -2118,23 +2547,26 @@ function initStaticUi() {
   setKpiCard(dom.kpiLocations, '—', 'Visible Regions');
   setKpiCard(dom.kpiLatitude, '—', 'Avg Latitude');
   setKpiCard(dom.kpiTimespan, '—', 'Time Window');
+  updateDataSourceUi();
   renderTableHeader();
   renderLocalitySortState();
   renderGranularityButtons();
-  dom.tableSortToggle.textContent = 'Showing: Most Recent';
-  dom.sourceButtons.forEach((button) => button.classList.toggle('mode-btn--active', button.dataset.source === state.dataSource));
+  dom.tableSortToggle.textContent = state.tableSort === 'top' ? 'Showing: Most Recent' : 'Showing: Oldest';
+  renderSourceButtons();
   updateDemoButtons();
 }
 
 async function start() {
   cacheDom();
+  await hydrateInitialDataSource();
   initStaticUi();
   attachControlListeners();
-  loadSource().catch((error) => {
-    showError(error.message || String(error));
-    appendLog(`Initial load failed: ${error.message || error}`);
-    setLoading(false);
-  });
+  if (state.dataSource === 'live') {
+    appendLog(`Configured live proxy detected. Loading server-aggregated ${state.timeGranularity} Arrow data.`);
+  } else {
+    appendLog('Loading bundled Arrow data. Enable the configured live proxy to default to server-backed mode.');
+  }
+  loadSource().catch((error) => handleLoadFailure(error, 'Initial load failed'));
 }
 
 start();
