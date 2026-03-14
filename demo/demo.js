@@ -173,6 +173,8 @@ const state = {
   groupQueryInflight: {},
   groupQueryTimers: {},
   groupQueryTokens: {},
+  pendingGroupRefreshes: new Map(),
+  pendingGroupFlushTimer: 0,
   lastInteractionMs: null,
   latestRequestId: 0,
   liveApiAvailable: null,
@@ -1527,66 +1529,78 @@ function buildControlGroupRequestKey(groupId, request) {
   });
 }
 
-async function refreshControlGroup(groupId) {
-  if (!state.runtime || !state.ready || typeof state.runtime.groups !== 'function') {
-    return;
+function renderControlGroupResult(groupId) {
+  if (groupId === GROUP_IDS.customerCountries) {
+    renderPickerOptions(dom.customerCountryOptions, dom.customerCountrySearch, FIELDS.customer_country, state.controlGroups[groupId]);
+  } else if (groupId === GROUP_IDS.regions) {
+    renderRegionOptions(state.controlGroups[groupId]);
   }
+}
+
+async function flushPendingGroupRefreshes() {
+  state.pendingGroupFlushTimer = 0;
+  const pending = new Map(state.pendingGroupRefreshes);
+  state.pendingGroupRefreshes.clear();
+
+  if (!pending.size || !state.runtime || !state.ready) return;
+
+  const groupsRequest = {};
+  const requestKeys = {};
+  const tokens = {};
+
+  for (const [groupId, entry] of pending) {
+    const cached = state.groupQueryCache[groupId];
+    if (cached && cached.key === entry.requestKey) {
+      state.controlGroups[groupId] = cached.value;
+      renderControlGroupResult(groupId);
+      continue;
+    }
+    if (state.groupQueryInflight[groupId] === entry.requestKey) continue;
+
+    const token = (state.groupQueryTokens[groupId] || 0) + 1;
+    state.groupQueryTokens[groupId] = token;
+    state.groupQueryInflight[groupId] = entry.requestKey;
+    tokens[groupId] = token;
+    requestKeys[groupId] = entry.requestKey;
+    groupsRequest[groupId] = entry.query;
+  }
+
+  if (!Object.keys(groupsRequest).length) return;
+
+  try {
+    const groups = await state.runtime.groups({ groups: groupsRequest });
+    for (const groupId in groupsRequest) {
+      if (state.groupQueryTokens[groupId] !== tokens[groupId]) continue;
+      state.controlGroups[groupId] = groups[groupId] || null;
+      state.groupQueryCache[groupId] = { key: requestKeys[groupId], value: state.controlGroups[groupId] };
+      state.groupQueryInflight[groupId] = null;
+      renderControlGroupResult(groupId);
+    }
+  } catch (error) {
+    for (const groupId in groupsRequest) {
+      if (state.groupQueryInflight[groupId] === requestKeys[groupId]) {
+        state.groupQueryInflight[groupId] = null;
+      }
+    }
+    if (state.runtime) {
+      appendLog(`Batched control query failed: ${error.message || error}`);
+    }
+  }
+}
+
+function refreshControlGroup(groupId) {
+  if (!state.runtime || !state.ready || typeof state.runtime.groups !== 'function') return;
 
   const search = groupId === GROUP_IDS.customerCountries
     ? dom.customerCountrySearch.value
     : dom.regionSearch.value;
-  const request = {
-    groups: {
-      [groupId]: buildOptionGroupQuery(groupId, search),
-    },
-  };
-  const requestKey = buildControlGroupRequestKey(groupId, request.groups[groupId]);
-  const cached = state.groupQueryCache[groupId];
+  const query = buildOptionGroupQuery(groupId, search);
+  const requestKey = buildControlGroupRequestKey(groupId, query);
 
-  if (cached && cached.key === requestKey) {
-    state.controlGroups[groupId] = cached.value;
-    if (groupId === GROUP_IDS.customerCountries) {
-      renderPickerOptions(dom.customerCountryOptions, dom.customerCountrySearch, FIELDS.customer_country, state.controlGroups[groupId]);
-      return;
-    }
-    renderRegionOptions(state.controlGroups[groupId]);
-    return;
-  }
+  state.pendingGroupRefreshes.set(groupId, { query, requestKey });
 
-  if (state.groupQueryInflight[groupId] === requestKey) {
-    return;
-  }
-
-  const token = (state.groupQueryTokens[groupId] || 0) + 1;
-  state.groupQueryTokens[groupId] = token;
-  state.groupQueryInflight[groupId] = requestKey;
-
-  try {
-    const groups = await state.runtime.groups(request);
-
-    if (state.groupQueryTokens[groupId] !== token || state.groupQueryInflight[groupId] !== requestKey) {
-      return;
-    }
-
-    state.controlGroups[groupId] = groups[groupId] || null;
-    state.groupQueryCache[groupId] = {
-      key: requestKey,
-      value: state.controlGroups[groupId],
-    };
-    state.groupQueryInflight[groupId] = null;
-
-    if (groupId === GROUP_IDS.customerCountries) {
-      renderPickerOptions(dom.customerCountryOptions, dom.customerCountrySearch, FIELDS.customer_country, state.controlGroups[groupId]);
-      return;
-    }
-    renderRegionOptions(state.controlGroups[groupId]);
-  } catch (error) {
-    if (state.groupQueryInflight[groupId] === requestKey) {
-      state.groupQueryInflight[groupId] = null;
-    }
-    if (state.runtime) {
-      appendLog(`Control query failed for ${groupId}: ${error.message || error}`);
-    }
+  if (!state.pendingGroupFlushTimer) {
+    state.pendingGroupFlushTimer = setTimeout(flushPendingGroupRefreshes, 0);
   }
 }
 
