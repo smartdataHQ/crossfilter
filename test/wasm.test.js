@@ -46,26 +46,38 @@ describe("wasm runtime", () => {
     var ctrl = createWasmRuntimeController({ wasm: true });
     var codes = new Uint32Array([0, 1, 2, 3]);
 
-    var r1 = ctrl.findEncodedMatches(codes, [1]);
-    var r2 = ctrl.findEncodedMatches(codes, [2]);
-    var r3 = ctrl.findEncodedMatches(codes, [1, 2]);
+    var r1 = Array.from(ctrl.findEncodedMatches(codes, [1]));
+    var r2 = Array.from(ctrl.findEncodedMatches(codes, [2]));
+    var r3 = Array.from(ctrl.findEncodedMatches(codes, [1, 2]));
 
-    expect(Array.from(r1)).toEqual([1]);
-    expect(Array.from(r2)).toEqual([2]);
-    expect(Array.from(r3)).toEqual([1, 2]);
+    expect(r1).toEqual([1]);
+    expect(r2).toEqual([2]);
+    expect(r3).toEqual([1, 2]);
+  });
+
+  it("returns a valid Uint32Array even when result is a view", () => {
+    var ctrl = createWasmRuntimeController({ wasm: true });
+    var codes = new Uint32Array([0, 1, 2, 1, 3]);
+    var result = ctrl.findEncodedMatches(codes, [1]);
+    expect(result instanceof Uint32Array).toBe(true);
+    expect(Array.from(result)).toEqual([1, 3]);
+    // Result should be usable with Array.from, iteration, indexing
+    var sum = 0;
+    for (var i = 0; i < result.length; i++) sum += result[i];
+    expect(sum).toBe(4);
   });
 
   it("handles filter transitions (different targets, same codes)", () => {
     var ctrl = createWasmRuntimeController({ wasm: true });
     var codes = new Uint32Array([0, 1, 2, 3, 4]);
 
-    var r1 = ctrl.findEncodedMatches(codes, [0, 1]);
-    var r2 = ctrl.findEncodedMatches(codes, [2, 3]);
-    var r3 = ctrl.findEncodedMatches(codes, [4]);
+    var r1 = Array.from(ctrl.findEncodedMatches(codes, [0, 1]));
+    var r2 = Array.from(ctrl.findEncodedMatches(codes, [2, 3]));
+    var r3 = Array.from(ctrl.findEncodedMatches(codes, [4]));
 
-    expect(Array.from(r1)).toEqual([0, 1]);
-    expect(Array.from(r2)).toEqual([2, 3]);
-    expect(Array.from(r3)).toEqual([4]);
+    expect(r1).toEqual([0, 1]);
+    expect(r2).toEqual([2, 3]);
+    expect(r3).toEqual([4]);
   });
 });
 

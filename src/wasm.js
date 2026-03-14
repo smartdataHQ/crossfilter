@@ -201,9 +201,8 @@ function buildRuntime() {
       new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
 
       var count = this.filterInU32(0, codes.length, dataBytes, targetCodes.length, outPtr);
-      var matches = new Uint32Array(count);
-      matches.set(new Uint32Array(buffer, outPtr, count));
-      return matches;
+      // SAFETY: returned view is only valid until next matchSmall/matchMarked call
+      return new Uint32Array(buffer, outPtr, count);
     },
     matchMarked: function(codes, targetCodes, maxTargetCode) {
       var dataBytes = codes.length * 4;
@@ -218,9 +217,8 @@ function buildRuntime() {
       new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
 
       var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
-      var matches = new Uint32Array(count);
-      matches.set(new Uint32Array(buffer, outPtr, count));
-      return matches;
+      // SAFETY: returned view is only valid until next matchSmall/matchMarked call
+      return new Uint32Array(buffer, outPtr, count);
     }
   };
 }
