@@ -231,6 +231,13 @@ function getProjectionTransform(projection, inputName, outputName) {
   }
   return projection.transforms[outputName] || projection.transforms[inputName] || null;
 }
+function normalizeNumericValue(value) {
+  if (typeof value === 'bigint') {
+    return Number(value);
+  }
+  var numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
 function projectBatch(batch, projection) {
   var actualFields = getFieldNames(batch);
   var inputFields = projection && Array.isArray(projection.fields) && projection.fields.length
@@ -243,6 +250,14 @@ function projectBatch(batch, projection) {
 
   for (var actualIndex = 0; actualIndex < actualFields.length; ++actualIndex) {
     fieldIndexes[actualFields[actualIndex]] = actualIndex;
+  }
+  if (projection && Array.isArray(projection.extraFields) && projection.extraFields.length) {
+    for (var extraIndex = 0; extraIndex < projection.extraFields.length; ++extraIndex) {
+      var extraField = projection.extraFields[extraIndex];
+      if (inputFields.indexOf(extraField) < 0) {
+        inputFields.push(extraField);
+      }
+    }
   }
 
   for (var fieldIndex = 0; fieldIndex < inputFields.length; ++fieldIndex) {
@@ -263,6 +278,16 @@ function projectBatch(batch, projection) {
       for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
         values[rowIndex] = normalizeTimestampValue(getValue(sourceColumn, rowIndex));
       }
+      columns[outputName] = values;
+    } else if (transform === 'number') {
+      values = new Float64Array(length);
+      for (rowIndex = 0; rowIndex < length; ++rowIndex) {
+        values[rowIndex] = normalizeNumericValue(getValue(sourceColumn, rowIndex));
+      }
+      columns[outputName] = values;
+    } else if (transform === 'constantOne') {
+      values = new Float64Array(length);
+      values.fill(1);
       columns[outputName] = values;
     } else {
       columns[outputName] = sourceColumn;

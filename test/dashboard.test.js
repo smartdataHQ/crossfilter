@@ -269,6 +269,94 @@ describe("dashboard runtime", () => {
     runtime.dispose();
   });
 
+  it("supports sum-only dashboard metrics for KPI and grouped reads", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["country"],
+      groups: [{
+        field: "country",
+        id: "countries",
+        metrics: [{ field: "total", id: "count", op: "sum" }]
+      }],
+      kpis: [{ field: "total", id: "count", op: "sum" }],
+      records: [
+        { country: "IS", total: 10 },
+        { country: "IS", total: 30 },
+        { country: "UK", total: 20 },
+        { country: "US", total: 0 }
+      ]
+    });
+
+    expect(runtime.snapshot()).toEqual({
+      groups: {
+        countries: [
+          { key: "IS", value: { count: 40 } },
+          { key: "UK", value: { count: 20 } },
+          { key: "US", value: { count: 0 } }
+        ]
+      },
+      kpis: {
+        count: 60
+      },
+      runtime: crossfilter.runtimeInfo()
+    });
+
+    expect(runtime.groups({
+      groups: {
+        countries: {
+          includeTotals: true,
+          limit: 2,
+          nonEmptyKeys: true,
+          sort: "desc",
+          sortMetric: "count"
+        }
+      }
+    })).toEqual({
+      countries: {
+        entries: [
+          { key: "IS", value: { count: 40 } },
+          { key: "UK", value: { count: 20 } }
+        ],
+        limit: 2,
+        offset: 0,
+        sort: "desc",
+        sortMetric: "count",
+        total: 2
+      }
+    });
+
+    runtime.updateFilters({
+      country: { type: "exact", value: "IS" }
+    });
+
+    expect(runtime.snapshot().kpis.count).toBe(40);
+
+    runtime.dispose();
+  });
+
+  it("returns filtered row counts alongside shaped queries when requested", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["country"],
+      kpis: [{ field: "total", id: "count", op: "sum" }],
+      records: [
+        { country: "IS", total: 10 },
+        { country: "IS", total: 30 },
+        { country: "UK", total: 20 }
+      ]
+    });
+
+    expect(runtime.query({
+      filters: { country: { type: "exact", value: "IS" } },
+      rowCount: true,
+      snapshot: false
+    })).toEqual({
+      rowCount: 2,
+      rows: [],
+      snapshot: null
+    });
+
+    runtime.dispose();
+  });
+
   it("merges appended columnar batches with stable mixed-value group ordering", () => {
     const runtime = crossfilter.createDashboardRuntime({
       dimensions: ["region"],

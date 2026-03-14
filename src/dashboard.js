@@ -262,6 +262,19 @@ function buildMetricReducer(metrics) {
   };
 }
 
+function getNativeSumMetric(metrics) {
+  return metrics && metrics.length === 1 && metrics[0].op === "sum"
+    ? metrics[0]
+    : null;
+}
+
+function createNativeSumAccessor(metric) {
+  return function(row) {
+    var value = row[metric.field];
+    return isFiniteNumber(value) ? value : 0;
+  };
+}
+
 function normalizeFilter(filter) {
   if (!filter || filter.type === "all") {
     return null;
@@ -419,14 +432,22 @@ function insertSortedEntry(entries, entry, compare, maxSize) {
 }
 
 function createKpiRuntime(cf, metrics) {
-  var reducer = buildMetricReducer(metrics);
-  var group = cf.groupAll().reduce(reducer.add, reducer.remove, reducer.initial);
+  var nativeSumMetric = getNativeSumMetric(metrics);
+  var reducer = nativeSumMetric ? null : buildMetricReducer(metrics);
+  var group = nativeSumMetric && typeof cf.groupAll === "function"
+    ? cf.groupAll().reduceSum(createNativeSumAccessor(nativeSumMetric))
+    : cf.groupAll().reduce(reducer.add, reducer.remove, reducer.initial);
 
   return {
     dispose: function() {
       group.dispose();
     },
     read: function() {
+      if (nativeSumMetric) {
+        var result = {};
+        result[nativeSumMetric.id] = group.value();
+        return result;
+      }
       return reducer.finalize(group.value());
     }
   };
@@ -436,13 +457,18 @@ function createGroupRuntime(dimension, spec, index) {
   var metrics = normalizeMetrics(spec.metrics, spec.id || "group_" + index);
   var metricsById = {};
   var metricIndex;
-  var reducer = buildMetricReducer(metrics);
+  var nativeSumMetric = getNativeSumMetric(metrics);
+  var reducer = nativeSumMetric ? null : buildMetricReducer(metrics);
   var groupAccessor = resolveGroupAccessor(spec);
   var group = groupAccessor ? dimension.group(groupAccessor) : dimension.group();
   var visibleMetric = null;
   var defaultSortMetric = null;
   var orderedMetricId = null;
-  group.reduce(reducer.add, reducer.remove, reducer.initial);
+  if (nativeSumMetric && typeof group.reduceSum === "function") {
+    group.reduceSum(createNativeSumAccessor(nativeSumMetric));
+  } else {
+    group.reduce(reducer.add, reducer.remove, reducer.initial);
+  }
 
   for (metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
     metricsById[metrics[metricIndex].id] = metrics[metricIndex];
@@ -456,10 +482,34 @@ function createGroupRuntime(dimension, spec, index) {
   }
   defaultSortMetric = metricsById[spec.sortMetric] || metricsById.rows || metrics[0] || null;
 
+  function metricStateValue(value, metric) {
+    if (!metric) {
+      return 0;
+    }
+    if (nativeSumMetric) {
+      return metric.id === nativeSumMetric.id ? value : 0;
+    }
+    return value ? value[metric.id] : 0;
+  }
+
+  function entryMetricValue(entry, metric) {
+    return entry ? metricStateValue(entry.value, metric) : 0;
+  }
+
+  function finalizeEntryValue(value) {
+    if (!nativeSumMetric) {
+      return reducer.finalize(value);
+    }
+
+    var result = {};
+    result[nativeSumMetric.id] = value;
+    return result;
+  }
+
   function finalizeEntry(entry) {
     return {
       key: entry.key,
-      value: reducer.finalize(entry.value)
+      value: finalizeEntryValue(entry.value)
     };
   }
 
@@ -481,7 +531,7 @@ function createGroupRuntime(dimension, spec, index) {
   }
 
   function compareEntries(query, sortMetric, left, right) {
-    var diff = metricComparableValue(sortMetric, left.value[sortMetric.id]) - metricComparableValue(sortMetric, right.value[sortMetric.id]);
+    var diff = metricComparableValue(sortMetric, entryMetricValue(left, sortMetric)) - metricComparableValue(sortMetric, entryMetricValue(right, sortMetric));
     if (!Number.isFinite(diff) || diff === 0) {
       return compareGroupKeys(left.key, right.key);
     }
@@ -489,7 +539,7 @@ function createGroupRuntime(dimension, spec, index) {
   }
 
   function topComparableValue(sortMetric, entry) {
-    var comparable = metricComparableValue(sortMetric, entry.value[sortMetric.id]);
+    var comparable = metricComparableValue(sortMetric, entryMetricValue(entry, sortMetric));
     return comparable == null ? Number.NEGATIVE_INFINITY : comparable;
   }
 
@@ -501,7 +551,7 @@ function createGroupRuntime(dimension, spec, index) {
       return true;
     }
     group.order(function(value) {
-      var comparable = metricComparableValue(sortMetric, value[sortMetric.id]);
+      var comparable = metricComparableValue(sortMetric, metricStateValue(value, sortMetric));
       return comparable == null ? Number.NEGATIVE_INFINITY : comparable;
     });
     orderedMetricId = sortMetric.id;
@@ -537,7 +587,7 @@ function createGroupRuntime(dimension, spec, index) {
 
       for (var rawIndex = 0; rawIndex < rawEntries.length; ++rawIndex) {
         var rawEntry = rawEntries[rawIndex];
-        var visible = !normalized.visibleOnly || metricHasVisibleValue(visibleMetric, rawEntry.value[visibleMetric.id]);
+        var visible = !normalized.visibleOnly || metricHasVisibleValue(visibleMetric, entryMetricValue(rawEntry, visibleMetric));
         if (visible && matchesGroupKey(rawEntry.key, normalized, null, false)) {
           filteredEntries.push(rawEntry);
         }
@@ -612,7 +662,7 @@ function createGroupRuntime(dimension, spec, index) {
     for (entryIndex = 0; entryIndex < allEntries.length; ++entryIndex) {
       var entry = allEntries[entryIndex];
       var forceInclude = includeKeySet && includeKeySet.has(entry.key);
-      var visible = !normalized.visibleOnly || metricHasVisibleValue(visibleMetric, entry.value[visibleMetric.id]);
+      var visible = !normalized.visibleOnly || metricHasVisibleValue(visibleMetric, entryMetricValue(entry, visibleMetric));
       var matchesBaseQuery = visible && matchesGroupKey(entry.key, normalized, keySet, false);
 
       if (matchesBaseQuery) {
@@ -820,6 +870,7 @@ export function createDashboardRuntime(crossfilter, options) {
   var currentFilters = {};
   var groupRuntimes = {};
   var kpiRuntime = createKpiRuntime(cf, normalizeMetrics(options.kpis, "kpi"));
+  var rowCountGroup = cf.groupAll().reduceCount();
 
   for (var fieldIndex = 0; fieldIndex < dimensionFields.length; ++fieldIndex) {
     dimensions[dimensionFields[fieldIndex]] = cf.dimension(dimensionFields[fieldIndex]);
@@ -918,6 +969,10 @@ export function createDashboardRuntime(crossfilter, options) {
       kpis: kpiRuntime.read(),
       runtime: typeof cf.runtimeInfo === "function" ? cf.runtimeInfo() : crossfilter.runtimeInfo()
     };
+  }
+
+  function readRowCount() {
+    return rowCountGroup.value();
   }
 
   function readRows(query) {
@@ -1022,6 +1077,10 @@ export function createDashboardRuntime(crossfilter, options) {
       snapshot: request.snapshot === false ? null : readSnapshot(request.snapshot)
     };
 
+    if (request.rowCount) {
+      response.rowCount = readRowCount();
+    }
+
     if (request.groups) {
       response.groups = readGroups(request.groups);
     }
@@ -1092,6 +1151,7 @@ export function createDashboardRuntime(crossfilter, options) {
         groupRuntimes[groupId].dispose();
       }
       kpiRuntime.dispose();
+      rowCountGroup.dispose();
       for (var dimensionIndex = 0; dimensionIndex < dimensionFields.length; ++dimensionIndex) {
         dimensions[dimensionFields[dimensionIndex]].dispose();
       }
@@ -1113,6 +1173,13 @@ export function createDashboardRuntime(crossfilter, options) {
     },
     rowSets: function(request) {
       return queryRowSets(request);
+    },
+    rowCount: function(request) {
+      request = request || {};
+      if (request.filters) {
+        updateFilters(request.filters);
+      }
+      return readRowCount();
     },
     runtimeInfo: function() {
       return typeof cf.runtimeInfo === "function" ? cf.runtimeInfo() : crossfilter.runtimeInfo();
