@@ -22,6 +22,10 @@ Want to learn more? [See the wiki.](https://github.com/crossfilter/crossfilter/w
 This package can be found under the name `crossfilter2` in npm:
 
      npm install crossfilter2
+
+For performance-sensitive browser dashboards, see `docs/optimal-client-usage.md`.
+
+The canonical browser demo is `demo/demo.js` + `demo/index.html`. It uses `createStreamingDashboardWorker(...)`, single-source Arrow streaming from Synmetrix `/api/v1/load`, worker-owned filters/groups/KPIs, combined `query({ filters, rows })` reads, and live `append(...)` / `removeFiltered(...)` mutation.
      
 ## Development
 

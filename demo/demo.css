@@ -110,6 +110,9 @@ body {
   flex: 1 1 auto;
   display: flex;
   justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
 }
 
 .header-right {
@@ -117,6 +120,9 @@ body {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 38%;
 }
 
 /* --- Mode Selector (segmented control) --- */
@@ -174,6 +180,12 @@ body {
 .badge--latency {
   background: var(--brand-light);
   color: var(--brand-accent);
+}
+
+.badge--status {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* --- Filter Bar --- */
@@ -714,6 +726,48 @@ body {
 
 .chart-card--tall {
   min-height: 360px;
+}
+
+/* --- Full-width timeline section --- */
+.timeline-section {
+  margin-bottom: 16px;
+  padding: 16px;
+}
+
+.chart-container--timeline {
+  width: 100%;
+  height: 280px;
+}
+
+/* --- Granularity selector --- */
+.granularity-selector {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.gran-btn {
+  padding: 2px 10px;
+  font-size: 11px;
+  font-weight: 400;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.gran-btn:hover {
+  background: var(--brand-lighter);
+  color: var(--brand-primary);
+}
+
+.gran-btn--active {
+  background: var(--brand-primary);
+  color: #fff;
+  border-color: var(--brand-primary);
+  font-weight: 700;
 }
 
 .chart-header {

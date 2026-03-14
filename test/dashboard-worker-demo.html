@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Crossfilter Dashboard Worker Demo</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        line-height: 1.4;
+        margin: 24px;
+      }
+      .card {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        margin-bottom: 16px;
+        padding: 16px;
+      }
+      pre {
+        background: #111;
+        border-radius: 8px;
+        color: #eee;
+        max-height: 420px;
+        overflow: auto;
+        padding: 12px;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Crossfilter Streaming Dashboard Worker Demo</h1>
+    <p>
+      This page runs the new Promise-based streaming dashboard worker API against
+      <code>test/data/query-result.arrow</code> and keeps fetch, Arrow decode, and dashboard construction off the main thread.
+    </p>
+
+    <div class="card">
+      <strong>Status:</strong> <span id="status">Preparing...</span>
+    </div>
+
+    <div class="card">
+      <h2>Log</h2>
+      <pre id="log"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Result</h2>
+      <pre id="result"></pre>
+    </div>
+
+    <script src="../crossfilter.js"></script>
+    <script type="module">
+      import { runDashboardWorkerDemo } from './dashboard-worker-demo.mjs';
+
+      const status = document.getElementById('status');
+      const log = document.getElementById('log');
+      const result = document.getElementById('result');
+
+      function append(message) {
+        log.textContent += message + '\n';
+        log.scrollTop = log.scrollHeight;
+      }
+
+      try {
+        const payload = await runDashboardWorkerDemo((message) => {
+          status.textContent = message;
+          append(`${new Date().toISOString()} ${message}`);
+        });
+        status.textContent = 'Completed';
+        append(`${new Date().toISOString()} Completed`);
+        result.textContent = JSON.stringify(payload, null, 2);
+      } catch (error) {
+        status.textContent = 'Failed';
+        append(error && error.stack ? error.stack : String(error));
+      }
+    </script>
+  </body>
+</html>

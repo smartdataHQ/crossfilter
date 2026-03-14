@@ -1,4 +1,5 @@
 import identity from './identity.js';
+import { compareNaturalOrder } from './natural-order.js';
 
 function bisect_by(f) {
 
@@ -15,7 +16,7 @@ function bisect_by(f) {
   function bisectLeft(a, x, lo, hi) {
     while (lo < hi) {
       var mid = lo + hi >>> 1;
-      if (f(a[mid]) < x) lo = mid + 1;
+      if (compareNaturalOrder(f(a[mid]), x) < 0) lo = mid + 1;
       else hi = mid;
     }
     return lo;
@@ -30,7 +31,7 @@ function bisect_by(f) {
   function bisectRight(a, x, lo, hi) {
     while (lo < hi) {
       var mid = lo + hi >>> 1;
-      if (x < f(a[mid])) hi = mid;
+      if (compareNaturalOrder(x, f(a[mid])) < 0) hi = mid;
       else lo = mid + 1;
     }
     return lo;

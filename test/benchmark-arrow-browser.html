@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Crossfilter Arrow+WASM Benchmark</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 24px;
+        line-height: 1.4;
+      }
+      h1, h2 {
+        margin-bottom: 8px;
+      }
+      .muted {
+        color: #555;
+      }
+      .card {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 12px;
+      }
+      th, td {
+        border: 1px solid #ddd;
+        padding: 8px;
+        text-align: left;
+      }
+      th {
+        background: #f6f6f6;
+      }
+      pre {
+        background: #111;
+        color: #eee;
+        padding: 12px;
+        border-radius: 8px;
+        overflow: auto;
+        max-height: 320px;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Crossfilter Arrow+WASM Benchmark</h1>
+    <p class="muted">
+      This page benchmarks the Arrow+WASM happy path on <code>test/data/query-result.arrow</code>.
+      Serve the repository root with a static server, then open this file.
+    </p>
+
+    <div class="card">
+      <strong>Status:</strong> <span id="status">Preparing...</span>
+    </div>
+
+    <div class="card">
+      <h2>Summary</h2>
+      <div id="summary">Waiting for results...</div>
+    </div>
+
+    <div class="card">
+      <h2>Workloads</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Workload</th>
+            <th>Median (ms)</th>
+            <th>Mean (ms)</th>
+            <th>P95 (ms)</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Log</h2>
+      <pre id="log"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Raw JSON</h2>
+      <pre id="json"></pre>
+    </div>
+
+    <script src="../crossfilter.js"></script>
+    <script src="../node_modules/apache-arrow/Arrow.es2015.min.js"></script>
+    <script type="module">
+      import { runBrowserBenchmark } from './benchmark-arrow-browser.mjs';
+
+      const status = document.getElementById('status');
+      const summary = document.getElementById('summary');
+      const log = document.getElementById('log');
+      const resultsBody = document.getElementById('results-body');
+      const json = document.getElementById('json');
+
+      function appendLog(message) {
+        log.textContent += message + '\n';
+        log.scrollTop = log.scrollHeight;
+      }
+
+      function formatNumber(value) {
+        return Number(value).toFixed(2);
+      }
+
+      function renderResults(result) {
+        status.textContent = 'Completed';
+        summary.innerHTML = [
+          `<div><strong>Rows:</strong> ${result.rows.toLocaleString()}</div>`,
+          `<div><strong>Columns:</strong> ${result.columns}</div>`,
+          `<div><strong>Runtime:</strong> ${result.runtime.active}</div>`,
+          `<div><strong>Build dashboard median:</strong> ${formatNumber(result.workloads.build_dashboard.median)} ms</div>`,
+          `<div><strong>Country single KPI median:</strong> ${formatNumber(result.workloads.kpis_country_single.median)} ms</div>`,
+          `<div><strong>Country/event/region single dashboard median:</strong> ${formatNumber(result.workloads['dashboard__country_single__event_single__region_single__time_off'].median)} ms</div>`
+        ].join('');
+
+        Object.entries(result.workloads).forEach(([id, metrics]) => {
+          const row = document.createElement('tr');
+          row.innerHTML = [
+            `<td><code>${id}</code></td>`,
+            `<td>${formatNumber(metrics.median)}</td>`,
+            `<td>${formatNumber(metrics.mean)}</td>`,
+            `<td>${formatNumber(metrics.p95)}</td>`
+          ].join('');
+          resultsBody.appendChild(row);
+        });
+
+        json.textContent = JSON.stringify(result, null, 2);
+      }
+
+      try {
+        const result = await runBrowserBenchmark(({ message, timestamp }) => {
+          status.textContent = message;
+          appendLog(`${timestamp} ${message}`);
+        });
+        appendLog('Benchmark completed.');
+        renderResults(result);
+      } catch (error) {
+        status.textContent = 'Failed';
+        appendLog(error && error.stack ? error.stack : String(error));
+      }
+    </script>
+  </body>
+</html>

@@ -2,3 +2,6 @@
 node_modules
 .idea/
 test/data/query-result.arrow
+test/results/
+.env
+.playwright-mcp/

@@ -18,15 +18,19 @@
     <h1 class="header-title">Crossfilter2 <span class="header-subtitle">Interactive Demo</span></h1>
   </div>
   <div class="header-center">
+    <div id="source-selector" class="mode-selector source-selector">
+      <button data-source="file" class="mode-btn mode-btn--active">Local File</button>
+      <button data-source="live" class="mode-btn">Live API</button>
+    </div>
     <div id="mode-selector" class="mode-selector">
-      <button data-mode="row_baseline" class="mode-btn">Row (baseline)</button>
-      <button data-mode="row_native" class="mode-btn">Row (native)</button>
-      <button data-mode="arrow_js" class="mode-btn">Arrow + JS</button>
-      <button data-mode="arrow_wasm" class="mode-btn mode-btn--active">Arrow + WASM</button>
+      <button class="mode-btn mode-btn--active" type="button" title="Arrow IPC is streamed into the worker runtime">Streaming Arrow</button>
+      <button class="mode-btn mode-btn--active" type="button" title="Filters, groups, and KPI reducers stay off the main thread">Worker Runtime</button>
+      <button class="mode-btn mode-btn--active" type="button" title="Dense encoded discrete filters use the WASM path when supported">WASM Filters</button>
     </div>
   </div>
   <div class="header-right">
     <span id="runtime-badge" class="badge">—</span>
+    <span id="stream-status" class="badge badge--status">Worker: starting</span>
     <span id="latency-display" class="badge badge--latency">— ms</span>
     <span id="load-time" class="badge">Load: — ms</span>
   </div>
@@ -127,6 +131,21 @@
   <div id="kpi-timespan" class="glass-card kpi-card"><div class="kpi-value">—</div><div class="kpi-label">Time Span</div></div>
 </section>
 
+<section class="glass-card chart-card timeline-section">
+  <div class="chart-header">
+    Events over Time
+    <span class="group-size-badge" id="time-granularity-badge"></span>
+    <div id="granularity-selector" class="granularity-selector">
+      <button data-gran="minute" class="gran-btn">Minute</button>
+      <button data-gran="hour" class="gran-btn">Hour</button>
+      <button data-gran="day" class="gran-btn">Day</button>
+      <button data-gran="week" class="gran-btn">Week</button>
+      <button data-gran="month" class="gran-btn">Month</button>
+    </div>
+  </div>
+  <div id="chart-timeline" class="chart-container chart-container--timeline"></div>
+</section>
+
 <section class="chart-grid">
   <div class="chart-col">
     <div class="glass-card chart-card"><div class="chart-header">Events by Type <span class="group-size-badge" id="event-group-size"></span></div><div id="chart-event" class="chart-container"></div></div>
@@ -134,13 +153,12 @@
     <div class="glass-card chart-card"><div class="chart-header">By Location Country <span class="group-size-badge" id="lc-group-size"></span></div><div id="list-location-country" class="list-container"></div></div>
   </div>
   <div class="chart-col">
-    <div class="glass-card chart-card chart-card--tall"><div class="chart-header">Events over Time</div><div id="chart-timeline" class="chart-container chart-container--tall"></div></div>
     <div class="glass-card chart-card"><div class="chart-header">By Region <span class="group-size-badge" id="region-group-size"></span></div><div id="chart-region" class="chart-container"></div></div>
     <div class="glass-card chart-card"><div class="chart-header">By Division <span class="group-size-badge" id="division-group-size"></span></div><div id="chart-division" class="chart-container"></div></div>
   </div>
   <div class="chart-col">
     <div class="glass-card chart-card"><div class="chart-header">By Municipality (Top 20) <span class="group-size-badge" id="muni-group-size"></span></div><div id="list-municipality" class="list-container"></div></div>
-    <div class="glass-card chart-card"><div class="chart-header">By Locality (Least Frequent) <span class="group-size-badge" id="loc-group-size"></span></div><div id="list-locality" class="list-container"></div></div>
+    <div class="glass-card chart-card"><div class="chart-header">By Locality (<span id="locality-sort-label">Least Frequent</span>) <button id="locality-sort-toggle" class="btn" style="font-size:11px;padding:2px 8px;margin-left:6px">Toggle</button> <span class="group-size-badge" id="loc-group-size"></span></div><div id="list-locality" class="list-container"></div></div>
     <div class="glass-card chart-card"><div class="chart-header">Top Postal Codes <span class="group-size-badge" id="postal-group-size"></span></div><div id="list-postal" class="list-container"></div></div>
   </div>
 </section>
@@ -170,6 +188,10 @@
     <div class="chart-header">Performance Log</div>
     <pre id="perf-log" class="perf-log"></pre>
   </div>
+  <details id="query-details" class="glass-card log-card" style="display:none">
+    <summary class="chart-header" style="cursor:pointer;user-select:none">Cube.dev Query</summary>
+    <pre id="query-display" class="perf-log" style="white-space:pre-wrap;word-break:break-all"></pre>
+  </details>
 </section>
 
 <div id="loading-overlay" class="loading-overlay">
@@ -179,7 +201,6 @@
 
 <script src="../crossfilter.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
-<script src="../node_modules/apache-arrow/Arrow.es2015.min.js"></script>
 <script type="module" src="demo.js"></script>
 
 </body>
