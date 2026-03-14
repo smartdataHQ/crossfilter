@@ -940,6 +940,8 @@ function crossfilter() {
       }
 
       matches = runtimeController.findEncodedMatches(lazyEncodedState.codes, targetCodes);
+      // Copy from possible WASM memory view before it can be invalidated
+      matches = new Uint32Array(matches);
 
       filterMode = nextMode;
       lo0 = 0;

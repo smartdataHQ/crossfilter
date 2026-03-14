@@ -841,7 +841,17 @@
   };
 
   var SMALL_TARGET_WASM_THRESHOLD = 4;
+  var SMALL_DATA_WASM_THRESHOLD = 1000;
   var MAX_WASM_MARK_BYTES = 32 * 1024 * 1024;
+
+  function arraysEqual(a, b) {
+    if (a === b) return true;
+    if (!a || !b || a.length !== b.length) return false;
+    for (var i = 0; i < a.length; ++i) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
 
   function encodeU32(value) {
     var bytes = [];
@@ -997,18 +1007,33 @@
     return {
       cachedCodes: null,
       cachedCodesLength: 0,
+      cachedTargets: null,
+      cachedTargetsLength: 0,
+      cachedTargetsOffset: 0,
       filterInU32: instance.exports.filterInU32,
       markFilterInU32: instance.exports.markFilterInU32,
       memory: instance.exports.memory,
       ensureCapacity: function(totalBytes) {
-        var pagesNeeded = Math.ceil(totalBytes / 65536);
-        var currentPages = this.memory.buffer.byteLength / 65536;
+        var currentBytes = this.memory.buffer.byteLength;
 
-        if (pagesNeeded > currentPages) {
-          this.memory.grow(pagesNeeded - currentPages);
-          this.cachedCodes = null;
-          this.cachedCodesLength = 0;
+        if (totalBytes <= currentBytes) {
+          return this.memory.buffer;
         }
+
+        var targetBytes = currentBytes;
+        while (targetBytes < totalBytes) {
+          targetBytes = targetBytes ? targetBytes * 2 : 65536;
+        }
+
+        var pagesNeeded = Math.ceil(targetBytes / 65536);
+        var currentPages = currentBytes / 65536;
+
+        this.memory.grow(pagesNeeded - currentPages);
+        this.cachedCodes = null;
+        this.cachedCodesLength = 0;
+        this.cachedTargets = null;
+        this.cachedTargetsLength = 0;
+        this.cachedTargetsOffset = 0;
 
         return this.memory.buffer;
       },
@@ -1020,6 +1045,16 @@
         this.cachedCodes = codes;
         this.cachedCodesLength = codes.length;
       },
+      syncTargets: function(buffer, targetCodes, offset) {
+        if (arraysEqual(this.cachedTargets, targetCodes)
+            && this.cachedTargetsOffset === offset) {
+          return;
+        }
+        new Uint32Array(buffer, offset, targetCodes.length).set(targetCodes);
+        this.cachedTargets = targetCodes.slice ? targetCodes.slice() : Array.prototype.slice.call(targetCodes);
+        this.cachedTargetsLength = targetCodes.length;
+        this.cachedTargetsOffset = offset;
+      },
       matchSmall: function(codes, targetCodes) {
         var dataBytes = codes.length * 4;
         var targetBytes = targetCodes.length * 4;
@@ -1028,12 +1063,11 @@
         var buffer = this.ensureCapacity(totalBytes);
 
         this.syncCodes(buffer, codes);
-        new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
+        this.syncTargets(buffer, targetCodes, dataBytes);
 
         var count = this.filterInU32(0, codes.length, dataBytes, targetCodes.length, outPtr);
-        var matches = new Uint32Array(count);
-        matches.set(new Uint32Array(buffer, outPtr, count));
-        return matches;
+        // SAFETY: returned view is only valid until next matchSmall/matchMarked call
+        return new Uint32Array(buffer, outPtr, count);
       },
       matchMarked: function(codes, targetCodes, maxTargetCode) {
         var dataBytes = codes.length * 4;
@@ -1045,12 +1079,14 @@
         var buffer = this.ensureCapacity(totalBytes);
 
         this.syncCodes(buffer, codes);
-        new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
+        this.syncTargets(buffer, targetCodes, dataBytes);
+
+        // Zero marks region — it may contain stale data from prior matchSmall output
+        new Uint32Array(buffer, markPtr, maxTargetCode + 1).fill(0);
 
         var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
-        var matches = new Uint32Array(count);
-        matches.set(new Uint32Array(buffer, outPtr, count));
-        return matches;
+        // SAFETY: returned view is only valid until next matchSmall/matchMarked call
+        return new Uint32Array(buffer, outPtr, count);
       }
     };
   }
@@ -1097,8 +1133,22 @@
     state.marks = nextMarks;
   }
 
+  function ensureScratchCapacity(state, size) {
+    if (state.scratch.length >= size) {
+      return state.scratch;
+    }
+
+    var nextSize = state.scratch.length || 256;
+    while (nextSize < size) {
+      nextSize <<= 1;
+    }
+
+    state.scratch = new Uint32Array(nextSize);
+    return state.scratch;
+  }
+
   function denseLookupMatches(codes, targetCodes, state) {
-    var matches = new Uint32Array(codes.length);
+    var matches = ensureScratchCapacity(state, codes.length);
     var count = 0;
     var i;
 
@@ -1157,7 +1207,8 @@
       : defaultRuntimeOptions.wasm !== false;
     var denseLookupState = {
       marks: new Uint32Array(0),
-      version: 1
+      version: 1,
+      scratch: new Uint32Array(0)
     };
 
     function configureRuntime(nextOptions) {
@@ -1182,17 +1233,23 @@
 
       var runtime = getSharedRuntime(enabled);
       var maxTargetCode;
-      if (runtime && targetCodes.length <= SMALL_TARGET_WASM_THRESHOLD) {
-        try {
-          return runtime.matchSmall(codes, targetCodes);
-        } catch (error) {
-          sharedRuntimeState.error = error;
-          sharedRuntimeState.runtime = null;
+
+      if (runtime) {
+        var useSmall = targetCodes.length <= SMALL_TARGET_WASM_THRESHOLD
+          && codes.length <= SMALL_DATA_WASM_THRESHOLD;
+
+        if (useSmall) {
+          try {
+            return runtime.matchSmall(codes, targetCodes);
+          } catch (error) {
+            sharedRuntimeState.error = error;
+            sharedRuntimeState.runtime = null;
+          }
         }
       }
 
       if (runtime) {
-        maxTargetCode = maxCodeValue(targetCodes);
+        maxTargetCode = Math.max(maxCodeValue(targetCodes), maxCodeValue(codes));
         if ((maxTargetCode + 1) * 4 <= MAX_WASM_MARK_BYTES) {
           try {
             return runtime.matchMarked(codes, targetCodes, maxTargetCode);
@@ -2457,8 +2514,44 @@
       "function getTableFromIPC(module) {",
       "  return module && (module.tableFromIPC || (module.default && module.default.tableFromIPC)) || null;",
       "}",
+      "function collectRowTransferables(obj) {",
+      "  var buffers = [];",
+      "  if (!obj || typeof obj !== 'object' || !obj.columns) return buffers;",
+      "  for (var field in obj.columns) {",
+      "    if (Object.prototype.hasOwnProperty.call(obj.columns, field)) {",
+      "      var col = obj.columns[field];",
+      "      if (ArrayBuffer.isView(col) && col.buffer) buffers.push(col.buffer);",
+      "    }",
+      "  }",
+      "  return buffers;",
+      "}",
+      "function collectResponseTransferables(payload) {",
+      "  if (!payload || typeof payload !== 'object') return [];",
+      "  var seen = [];",
+      "  var buffers = [];",
+      "  function add(obj) {",
+      "    var found = collectRowTransferables(obj);",
+      "    for (var i = 0; i < found.length; ++i) {",
+      "      if (seen.indexOf(found[i]) < 0) {",
+      "        seen.push(found[i]);",
+      "        buffers.push(found[i]);",
+      "      }",
+      "    }",
+      "  }",
+      "  add(payload);",
+      "  if (payload.rows) add(payload.rows);",
+      "  if (payload.rowSets) {",
+      "    for (var setId in payload.rowSets) {",
+      "      if (Object.prototype.hasOwnProperty.call(payload.rowSets, setId)) {",
+      "        add(payload.rowSets[setId]);",
+      "      }",
+      "    }",
+      "  }",
+      "  return buffers;",
+      "}",
       "function respond(id, payload) {",
-      "  self.postMessage({ id: id, ok: true, payload: payload });",
+      "  var transferables = collectResponseTransferables(payload);",
+      "  self.postMessage({ id: id, ok: true, payload: payload }, transferables);",
       "}",
       "function fail(id, error) {",
       "  self.postMessage({ id: id, ok: false, error: {",
@@ -2881,6 +2974,18 @@ function getValue(column, index) {
   if (typeof column.at === 'function') return column.at(index);
   return column[index];
 }
+function resolveColumnAccessor(column) {
+  if (column == null) return null;
+  if (ArrayBuffer.isView(column) || Array.isArray(column)) return 'index';
+  if (typeof column.get === 'function') return 'get';
+  if (typeof column.at === 'function') return 'at';
+  return 'index';
+}
+function getValueByKind(column, index, kind) {
+  if (kind === 'get') return column.get(index);
+  if (kind === 'at') return column.at(index);
+  return column[index];
+}
 function allocateMergedColumn(column, length) {
   if (ArrayBuffer.isView(column) && typeof column.constructor === 'function' && typeof column.BYTES_PER_ELEMENT === 'number') {
     return new column.constructor(length);
@@ -2892,8 +2997,9 @@ function copyColumnValues(target, targetOffset, source, length) {
     target.set(source, targetOffset);
     return;
   }
+  var sourceKind = resolveColumnAccessor(source);
   for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
-    target[targetOffset + rowIndex] = getValue(source, rowIndex);
+    target[targetOffset + rowIndex] = source == null ? undefined : getValueByKind(source, rowIndex, sourceKind);
   }
 }
 function mergeProjectedBatches(batches) {
@@ -2960,8 +3066,44 @@ function normalizeTimestampValue(value) {
   }
   return 0;
 }
+function collectRowTransferables(obj) {
+  var buffers = [];
+  if (!obj || typeof obj !== 'object' || !obj.columns) return buffers;
+  for (var field in obj.columns) {
+    if (Object.prototype.hasOwnProperty.call(obj.columns, field)) {
+      var col = obj.columns[field];
+      if (ArrayBuffer.isView(col) && col.buffer) buffers.push(col.buffer);
+    }
+  }
+  return buffers;
+}
+function collectResponseTransferables(payload) {
+  if (!payload || typeof payload !== 'object') return [];
+  var seen = [];
+  var buffers = [];
+  function add(obj) {
+    var found = collectRowTransferables(obj);
+    for (var i = 0; i < found.length; ++i) {
+      if (seen.indexOf(found[i]) < 0) {
+        seen.push(found[i]);
+        buffers.push(found[i]);
+      }
+    }
+  }
+  add(payload);
+  if (payload.rows) add(payload.rows);
+  if (payload.rowSets) {
+    for (var setId in payload.rowSets) {
+      if (Object.prototype.hasOwnProperty.call(payload.rowSets, setId)) {
+        add(payload.rowSets[setId]);
+      }
+    }
+  }
+  return buffers;
+}
 function respond(id, payload) {
-  self.postMessage({ id: id, ok: true, payload: payload });
+  var transferables = collectResponseTransferables(payload);
+  self.postMessage({ id: id, ok: true, payload: payload }, transferables);
 }
 function fail(id, error) {
   self.postMessage({ id: id, ok: false, error: {
@@ -3023,16 +3165,18 @@ function projectBatch(batch, projection) {
       projectedFields.push(outputName);
     }
 
+    var sourceKind = resolveColumnAccessor(sourceColumn);
+
     if (transform === 'timestampMs') {
       var values = new Float64Array(length);
       for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
-        values[rowIndex] = normalizeTimestampValue(getValue(sourceColumn, rowIndex));
+        values[rowIndex] = normalizeTimestampValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
       }
       columns[outputName] = values;
     } else if (transform === 'number') {
       values = new Float64Array(length);
       for (rowIndex = 0; rowIndex < length; ++rowIndex) {
-        values[rowIndex] = normalizeNumericValue(getValue(sourceColumn, rowIndex));
+        values[rowIndex] = normalizeNumericValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
       }
       columns[outputName] = values;
     } else if (transform === 'constantOne') {
@@ -3051,9 +3195,27 @@ function projectBatch(batch, projection) {
   };
 }
 function buildLookupKey(columns, keyFields, rowIndex) {
+  if (keyFields.length === 1) {
+    var value = getValue(columns[keyFields[0]], rowIndex);
+    return value == null ? '' : String(value);
+  }
   var parts = new Array(keyFields.length);
   for (var fieldIndex = 0; fieldIndex < keyFields.length; ++fieldIndex) {
     var value = getValue(columns[keyFields[fieldIndex]], rowIndex);
+    parts[fieldIndex] = value == null ? '' : String(value);
+  }
+  return parts.join('|');
+}
+function buildLookupKeyResolved(columns, keyFields, keyKinds, rowIndex) {
+  if (keyFields.length === 1) {
+    var col = columns[keyFields[0]];
+    var value = col == null ? undefined : getValueByKind(col, rowIndex, keyKinds[0]);
+    return value == null ? '' : String(value);
+  }
+  var parts = new Array(keyFields.length);
+  for (var fieldIndex = 0; fieldIndex < keyFields.length; ++fieldIndex) {
+    var col = columns[keyFields[fieldIndex]];
+    var value = col == null ? undefined : getValueByKind(col, rowIndex, keyKinds[fieldIndex]);
     parts[fieldIndex] = value == null ? '' : String(value);
   }
   return parts.join('|');
@@ -3383,15 +3545,24 @@ async function buildLookupIndexFromSource(source) {
 
   for await (var batch of reader) {
     var projected = projectBatch(batch, source.projection);
+    var keyKinds = new Array(source.lookup.keyFields.length);
+    for (var ki = 0; ki < source.lookup.keyFields.length; ++ki) {
+      keyKinds[ki] = resolveColumnAccessor(projected.columns[source.lookup.keyFields[ki]]);
+    }
+    var valKinds = new Array(valueFields.length);
+    for (var vi = 0; vi < valueFields.length; ++vi) {
+      valKinds[vi] = resolveColumnAccessor(projected.columns[valueFields[vi]]);
+    }
 
     for (var rowIndex = 0; rowIndex < projected.length; ++rowIndex) {
-      var key = buildLookupKey(projected.columns, source.lookup.keyFields, rowIndex);
+      var key = buildLookupKeyResolved(projected.columns, source.lookup.keyFields, keyKinds, rowIndex);
       if (index.has(key)) {
         continue;
       }
       var values = new Array(valueFields.length);
       for (var valueIndex = 0; valueIndex < valueFields.length; ++valueIndex) {
-        var fieldValue = getValue(projected.columns[valueFields[valueIndex]], rowIndex);
+        var valCol = projected.columns[valueFields[valueIndex]];
+        var fieldValue = valCol == null ? undefined : getValueByKind(valCol, rowIndex, valKinds[valueIndex]);
         values[valueIndex] = fieldValue;
         if (valueKinds[valueIndex] !== 'generic' && typeof fieldValue === 'number' && Number.isFinite(fieldValue)) {
           valueKinds[valueIndex] = 'number';
@@ -3444,8 +3615,13 @@ function applyLookupIndexes(baseBatches, lookupResults) {
         }
       }
 
+      var lookupKeyKinds = new Array(lookup.keyFields.length);
+      for (var ki = 0; ki < lookup.keyFields.length; ++ki) {
+        lookupKeyKinds[ki] = resolveColumnAccessor(batch.columns[lookup.keyFields[ki]]);
+      }
+
       for (var rowIndex = 0; rowIndex < batch.length; ++rowIndex) {
-        var values = lookup.index.get(buildLookupKey(batch.columns, lookup.keyFields, rowIndex));
+        var values = lookup.index.get(buildLookupKeyResolved(batch.columns, lookup.keyFields, lookupKeyKinds, rowIndex));
         if (!values) {
           continue;
         }
@@ -4785,6 +4961,8 @@ self.onmessage = async function(event) {
         }
 
         matches = runtimeController.findEncodedMatches(lazyEncodedState.codes, targetCodes);
+        // Copy from possible WASM memory view before it can be invalidated
+        matches = new Uint32Array(matches);
 
         filterMode = nextMode;
         lo0 = 0;

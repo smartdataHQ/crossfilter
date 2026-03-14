@@ -11,7 +11,17 @@ var sharedRuntimeState = {
 };
 
 var SMALL_TARGET_WASM_THRESHOLD = 4;
+var SMALL_DATA_WASM_THRESHOLD = 1000;
 var MAX_WASM_MARK_BYTES = 32 * 1024 * 1024;
+
+function arraysEqual(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (var i = 0; i < a.length; ++i) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 function encodeU32(value) {
   var bytes = [];
@@ -167,18 +177,33 @@ function buildRuntime() {
   return {
     cachedCodes: null,
     cachedCodesLength: 0,
+    cachedTargets: null,
+    cachedTargetsLength: 0,
+    cachedTargetsOffset: 0,
     filterInU32: instance.exports.filterInU32,
     markFilterInU32: instance.exports.markFilterInU32,
     memory: instance.exports.memory,
     ensureCapacity: function(totalBytes) {
-      var pagesNeeded = Math.ceil(totalBytes / 65536);
-      var currentPages = this.memory.buffer.byteLength / 65536;
+      var currentBytes = this.memory.buffer.byteLength;
 
-      if (pagesNeeded > currentPages) {
-        this.memory.grow(pagesNeeded - currentPages);
-        this.cachedCodes = null;
-        this.cachedCodesLength = 0;
+      if (totalBytes <= currentBytes) {
+        return this.memory.buffer;
       }
+
+      var targetBytes = currentBytes;
+      while (targetBytes < totalBytes) {
+        targetBytes = targetBytes ? targetBytes * 2 : 65536;
+      }
+
+      var pagesNeeded = Math.ceil(targetBytes / 65536);
+      var currentPages = currentBytes / 65536;
+
+      this.memory.grow(pagesNeeded - currentPages);
+      this.cachedCodes = null;
+      this.cachedCodesLength = 0;
+      this.cachedTargets = null;
+      this.cachedTargetsLength = 0;
+      this.cachedTargetsOffset = 0;
 
       return this.memory.buffer;
     },
@@ -190,6 +215,16 @@ function buildRuntime() {
       this.cachedCodes = codes;
       this.cachedCodesLength = codes.length;
     },
+    syncTargets: function(buffer, targetCodes, offset) {
+      if (arraysEqual(this.cachedTargets, targetCodes)
+          && this.cachedTargetsOffset === offset) {
+        return;
+      }
+      new Uint32Array(buffer, offset, targetCodes.length).set(targetCodes);
+      this.cachedTargets = targetCodes.slice ? targetCodes.slice() : Array.prototype.slice.call(targetCodes);
+      this.cachedTargetsLength = targetCodes.length;
+      this.cachedTargetsOffset = offset;
+    },
     matchSmall: function(codes, targetCodes) {
       var dataBytes = codes.length * 4;
       var targetBytes = targetCodes.length * 4;
@@ -198,12 +233,11 @@ function buildRuntime() {
       var buffer = this.ensureCapacity(totalBytes);
 
       this.syncCodes(buffer, codes);
-      new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
+      this.syncTargets(buffer, targetCodes, dataBytes);
 
       var count = this.filterInU32(0, codes.length, dataBytes, targetCodes.length, outPtr);
-      var matches = new Uint32Array(count);
-      matches.set(new Uint32Array(buffer, outPtr, count));
-      return matches;
+      // SAFETY: returned view is only valid until next matchSmall/matchMarked call
+      return new Uint32Array(buffer, outPtr, count);
     },
     matchMarked: function(codes, targetCodes, maxTargetCode) {
       var dataBytes = codes.length * 4;
@@ -215,12 +249,14 @@ function buildRuntime() {
       var buffer = this.ensureCapacity(totalBytes);
 
       this.syncCodes(buffer, codes);
-      new Uint32Array(buffer, dataBytes, targetCodes.length).set(targetCodes);
+      this.syncTargets(buffer, targetCodes, dataBytes);
+
+      // Zero marks region — it may contain stale data from prior matchSmall output
+      new Uint32Array(buffer, markPtr, maxTargetCode + 1).fill(0);
 
       var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
-      var matches = new Uint32Array(count);
-      matches.set(new Uint32Array(buffer, outPtr, count));
-      return matches;
+      // SAFETY: returned view is only valid until next matchSmall/matchMarked call
+      return new Uint32Array(buffer, outPtr, count);
     }
   };
 }
@@ -267,8 +303,22 @@ function ensureDenseLookupCapacity(state, size) {
   state.marks = nextMarks;
 }
 
+function ensureScratchCapacity(state, size) {
+  if (state.scratch.length >= size) {
+    return state.scratch;
+  }
+
+  var nextSize = state.scratch.length || 256;
+  while (nextSize < size) {
+    nextSize <<= 1;
+  }
+
+  state.scratch = new Uint32Array(nextSize);
+  return state.scratch;
+}
+
 function denseLookupMatches(codes, targetCodes, state) {
-  var matches = new Uint32Array(codes.length);
+  var matches = ensureScratchCapacity(state, codes.length);
   var count = 0;
   var i;
 
@@ -327,7 +377,8 @@ export function createWasmRuntimeController(options) {
     : defaultRuntimeOptions.wasm !== false;
   var denseLookupState = {
     marks: new Uint32Array(0),
-    version: 1
+    version: 1,
+    scratch: new Uint32Array(0)
   };
 
   function configureRuntime(nextOptions) {
@@ -352,17 +403,23 @@ export function createWasmRuntimeController(options) {
 
     var runtime = getSharedRuntime(enabled);
     var maxTargetCode;
-    if (runtime && targetCodes.length <= SMALL_TARGET_WASM_THRESHOLD) {
-      try {
-        return runtime.matchSmall(codes, targetCodes);
-      } catch (error) {
-        sharedRuntimeState.error = error;
-        sharedRuntimeState.runtime = null;
+
+    if (runtime) {
+      var useSmall = targetCodes.length <= SMALL_TARGET_WASM_THRESHOLD
+        && codes.length <= SMALL_DATA_WASM_THRESHOLD;
+
+      if (useSmall) {
+        try {
+          return runtime.matchSmall(codes, targetCodes);
+        } catch (error) {
+          sharedRuntimeState.error = error;
+          sharedRuntimeState.runtime = null;
+        }
       }
     }
 
     if (runtime) {
-      maxTargetCode = maxCodeValue(targetCodes);
+      maxTargetCode = Math.max(maxCodeValue(targetCodes), maxCodeValue(codes));
       if ((maxTargetCode + 1) * 4 <= MAX_WASM_MARK_BYTES) {
         try {
           return runtime.matchMarked(codes, targetCodes, maxTargetCode);
@@ -404,3 +461,5 @@ export function canUseWasmScan() {
 export function findEncodedMatches(codes, targetCodes) {
   return defaultRuntimeController.findEncodedMatches(codes, targetCodes);
 }
+
+export { denseLookupMatches as _denseLookupMatches };

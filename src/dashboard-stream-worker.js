@@ -131,6 +131,18 @@ function getValue(column, index) {
   if (typeof column.at === 'function') return column.at(index);
   return column[index];
 }
+function resolveColumnAccessor(column) {
+  if (column == null) return null;
+  if (ArrayBuffer.isView(column) || Array.isArray(column)) return 'index';
+  if (typeof column.get === 'function') return 'get';
+  if (typeof column.at === 'function') return 'at';
+  return 'index';
+}
+function getValueByKind(column, index, kind) {
+  if (kind === 'get') return column.get(index);
+  if (kind === 'at') return column.at(index);
+  return column[index];
+}
 function allocateMergedColumn(column, length) {
   if (ArrayBuffer.isView(column) && typeof column.constructor === 'function' && typeof column.BYTES_PER_ELEMENT === 'number') {
     return new column.constructor(length);
@@ -142,8 +154,9 @@ function copyColumnValues(target, targetOffset, source, length) {
     target.set(source, targetOffset);
     return;
   }
+  var sourceKind = resolveColumnAccessor(source);
   for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
-    target[targetOffset + rowIndex] = getValue(source, rowIndex);
+    target[targetOffset + rowIndex] = source == null ? undefined : getValueByKind(source, rowIndex, sourceKind);
   }
 }
 function mergeProjectedBatches(batches) {
@@ -210,8 +223,44 @@ function normalizeTimestampValue(value) {
   }
   return 0;
 }
+function collectRowTransferables(obj) {
+  var buffers = [];
+  if (!obj || typeof obj !== 'object' || !obj.columns) return buffers;
+  for (var field in obj.columns) {
+    if (Object.prototype.hasOwnProperty.call(obj.columns, field)) {
+      var col = obj.columns[field];
+      if (ArrayBuffer.isView(col) && col.buffer) buffers.push(col.buffer);
+    }
+  }
+  return buffers;
+}
+function collectResponseTransferables(payload) {
+  if (!payload || typeof payload !== 'object') return [];
+  var seen = [];
+  var buffers = [];
+  function add(obj) {
+    var found = collectRowTransferables(obj);
+    for (var i = 0; i < found.length; ++i) {
+      if (seen.indexOf(found[i]) < 0) {
+        seen.push(found[i]);
+        buffers.push(found[i]);
+      }
+    }
+  }
+  add(payload);
+  if (payload.rows) add(payload.rows);
+  if (payload.rowSets) {
+    for (var setId in payload.rowSets) {
+      if (Object.prototype.hasOwnProperty.call(payload.rowSets, setId)) {
+        add(payload.rowSets[setId]);
+      }
+    }
+  }
+  return buffers;
+}
 function respond(id, payload) {
-  self.postMessage({ id: id, ok: true, payload: payload });
+  var transferables = collectResponseTransferables(payload);
+  self.postMessage({ id: id, ok: true, payload: payload }, transferables);
 }
 function fail(id, error) {
   self.postMessage({ id: id, ok: false, error: {
@@ -273,16 +322,18 @@ function projectBatch(batch, projection) {
       projectedFields.push(outputName);
     }
 
+    var sourceKind = resolveColumnAccessor(sourceColumn);
+
     if (transform === 'timestampMs') {
       var values = new Float64Array(length);
       for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
-        values[rowIndex] = normalizeTimestampValue(getValue(sourceColumn, rowIndex));
+        values[rowIndex] = normalizeTimestampValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
       }
       columns[outputName] = values;
     } else if (transform === 'number') {
       values = new Float64Array(length);
       for (rowIndex = 0; rowIndex < length; ++rowIndex) {
-        values[rowIndex] = normalizeNumericValue(getValue(sourceColumn, rowIndex));
+        values[rowIndex] = normalizeNumericValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
       }
       columns[outputName] = values;
     } else if (transform === 'constantOne') {
@@ -301,9 +352,27 @@ function projectBatch(batch, projection) {
   };
 }
 function buildLookupKey(columns, keyFields, rowIndex) {
+  if (keyFields.length === 1) {
+    var value = getValue(columns[keyFields[0]], rowIndex);
+    return value == null ? '' : String(value);
+  }
   var parts = new Array(keyFields.length);
   for (var fieldIndex = 0; fieldIndex < keyFields.length; ++fieldIndex) {
     var value = getValue(columns[keyFields[fieldIndex]], rowIndex);
+    parts[fieldIndex] = value == null ? '' : String(value);
+  }
+  return parts.join('|');
+}
+function buildLookupKeyResolved(columns, keyFields, keyKinds, rowIndex) {
+  if (keyFields.length === 1) {
+    var col = columns[keyFields[0]];
+    var value = col == null ? undefined : getValueByKind(col, rowIndex, keyKinds[0]);
+    return value == null ? '' : String(value);
+  }
+  var parts = new Array(keyFields.length);
+  for (var fieldIndex = 0; fieldIndex < keyFields.length; ++fieldIndex) {
+    var col = columns[keyFields[fieldIndex]];
+    var value = col == null ? undefined : getValueByKind(col, rowIndex, keyKinds[fieldIndex]);
     parts[fieldIndex] = value == null ? '' : String(value);
   }
   return parts.join('|');
@@ -633,15 +702,24 @@ async function buildLookupIndexFromSource(source) {
 
   for await (var batch of reader) {
     var projected = projectBatch(batch, source.projection);
+    var keyKinds = new Array(source.lookup.keyFields.length);
+    for (var ki = 0; ki < source.lookup.keyFields.length; ++ki) {
+      keyKinds[ki] = resolveColumnAccessor(projected.columns[source.lookup.keyFields[ki]]);
+    }
+    var valKinds = new Array(valueFields.length);
+    for (var vi = 0; vi < valueFields.length; ++vi) {
+      valKinds[vi] = resolveColumnAccessor(projected.columns[valueFields[vi]]);
+    }
 
     for (var rowIndex = 0; rowIndex < projected.length; ++rowIndex) {
-      var key = buildLookupKey(projected.columns, source.lookup.keyFields, rowIndex);
+      var key = buildLookupKeyResolved(projected.columns, source.lookup.keyFields, keyKinds, rowIndex);
       if (index.has(key)) {
         continue;
       }
       var values = new Array(valueFields.length);
       for (var valueIndex = 0; valueIndex < valueFields.length; ++valueIndex) {
-        var fieldValue = getValue(projected.columns[valueFields[valueIndex]], rowIndex);
+        var valCol = projected.columns[valueFields[valueIndex]];
+        var fieldValue = valCol == null ? undefined : getValueByKind(valCol, rowIndex, valKinds[valueIndex]);
         values[valueIndex] = fieldValue;
         if (valueKinds[valueIndex] !== 'generic' && typeof fieldValue === 'number' && Number.isFinite(fieldValue)) {
           valueKinds[valueIndex] = 'number';
@@ -694,8 +772,13 @@ function applyLookupIndexes(baseBatches, lookupResults) {
         }
       }
 
+      var lookupKeyKinds = new Array(lookup.keyFields.length);
+      for (var ki = 0; ki < lookup.keyFields.length; ++ki) {
+        lookupKeyKinds[ki] = resolveColumnAccessor(batch.columns[lookup.keyFields[ki]]);
+      }
+
       for (var rowIndex = 0; rowIndex < batch.length; ++rowIndex) {
-        var values = lookup.index.get(buildLookupKey(batch.columns, lookup.keyFields, rowIndex));
+        var values = lookup.index.get(buildLookupKeyResolved(batch.columns, lookup.keyFields, lookupKeyKinds, rowIndex));
         if (!values) {
           continue;
         }
