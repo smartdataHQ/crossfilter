@@ -91,6 +91,26 @@ describe("wasm runtime", () => {
     expect(Array.from(r2)).toEqual([0, 2, 4]);
   });
 
+  it("handles alternating small and large target sets without error", () => {
+    var ctrl = createWasmRuntimeController({ wasm: true });
+    var codes = new Uint32Array(5000);
+    for (var i = 0; i < 5000; ++i) codes[i] = i % 100;
+
+    // Small target — uses matchSmall
+    var r1 = ctrl.findEncodedMatches(codes, [1, 2]);
+    expect(r1.length).toBe(100);
+
+    // Large target — uses matchMarked, needs more memory for marks
+    var bigTargets = [];
+    for (var j = 0; j < 50; j++) bigTargets.push(j * 2);
+    var r2 = ctrl.findEncodedMatches(codes, bigTargets);
+    expect(r2.length).toBe(2500);
+
+    // Back to small — should not re-grow
+    var r3 = ctrl.findEncodedMatches(codes, [3]);
+    expect(r3.length).toBe(50);
+  });
+
   it("handles filter transitions (different targets, same codes)", () => {
     var ctrl = createWasmRuntimeController({ wasm: true });
     var codes = new Uint32Array([0, 1, 2, 3, 4]);

@@ -183,17 +183,26 @@ function buildRuntime() {
     markFilterInU32: instance.exports.markFilterInU32,
     memory: instance.exports.memory,
     ensureCapacity: function(totalBytes) {
-      var pagesNeeded = Math.ceil(totalBytes / 65536);
-      var currentPages = this.memory.buffer.byteLength / 65536;
+      var currentBytes = this.memory.buffer.byteLength;
 
-      if (pagesNeeded > currentPages) {
-        this.memory.grow(pagesNeeded - currentPages);
-        this.cachedCodes = null;
-        this.cachedCodesLength = 0;
-        this.cachedTargets = null;
-        this.cachedTargetsLength = 0;
-        this.cachedTargetsOffset = 0;
+      if (totalBytes <= currentBytes) {
+        return this.memory.buffer;
       }
+
+      var targetBytes = currentBytes;
+      while (targetBytes < totalBytes) {
+        targetBytes = targetBytes ? targetBytes * 2 : 65536;
+      }
+
+      var pagesNeeded = Math.ceil(targetBytes / 65536);
+      var currentPages = currentBytes / 65536;
+
+      this.memory.grow(pagesNeeded - currentPages);
+      this.cachedCodes = null;
+      this.cachedCodesLength = 0;
+      this.cachedTargets = null;
+      this.cachedTargetsLength = 0;
+      this.cachedTargetsOffset = 0;
 
       return this.memory.buffer;
     },
@@ -240,6 +249,9 @@ function buildRuntime() {
 
       this.syncCodes(buffer, codes);
       this.syncTargets(buffer, targetCodes, dataBytes);
+
+      // Zero marks region — it may contain stale data from prior matchSmall output
+      new Uint32Array(buffer, markPtr, maxTargetCode + 1).fill(0);
 
       var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
       // SAFETY: returned view is only valid until next matchSmall/matchMarked call
