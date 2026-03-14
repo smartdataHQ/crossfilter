@@ -72,7 +72,19 @@ function createWorkerSource(crossfilterUrl, arrowUrl) {
     "        if (!runtime) {",
     "          throw new Error('Dashboard worker is not initialized.');",
     "        }",
-    "        respond(id, runtime.snapshot(message.payload.filters));",
+    "        respond(id, runtime.snapshot(message.payload.filters, message.payload.options || null));",
+    "        return;",
+    "      case 'groups':",
+    "        if (!runtime) {",
+    "          throw new Error('Dashboard worker is not initialized.');",
+    "        }",
+    "        respond(id, runtime.groups(message.payload.request));",
+    "        return;",
+    "      case 'bounds':",
+    "        if (!runtime) {",
+    "          throw new Error('Dashboard worker is not initialized.');",
+    "        }",
+    "        respond(id, runtime.bounds(message.payload.request));",
     "        return;",
     "      case 'query':",
     "        if (!runtime) {",
@@ -85,6 +97,12 @@ function createWorkerSource(crossfilterUrl, arrowUrl) {
     "          throw new Error('Dashboard worker is not initialized.');",
     "        }",
     "        respond(id, runtime.rows(message.payload.query));",
+    "        return;",
+    "      case 'rowSets':",
+    "        if (!runtime) {",
+    "          throw new Error('Dashboard worker is not initialized.');",
+    "        }",
+    "        respond(id, runtime.rowSets(message.payload.request));",
     "        return;",
     "      case 'append':",
     "        if (!runtime) {",
@@ -245,6 +263,9 @@ export function createDashboardWorker(options) {
       append: function(records) {
         return call('append', { records: records || [] });
       },
+      bounds: function(request) {
+        return call("bounds", { request: request || null });
+      },
       dispose: function() {
         if (disposed) {
           return Promise.resolve();
@@ -262,6 +283,9 @@ export function createDashboardWorker(options) {
       query: function(request) {
         return call('query', { request: request || null });
       },
+      groups: function(request) {
+        return call("groups", { request: request || null });
+      },
       removeFiltered: function(selection) {
         return call('removeFiltered', { selection: selection || 'included' });
       },
@@ -271,11 +295,17 @@ export function createDashboardWorker(options) {
       runtimeInfo: function() {
         return call("runtimeInfo");
       },
-      snapshot: function(filters) {
-        return call("snapshot", { filters: filters || null });
+      snapshot: function(filters, options) {
+        return call("snapshot", {
+          filters: filters || null,
+          options: options || null
+        });
       },
       rows: function(query) {
         return call("rows", { query: query || null });
+      },
+      rowSets: function(request) {
+        return call("rowSets", { request: request || null });
       },
       updateFilters: function(filters) {
         return call("updateFilters", { filters: filters || null });

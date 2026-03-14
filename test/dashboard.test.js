@@ -233,6 +233,20 @@ describe("dashboard runtime", () => {
       { country: "UK", time: Date.UTC(2026, 0, 1, 12) }
     ]);
 
+    expect(runtime.rows({
+      columnar: true,
+      fields: ["country", "time"],
+      limit: 2,
+      sortBy: "time"
+    })).toEqual({
+      columns: {
+        country: ["US", "UK"],
+        time: [Date.UTC(2026, 0, 2, 9), Date.UTC(2026, 0, 1, 12)]
+      },
+      fields: ["country", "time"],
+      length: 2
+    });
+
     expect(runtime.query({
       filters: { country: { type: "exact", value: "IS" } },
       rows: {
@@ -254,6 +268,272 @@ describe("dashboard runtime", () => {
         },
         kpis: { rows: 1 },
         runtime: crossfilter.runtimeInfo()
+      }
+    });
+
+    expect(runtime.query({
+      filters: { country: { type: "exact", value: "IS" } },
+      rows: {
+        columnar: true,
+        direction: "bottom",
+        fields: ["country", "time"],
+        limit: 1,
+        sortBy: "time"
+      }
+    })).toEqual({
+      rows: {
+        columns: {
+          country: ["IS"],
+          time: [Date.UTC(2026, 0, 1, 10)]
+        },
+        fields: ["country", "time"],
+        length: 1
+      },
+      snapshot: {
+        groups: {
+          days: [
+            { key: Date.UTC(2026, 0, 1), value: { rows: 1 } },
+            { key: Date.UTC(2026, 0, 2), value: { rows: 0 } }
+          ]
+        },
+        kpis: { rows: 1 },
+        runtime: crossfilter.runtimeInfo()
+      }
+    });
+
+    runtime.dispose();
+  });
+
+  it("supports additive bounds and batched row-set queries", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["country", "time", "total"],
+      kpis: [{ id: "rows", op: "count" }],
+      records: [
+        { country: "IS", time: 10, total: 100 },
+        { country: "UK", time: 20, total: 200 },
+        { country: "US", time: 30, total: 300 },
+        { country: "ZA", time: 40, total: 400 }
+      ]
+    });
+
+    expect(runtime.bounds({ fields: ["time", "total"] })).toEqual({
+      time: { min: 10, max: 40 },
+      total: { min: 100, max: 400 }
+    });
+
+    expect(runtime.rowSets({
+      latest: {
+        columnar: true,
+        fields: ["country", "time"],
+        limit: 1,
+        sortBy: "time"
+      },
+      oldest: {
+        columnar: true,
+        direction: "bottom",
+        fields: ["country", "time"],
+        limit: 1,
+        sortBy: "time"
+      }
+    })).toEqual({
+      latest: {
+        columns: {
+          country: ["ZA"],
+          time: [40]
+        },
+        fields: ["country", "time"],
+        length: 1
+      },
+      oldest: {
+        columns: {
+          country: ["IS"],
+          time: [10]
+        },
+        fields: ["country", "time"],
+        length: 1
+      }
+    });
+
+    expect(runtime.query({
+      bounds: { fields: ["time"] },
+      filters: { country: { type: "in", values: ["IS", "UK"] } },
+      rowSets: {
+        oldest: {
+          fields: ["country", "time"],
+          limit: 1,
+          sortBy: "time",
+          direction: "bottom"
+        }
+      },
+      snapshot: false
+    })).toEqual({
+      bounds: {
+        time: { min: 10, max: 20 }
+      },
+      rowSets: {
+        oldest: [
+          { country: "IS", time: 10 }
+        ]
+      },
+      rows: [],
+      snapshot: null
+    });
+
+    runtime.dispose();
+  });
+
+  it("supports additive shaped group queries without changing legacy snapshots", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["country"],
+      groups: [{ field: "country", id: "countries", metrics: [{ id: "rows", op: "count" }] }],
+      kpis: [{ id: "rows", op: "count" }],
+      records: [
+        { country: "IS" },
+        { country: "IS" },
+        { country: "UK" },
+        { country: "US" },
+        { country: "ZA" }
+      ]
+    });
+
+    expect(runtime.snapshot().groups.countries).toEqual([
+      { key: "IS", value: { rows: 2 } },
+      { key: "UK", value: { rows: 1 } },
+      { key: "US", value: { rows: 1 } },
+      { key: "ZA", value: { rows: 1 } }
+    ]);
+
+    expect(runtime.snapshot(null, {
+      groups: {
+        countries: {
+          includeTotals: true,
+          limit: 2,
+          nonEmptyKeys: true,
+          sort: "desc",
+          sortMetric: "rows"
+        }
+      }
+    })).toEqual({
+      groups: {
+        countries: {
+          entries: [
+            { key: "IS", value: { rows: 2 } },
+            { key: "UK", value: { rows: 1 } }
+          ],
+          limit: 2,
+          offset: 0,
+          sort: "desc",
+          sortMetric: "rows",
+          total: 4
+        }
+      },
+      kpis: { rows: 5 },
+      runtime: crossfilter.runtimeInfo()
+    });
+
+    expect(runtime.groups({
+      groups: {
+        countries: {
+          includeKeys: ["ZA"],
+          includeTotals: true,
+          limit: 1,
+          search: "i",
+          sort: "desc",
+          sortMetric: "rows"
+        }
+      }
+    })).toEqual({
+      countries: {
+        entries: [
+          { key: "IS", value: { rows: 2 } },
+          { key: "ZA", value: { rows: 1 } }
+        ],
+        limit: 1,
+        offset: 0,
+        sort: "desc",
+        sortMetric: "rows",
+        total: 1
+      }
+    });
+
+    expect(runtime.query({
+      groups: {
+        countries: {
+          includeTotals: true,
+          limit: 1,
+          sort: "desc",
+          sortMetric: "rows"
+        }
+      },
+      snapshot: { groups: false }
+    })).toEqual({
+      groups: {
+        countries: {
+          entries: [{ key: "IS", value: { rows: 2 } }],
+          limit: 1,
+          offset: 0,
+          sort: "desc",
+          sortMetric: "rows",
+          total: 4
+        }
+      },
+      rows: [],
+      snapshot: {
+        groups: {},
+        kpis: { rows: 5 },
+        runtime: crossfilter.runtimeInfo()
+      }
+    });
+
+    runtime.dispose();
+  });
+
+  it("keeps limited shaped group queries correct with offsets and forced keys", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["country"],
+      groups: [{ field: "country", id: "countries", metrics: [{ id: "rows", op: "count" }] }],
+      records: [
+        { country: "A" },
+        { country: "A" },
+        { country: "A" },
+        { country: "A" },
+        { country: "A" },
+        { country: "B" },
+        { country: "B" },
+        { country: "B" },
+        { country: "B" },
+        { country: "C" },
+        { country: "C" },
+        { country: "C" },
+        { country: "D" },
+        { country: "D" },
+        { country: "E" }
+      ]
+    });
+
+    expect(runtime.groups({
+      groups: {
+        countries: {
+          includeKeys: ["E"],
+          includeTotals: true,
+          limit: 2,
+          offset: 1,
+          sort: "desc",
+          sortMetric: "rows"
+        }
+      }
+    })).toEqual({
+      countries: {
+        entries: [
+          { key: "B", value: { rows: 4 } },
+          { key: "C", value: { rows: 3 } },
+          { key: "E", value: { rows: 1 } }
+        ],
+        limit: 2,
+        offset: 1,
+        sort: "desc",
+        sortMetric: "rows",
+        total: 5
       }
     });
 
