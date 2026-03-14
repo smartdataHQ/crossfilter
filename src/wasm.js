@@ -404,3 +404,5 @@ export function canUseWasmScan() {
 export function findEncodedMatches(codes, targetCodes) {
   return defaultRuntimeController.findEncodedMatches(codes, targetCodes);
 }
+
+export { denseLookupMatches as _denseLookupMatches };
