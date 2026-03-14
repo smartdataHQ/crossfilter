@@ -250,6 +250,58 @@ function crossfilter() {
     return row ? row[field] : undefined;
   }
 
+  function isFiniteMetricNumber(value) {
+    return typeof value === 'number' && Number.isFinite(value);
+  }
+
+  function resolveReduceMetricSpec(add, remove, initial) {
+    var metricSpec = add && add._xfilterMetricSpec;
+    if (!metricSpec || metricSpec !== (remove && remove._xfilterMetricSpec) || metricSpec !== (initial && initial._xfilterMetricSpec)) {
+      return null;
+    }
+    return metricSpec;
+  }
+
+  function applyReduceMetricSpec(state, metricSpec, rowIndex, delta) {
+    if (!state) {
+      return state;
+    }
+
+    for (var metricIndex = 0; metricIndex < metricSpec.length; ++metricIndex) {
+      var metric = metricSpec[metricIndex];
+      var value;
+
+      switch (metric.op) {
+        case 'count':
+          state[metric.id] += delta;
+          break;
+        case 'sum':
+          value = getFieldValue(rowIndex, metric.field);
+          if (isFiniteMetricNumber(value)) {
+            state[metric.id] += delta * value;
+          }
+          break;
+        case 'avg':
+          value = getFieldValue(rowIndex, metric.field);
+          if (isFiniteMetricNumber(value)) {
+            state[metric.id].sum += delta * value;
+            state[metric.id].count += delta;
+          }
+          break;
+        case 'avgNonZero':
+          value = getFieldValue(rowIndex, metric.field);
+          if (isFiniteMetricNumber(value) && value !== 0) {
+            state[metric.id].sum += delta * value;
+            state[metric.id].count += delta;
+          }
+          break;
+      }
+    }
+
+    state.__version += 1;
+    return state;
+  }
+
   function materializeAllRecords() {
     if (!columnarBatches.length) {
       return;
@@ -2067,6 +2119,7 @@ function crossfilter() {
           reduceAdd,
           reduceRemove,
           reduceInitial,
+          reduceMetricSpec = null,
           reduceMode = null,
           update = cr_null,
           reset = cr_null,
@@ -2250,9 +2303,18 @@ function crossfilter() {
             // Always add new values to groups. Only remove when another dimension has filtered them out.
             // This gives groups full information on data life-cycle without paying for no-op filter checks.
             if (reduceMode === 'count') {
-              g.value += 1;
-              if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
-                g.value -= 1;
+              if (!resetNeeded) {
+                g.value += 1;
+                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
+                  g.value -= 1;
+                }
+              }
+            } else if (reduceMode === 'metricSpec') {
+              if (!resetNeeded) {
+                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, j, 1);
+                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
+                  g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, j, -1);
+                }
               }
             } else {
               var rowRecord = getRecord(j);
@@ -2431,6 +2493,8 @@ function crossfilter() {
                 g = groups[groupIndex[k][j]];
                 if (reduceMode === 'count') {
                   g.value += 1;
+                } else if (reduceMode === 'metricSpec') {
+                  g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, 1);
                 } else {
                   g.value = reduceAdd(g.value, getRecord(k), false, j);
                 }
@@ -2445,6 +2509,8 @@ function crossfilter() {
                 g = groups[groupIndex[k][j]];
                 if (reduceMode === 'count') {
                   g.value -= 1;
+                } else if (reduceMode === 'metricSpec') {
+                  g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, -1);
                 } else {
                   g.value = reduceRemove(g.value, getRecord(k), notFilter, j);
                 }
@@ -2460,6 +2526,8 @@ function crossfilter() {
             g = groups[groupIndex[k]];
             if (reduceMode === 'count') {
               g.value += 1;
+            } else if (reduceMode === 'metricSpec') {
+              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, 1);
             } else {
               g.value = reduceAdd(g.value, getRecord(k), false);
             }
@@ -2472,6 +2540,8 @@ function crossfilter() {
             g = groups[groupIndex[k]];
             if (reduceMode === 'count') {
               g.value -= 1;
+            } else if (reduceMode === 'metricSpec') {
+              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, -1);
             } else {
               g.value = reduceRemove(g.value, getRecord(k), notFilter);
             }
@@ -2495,6 +2565,8 @@ function crossfilter() {
           if (filters.zeroExcept(k = added[i], offset, zero)) {
             if (reduceMode === 'count') {
               g.value += 1;
+            } else if (reduceMode === 'metricSpec') {
+              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, 1);
             } else {
               g.value = reduceAdd(g.value, getRecord(k), false);
             }
@@ -2506,6 +2578,8 @@ function crossfilter() {
           if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
             if (reduceMode === 'count') {
               g.value -= 1;
+            } else if (reduceMode === 'metricSpec') {
+              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, -1);
             } else {
               g.value = reduceRemove(g.value, getRecord(k), notFilter);
             }
@@ -2535,6 +2609,8 @@ function crossfilter() {
               g = groups[groupIndex[i][j]];
               if (reduceMode === 'count') {
                 g.value += 1;
+              } else if (reduceMode === 'metricSpec') {
+                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, 1);
               } else {
                 var iterableRecord = getRecord(i);
                 g.value = reduceAdd(g.value, iterableRecord, true, j);
@@ -2550,6 +2626,8 @@ function crossfilter() {
                 g = groups[groupIndex[i][j]];
                 if (reduceMode === 'count') {
                   g.value -= 1;
+                } else if (reduceMode === 'metricSpec') {
+                  g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, -1);
                 } else {
                   var filteredIterableRecord = getRecord(i);
                   g.value = reduceRemove(g.value, filteredIterableRecord, false, j);
@@ -2564,6 +2642,8 @@ function crossfilter() {
           g = groups[groupIndex[i]];
           if (reduceMode === 'count') {
             g.value += 1;
+          } else if (reduceMode === 'metricSpec') {
+            g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, 1);
           } else {
             g.value = reduceAdd(g.value, getRecord(i), true);
           }
@@ -2576,6 +2656,8 @@ function crossfilter() {
             g = groups[groupIndex[i]];
             if (reduceMode === 'count') {
               g.value -= 1;
+            } else if (reduceMode === 'metricSpec') {
+              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, -1);
             } else {
               g.value = reduceRemove(g.value, getRecord(i), false);
             }
@@ -2599,6 +2681,8 @@ function crossfilter() {
         for (i = 0; i < n; ++i) {
           if (reduceMode === 'count') {
             g.value += 1;
+          } else if (reduceMode === 'metricSpec') {
+            g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, 1);
           } else {
             g.value = reduceAdd(g.value, getRecord(i), true);
           }
@@ -2611,6 +2695,8 @@ function crossfilter() {
           if (!filters.zeroExcept(i, offset, zero)) {
             if (reduceMode === 'count') {
               g.value -= 1;
+            } else if (reduceMode === 'metricSpec') {
+              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, -1);
             } else {
               g.value = reduceRemove(g.value, getRecord(i), false);
             }
@@ -2636,7 +2722,11 @@ function crossfilter() {
         reduceAdd = add;
         reduceRemove = remove;
         reduceInitial = initial;
+        reduceMetricSpec = resolveReduceMetricSpec(add, remove, initial);
         reduceMode = null;
+        if (reduceMetricSpec) {
+          reduceMode = 'metricSpec';
+        }
         resetNeeded = true;
         return group;
       }
@@ -2732,6 +2822,7 @@ function crossfilter() {
         reduceAdd,
         reduceRemove,
         reduceInitial,
+        reduceMetricSpec = null,
         reduceMode = null,
         resetNeeded = true,
         markResetNeeded = registerResetListener(function() {
@@ -2761,6 +2852,11 @@ function crossfilter() {
           if (applyFilteredRemovals && !filters.zero(i)) {
             reduceValue -= 1;
           }
+        } else if (reduceMode === 'metricSpec') {
+          reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, 1);
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, -1);
+          }
         } else {
           var rowRecord = getRecord(i);
 
@@ -2788,6 +2884,8 @@ function crossfilter() {
         if (filters.zero(k = added[i])) {
           if (reduceMode === 'count') {
             reduceValue += 1;
+          } else if (reduceMode === 'metricSpec') {
+            reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, k, 1);
           } else {
             reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
           }
@@ -2799,6 +2897,8 @@ function crossfilter() {
         if (filters.only(k = removed[i], filterOffset, filterOne)) {
           if (reduceMode === 'count') {
             reduceValue -= 1;
+          } else if (reduceMode === 'metricSpec') {
+            reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, k, -1);
           } else {
             reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
           }
@@ -2820,6 +2920,11 @@ function crossfilter() {
           if (applyFilteredRemovals && !filters.zero(i)) {
             reduceValue -= 1;
           }
+        } else if (reduceMode === 'metricSpec') {
+          reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, 1);
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, -1);
+          }
         } else {
           var rowRecord = getRecord(i);
 
@@ -2840,7 +2945,11 @@ function crossfilter() {
       reduceAdd = add;
       reduceRemove = remove;
       reduceInitial = initial;
+      reduceMetricSpec = resolveReduceMetricSpec(add, remove, initial);
       reduceMode = null;
+      if (reduceMetricSpec) {
+        reduceMode = 'metricSpec';
+      }
       resetNeeded = true;
       return group;
     }

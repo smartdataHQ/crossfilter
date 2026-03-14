@@ -1340,6 +1340,14 @@
   }
 
   function buildMetricReducer(metrics) {
+    var metricSpec = metrics.map(function(metric) {
+      return {
+        field: metric.field || null,
+        id: metric.id,
+        op: metric.op
+      };
+    });
+
     function initial() {
       var state = {};
 
@@ -1470,6 +1478,10 @@
       state.__cacheVersion = state.__version;
       return result;
     }
+
+    add._xfilterMetricSpec = metricSpec;
+    remove._xfilterMetricSpec = metricSpec;
+    initial._xfilterMetricSpec = metricSpec;
 
     return {
       add: add,
@@ -1658,6 +1670,7 @@
     var group = groupAccessor ? dimension.group(groupAccessor) : dimension.group();
     var visibleMetric = null;
     var defaultSortMetric = null;
+    var orderedMetricId = null;
     group.reduce(reducer.add, reducer.remove, reducer.initial);
 
     for (metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
@@ -1704,6 +1717,94 @@
       return query.sort === "asc" ? diff : -diff;
     }
 
+    function topComparableValue(sortMetric, entry) {
+      var comparable = metricComparableValue(sortMetric, entry.value[sortMetric.id]);
+      return comparable == null ? Number.NEGATIVE_INFINITY : comparable;
+    }
+
+    function ensureTopOrder(sortMetric) {
+      if (!sortMetric || typeof group.order !== "function" || typeof group.top !== "function") {
+        return false;
+      }
+      if (orderedMetricId === sortMetric.id) {
+        return true;
+      }
+      group.order(function(value) {
+        var comparable = metricComparableValue(sortMetric, value[sortMetric.id]);
+        return comparable == null ? Number.NEGATIVE_INFINITY : comparable;
+      });
+      orderedMetricId = sortMetric.id;
+      return true;
+    }
+
+    function canUseTopQuery(normalized, sortMetric) {
+      return !!(
+        normalized
+        && normalized.sort === "desc"
+        && sortMetric
+        && normalized.includeTotals === false
+        && !normalized.includeKeys
+        && !normalized.keys
+        && !normalized.search
+        && typeof group.size === "function"
+        && ensureTopOrder(sortMetric)
+      );
+    }
+
+    function readTopQuery(normalized, sortMetric) {
+      var limitWindow = normalized.limit == null ? null : normalized.offset + normalized.limit;
+      var groupSize = group.size();
+      var requested = limitWindow == null
+        ? groupSize
+        : Math.min(groupSize, Math.max(limitWindow + 1, 32));
+      var rawEntries;
+      var filteredEntries;
+
+      do {
+        rawEntries = group.top(requested);
+        filteredEntries = [];
+
+        for (var rawIndex = 0; rawIndex < rawEntries.length; ++rawIndex) {
+          var rawEntry = rawEntries[rawIndex];
+          var visible = !normalized.visibleOnly || metricHasVisibleValue(visibleMetric, rawEntry.value[visibleMetric.id]);
+          if (visible && matchesGroupKey(rawEntry.key, normalized, null, false)) {
+            filteredEntries.push(rawEntry);
+          }
+        }
+
+        filteredEntries.sort(function(left, right) {
+          return compareEntries(normalized, sortMetric, left, right);
+        });
+
+        if (limitWindow == null || requested >= groupSize) {
+          break;
+        }
+
+        var shouldExpand = filteredEntries.length < limitWindow;
+        if (!shouldExpand) {
+          var boundaryEntry = filteredEntries[limitWindow - 1];
+          shouldExpand = !!boundaryEntry
+            && topComparableValue(sortMetric, rawEntries[rawEntries.length - 1]) >= topComparableValue(sortMetric, boundaryEntry);
+        }
+
+        if (!shouldExpand) {
+          break;
+        }
+
+        requested = Math.min(groupSize, Math.max(requested + 32, requested * 2));
+      } while (true);
+
+      return {
+        entries: (normalized.limit == null
+          ? filteredEntries.slice(normalized.offset)
+          : filteredEntries.slice(normalized.offset, normalized.offset + normalized.limit)).map(finalizeEntry),
+        limit: normalized.limit,
+        offset: normalized.offset,
+        sort: normalized.sort,
+        sortMetric: sortMetric ? sortMetric.id : null
+      };
+    }
+
     function readQuery(query) {
       var normalized = normalizeGroupQuery(query);
       var allEntries;
@@ -1720,6 +1821,10 @@
 
       if (!normalized) {
         return readAll();
+      }
+
+      if (canUseTopQuery(normalized, sortMetric)) {
+        return readTopQuery(normalized, sortMetric);
       }
 
       allEntries = group.all();
@@ -3898,6 +4003,58 @@ self.onmessage = async function(event) {
       return row ? row[field] : undefined;
     }
 
+    function isFiniteMetricNumber(value) {
+      return typeof value === 'number' && Number.isFinite(value);
+    }
+
+    function resolveReduceMetricSpec(add, remove, initial) {
+      var metricSpec = add && add._xfilterMetricSpec;
+      if (!metricSpec || metricSpec !== (remove && remove._xfilterMetricSpec) || metricSpec !== (initial && initial._xfilterMetricSpec)) {
+        return null;
+      }
+      return metricSpec;
+    }
+
+    function applyReduceMetricSpec(state, metricSpec, rowIndex, delta) {
+      if (!state) {
+        return state;
+      }
+
+      for (var metricIndex = 0; metricIndex < metricSpec.length; ++metricIndex) {
+        var metric = metricSpec[metricIndex];
+        var value;
+
+        switch (metric.op) {
+          case 'count':
+            state[metric.id] += delta;
+            break;
+          case 'sum':
+            value = getFieldValue(rowIndex, metric.field);
+            if (isFiniteMetricNumber(value)) {
+              state[metric.id] += delta * value;
+            }
+            break;
+          case 'avg':
+            value = getFieldValue(rowIndex, metric.field);
+            if (isFiniteMetricNumber(value)) {
+              state[metric.id].sum += delta * value;
+              state[metric.id].count += delta;
+            }
+            break;
+          case 'avgNonZero':
+            value = getFieldValue(rowIndex, metric.field);
+            if (isFiniteMetricNumber(value) && value !== 0) {
+              state[metric.id].sum += delta * value;
+              state[metric.id].count += delta;
+            }
+            break;
+        }
+      }
+
+      state.__version += 1;
+      return state;
+    }
+
     function materializeAllRecords() {
       if (!columnarBatches.length) {
         return;
@@ -5714,6 +5871,7 @@ self.onmessage = async function(event) {
             reduceAdd,
             reduceRemove,
             reduceInitial,
+            reduceMetricSpec = null,
             reduceMode = null,
             update = cr_null,
             reset = cr_null,
@@ -5897,9 +6055,18 @@ self.onmessage = async function(event) {
               // Always add new values to groups. Only remove when another dimension has filtered them out.
               // This gives groups full information on data life-cycle without paying for no-op filter checks.
               if (reduceMode === 'count') {
-                g.value += 1;
-                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
-                  g.value -= 1;
+                if (!resetNeeded) {
+                  g.value += 1;
+                  if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
+                    g.value -= 1;
+                  }
+                }
+              } else if (reduceMode === 'metricSpec') {
+                if (!resetNeeded) {
+                  g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, j, 1);
+                  if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
+                    g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, j, -1);
+                  }
                 }
               } else {
                 var rowRecord = getRecord(j);
@@ -6078,6 +6245,8 @@ self.onmessage = async function(event) {
                   g = groups[groupIndex[k][j]];
                   if (reduceMode === 'count') {
                     g.value += 1;
+                  } else if (reduceMode === 'metricSpec') {
+                    g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, 1);
                   } else {
                     g.value = reduceAdd(g.value, getRecord(k), false, j);
                   }
@@ -6092,6 +6261,8 @@ self.onmessage = async function(event) {
                   g = groups[groupIndex[k][j]];
                   if (reduceMode === 'count') {
                     g.value -= 1;
+                  } else if (reduceMode === 'metricSpec') {
+                    g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, -1);
                   } else {
                     g.value = reduceRemove(g.value, getRecord(k), notFilter, j);
                   }
@@ -6107,6 +6278,8 @@ self.onmessage = async function(event) {
               g = groups[groupIndex[k]];
               if (reduceMode === 'count') {
                 g.value += 1;
+              } else if (reduceMode === 'metricSpec') {
+                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, 1);
               } else {
                 g.value = reduceAdd(g.value, getRecord(k), false);
               }
@@ -6119,6 +6292,8 @@ self.onmessage = async function(event) {
               g = groups[groupIndex[k]];
               if (reduceMode === 'count') {
                 g.value -= 1;
+              } else if (reduceMode === 'metricSpec') {
+                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, -1);
               } else {
                 g.value = reduceRemove(g.value, getRecord(k), notFilter);
               }
@@ -6142,6 +6317,8 @@ self.onmessage = async function(event) {
             if (filters.zeroExcept(k = added[i], offset, zero)) {
               if (reduceMode === 'count') {
                 g.value += 1;
+              } else if (reduceMode === 'metricSpec') {
+                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, 1);
               } else {
                 g.value = reduceAdd(g.value, getRecord(k), false);
               }
@@ -6153,6 +6330,8 @@ self.onmessage = async function(event) {
             if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
               if (reduceMode === 'count') {
                 g.value -= 1;
+              } else if (reduceMode === 'metricSpec') {
+                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, -1);
               } else {
                 g.value = reduceRemove(g.value, getRecord(k), notFilter);
               }
@@ -6182,6 +6361,8 @@ self.onmessage = async function(event) {
                 g = groups[groupIndex[i][j]];
                 if (reduceMode === 'count') {
                   g.value += 1;
+                } else if (reduceMode === 'metricSpec') {
+                  g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, 1);
                 } else {
                   var iterableRecord = getRecord(i);
                   g.value = reduceAdd(g.value, iterableRecord, true, j);
@@ -6197,6 +6378,8 @@ self.onmessage = async function(event) {
                   g = groups[groupIndex[i][j]];
                   if (reduceMode === 'count') {
                     g.value -= 1;
+                  } else if (reduceMode === 'metricSpec') {
+                    g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, -1);
                   } else {
                     var filteredIterableRecord = getRecord(i);
                     g.value = reduceRemove(g.value, filteredIterableRecord, false, j);
@@ -6211,6 +6394,8 @@ self.onmessage = async function(event) {
             g = groups[groupIndex[i]];
             if (reduceMode === 'count') {
               g.value += 1;
+            } else if (reduceMode === 'metricSpec') {
+              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, 1);
             } else {
               g.value = reduceAdd(g.value, getRecord(i), true);
             }
@@ -6223,6 +6408,8 @@ self.onmessage = async function(event) {
               g = groups[groupIndex[i]];
               if (reduceMode === 'count') {
                 g.value -= 1;
+              } else if (reduceMode === 'metricSpec') {
+                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, -1);
               } else {
                 g.value = reduceRemove(g.value, getRecord(i), false);
               }
@@ -6246,6 +6433,8 @@ self.onmessage = async function(event) {
           for (i = 0; i < n; ++i) {
             if (reduceMode === 'count') {
               g.value += 1;
+            } else if (reduceMode === 'metricSpec') {
+              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, 1);
             } else {
               g.value = reduceAdd(g.value, getRecord(i), true);
             }
@@ -6258,6 +6447,8 @@ self.onmessage = async function(event) {
             if (!filters.zeroExcept(i, offset, zero)) {
               if (reduceMode === 'count') {
                 g.value -= 1;
+              } else if (reduceMode === 'metricSpec') {
+                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, -1);
               } else {
                 g.value = reduceRemove(g.value, getRecord(i), false);
               }
@@ -6283,7 +6474,11 @@ self.onmessage = async function(event) {
           reduceAdd = add;
           reduceRemove = remove;
           reduceInitial = initial;
+          reduceMetricSpec = resolveReduceMetricSpec(add, remove, initial);
           reduceMode = null;
+          if (reduceMetricSpec) {
+            reduceMode = 'metricSpec';
+          }
           resetNeeded = true;
           return group;
         }
@@ -6379,6 +6574,7 @@ self.onmessage = async function(event) {
           reduceAdd,
           reduceRemove,
           reduceInitial,
+          reduceMetricSpec = null,
           reduceMode = null,
           resetNeeded = true,
           markResetNeeded = registerResetListener(function() {
@@ -6408,6 +6604,11 @@ self.onmessage = async function(event) {
             if (applyFilteredRemovals && !filters.zero(i)) {
               reduceValue -= 1;
             }
+          } else if (reduceMode === 'metricSpec') {
+            reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, 1);
+            if (applyFilteredRemovals && !filters.zero(i)) {
+              reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, -1);
+            }
           } else {
             var rowRecord = getRecord(i);
 
@@ -6435,6 +6636,8 @@ self.onmessage = async function(event) {
           if (filters.zero(k = added[i])) {
             if (reduceMode === 'count') {
               reduceValue += 1;
+            } else if (reduceMode === 'metricSpec') {
+              reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, k, 1);
             } else {
               reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
             }
@@ -6446,6 +6649,8 @@ self.onmessage = async function(event) {
           if (filters.only(k = removed[i], filterOffset, filterOne)) {
             if (reduceMode === 'count') {
               reduceValue -= 1;
+            } else if (reduceMode === 'metricSpec') {
+              reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, k, -1);
             } else {
               reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
             }
@@ -6467,6 +6672,11 @@ self.onmessage = async function(event) {
             if (applyFilteredRemovals && !filters.zero(i)) {
               reduceValue -= 1;
             }
+          } else if (reduceMode === 'metricSpec') {
+            reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, 1);
+            if (applyFilteredRemovals && !filters.zero(i)) {
+              reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, -1);
+            }
           } else {
             var rowRecord = getRecord(i);
 
@@ -6487,7 +6697,11 @@ self.onmessage = async function(event) {
         reduceAdd = add;
         reduceRemove = remove;
         reduceInitial = initial;
+        reduceMetricSpec = resolveReduceMetricSpec(add, remove, initial);
         reduceMode = null;
+        if (reduceMetricSpec) {
+          reduceMode = 'metricSpec';
+        }
         resetNeeded = true;
         return group;
       }

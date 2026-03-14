@@ -177,6 +177,98 @@ describe("dashboard runtime", () => {
     runtime.dispose();
   });
 
+  it("keeps columnar dashboard metric reducers correct across filters and appends", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      columnarOptions: {
+        fields: ["country", "latitude", "total"],
+        length: 3,
+      },
+      columns: {
+        country: ["IS", "UK", "IS"],
+        latitude: new Float64Array([64, 51, 0]),
+        total: new Float64Array([10, 20, 30]),
+      },
+      dimensions: ["country"],
+      groups: [{
+        field: "country",
+        id: "countries",
+        metrics: [
+          { id: "rows", op: "count" },
+          { field: "total", id: "sumTotal", op: "sum" },
+          { field: "latitude", id: "avgLat", op: "avgNonZero" }
+        ]
+      }],
+      kpis: [
+        { id: "rows", op: "count" },
+        { field: "total", id: "sumTotal", op: "sum" },
+        { field: "latitude", id: "avgLat", op: "avgNonZero" }
+      ],
+    });
+
+    expect(runtime.snapshot()).toEqual({
+      groups: {
+        countries: [
+          { key: "IS", value: { rows: 2, sumTotal: 40, avgLat: 64 } },
+          { key: "UK", value: { rows: 1, sumTotal: 20, avgLat: 51 } },
+        ],
+      },
+      kpis: {
+        rows: 3,
+        sumTotal: 60,
+        avgLat: 57.5
+      },
+      runtime: crossfilter.runtimeInfo(),
+    });
+
+    runtime.updateFilters({
+      country: { type: "exact", value: "IS" }
+    });
+
+    expect(runtime.snapshot()).toEqual({
+      groups: {
+        countries: [
+          { key: "IS", value: { rows: 2, sumTotal: 40, avgLat: 64 } },
+          { key: "UK", value: { rows: 1, sumTotal: 20, avgLat: 51 } },
+        ],
+      },
+      kpis: {
+        rows: 2,
+        sumTotal: 40,
+        avgLat: 64
+      },
+      runtime: crossfilter.runtimeInfo(),
+    });
+
+    expect(runtime.appendColumns({
+      country: ["US"],
+      latitude: new Float64Array([35]),
+      total: new Float64Array([40]),
+    }, {
+      fields: ["country", "latitude", "total"],
+      length: 1,
+    })).toBe(4);
+
+    runtime.reset();
+
+    expect(runtime.snapshot()).toEqual({
+      groups: {
+        countries: [
+          { key: "IS", value: { rows: 2, sumTotal: 40, avgLat: 64 } },
+          { key: "UK", value: { rows: 1, sumTotal: 20, avgLat: 51 } },
+          { key: "US", value: { rows: 1, sumTotal: 40, avgLat: 35 } },
+        ],
+      },
+      kpis: {
+        rows: 4,
+        sumTotal: 100,
+        avgLat: 50
+      },
+      runtime: crossfilter.runtimeInfo(),
+    });
+
+    runtime.dispose();
+  });
+
   it("merges appended columnar batches with stable mixed-value group ordering", () => {
     const runtime = crossfilter.createDashboardRuntime({
       dimensions: ["region"],
@@ -534,6 +626,46 @@ describe("dashboard runtime", () => {
         sort: "desc",
         sortMetric: "rows",
         total: 5
+      }
+    });
+
+    runtime.dispose();
+  });
+
+  it("keeps descending limited group queries exact across tied metrics without totals", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["country"],
+      groups: [{ field: "country", id: "countries", metrics: [{ id: "rows", op: "count" }] }],
+      records: [
+        { country: "A" },
+        { country: "A" },
+        { country: "B" },
+        { country: "B" },
+        { country: "C" },
+        { country: "C" },
+        { country: "D" }
+      ]
+    });
+
+    expect(runtime.groups({
+      groups: {
+        countries: {
+          includeTotals: false,
+          limit: 1,
+          offset: 1,
+          sort: "desc",
+          sortMetric: "rows"
+        }
+      }
+    })).toEqual({
+      countries: {
+        entries: [
+          { key: "B", value: { rows: 2 } }
+        ],
+        limit: 1,
+        offset: 1,
+        sort: "desc",
+        sortMetric: "rows"
       }
     });
 
