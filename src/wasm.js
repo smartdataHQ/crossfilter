@@ -11,6 +11,7 @@ var sharedRuntimeState = {
 };
 
 var SMALL_TARGET_WASM_THRESHOLD = 4;
+var SMALL_DATA_WASM_THRESHOLD = 1000;
 var MAX_WASM_MARK_BYTES = 32 * 1024 * 1024;
 
 function arraysEqual(a, b) {
@@ -402,17 +403,23 @@ export function createWasmRuntimeController(options) {
 
     var runtime = getSharedRuntime(enabled);
     var maxTargetCode;
-    if (runtime && targetCodes.length <= SMALL_TARGET_WASM_THRESHOLD) {
-      try {
-        return runtime.matchSmall(codes, targetCodes);
-      } catch (error) {
-        sharedRuntimeState.error = error;
-        sharedRuntimeState.runtime = null;
+
+    if (runtime) {
+      var useSmall = targetCodes.length <= SMALL_TARGET_WASM_THRESHOLD
+        && codes.length <= SMALL_DATA_WASM_THRESHOLD;
+
+      if (useSmall) {
+        try {
+          return runtime.matchSmall(codes, targetCodes);
+        } catch (error) {
+          sharedRuntimeState.error = error;
+          sharedRuntimeState.runtime = null;
+        }
       }
     }
 
     if (runtime) {
-      maxTargetCode = maxCodeValue(targetCodes);
+      maxTargetCode = Math.max(maxCodeValue(targetCodes), maxCodeValue(codes));
       if ((maxTargetCode + 1) * 4 <= MAX_WASM_MARK_BYTES) {
         try {
           return runtime.matchMarked(codes, targetCodes, maxTargetCode);

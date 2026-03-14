@@ -111,6 +111,26 @@ describe("wasm runtime", () => {
     expect(r3.length).toBe(50);
   });
 
+  it("routes to correct strategy for 2 targets on large dataset", () => {
+    var ctrl = createWasmRuntimeController({ wasm: true });
+    var jsCtrl = createWasmRuntimeController({ wasm: false });
+    var codes = new Uint32Array(5000);
+    for (var i = 0; i < 5000; ++i) codes[i] = i % 100;
+
+    // 2 targets — previously used matchSmall, now should use matchMarked for large n
+    var targets = [10, 20];
+    var wasmResult = Array.from(ctrl.findEncodedMatches(codes, targets));
+    var jsResult = Array.from(jsCtrl.findEncodedMatches(codes, targets));
+    expect(wasmResult).toEqual(jsResult);
+  });
+
+  it("still uses matchSmall for tiny datasets with few targets", () => {
+    var ctrl = createWasmRuntimeController({ wasm: true });
+    var codes = new Uint32Array([0, 1, 2, 3, 4]);
+    var result = ctrl.findEncodedMatches(codes, [1, 2, 3]);
+    expect(Array.from(result)).toEqual([1, 2, 3]);
+  });
+
   it("handles filter transitions (different targets, same codes)", () => {
     var ctrl = createWasmRuntimeController({ wasm: true });
     var codes = new Uint32Array([0, 1, 2, 3, 4]);
