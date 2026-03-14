@@ -290,8 +290,22 @@ function ensureDenseLookupCapacity(state, size) {
   state.marks = nextMarks;
 }
 
+function ensureScratchCapacity(state, size) {
+  if (state.scratch.length >= size) {
+    return state.scratch;
+  }
+
+  var nextSize = state.scratch.length || 256;
+  while (nextSize < size) {
+    nextSize <<= 1;
+  }
+
+  state.scratch = new Uint32Array(nextSize);
+  return state.scratch;
+}
+
 function denseLookupMatches(codes, targetCodes, state) {
-  var matches = new Uint32Array(codes.length);
+  var matches = ensureScratchCapacity(state, codes.length);
   var count = 0;
   var i;
 
@@ -350,7 +364,8 @@ export function createWasmRuntimeController(options) {
     : defaultRuntimeOptions.wasm !== false;
   var denseLookupState = {
     marks: new Uint32Array(0),
-    version: 1
+    version: 1,
+    scratch: new Uint32Array(0)
   };
 
   function configureRuntime(nextOptions) {

@@ -142,6 +142,18 @@ describe("denseLookupMatches (JS fallback)", () => {
     expect(state.version).toBe(2);
   });
 
+  it("JS fallback handles large datasets without regression", () => {
+    var state = { marks: new Uint32Array(0), version: 1, scratch: new Uint32Array(0) };
+    var codes = new Uint32Array(10000);
+    for (var i = 0; i < 10000; ++i) codes[i] = i % 50;
+    var targets = [0, 10, 20, 30, 40];
+
+    var result = _denseLookupMatches(codes, targets, state);
+    expect(result.length).toBe(1000); // 5 targets * 200 each in 10000/50
+    expect(result[0]).toBe(0);
+    expect(result[1]).toBe(10);
+  });
+
   it("returns no matches when no codes match", () => {
     var state = { marks: new Uint32Array(0), version: 1, scratch: new Uint32Array(0) };
     var codes = new Uint32Array([0, 1, 2]);
