@@ -230,6 +230,7 @@ function createEmptyFilterState() {
 function cacheDom() {
   dom = {
     addRowsBtn: document.getElementById('add-rows-btn'),
+    burstAppendBtn: document.getElementById('burst-append-btn'),
     chartDivision: document.getElementById('chart-division'),
     chartCustomerCountry: document.getElementById('chart-customer-country'),
     chartEvent: document.getElementById('chart-event'),
@@ -1811,6 +1812,9 @@ function updateDemoButtons() {
   if (dom.addRowsBtn) {
     dom.addRowsBtn.disabled = !state.ready;
   }
+  if (dom.burstAppendBtn) {
+    dom.burstAppendBtn.disabled = !state.ready;
+  }
   if (dom.removeFilteredBtn) {
     dom.removeFilteredBtn.disabled = !state.ready || Object.keys(buildDashboardFilters()).length === 0;
   }
@@ -1986,20 +1990,41 @@ async function runRuntimeMutation(logLabel, loadingText, operation) {
   }
 }
 
-async function onAddRows() {
-  if (!state.seedRows.length) {
-    hideError();
-    setLoading(true, 'Loading seed rows for synthetic append...');
-    try {
-      state.seedRows = await loadSeedRows(state.runtime);
-    } catch (error) {
-      setLoading(false);
-      showError(error.message || String(error));
-      appendLog(`Seed row load failed: ${error.message || error}`);
-      return;
-    }
-    setLoading(false);
+function describeActiveFilterPaths() {
+  const filters = buildDashboardFilters();
+  const activeFields = Object.keys(filters);
+  if (!activeFields.length) {
+    return 'no active filters';
   }
+  const descriptions = activeFields.map(function (field) {
+    var filter = filters[field];
+    if (filter.type === 'range') return fieldLabel(field) + ' range';
+    if (filter.type === 'in') return fieldLabel(field) + ' in(' + filter.values.length + ')';
+    return fieldLabel(field) + ' ' + filter.type;
+  });
+  return descriptions.join(', ');
+}
+
+async function ensureSeedRows() {
+  if (state.seedRows.length) {
+    return true;
+  }
+  hideError();
+  setLoading(true, 'Loading seed rows for synthetic append...');
+  try {
+    state.seedRows = await loadSeedRows(state.runtime);
+  } catch (error) {
+    setLoading(false);
+    showError(error.message || String(error));
+    appendLog(`Seed row load failed: ${error.message || error}`);
+    return false;
+  }
+  setLoading(false);
+  return true;
+}
+
+async function onAddRows() {
+  if (!(await ensureSeedRows())) return;
 
   const rows = generateSyntheticRows(1000);
   if (!rows.length) {
@@ -2007,7 +2032,55 @@ async function onAddRows() {
     return;
   }
 
+  const filterDesc = describeActiveFilterPaths();
+  appendLog(`Appending 1,000 rows (${filterDesc})`);
   await runRuntimeMutation('Add 1000 rows', 'Appending 1,000 synthetic rows...', () => state.runtime.append(rows));
+}
+
+async function onBurstAppend() {
+  if (!state.runtime || !state.ready) return;
+  if (!(await ensureSeedRows())) return;
+
+  const batchCount = 10;
+  const batchSize = 1000;
+  const filterDesc = describeActiveFilterPaths();
+  const hasActiveFilters = Object.keys(buildDashboardFilters()).length > 0;
+  appendLog(`Burst append: ${batchCount} x ${formatNumber(batchSize)} rows (${filterDesc})`);
+  if (hasActiveFilters) {
+    appendLog('  groupAll skips full rebuild, filterRange codes cached, selected buffer reused');
+  } else {
+    appendLog('  groupAll skips full rebuild (no active filters — try filtering first for full optimization demo)');
+  }
+
+  hideError();
+  setLoading(true, `Burst appending ${batchCount} batches of ${formatNumber(batchSize)} rows...`);
+  const totalStart = performance.now();
+  var batchTimes = [];
+
+  try {
+    for (var batch = 0; batch < batchCount; ++batch) {
+      var rows = generateSyntheticRows(batchSize);
+      if (!rows.length) break;
+      var batchStart = performance.now();
+      await state.runtime.append(rows);
+      batchTimes.push(performance.now() - batchStart);
+    }
+
+    var totalMs = performance.now() - totalStart;
+    var avgMs = batchTimes.reduce(function (sum, t) { return sum + t; }, 0) / batchTimes.length;
+    var minMs = Math.min.apply(null, batchTimes);
+    var maxMs = Math.max.apply(null, batchTimes);
+    appendLog(`Burst complete: ${totalMs.toFixed(1)} ms total, ${avgMs.toFixed(1)} ms avg/batch (min ${minMs.toFixed(1)}, max ${maxMs.toFixed(1)})`);
+    appendLog(`  ${formatNumber(batchCount * batchSize)} rows appended in ${batchTimes.length} batches`);
+
+    state.baseTimeBounds = await readBaseTimeBounds(state.runtime, {});
+    await refreshView(true);
+  } catch (error) {
+    showError(error.message || String(error));
+    appendLog(`Burst append failed at batch ${batchTimes.length + 1}: ${error.message || error}`);
+  } finally {
+    setLoading(false);
+  }
 }
 
 async function onRemoveFiltered() {
@@ -2016,6 +2089,9 @@ async function onRemoveFiltered() {
     return;
   }
 
+  const filterDesc = describeActiveFilterPaths();
+  appendLog(`Removing excluded rows (${filterDesc})`);
+  appendLog('  codeCounts will be rebuilt after compaction for correct re-filter');
   await runRuntimeMutation('Remove excluded rows', 'Removing excluded rows...', () => state.runtime.removeFiltered('excluded'));
 }
 
@@ -2382,6 +2458,11 @@ function attachControlListeners() {
       onAddRows();
     });
   }
+  if (dom.burstAppendBtn) {
+    dom.burstAppendBtn.addEventListener('click', () => {
+      onBurstAppend();
+    });
+  }
   if (dom.removeFilteredBtn) {
     dom.removeFilteredBtn.addEventListener('click', () => {
       onRemoveFiltered();
@@ -2546,6 +2627,10 @@ function initStaticUi() {
   if (dom.addRowsBtn) {
     dom.addRowsBtn.textContent = 'Add 1000 Rows';
     dom.addRowsBtn.title = 'Append 1,000 synthetic rows without rebuilding the worker runtime';
+  }
+  if (dom.burstAppendBtn) {
+    dom.burstAppendBtn.textContent = 'Burst Append 10k';
+    dom.burstAppendBtn.title = 'Append 10 batches of 1,000 rows sequentially — exercises groupAll fast path, filterRange target cache, and buffer reuse';
   }
   if (dom.removeFilteredBtn) {
     dom.removeFilteredBtn.textContent = 'Remove Excluded';
