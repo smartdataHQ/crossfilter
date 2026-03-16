@@ -1418,23 +1418,23 @@ describe("crossfilter", () => {
 
       it("allows the filter value to be null", function () {
         try {
-          data.tip.filterExact(null); // equivalent to 0 by natural ordering
+          data.tip.filterExact(null);
           assert.deepStrictEqual(data.date.top(2), [
             {
-              date: "2011-11-14T22:58:54Z",
-              quantity: 2,
+              date: "2011-11-14T20:06:33Z",
+              quantity: 1,
               total: 100,
-              tip: 0,
-              type: "visa",
-              tags: [2, 3, 4],
+              tip: null,
+              type: "cash",
+              tags: [2, 4, 5],
             },
             {
-              date: "2011-11-14T22:48:05Z",
+              date: "2011-11-14T18:14:53Z",
               quantity: 2,
-              total: 91,
-              tip: 0,
-              type: "tab",
-              tags: [2, 4, 5],
+              total: 100,
+              tip: null,
+              type: "cash",
+              tags: [2, 3, 4],
             },
           ]);
         } finally {
@@ -2913,6 +2913,163 @@ describe("crossfilter", () => {
       assert.deepStrictEqual(foos.top(1), [{ key: -998, value: 8977.5 }]);
     });
 
+    it("applies a pending lazy exact filter when the first batch has no matches", function () {
+      var data = crossfilter(),
+        foo = data.dimension(function (d) {
+          return -d.foo;
+        }),
+        bar = data.dimension(function (d) {
+          return d.bar;
+        }),
+        foos = foo.group().reduceCount();
+
+      bar.filterExact(1);
+
+      data.add([
+        { foo: 0, bar: 0 },
+        { foo: 1, bar: 0 },
+        { foo: 2, bar: 0 },
+        { foo: 3, bar: 0 },
+      ]);
+
+      assert.deepStrictEqual(data.allFiltered(), []);
+      assert.deepStrictEqual(foos.all(), [
+        { key: -3, value: 0 },
+        { key: -2, value: 0 },
+        { key: -1, value: 0 },
+        { key: -0, value: 0 },
+      ]);
+
+      data.add([
+        { foo: 4, bar: 1 },
+        { foo: 5, bar: 1 },
+      ]);
+
+      assert.deepStrictEqual(data.allFiltered(), [
+        { foo: 4, bar: 1 },
+        { foo: 5, bar: 1 },
+      ]);
+      assert.deepStrictEqual(
+        foos.all().filter(function (d) {
+          return d.value > 0;
+        }),
+        [
+          { key: -5, value: 1 },
+          { key: -4, value: 1 },
+        ]
+      );
+    });
+
+    it("lazy append reuses codes buffer when capacity allows", function () {
+      var cf = crossfilter();
+      var dim = cf.dimension(function (d) { return d.key; });
+      cf.add([{ key: "a" }, { key: "b" }]);
+      cf.add([{ key: "a" }, { key: "c" }]);
+      var g = dim.group().reduceCount();
+      assert.deepStrictEqual(g.all(), [
+        { key: "a", value: 2 },
+        { key: "b", value: 1 },
+        { key: "c", value: 1 },
+      ]);
+    });
+
+    it("lazy dimension stays encoded when appending with existing groups", function () {
+      var cf = crossfilter();
+      var dim = cf.dimension(function (d) { return d.type; });
+      cf.add([
+        { type: "a", amount: 10 },
+        { type: "b", amount: 20 },
+      ]);
+      var g = dim.group().reduceSum(function (d) { return d.amount; });
+      assert.deepStrictEqual(g.all(), [
+        { key: "a", value: 10 },
+        { key: "b", value: 20 },
+      ]);
+      cf.add([
+        { type: "a", amount: 5 },
+        { type: "c", amount: 30 },
+      ]);
+      assert.deepStrictEqual(g.all(), [
+        { key: "a", value: 15 },
+        { key: "b", value: 20 },
+        { key: "c", value: 30 },
+      ]);
+      dim.filterExact("a");
+      assert.deepStrictEqual(cf.allFiltered().length, 2);
+      dim.filterAll();
+    });
+
+    it("lazy append with existing group handles cross-dimension filter", function () {
+      var cf = crossfilter();
+      var typeDim = cf.dimension(function (d) { return d.type; });
+      var amountDim = cf.dimension(function (d) { return d.amount; });
+      cf.add([
+        { type: "a", amount: 10 },
+        { type: "b", amount: 20 },
+      ]);
+      var g = typeDim.group().reduceSum(function (d) { return d.amount; });
+      amountDim.filterRange([15, 100]);
+      cf.add([
+        { type: "a", amount: 30 },
+        { type: "b", amount: 5 },
+      ]);
+      assert.deepStrictEqual(g.all(), [
+        { key: "a", value: 30 },
+        { key: "b", value: 20 },
+      ]);
+      amountDim.filterAll();
+    });
+
+    it("lazy append with existing group and new key introduces group correctly", function () {
+      var cf = crossfilter();
+      var dim = cf.dimension(function (d) { return d.key; });
+      cf.add([{ key: "b" }, { key: "b" }]);
+      var g = dim.group().reduceCount();
+      assert.deepStrictEqual(g.all(), [{ key: "b", value: 2 }]);
+      cf.add([{ key: "a" }, { key: "c" }]);
+      assert.deepStrictEqual(g.all(), [
+        { key: "a", value: 1 },
+        { key: "b", value: 2 },
+        { key: "c", value: 1 },
+      ]);
+    });
+
+    it("lazy filterRange stays encoded for orderable values", function () {
+      var cf = crossfilter();
+      var dim = cf.dimension(function (d) { return d.value; });
+      cf.add([
+        { value: 10 }, { value: 20 }, { value: 30 },
+        { value: 40 }, { value: 50 },
+      ]);
+      dim.filterRange([20, 40]);
+      assert.deepStrictEqual(cf.allFiltered(), [
+        { value: 20 }, { value: 30 },
+      ]);
+      dim.filterRange([10, 50]);
+      assert.deepStrictEqual(cf.allFiltered(), [
+        { value: 10 }, { value: 20 }, { value: 30 }, { value: 40 },
+      ]);
+      dim.filterAll();
+      assert.equal(cf.allFiltered().length, 5);
+    });
+
+    it("dimension groupAll stays lazy encoded", function () {
+      var cf = crossfilter();
+      var dim = cf.dimension(function (d) { return d.type; });
+      cf.add([
+        { type: "a", amount: 10 },
+        { type: "b", amount: 20 },
+        { type: "a", amount: 30 },
+      ]);
+      var ga = dim.groupAll().reduceSum(function (d) { return d.amount; });
+      assert.equal(ga.value(), 60);
+      dim.filterExact("a");
+      assert.equal(ga.value(), 60);
+      dim.filterAll();
+      cf.add([{ type: "c", amount: 40 }]);
+      assert.equal(ga.value(), 100);
+    });
+
     it("can add a record that matches the tag filter", function () {
       var data2 = crossfilter();
       var fooDimension = data2.dimension(function (d) {
@@ -3965,20 +4122,20 @@ describe("crossfilter", () => {
 
       it("allows the filter value to be null", function () {
         try {
-          data.tip.filterExact(null); // equivalent to 0 by natural ordering
+          data.tip.filterExact(null);
           assert.deepStrictEqual(data.tags.top(2), [
-            {
-              date: "2011-11-14T22:48:05Z",
-              quantity: 2,
-              total: 91,
-              tip: 0,
-              type: "tab",
-              tags: [2, 4, 5],
-            },
             {
               date: "2011-11-14T20:06:33Z",
               quantity: 1,
               total: 100,
+              tip: null,
+              type: "cash",
+              tags: [2, 4, 5],
+            },
+            {
+              date: "2011-11-14T17:25:45Z",
+              quantity: 2,
+              total: 200,
               tip: null,
               type: "cash",
               tags: [2, 4, 5],

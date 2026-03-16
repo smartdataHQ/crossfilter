@@ -4074,6 +4074,20 @@ self.onmessage = async function(event) {
   crossfilter.createStreamingDashboardWorker = function(options) {
     return createStreamingDashboardWorker(options);
   };
+  // Match simple property access patterns in function source:
+  //   d => d.prop, (d) => d['prop'], function(d) { return d.prop; }
+  var re_arrowAccessor = /^\(?(\w+)\)?\s*=>\s*\1(?:\.(\w+)|\[['"]([^'"]+)['"]\])\s*$/;
+  var re_functionAccessor = /^function\s*\w*\s*\(\s*(\w+)\s*\)\s*\{\s*return\s+\1(?:\.(\w+)|\[['"]([^'"]+)['"]\])\s*;?\s*\}$/;
+
+  function tryExtractAccessorPath(fn) {
+    try {
+      var source = fn.toString().trim();
+      var match = re_arrowAccessor.exec(source) || re_functionAccessor.exec(source);
+      return match ? (match[2] || match[3]) : null;
+    } catch (e) {
+      return null;
+    }
+  }
 
   function crossfilter() {
     var runtimeController = createWasmRuntimeController();
@@ -4522,10 +4536,13 @@ self.onmessage = async function(event) {
 
     // Adds a new dimension with the specified value accessor function.
     function dimension(value, iterable) {
+      var accessorPath;
 
       if (typeof value === 'string') {
-        var accessorPath = value;
+        accessorPath = value;
         value = function(d) { return result(d, accessorPath); };
+      } else if (typeof value === 'function') {
+        accessorPath = tryExtractAccessorPath(value);
       }
 
       var dimension = {
@@ -4557,6 +4574,7 @@ self.onmessage = async function(event) {
           index, // maps sorted value index -> record index (in data)
           newValues, // temporary array storing newly-added values
           newIndex, // temporary array storing newly-added index
+          lastAppendedCodes, // temporary: appended codes from lazy preAdd
           iterablesIndexCount,
           iterablesIndexFilterStatus,
           iterablesEmptyRows = [],
@@ -4573,6 +4591,7 @@ self.onmessage = async function(event) {
           filterMode = 'all',
           filterInValues = null,
           exactRangeCache = new Map(),
+          lazyFilterTargetCodes = null,
           lazyEncodedState = null,
           indexListeners = [], // when data is added
           dimensionGroups = [],
@@ -4601,7 +4620,8 @@ self.onmessage = async function(event) {
           return null;
         }
 
-        var codes = new Uint32Array(sourceValues.length),
+        var codesCapacity = sourceValues.length < 64 ? 64 : sourceValues.length,
+            codes = new Uint32Array(codesCapacity),
             valueToCode = new Map(),
             codeToValue = [undefined],
             i,
@@ -4623,6 +4643,7 @@ self.onmessage = async function(event) {
 
         return {
           codeCounts: buildCodeCounts(codes, codeToValue.length),
+          codesLength: sourceValues.length,
           codeToValue: codeToValue,
           codes: codes,
           matchIndices: null,
@@ -4638,7 +4659,8 @@ self.onmessage = async function(event) {
           return null;
         }
 
-        var codes = new Uint32Array(length),
+        var codesCapacity = length < 64 ? 64 : length,
+            codes = new Uint32Array(codesCapacity),
             valueToCode = new Map(),
             codeToValue = [undefined],
             i,
@@ -4660,6 +4682,7 @@ self.onmessage = async function(event) {
 
         return {
           codeCounts: buildCodeCounts(codes, codeToValue.length),
+          codesLength: length,
           codeToValue: codeToValue,
           codes: codes,
           matchIndices: null,
@@ -4680,19 +4703,41 @@ self.onmessage = async function(event) {
         lazyEncodedState.selectionMarks = nextMarks;
       }
 
+      function getLazyCodes() {
+        return lazyEncodedState.codes.length === lazyEncodedState.codesLength
+          ? lazyEncodedState.codes
+          : lazyEncodedState.codes.subarray(0, lazyEncodedState.codesLength);
+      }
+
+      function growLazyCodeCounts(codeCounts, code) {
+        var nextCounts = new Uint32Array(lazyEncodedState.codeToValue.length);
+        nextCounts.set(codeCounts);
+        lazyEncodedState.codeCounts = nextCounts;
+        return nextCounts;
+      }
+
       function appendLazyEncodedValues(sourceValues) {
         if (!lazyEncodedState) {
           return null;
         }
 
-        var existingCodes = lazyEncodedState.codes,
+        var existingLength = lazyEncodedState.codesLength,
+            newLength = existingLength + sourceValues.length,
+            codes = lazyEncodedState.codes,
+            codeCounts = lazyEncodedState.codeCounts,
             appendedCodes = new Uint32Array(sourceValues.length),
-            nextCodes = new Uint32Array(existingCodes.length + sourceValues.length),
             i,
             valueToEncode,
             code;
 
-        nextCodes.set(existingCodes);
+        if (newLength > codes.length) {
+          var nextCapacity = codes.length;
+          while (nextCapacity < newLength) nextCapacity *= 2;
+          var nextCodes = new Uint32Array(nextCapacity);
+          nextCodes.set(codes.subarray(0, existingLength));
+          codes = nextCodes;
+          lazyEncodedState.codes = codes;
+        }
 
         for (i = 0; i < sourceValues.length; ++i) {
           valueToEncode = sourceValues[i];
@@ -4704,12 +4749,16 @@ self.onmessage = async function(event) {
             lazyEncodedState.valueToCode.set(valueToEncode, code);
             lazyEncodedState.codeToValue.push(valueToEncode);
           }
-          appendedCodes[i] = lazyEncodedState.valueToCode.get(valueToEncode);
-          nextCodes[existingCodes.length + i] = appendedCodes[i];
+          code = lazyEncodedState.valueToCode.get(valueToEncode);
+          appendedCodes[i] = code;
+          codes[existingLength + i] = code;
+          if (code >= codeCounts.length) {
+            codeCounts = growLazyCodeCounts(codeCounts);
+          }
+          ++codeCounts[code];
         }
 
-        lazyEncodedState.codes = nextCodes;
-        lazyEncodedState.codeCounts = buildCodeCounts(nextCodes, lazyEncodedState.codeToValue.length);
+        lazyEncodedState.codesLength = newLength;
         ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
         return appendedCodes;
       }
@@ -4719,14 +4768,23 @@ self.onmessage = async function(event) {
           return null;
         }
 
-        var existingCodes = lazyEncodedState.codes,
+        var existingLength = lazyEncodedState.codesLength,
+            newLength = existingLength + length,
+            codes = lazyEncodedState.codes,
+            codeCounts = lazyEncodedState.codeCounts,
             appendedCodes = new Uint32Array(length),
-            nextCodes = new Uint32Array(existingCodes.length + length),
             i,
             valueToEncode,
             code;
 
-        nextCodes.set(existingCodes);
+        if (newLength > codes.length) {
+          var nextCapacity = codes.length;
+          while (nextCapacity < newLength) nextCapacity *= 2;
+          var nextCodes = new Uint32Array(nextCapacity);
+          nextCodes.set(codes.subarray(0, existingLength));
+          codes = nextCodes;
+          lazyEncodedState.codes = codes;
+        }
 
         for (i = 0; i < length; ++i) {
           valueToEncode = accessor(offset + i);
@@ -4738,12 +4796,16 @@ self.onmessage = async function(event) {
             lazyEncodedState.valueToCode.set(valueToEncode, code);
             lazyEncodedState.codeToValue.push(valueToEncode);
           }
-          appendedCodes[i] = lazyEncodedState.valueToCode.get(valueToEncode);
-          nextCodes[existingCodes.length + i] = appendedCodes[i];
+          code = lazyEncodedState.valueToCode.get(valueToEncode);
+          appendedCodes[i] = code;
+          codes[existingLength + i] = code;
+          if (code >= codeCounts.length) {
+            codeCounts = growLazyCodeCounts(codeCounts);
+          }
+          ++codeCounts[code];
         }
 
-        lazyEncodedState.codes = nextCodes;
-        lazyEncodedState.codeCounts = buildCodeCounts(nextCodes, lazyEncodedState.codeToValue.length);
+        lazyEncodedState.codesLength = newLength;
         ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
         return appendedCodes;
       }
@@ -4843,9 +4905,9 @@ self.onmessage = async function(event) {
       }
 
       function applyLazySelectionState(nextMatches) {
-        var notifyListeners = filterListeners.length > 0,
-            added = notifyListeners ? [] : null,
-            removed = notifyListeners ? [] : null,
+        var shouldNotify = filterListeners.length > 0 || callbacks.length > 0,
+            added = shouldNotify ? [] : null,
+            removed = shouldNotify ? [] : null,
             currentSelected = lazyEncodedState.selected,
             currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
             currentIndex,
@@ -4885,7 +4947,7 @@ self.onmessage = async function(event) {
                 filters[offset][currentValue] |= one;
               }
               currentSelected[currentValue] = 0;
-              if (notifyListeners) {
+              if (shouldNotify) {
                 removed.push(currentValue);
               }
               ++currentIndex;
@@ -4896,7 +4958,7 @@ self.onmessage = async function(event) {
               filters[offset][nextValue] &= zero;
             }
             currentSelected[nextValue] = 1;
-            if (notifyListeners) {
+            if (shouldNotify) {
               added.push(nextValue);
             }
             ++nextIndex;
@@ -4904,7 +4966,7 @@ self.onmessage = async function(event) {
 
           lazyEncodedState.selected = normalizeLazySelectionMask(currentSelected);
           lazyEncodedState.matchIndices = nextMatches;
-          if (notifyListeners) {
+          if (shouldNotify) {
             notifyFilterListeners(one, offset, added, removed);
           }
           return dimension;
@@ -4929,14 +4991,14 @@ self.onmessage = async function(event) {
             if (filters[offset][i] & one) {
               filters[offset][i] &= zero;
             }
-            if (notifyListeners) {
+            if (shouldNotify) {
               added.push(i);
             }
           } else {
             if (!(filters[offset][i] & one)) {
               filters[offset][i] |= one;
             }
-            if (notifyListeners) {
+            if (shouldNotify) {
               removed.push(i);
             }
           }
@@ -4944,7 +5006,7 @@ self.onmessage = async function(event) {
 
         lazyEncodedState.selected = nextSelected;
         lazyEncodedState.matchIndices = nextMatches;
-        if (notifyListeners) {
+        if (shouldNotify) {
           notifyFilterListeners(one, offset, added, removed);
         }
         return dimension;
@@ -4960,7 +5022,7 @@ self.onmessage = async function(event) {
           return applyLazySelectionState(null);
         }
 
-        matches = runtimeController.findEncodedMatches(lazyEncodedState.codes, targetCodes);
+        matches = runtimeController.findEncodedMatches(getLazyCodes(), targetCodes);
         // Copy from possible WASM memory view before it can be invalidated
         matches = new Uint32Array(matches);
 
@@ -4974,6 +5036,24 @@ self.onmessage = async function(event) {
       function resolveLazyTargetCodes() {
         if (!lazyEncodedState || !filterValuePresent || filterMode === 'all') {
           return new Uint32Array(0);
+        }
+
+        if (lazyFilterTargetCodes) {
+          // Recompute range codes in case new values appeared in codeToValue
+          var codeToValue = lazyEncodedState.codeToValue,
+              rangeCodes = [],
+              code,
+              v,
+              range = filterValue;
+
+          for (code = 1; code < codeToValue.length; ++code) {
+            v = codeToValue[code];
+            if (v >= range[0] && v < range[1]) {
+              rangeCodes.push(code);
+            }
+          }
+          lazyFilterTargetCodes = new Uint32Array(rangeCodes);
+          return lazyFilterTargetCodes;
         }
 
         if (filterMode === 'in') {
@@ -5055,16 +5135,18 @@ self.onmessage = async function(event) {
           }
         }
 
-        nextCodes = new Uint32Array(nextLength);
+        var nextCodesCapacity = nextLength < 64 ? 64 : nextLength;
+        nextCodes = new Uint32Array(nextCodesCapacity);
         if (nextSelected) {
           nextSelected = new Uint8Array(nextLength);
         }
 
+        var existingCodes = getLazyCodes();
         for (i = 0, rowIndex = 0; i < reIndex.length; ++i) {
           if (reIndex[i] === REMOVED_INDEX) {
             continue;
           }
-          nextCodes[rowIndex] = lazyEncodedState.codes[i];
+          nextCodes[rowIndex] = existingCodes[i];
           if (nextSelected && lazyEncodedState.selected[i]) {
             nextSelected[rowIndex] = 1;
           }
@@ -5083,6 +5165,7 @@ self.onmessage = async function(event) {
         }
 
         lazyEncodedState.codes = nextCodes;
+        lazyEncodedState.codesLength = nextLength;
         lazyEncodedState.matchIndices = nextMatchIndices;
         lazyEncodedState.selected = normalizeLazySelectionMask(nextSelected);
         lo0 = 0;
@@ -5094,13 +5177,14 @@ self.onmessage = async function(event) {
           return;
         }
 
-        var materializedValues = new Array(lazyEncodedState.codes.length),
+        var lazyCodes = getLazyCodes(),
+            materializedValues = new Array(lazyCodes.length),
             bounds,
             i,
             ranges;
 
         for (i = 0; i < materializedValues.length; ++i) {
-          materializedValues[i] = lazyEncodedState.codeToValue[lazyEncodedState.codes[i]];
+          materializedValues[i] = lazyEncodedState.codeToValue[lazyCodes[i]];
         }
 
         newValues = materializedValues;
@@ -5381,15 +5465,32 @@ self.onmessage = async function(event) {
         }
 
         if (!iterable && accessorPath) {
-          if (lazyEncodedState && !values && indexListeners.length) {
-            materializeLazyEncodedState();
-          }
-
           if (!n0 && !values) {
             lazyEncodedState = columnAccessorSegment
               ? createLazyEncodedStateFromAccessor(columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
               : createLazyEncodedState(ensureSourceValues());
             if (lazyEncodedState) {
+              if (filterValuePresent && filterMode !== 'all') {
+                var initialTargetCodes = resolveLazyTargetCodes();
+                if (initialTargetCodes) {
+                  var initialMatches = initialTargetCodes.length
+                    ? runtimeController.findEncodedMatches(getLazyCodes(), initialTargetCodes)
+                    : new Uint32Array(0);
+                  initialMatches = new Uint32Array(initialMatches);
+                  var initialSelected = new Uint8Array(n1);
+                  for (var mi = 0; mi < initialMatches.length; ++mi) {
+                    initialSelected[initialMatches[mi]] = 1;
+                  }
+                  for (var ri = 0; ri < n1; ++ri) {
+                    if (!initialSelected[ri]) {
+                      filters[offset][ri] |= one;
+                    }
+                  }
+                  lazyEncodedState.matchIndices = normalizeLazyMatchIndices(initialMatches);
+                  lazyEncodedState.selected = normalizeLazySelectionMask(initialSelected);
+                }
+              }
+              lastAppendedCodes = getLazyCodes();
               lo0 = 0;
               hi0 = 0;
               return;
@@ -5400,6 +5501,7 @@ self.onmessage = async function(event) {
               : appendLazyEncodedValues(ensureSourceValues());
             if (appendedCodes) {
               applyLazyFilterToNewRows(n0, appendedCodes);
+              lastAppendedCodes = appendedCodes;
               lo0 = 0;
               hi0 = 0;
               return;
@@ -5594,8 +5696,9 @@ self.onmessage = async function(event) {
 
       // When all filters have updated, notify index listeners of the new values.
       function postAdd(newData, n0, n1) {
-        indexListeners.forEach(function(l) { l(newValues, newIndex, n0, n1); });
+        indexListeners.forEach(function(l) { l(newValues, newIndex, n0, n1, lastAppendedCodes); });
         newValues = newIndex = null;
+        lastAppendedCodes = null;
       }
 
       function removeData(reIndex) {
@@ -5728,6 +5831,7 @@ self.onmessage = async function(event) {
 
       // Filters this dimension to select the exact value.
       function filterExact(value) {
+        lazyFilterTargetCodes = null;
         if (lazyEncodedState && !values) {
           var exactCodes = encodeLazyFilterValues([value]);
           if (exactCodes) {
@@ -5749,6 +5853,7 @@ self.onmessage = async function(event) {
       }
 
       function filterIn(valuesToSelect) {
+        lazyFilterTargetCodes = null;
         if (lazyEncodedState && !values) {
           var lazyExactFilterValues = normalizeExactFilterValues(valuesToSelect),
               lazyEncodedValues = encodeLazyFilterValues(lazyExactFilterValues);
@@ -5792,6 +5897,29 @@ self.onmessage = async function(event) {
       // Filters this dimension to select the specified range [lo, hi].
       // The lower bound is inclusive, and the upper bound is exclusive.
       function filterRange(range) {
+        if (lazyEncodedState && !values && hasLazyEncodedGroupingSupport()) {
+          var codeToValue = lazyEncodedState.codeToValue,
+              rangeCodes = [],
+              rangeCode,
+              rangeValue;
+
+          for (rangeCode = 1; rangeCode < codeToValue.length; ++rangeCode) {
+            rangeValue = codeToValue[rangeCode];
+            if (rangeValue >= range[0] && rangeValue < range[1]) {
+              rangeCodes.push(rangeCode);
+            }
+          }
+
+          filterValue = range;
+          setFilterValuePresent(true);
+          refilter = xfilterFilter.filterRange(bisect, range);
+          refilterFunction = null;
+          filterInValues = null;
+          filterMode = 'bounds';
+          lazyFilterTargetCodes = new Uint32Array(rangeCodes);
+          return applyLazyEncodedFilter(lazyFilterTargetCodes, 'bounds');
+        }
+
         if (lazyEncodedState && !values) {
           materializeLazyEncodedState();
         }
@@ -5803,6 +5931,7 @@ self.onmessage = async function(event) {
 
       // Clears any filters on this dimension.
       function filterAll() {
+        lazyFilterTargetCodes = null;
         if (lazyEncodedState && !values) {
           filterValue = undefined;
           setFilterValuePresent(false);
@@ -5821,6 +5950,7 @@ self.onmessage = async function(event) {
 
       // Filters this dimension using an arbitrary function.
       function filterFunction(f) {
+        lazyFilterTargetCodes = null;
         if (lazyEncodedState && !values) {
           materializeLazyEncodedState();
         }
@@ -6110,7 +6240,7 @@ self.onmessage = async function(event) {
       function group(key) {
         if (arguments.length < 1) key = cr_identity;
 
-        var useLazyEncodedGrouping = key === cr_identity && hasLazyEncodedGroupingSupport();
+        var useLazyEncodedGrouping = (key === cr_identity || key === cr_null) && hasLazyEncodedGroupingSupport();
         if (!useLazyEncodedGrouping) {
           materializeLazyEncodedState();
         }
@@ -6136,6 +6266,7 @@ self.onmessage = async function(event) {
             groupWidth = 8,
             groupCapacity = capacity(groupWidth),
             k = 0, // cardinality
+            lazyCodeToGroup = null,
             select,
             heap,
             reduceAdd,
@@ -6164,13 +6295,40 @@ self.onmessage = async function(event) {
 
         // Incorporates the specified new values into this group.
         // This function is responsible for updating groups and groupIndex.
-        function add(newValues, newIndex, n0, n1) {
+        function add(newValues, newIndex, n0, n1, appendedCodes) {
+
+          // Incremental lazy append: groups already exist, dimension is still encoded
+          if (appendedCodes && lazyCodeToGroup && lazyEncodedState && !values && k > 0) {
+            var hasNewGroups = false,
+                incrCode,
+                incrI;
+
+            for (incrI = 0; incrI < appendedCodes.length; ++incrI) {
+              incrCode = appendedCodes[incrI];
+              if (incrCode > 0 && lazyCodeToGroup[incrCode] === undefined) {
+                hasNewGroups = true;
+                break;
+              }
+            }
+
+            if (!hasNewGroups) {
+              // Fast path: extend groupIndex for new rows, no new groups
+              if (k > 1) {
+                groupIndex = xfilterArray.arrayLengthen(groupIndex, n);
+                for (incrI = 0; incrI < appendedCodes.length; ++incrI) {
+                  groupIndex[n0 + incrI] = lazyCodeToGroup[appendedCodes[incrI]];
+                }
+              }
+              resetNeeded = true;
+              return;
+            }
+            // hasNewGroups: fall through to full lazy rebuild below
+          }
 
           if (useLazyEncodedGrouping && lazyEncodedState && !values) {
             var codeToValue = lazyEncodedState.codeToValue,
-                codes = lazyEncodedState.codes,
+                codes = getLazyCodes(),
                 sortedCodes = [],
-                codeToGroup,
                 initialValue = resetNeeded ? cr_null : reduceInitial,
                 rowIndex,
                 encodedCode,
@@ -6193,22 +6351,28 @@ self.onmessage = async function(event) {
               return order || a - b;
             });
 
-            if (!sortedCodes.length && groupAll) {
+            if (groupAll) {
               k = 1;
               groups = [{key: null, value: initialValue()}];
               groupIndex = null;
+              lazyCodeToGroup = null;
+            } else if (!sortedCodes.length) {
+              k = 0;
+              groups = [];
+              groupIndex = null;
+              lazyCodeToGroup = null;
             } else {
               while (sortedCodes.length > groupCapacity) {
                 groupWidth <<= 1;
                 groupCapacity = capacity(groupWidth);
               }
 
-              codeToGroup = new Array(codeToValue.length);
+              lazyCodeToGroup = new Array(codeToValue.length);
 
               for (sortIndex = 0; sortIndex < sortedCodes.length; ++sortIndex) {
                 encodedCode = sortedCodes[sortIndex];
                 groups[sortIndex] = {key: codeToValue[encodedCode], value: initialValue()};
-                codeToGroup[encodedCode] = sortIndex;
+                lazyCodeToGroup[encodedCode] = sortIndex;
               }
 
               k = groups.length;
@@ -6216,7 +6380,7 @@ self.onmessage = async function(event) {
 
               if (groupIndex) {
                 for (rowIndex = 0; rowIndex < n; ++rowIndex) {
-                  groupIndex[rowIndex] = codeToGroup[codes[rowIndex]];
+                  groupIndex[rowIndex] = lazyCodeToGroup[codes[rowIndex]];
                 }
               }
             }
@@ -6426,6 +6590,7 @@ self.onmessage = async function(event) {
         }
 
         function removeData(reIndex) {
+          lazyCodeToGroup = null;
           if (k > 1 || iterable) {
             var oldK = k,
                 oldGroups = groups,
