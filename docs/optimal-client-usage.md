@@ -18,7 +18,7 @@ For the current engine, the best browser path is:
 
 - `crossfilter.createStreamingDashboardWorker(...)` for worker-owned fetch and streaming decode
 - Arrow IPC, not pre-materialized JSON rows
-- field-name dimensions, not accessor functions
+- simple dimension accessors (string or `d => d.field` — both auto-optimized)
 - declarative groups and KPI specs through `createDashboardRuntime(...)` / worker runtimes
 - `rows(...)` for paged table slices
 - `append(records)` or `removeFiltered(...)` for live demo-style data mutation without rebuilding the runtime
@@ -30,6 +30,46 @@ The slower fallback paths are still supported, but they leave performance on the
 - using `filterFunction(...)` for discrete selections
 - rebuilding dimensions/groups on each interaction
 - returning full row payloads to the UI when the UI only needs aggregates
+
+## Automatic WASM acceleration for function accessors
+
+Function accessors like `cf.dimension(d => d.field)` are now automatically optimized.
+The library extracts the property name from simple accessor functions and uses it to enter
+the same fast WASM-encoded path that string accessors use. These are all equivalent:
+
+```js
+cf.dimension('country');                          // string accessor (original fast path)
+cf.dimension(d => d.country);                     // arrow function (now auto-optimized)
+cf.dimension(function(d) { return d.country; });  // traditional function (now auto-optimized)
+cf.dimension(d => d['country']);                   // bracket notation (now auto-optimized)
+```
+
+The auto-extraction only works for simple single-property access. Functions with
+transformations, defaults, or multi-level paths fall back to the standard path:
+
+```js
+cf.dimension(d => d.field ?? '');      // not extracted (has default)
+cf.dimension(d => -d.field);           // not extracted (negation)
+cf.dimension(d => d.a.b);             // not extracted (nested path)
+```
+
+This means existing code using the classic crossfilter API (dc.js, etc.) gets WASM
+acceleration without any changes.
+
+### What the lazy encoded path accelerates
+
+When a dimension enters the lazy encoded path (via string or auto-extracted accessor):
+
+- **filterExact / filterIn**: use WASM-accelerated encoded matching
+- **filterRange**: scans the encoded value set instead of materializing and sorting
+- **group / groupAll**: build groups directly from encoded values without materialization
+- **data.add()**: appends use capacity-growth buffers (amortized O(1)) and incremental
+  group updates (O(batchSize) instead of O(n log n) materialization)
+
+The only operations that force materialization back to sorted arrays are:
+- `filterFunction(...)` (arbitrary predicates cannot be encoded)
+- `top()` / `bottom()` on the dimension itself (need sorted order)
+- Non-orderable dimension values (objects, mixed types)
 
 ## Dashboard-specific API
 
@@ -314,22 +354,24 @@ await runtime.removeFiltered('excluded');
 
 ## Recommended synchronous fallback
 
-If you cannot use a worker, the best synchronous path is still Arrow + field-name dimensions + native filters:
+If you cannot use a worker, the best synchronous path is Arrow + native filters.
+Both string and function accessors get full WASM acceleration:
 
 ```js
-import crossfilter from 'crossfilter2';
+import crossfilter from '@smartdatahq/crossfilter';
 import { tableFromIPC } from 'apache-arrow';
 
 const response = await fetch('/data/query-result.arrow');
 const buffer = await response.arrayBuffer();
 const table = tableFromIPC(new Uint8Array(buffer));
 
+crossfilter.configureRuntime({ wasm: true });
 const cf = crossfilter.fromArrowTable(table);
-cf.configureRuntime({ wasm: true });
 
-const country = cf.dimension('semantic_events__dimensions_customer_country');
-const event = cf.dimension('semantic_events__event');
-const time = cf.dimension('semantic_events__timestamp_minute');
+// Both styles are equivalent — function accessors are auto-optimized
+const country = cf.dimension('customer_country');
+const event = cf.dimension(d => d.event);
+const time = cf.dimension(function(d) { return d.timestamp; });
 ```
 
 Prefer:
@@ -398,7 +440,7 @@ Prefer this:
 
 - Arrow IPC input
 - `createStreamingDashboardWorker(...)` in the browser
-- field-name dimensions
+- simple dimension accessors (string or `d => d.field` — both get WASM acceleration)
 - `filterExact`, `filterIn`, `filterRange`
 - declarative groups and KPIs
 - worker snapshots plus paged `rows(...)`
@@ -409,7 +451,7 @@ Avoid this:
 
 - main-thread Arrow decode when a worker is available
 - row-object materialization before ingest
-- accessor functions for hot dimensions
+- complex accessor functions that prevent auto-extraction (e.g., `d => d.field ?? ''`, `d => fn(d)`)
 - `filterFunction(...)` for discrete selection
 - rebuilding crossfilter or dashboard runtimes on each interaction
 - returning entire datasets to the UI when aggregates or row slices are enough
