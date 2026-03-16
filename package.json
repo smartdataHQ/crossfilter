@@ -1,47 +1,43 @@
 {
-  "name": "crossfilter2",
-  "version": "1.5.4",
-  "description": "Fast multidimensional filtering for coordinated views.",
+  "name": "@smartdatahq/crossfilter",
+  "version": "2.0.0",
+  "description": "Fast multidimensional filtering with Arrow streaming, WASM filters, and worker-backed dashboard runtimes.",
   "license": "Apache-2.0",
   "keywords": [
     "analytics",
+    "arrow",
+    "crossfilter",
+    "dashboard",
     "visualization",
-    "crossfilter"
+    "wasm"
   ],
   "author": {
-    "name": "Mike Bostock",
-    "url": "http://bost.ocks.org/mike"
+    "name": "SmartData HQ",
+    "url": "https://github.com/smartdataHQ"
   },
   "contributors": [
+    {
+      "name": "Mike Bostock",
+      "url": "http://bost.ocks.org/mike"
+    },
     {
       "name": "Jason Davies",
       "url": "http://www.jasondavies.com/"
     }
   ],
-  "maintainers": [
-    {
-      "name": "Gordon Woodhull",
-      "url": "https://github.com/gordonwoodhull"
-    },
-    {
-      "name": "Tanner Linsley",
-      "url": "https://github.com/tannerlinsley"
-    },
-    {
-      "name": "Ethan Jewett",
-      "url": "https://github.com/esjewett"
-    }
-  ],
-  "homepage": "https://crossfilter.github.io/crossfilter/",
+  "homepage": "https://github.com/smartdataHQ/crossfilter",
   "main": "./crossfilter.js",
   "module": "main.js",
   "types": "./index.d.ts",
   "unpkg": "./crossfilter.min.js",
   "repository": {
     "type": "git",
-    "url": "http://github.com/crossfilter/crossfilter.git"
+    "url": "https://github.com/smartdataHQ/crossfilter.git"
   },
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@ranfdev/deepobj": "1.0.2"
   },
