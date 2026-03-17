@@ -98,13 +98,13 @@ function renderFiltered() {
 
   var html = '<table class="tbl"><thead><tr>' +
     '<th title="Product name">Product</th>' +
-    '<th title="Stockout pattern: Longer than usual, Typical, Seasonal (DOW pattern), or Rare occurrence">Pattern</th>' +
+    '<th title="Stockout character: Longer than usual, Typical, Seasonal (DOW pattern), or Rare">Pattern</th>' +
     '<th title="Average stockout duration for this product at this store">Avg Duration</th>' +
     '<th title="Total estimated lost sales across all stockout events">Total Lost</th>' +
-    '<th title="Composite trend: Active, Worsening, Improving, or Stable based on duration, frequency, and severity changes">Signal</th>' +
-    '<th title="Duration trend: recent-half avg vs older-half avg. Arrow up = stockouts getting longer">Duration Trend</th>' +
-    '<th title="Frequency trend: recent stockouts/month vs older. Arrow up = happening more often">Frequency Trend</th>' +
-    '<th title="Impact trend: recent lost-sales/day vs older. Arrow up = each stockout costs more">Impact Trend</th>' +
+    '<th title="Overall status: Active, Active &amp; Worsening, Worsening, Improving, or Stable">Status</th>' +
+    '<th title="Are stockouts lasting longer? Recent-half avg duration vs older-half. \u2191 = getting longer">Duration \u0394</th>' +
+    '<th title="Are stockouts more frequent? Recent stockouts/month vs older. \u2191 = more often">Frequency \u0394</th>' +
+    '<th title="Is each stockout costlier? Recent lost-sales/day vs older. \u2191 = higher impact">Impact \u0394</th>' +
     '</tr></thead><tbody>';
 
   for (var i = 0; i < filtered.length; ++i) {

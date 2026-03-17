@@ -132,12 +132,12 @@ function renderFiltered() {
 
   var html = '<table class="tbl"><thead><tr>' +
     '<th title="Product name">Product</th>' +
-    '<th title="3-day stockout probability from DOW-based forecast">3-Day Prob</th>' +
-    '<th title="Composite risk score based on frequency, duration, impact, and trend">Risk Score</th>' +
-    '<th title="Day of the week with highest stockout probability">Risk Day</th>' +
-    '<th title="Current trend signal">Signal</th>' +
+    '<th title="Probability of stockout in the next 3 days based on day-of-week history">3-Day Prob</th>' +
+    '<th title="Composite risk score (0-100%) combining frequency, duration, impact, and trend">Risk Score</th>' +
+    '<th title="Day of the week with highest stockout probability">Worst Day</th>' +
+    '<th title="Overall status: Worsening, Improving, or Stable">Status</th>' +
     '<th title="Days since last stockout ended">Last</th>' +
-    '<th title="Average stockout frequency per month">Freq</th>' +
+    '<th title="Historical stockout frequency">Freq/Mo</th>' +
     '</tr></thead><tbody>';
 
   for (var i = 0; i < filtered.length; ++i) {

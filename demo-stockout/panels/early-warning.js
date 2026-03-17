@@ -12,13 +12,13 @@ var sortDir = -1; // -1 = desc, 1 = asc
 
 var COLUMNS = [
   { key: 'product', label: 'Product', title: 'Product name', type: 'string' },
-  { key: 'trend_signal', label: 'Trend', title: 'Frequency trend: worsening = stockouts becoming more frequent', type: 'badge' },
-  { key: 'severity_trend', label: 'Severity', title: 'Severity trend: escalating = each stockout getting worse', type: 'badge' },
-  { key: 'risk_score', label: 'Risk Score', title: 'Composite risk score', type: 'bar' },
-  { key: '_dur_delta', label: 'Dur \u0394', title: 'Duration trend: recent-half avg vs older-half avg', type: 'delta', recent: 'avg_duration_recent_half', older: 'avg_duration_older_half' },
-  { key: '_freq_delta', label: 'Freq \u0394', title: 'Frequency trend: recent stockouts/month vs older', type: 'delta', recent: 'frequency_recent_per_month', older: 'frequency_older_per_month' },
-  { key: '_impact_delta', label: 'Impact \u0394', title: 'Impact trend: recent lost-sales/day vs older', type: 'delta', recent: 'avg_impact_recent_half', older: 'avg_impact_older_half' },
-  { key: 'forecast_stockout_probability', label: 'Forecast', title: '3-day forecast stockout probability', type: 'bar' },
+  { key: 'trend_signal', label: 'Recurrence', title: 'Are stockouts recurring more often and lasting longer? Worsening = yes', type: 'badge' },
+  { key: 'severity_trend', label: 'Escalation', title: 'Is each stockout event getting more severe (higher impact)? Escalating = yes', type: 'badge' },
+  { key: 'risk_score', label: 'Risk Score', title: 'Composite risk score (0-100%) combining frequency, duration, impact, and trend', type: 'bar' },
+  { key: '_dur_delta', label: 'Duration \u0394', title: 'Are stockouts lasting longer? Recent-half avg duration vs older-half. \u2191 = getting longer', type: 'delta', recent: 'avg_duration_recent_half', older: 'avg_duration_older_half' },
+  { key: '_freq_delta', label: 'Frequency \u0394', title: 'Are stockouts more frequent? Recent stockouts/month vs older. \u2191 = more often', type: 'delta', recent: 'frequency_recent_per_month', older: 'frequency_older_per_month' },
+  { key: '_impact_delta', label: 'Impact \u0394', title: 'Is each stockout costlier? Recent lost-sales/day vs older. \u2191 = higher impact', type: 'delta', recent: 'avg_impact_recent_half', older: 'avg_impact_older_half' },
+  { key: 'forecast_stockout_probability', label: '3-Day Prob', title: 'Probability of stockout in the next 3 days based on day-of-week history', type: 'bar' },
 ];
 
 export function renderEarlyWarning(rowsResult) {

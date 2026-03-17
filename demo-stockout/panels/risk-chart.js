@@ -38,12 +38,12 @@ export function renderRiskChart(storeResult, warningResult) {
 
   var html = '<table class="tbl"><thead><tr>' +
     '<th title="Product name">Product</th>' +
-    '<th title="Composite risk score based on frequency, duration, impact, and trend">Risk Score</th>' +
-    '<th title="3-day stockout probability from DOW-based forecast">3-Day Prob</th>' +
-    '<th title="Stockout pattern: Longer, Typical, Seasonal, or Rare">Pattern</th>' +
+    '<th title="Composite risk score (0-100%) combining frequency, duration, impact, and trend">Risk Score</th>' +
+    '<th title="Probability of stockout in the next 3 days based on day-of-week history">3-Day Prob</th>' +
+    '<th title="Stockout character: Longer than usual, Typical, Seasonal (DOW pattern), or Rare">Pattern</th>' +
     '<th title="Days since last stockout ended">Last</th>' +
-    '<th title="Frequency trend: recent vs older half. Arrow up = more frequent">Freq</th>' +
-    '<th title="Current trend signal">Signal</th>' +
+    '<th title="Are stockouts more frequent? Recent stockouts/month vs older. \u2191 = more often">Frequency \u0394</th>' +
+    '<th title="Overall status: Worsening, Improving, or Stable">Status</th>' +
     '</tr></thead><tbody>';
 
   for (var i = 0; i < rows.length; ++i) {
