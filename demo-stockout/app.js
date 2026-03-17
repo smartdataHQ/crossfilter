@@ -387,10 +387,10 @@ async function refreshAllPanels() {
         snapshot: {},
         rowCount: true,
         rowSets: {
-          stockout: { fields: MAIN_FIELDS, sortBy: 'risk_score', direction: 'top', columnar: true },
-          forecast: { fields: MAIN_FIELDS, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
-          risk:     { fields: MAIN_FIELDS, sortBy: 'risk_score', direction: 'top', columnar: true },
-          warning:  { fields: MAIN_FIELDS, sortBy: 'risk_score', direction: 'top', columnar: true },
+          stockout: { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
+          forecast: { fields: MAIN_FIELDS, limit: 10000, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
+          risk:     { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
+          warning:  { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
         },
       }).catch(function (err) { console.error('cf-main query failed:', err); return null; })
     );
@@ -545,7 +545,7 @@ async function applyDowFilters() {
   if (dowSelectedProduct) filters.product = { type: 'in', values: [dowSelectedProduct] };
   await runtimes['cf-dow'].updateFilters(filters);
   try {
-    var result = await runtimes['cf-dow'].rows({ fields: DOW_FIELDS, columnar: true });
+    var result = await runtimes['cf-dow'].rows({ fields: DOW_FIELDS, limit: 50000, columnar: true });
     renderDowPattern(result, echarts, THEME_NAME);
   } catch (err) { console.error('DOW query failed:', err); }
 }
