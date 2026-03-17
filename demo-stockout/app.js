@@ -9,7 +9,7 @@ import { registerRuntime, dispatchFilters, disposeAll, onPanelRefresh } from './
 import { renderKpis } from './panels/kpis.js';
 import { renderStockoutTable } from './panels/stockout-table.js';
 import { renderForecast } from './panels/forecast.js';
-import { renderRiskChart, disposeRiskChart } from './panels/risk-chart.js';
+import { renderRiskChart } from './panels/risk-chart.js';
 import { renderEarlyWarning } from './panels/early-warning.js';
 import { renderDowPattern, disposeDow } from './panels/dow-pattern.js';
 
@@ -455,16 +455,27 @@ async function refreshRiskChart() {
     return;
   }
   try {
-    var result = await runtimes['cf-store'].rows({
-      fields: ['product', 'risk_score', 'risk_tier', 'is_currently_active'],
-      limit: 50,
-      sortBy: 'risk_score',
-      direction: 'top',
-      columnar: true,
-    });
-    renderRiskChart(result, echarts, THEME_NAME);
+    var riskFields = [
+      'product', 'risk_score', 'is_currently_active',
+      'forecast_stockout_probability', 'forecast_warning',
+      'stockouts_per_month', 'avg_duration_days', 'median_duration_days',
+      'stddev_duration_days', 'days_since_last', 'confirmed_stockouts',
+      'dow_pattern', 'highest_risk_day', 'trend_signal',
+    ];
+    var promises = [
+      runtimes['cf-store'].rows({ fields: riskFields, limit: 50, sortBy: 'risk_score', direction: 'top', columnar: true }),
+    ];
+    if (runtimes['cf-warning']) {
+      promises.push(runtimes['cf-warning'].rows({
+        fields: ['product', 'avg_duration_recent_half', 'avg_duration_older_half',
+          'frequency_recent_per_month', 'frequency_older_per_month'],
+        limit: 500, sortBy: 'risk_score', direction: 'top', columnar: true,
+      }));
+    }
+    var results = await Promise.all(promises);
+    renderRiskChart(results[0], results[1] || null);
   } catch (err) {
-    console.error('Risk chart query failed:', err);
+    console.error('Risk table query failed:', err);
     document.getElementById('panel-risk').innerHTML = '<div class="panel-error">Failed to load</div>';
   }
 }
@@ -533,7 +544,6 @@ onStateChange(async function (newState, prevState) {
     }
     // New store -> dispose and reload
     if (categoryPieInstance) { categoryPieInstance.dispose(); categoryPieInstance = null; }
-    disposeRiskChart();
     disposeDow();
     endedCategoryFilter = null;
     await disposeAll();
@@ -554,11 +564,10 @@ onPanelRefresh(function () {
 
 // Resize handler for ECharts
 window.addEventListener('resize', function () {
-  var riskEl = document.getElementById('panel-risk');
   var dowEl = document.getElementById('panel-dow');
   var catEl = document.getElementById('panel-category');
 
-  [riskEl, dowEl, catEl].forEach(function (el) {
+  [dowEl, catEl].forEach(function (el) {
     if (el) {
       var instance = echarts.getInstanceByDom(el);
       if (instance) instance.resize();
