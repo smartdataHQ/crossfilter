@@ -80,8 +80,8 @@ function esc(v) {
 function formatISKShort(v) {
   if (v == null || isNaN(v)) return '\u2014';
   v = Number(v);
-  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M';
-  if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + '<abbr title="million">M</abbr>';
+  if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + '<abbr title="thousand">K</abbr>';
   return Math.round(v) + '';
 }
 
@@ -177,7 +177,7 @@ dom.clearBtn.addEventListener('click', function () {
 // ---- Worker Creation (once, all stores) ----
 
 async function createWorkers() {
-  setOverlay(true, 'Loading all store data...');
+  setOverlay(true, 'Starting...');
 
   showShimmer('panel-trend');
   showShimmer('panel-category');
@@ -188,12 +188,24 @@ async function createWorkers() {
   showShimmer('panel-early-warning');
   dom.kpiRow.innerHTML = '<div class="shimmer" style="grid-column:1/-1;min-height:80px;"></div>';
 
+  // Progress tracking (Principle 1: report progress for operations > 1s)
+  var progress = { workers: 0, extras: 0, total: ALL_CUBE_IDS.length + 3 };
+  function updateProgress(label) {
+    var done = progress.workers + progress.extras;
+    var pct = Math.round(done / progress.total * 100);
+    setOverlay(true, label + ' (' + pct + '%)');
+  }
+
   // All network requests in parallel: 3 workers + 2 yesterday fetches + store list
   var results = await Promise.allSettled(
     ALL_CUBE_IDS.map(function (cubeId) {
       var opts = buildWorkerOptions(cubeId);
+      updateProgress('Connecting to ' + cubeId);
       return crossfilter.createStreamingDashboardWorker(opts).then(function (runtime) {
-        return runtime.ready.then(function () {
+        return runtime.ready.then(function (readyPayload) {
+          progress.workers++;
+          var rows = readyPayload && readyPayload.load ? readyPayload.load.rowsLoaded : '?';
+          updateProgress(cubeId + ': ' + rows + ' rows loaded');
           var config = getCubeConfig(cubeId);
           registerRuntime(cubeId, runtime, config.workerDimensions);
           runtimes[cubeId] = runtime;
@@ -201,9 +213,21 @@ async function createWorkers() {
         });
       });
     }).concat([
-      fetchEndedYesterday().then(function (data) { allEndedYesterday = data; }),
-      fetchStartedYesterday().then(function (data) { allStartedYesterday = data; }),
-      fetchStoreList().then(function (stores) { storeList = stores; }),
+      fetchEndedYesterday().then(function (data) {
+        allEndedYesterday = data;
+        progress.extras++;
+        updateProgress('Ended yesterday: ' + data.length + ' events');
+      }),
+      fetchStartedYesterday().then(function (data) {
+        allStartedYesterday = data;
+        progress.extras++;
+        updateProgress('Started yesterday: ' + data.length + ' events');
+      }),
+      fetchStoreList().then(function (stores) {
+        storeList = stores;
+        progress.extras++;
+        updateProgress(stores.length + ' stores loaded');
+      }),
     ])
   );
 
