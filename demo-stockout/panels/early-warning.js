@@ -1,12 +1,25 @@
 // demo-stockout/panels/early-warning.js
 //
-// Products NOT currently stocked out but showing deteriorating trends.
-// Filtered by severity trend, category, supplier.
+// Products NOT stocked out, NOT high risk, but deteriorating.
+// Sortable column headers. Filtered by severity, category, supplier.
 
 var allRows = [];
 var sevSelect = null;
 var catSelect = null;
 var supSelect = null;
+var sortField = 'risk_score';
+var sortDir = -1; // -1 = desc, 1 = asc
+
+var COLUMNS = [
+  { key: 'product', label: 'Product', title: 'Product name', type: 'string' },
+  { key: 'trend_signal', label: 'Trend', title: 'Frequency trend: worsening = stockouts becoming more frequent', type: 'badge' },
+  { key: 'severity_trend', label: 'Severity', title: 'Severity trend: escalating = each stockout getting worse', type: 'badge' },
+  { key: 'risk_score', label: 'Risk Score', title: 'Composite risk score', type: 'bar' },
+  { key: '_dur_delta', label: 'Dur \u0394', title: 'Duration trend: recent-half avg vs older-half avg', type: 'delta', recent: 'avg_duration_recent_half', older: 'avg_duration_older_half' },
+  { key: '_freq_delta', label: 'Freq \u0394', title: 'Frequency trend: recent stockouts/month vs older', type: 'delta', recent: 'frequency_recent_per_month', older: 'frequency_older_per_month' },
+  { key: '_impact_delta', label: 'Impact \u0394', title: 'Impact trend: recent lost-sales/day vs older', type: 'delta', recent: 'avg_impact_recent_half', older: 'avg_impact_older_half' },
+  { key: 'forecast_stockout_probability', label: 'Forecast', title: '3-day forecast stockout probability', type: 'bar' },
+];
 
 export function renderEarlyWarning(rowsResult) {
   var el = document.getElementById('panel-early-warning');
@@ -17,34 +30,60 @@ export function renderEarlyWarning(rowsResult) {
   supSelect = supSelect || document.getElementById('warning-sup-filter');
 
   var rows = columnarToRows(rowsResult);
-
-  // Early warning = NOT stocked out, NOT already high risk, but deteriorating.
-  // These are products heading toward trouble but not there yet.
   allRows = rows.filter(function (r) {
     var active = r.is_currently_active;
     if (active === 1 || active === true || active === 'true' || active === '1') return false;
-    // Exclude high-risk products (they belong in HIGHEST RISK table)
     var score = Number(r.risk_score) || 0;
     if (score >= 0.5) return false;
-    // Must show a worsening signal
     var trend = String(r.trend_signal || '').toUpperCase();
     var severity = String(r.severity_trend || '').toUpperCase();
     return trend === 'WORSENING' || severity === 'ESCALATING' || severity === 'WORSENING';
   });
-  // Sort by rate of deterioration: prioritize products where frequency is increasing fastest
-  allRows.sort(function (a, b) {
-    var aRatio = deteriorationRate(a);
-    var bRatio = deteriorationRate(b);
-    return bRatio - aRatio;
-  });
 
+  sortRows();
   populateSelects(allRows);
+  renderFiltered();
+}
+
+function sortRows() {
+  var field = sortField;
+  var dir = sortDir;
+
+  allRows.sort(function (a, b) {
+    var av = sortValue(a, field);
+    var bv = sortValue(b, field);
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+}
+
+function sortValue(row, field) {
+  // Delta columns: sort by the ratio (recent/older)
+  var col = COLUMNS.filter(function (c) { return c.key === field; })[0];
+  if (col && col.type === 'delta') {
+    var r = Number(row[col.recent]) || 0;
+    var o = Number(row[col.older]) || 0;
+    return o > 0 ? r / o : (r > 0 ? 2 : 1);
+  }
+  var v = row[field];
+  if (v == null) return '';
+  return typeof v === 'string' ? v.toLowerCase() : Number(v) || 0;
+}
+
+function onHeaderClick(field) {
+  if (sortField === field) {
+    sortDir = sortDir * -1; // toggle direction
+  } else {
+    sortField = field;
+    sortDir = -1; // default desc for new field
+  }
+  sortRows();
   renderFiltered();
 }
 
 function populateSelects(rows) {
   if (!sevSelect || !catSelect || !supSelect) return;
-
   var prevSev = sevSelect.value;
   var prevCat = catSelect.value;
   var prevSup = supSelect.value;
@@ -100,60 +139,61 @@ function renderFiltered() {
     return;
   }
 
-  var html = '<table class="tbl"><thead><tr>' +
-    '<th title="Product name">Product</th>' +
-    '<th title="Frequency trend: worsening = stockouts becoming more frequent">Trend</th>' +
-    '<th title="Severity trend: escalating = each stockout getting worse (longer, costlier)">Severity</th>' +
-    '<th title="Composite risk score">Risk</th>' +
-    '<th title="Duration trend: recent-half avg vs older-half avg">Dur \u0394</th>' +
-    '<th title="Frequency trend: recent stockouts/month vs older">Freq \u0394</th>' +
-    '<th title="Impact trend: recent lost-sales/day vs older">Impact \u0394</th>' +
-    '<th title="3-day forecast stockout probability">Forecast</th>' +
-    '</tr></thead><tbody>';
+  // Build header with sort indicators
+  var header = '<table class="tbl"><thead><tr>';
+  for (var c = 0; c < COLUMNS.length; ++c) {
+    var col = COLUMNS[c];
+    var arrow = '';
+    if (sortField === col.key) arrow = sortDir < 0 ? ' \u25bc' : ' \u25b2';
+    header += '<th title="' + col.title + '" data-sort="' + col.key + '" class="sortable">' +
+      col.label + arrow + '</th>';
+  }
+  header += '</tr></thead><tbody>';
 
+  var body = '';
   for (var i = 0; i < filtered.length; ++i) {
     var r = filtered[i];
-    html += '<tr>' +
-      '<td class="val">' + esc(r.product) + '</td>' +
-      '<td>' + trendBadge(r.trend_signal) + '</td>' +
-      '<td>' + severityBadge(r.severity_trend) + '</td>' +
-      '<td>' + riskBar(Number(r.risk_score) || 0) + '</td>' +
-      '<td>' + deltaCell(r.avg_duration_recent_half, r.avg_duration_older_half) + '</td>' +
-      '<td>' + deltaCell(r.frequency_recent_per_month, r.frequency_older_per_month) + '</td>' +
-      '<td>' + deltaCell(r.avg_impact_recent_half, r.avg_impact_older_half) + '</td>' +
-      '<td>' + forecastCell(r.forecast_stockout_probability) + '</td>' +
-      '</tr>';
+    body += '<tr>';
+    for (var j = 0; j < COLUMNS.length; ++j) {
+      body += renderCell(r, COLUMNS[j]);
+    }
+    body += '</tr>';
   }
 
-  html += '</tbody></table>';
-  el.innerHTML = html;
+  el.innerHTML = header + body + '</tbody></table>';
+
+  // Attach sort click handlers
+  var ths = el.querySelectorAll('th.sortable');
+  for (var t = 0; t < ths.length; ++t) {
+    ths[t].addEventListener('click', function (e) {
+      onHeaderClick(e.currentTarget.dataset.sort);
+    });
+  }
 }
 
-// Rate of deterioration: how fast is this product getting worse?
-// Combines frequency increase + duration increase + impact increase.
-function deteriorationRate(r) {
-  var freqR = Number(r.frequency_recent_per_month) || 0;
-  var freqO = Number(r.frequency_older_per_month) || 0;
-  var durR = Number(r.avg_duration_recent_half) || 0;
-  var durO = Number(r.avg_duration_older_half) || 0;
-  var impR = Number(r.avg_impact_recent_half) || 0;
-  var impO = Number(r.avg_impact_older_half) || 0;
-  var ratio = function (recent, older) {
-    if (older > 0) return recent / older;
-    return recent > 0 ? 2 : 1;
-  };
-  return ratio(freqR, freqO) + ratio(durR, durO) + ratio(impR, impO);
+function renderCell(r, col) {
+  switch (col.type) {
+    case 'string':
+      return '<td class="val">' + esc(r[col.key]) + '</td>';
+    case 'badge':
+      return '<td>' + (col.key === 'severity_trend' ? severityBadge(r[col.key]) : trendBadge(r[col.key])) + '</td>';
+    case 'bar':
+      return '<td>' + scoreBar(Number(r[col.key]) || 0) + '</td>';
+    case 'delta':
+      return '<td>' + deltaCell(r[col.recent], r[col.older]) + '</td>';
+    default:
+      return '<td>' + esc(r[col.key]) + '</td>';
+  }
 }
 
-function riskBar(score) {
-  var pct = Math.round(score * 100);
-  var color = score >= 0.5 ? '#ff4d6a' : score >= 0.3 ? '#ffb84d' : '#4da6ff';
+function scoreBar(value) {
+  var pct = Math.round(value * 100);
+  var color = value >= 0.5 ? '#ff4d6a' : value >= 0.3 ? '#ffb84d' : '#4da6ff';
   return '<div style="display:flex;align-items:center;gap:4px;min-width:70px">' +
     '<div style="flex:1;height:3px;background:#1e2a3a;border-radius:2px;overflow:hidden">' +
     '<div style="width:' + pct + '%;height:100%;background:' + color + '"></div>' +
     '</div>' +
-    '<span style="font-size:9px;color:' + color + '">' + pct + '%</span>' +
-    '</div>';
+    '<span style="font-size:9px;color:' + color + '">' + pct + '%</span></div>';
 }
 
 function deltaCell(recent, older) {
@@ -166,13 +206,6 @@ function deltaCell(recent, older) {
   else if (ratio < 0.8) { arrow = '\u2193'; cls = 'delta-down'; }
   else { arrow = '\u2192'; cls = 'delta-flat'; }
   return '<span class="' + cls + '">' + arrow + ' ' + r.toFixed(1) + '</span>';
-}
-
-function forecastCell(prob) {
-  var p = Number(prob);
-  if (isNaN(p) || p === 0) return '<span style="color:#4a5a6e">\u2014</span>';
-  var color = p >= 0.7 ? '#ff4d6a' : p >= 0.4 ? '#ffb84d' : '#00e68a';
-  return '<span style="color:' + color + ';font-weight:600">' + Math.round(p * 100) + '%</span>';
 }
 
 function trendBadge(signal) {

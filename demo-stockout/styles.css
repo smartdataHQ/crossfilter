@@ -483,6 +483,15 @@ body::before {
   color: var(--text-secondary);
 }
 
+.tbl th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.tbl th.sortable:hover {
+  color: var(--accent-blue);
+}
+
 .tbl td {
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
