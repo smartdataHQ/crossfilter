@@ -38,25 +38,23 @@ export function renderRiskChart(storeResult, warningResult) {
 
   var html = '<table class="tbl"><thead><tr>' +
     '<th title="Product name">Product</th>' +
-    '<th title="Composite risk score (0-100%) based on frequency, duration, impact, and trend">Risk</th>' +
-    '<th title="3-day stockout probability from DOW-based forecast model">Forecast</th>' +
-    '<th title="Stockout pattern: Longer, Typical, Seasonal, or Rare">Pattern</th>' +
+    '<th title="Composite risk score (0-100%) combining frequency, duration, impact, and trend">Risk Score</th>' +
+    '<th title="Probability of stockout in the next 3 days based on day-of-week history">3-Day Prob</th>' +
+    '<th title="Stockout character: Longer than usual, Typical, Seasonal (DOW pattern), or Rare">Pattern</th>' +
     '<th title="Days since last stockout ended">Last</th>' +
-    '<th title="Frequency trend: recent vs older half. Arrow up = more frequent">Freq</th>' +
-    '<th title="Current trend signal">Signal</th>' +
+    '<th title="Are stockouts more frequent? Recent stockouts/month vs older. \u2191 = more often">Frequency \u0394</th>' +
+    '<th title="Overall status: Worsening, Improving, or Stable">Status</th>' +
     '</tr></thead><tbody>';
 
   for (var i = 0; i < rows.length; ++i) {
     var r = rows[i];
     var w = wMap[r.product] || {};
-    var score = Number(r.risk_score) || 0;
-    var forecast = Number(r.forecast_stockout_probability) || 0;
 
     var isSelected = r.product === selectedProduct;
     html += '<tr data-product="' + esc(r.product) + '" class="risk-row' + (isSelected ? ' risk-selected' : '') + '" style="cursor:pointer">' +
       '<td class="val">' + esc(r.product) + '</td>' +
-      '<td>' + riskBar(score) + '</td>' +
-      '<td>' + forecastCell(forecast, r.forecast_warning) + '</td>' +
+      '<td>' + scoreBar(Number(r.risk_score) || 0, 'risk') + '</td>' +
+      '<td>' + scoreBar(Number(r.forecast_stockout_probability) || 0, 'prob') + '</td>' +
       '<td>' + labelBadge(r) + '</td>' +
       '<td>' + fmtDays(r.days_since_last) + '</td>' +
       '<td>' + deltaCell(Number(w.frequency_recent_per_month), Number(w.frequency_older_per_month)) + '</td>' +
@@ -86,23 +84,21 @@ export function renderRiskChart(storeResult, warningResult) {
   });
 }
 
-// Inline horizontal bar for risk score
-function riskBar(score) {
-  var pct = Math.round(score * 100);
-  var color = score >= 0.75 ? '#ff4d6a' : score >= 0.5 ? '#ff8c4d' : score >= 0.25 ? '#ffb84d' : '#00e68a';
-  return '<div style="display:flex;align-items:center;gap:6px;min-width:90px">' +
+// Unified inline bar for both risk score and probability (0-1)
+function scoreBar(value, type) {
+  var pct = Math.round(value * 100);
+  var color;
+  if (type === 'prob') {
+    color = value >= 0.7 ? '#ff4d6a' : value >= 0.4 ? '#ffb84d' : '#00e68a';
+  } else {
+    color = value >= 0.75 ? '#ff4d6a' : value >= 0.5 ? '#ff8c4d' : value >= 0.25 ? '#ffb84d' : '#00e68a';
+  }
+  return '<div style="display:flex;align-items:center;gap:4px;min-width:80px">' +
     '<div style="flex:1;height:4px;background:#1e2a3a;border-radius:2px;overflow:hidden">' +
     '<div style="width:' + pct + '%;height:100%;background:' + color + ';border-radius:2px"></div>' +
     '</div>' +
     '<span style="font-size:10px;color:' + color + ';font-weight:600;min-width:28px">' + pct + '%</span>' +
     '</div>';
-}
-
-function forecastCell(prob, warning) {
-  if (!prob) return '<span style="color:#4a5a6e">\u2014</span>';
-  var pct = Math.round(prob * 100);
-  var color = prob >= 0.7 ? '#ff4d6a' : prob >= 0.4 ? '#ffb84d' : '#00e68a';
-  return '<span style="color:' + color + ';font-weight:600">' + pct + '%</span>';
 }
 
 function labelBadge(r) {

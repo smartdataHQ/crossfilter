@@ -66,7 +66,7 @@
     <div class="card-head">
       <span class="card-t">AT RISK — NEXT 3 DAYS</span>
       <div class="card-filters">
-        <select id="forecast-day-filter" class="filter-select"><option value="">All Days</option></select>
+        <div id="forecast-day-btns" class="day-btns"></div>
         <select id="forecast-cat-filter" class="filter-select"><option value="">All Categories</option></select>
         <select id="forecast-sup-filter" class="filter-select"><option value="">All Suppliers</option></select>
         <span id="forecast-count" class="card-tag"></span>
@@ -76,14 +76,14 @@
     <div id="panel-forecast-table" class="table-scroll"></div>
   </section>
 
-  <div class="grid-2col">
+  <div class="grid-risk-dow">
     <section class="card anim d6">
       <div class="card-head"><span class="card-t">HIGHEST RISK</span></div>
       <div id="panel-risk" class="table-scroll"></div>
     </section>
     <section class="card anim d6">
-      <div class="card-head"><span class="card-t">DAY-OF-WEEK PATTERN</span> <span id="dow-product-label" class="card-tag" hidden></span></div>
-      <div id="panel-dow" class="chart-wrap"></div>
+      <div class="card-head"><span class="card-t">DOW PATTERN</span> <span id="dow-product-label" class="card-tag" hidden></span></div>
+      <div id="panel-dow" class="chart-wrap chart-wrap-narrow"></div>
       <div id="panel-dow-badges" class="dow-badges"></div>
     </section>
   </div>

@@ -449,12 +449,14 @@ async function refreshForecast() {
     return;
   }
   try {
+    var forecastFields = [
+      'product', 'product_category', 'supplier', 'forecast_stockout_probability',
+      'days_since_last', 'stockouts_per_month', 'highest_risk_day',
+      'is_currently_active', 'forecast_warning', 'risk_score',
+      'avg_duration_days', 'trend_signal', 'dow_pattern',
+    ];
     var result = await runtimes['cf-store'].rows({
-      fields: [
-        'product', 'product_category', 'supplier', 'forecast_stockout_probability',
-        'days_since_last', 'stockouts_per_month', 'highest_risk_day',
-        'is_currently_active', 'forecast_warning',
-      ],
+      fields: forecastFields,
       limit: 200,
       sortBy: 'forecast_stockout_probability',
       direction: 'top',

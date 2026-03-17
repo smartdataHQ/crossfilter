@@ -406,12 +406,45 @@ body::before {
   color: var(--accent-red);
 }
 
+.grid-risk-dow {
+  display: grid;
+  grid-template-columns: 3fr 2fr;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.grid-risk-dow .card { margin-bottom: 0; }
+
 /* Chart container */
 .chart-wrap {
   position: relative;
   height: 280px;
   padding: 8px;
 }
+
+.chart-wrap-narrow { height: 220px; }
+
+/* Day filter buttons */
+.day-btns {
+  display: flex;
+  gap: 2px;
+}
+
+.day-btn {
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  padding: 3px 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.day-btn:hover { border-color: var(--accent-blue); color: var(--text-secondary); }
+.day-btn.day-active { background: var(--accent-blue-dim); border-color: var(--accent-blue); color: var(--accent-blue); }
 
 /* Tables */
 .table-scroll {
@@ -448,6 +481,15 @@ body::before {
 
 .tbl th[title]:hover {
   color: var(--text-secondary);
+}
+
+.tbl th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.tbl th.sortable:hover {
+  color: var(--accent-blue);
 }
 
 .tbl td {
@@ -637,7 +679,7 @@ body::before {
 
 /* Responsive */
 @media (max-width: 1024px) {
-  .grid-2col { grid-template-columns: 1fr; }
+  .grid-2col, .grid-risk-dow { grid-template-columns: 1fr; }
   .kpi-row { grid-template-columns: repeat(3, 1fr); }
 }
 
