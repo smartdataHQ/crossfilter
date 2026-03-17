@@ -63,7 +63,15 @@
   </section>
 
   <section class="card anim d5">
-    <div class="card-head"><span class="card-t">AT RISK — NEXT 3 DAYS</span> <span id="forecast-count" class="card-tag"></span></div>
+    <div class="card-head">
+      <span class="card-t">AT RISK — NEXT 3 DAYS</span>
+      <div class="card-filters">
+        <select id="forecast-day-filter" class="filter-select"><option value="">All Days</option></select>
+        <select id="forecast-cat-filter" class="filter-select"><option value="">All Categories</option></select>
+        <select id="forecast-sup-filter" class="filter-select"><option value="">All Suppliers</option></select>
+        <span id="forecast-count" class="card-tag"></span>
+      </div>
+    </div>
     <div id="panel-forecast-cards" class="forecast-cards"></div>
     <div id="panel-forecast-table" class="table-scroll"></div>
   </section>
