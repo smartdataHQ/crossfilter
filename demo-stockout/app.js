@@ -1,6 +1,15 @@
 // demo-stockout/app.js
 //
 // Entry point: startup, store picker, worker orchestration, panel wiring.
+//
+// Optimization strategy:
+//   - 3 crossfilter workers (cf-store, cf-warning, cf-dow) created in parallel
+//   - 2 lightweight JSON fetches (ended/started yesterday) in parallel with workers
+//   - Each worker gets ONE batched query() call per refresh cycle:
+//     cf-store:   snapshot + 3 rowSets (stockout, forecast, risk) in 1 round-trip
+//     cf-warning: 1 rows() call (used by stockout table + early warning)
+//     cf-dow:     1 rows() call
+//   - Total: 3 postMessage round-trips per refresh (was 8)
 
 import { registerTheme, THEME_NAME } from './theme.js';
 import { getState, setState, onStateChange, PARAM_TO_DIMENSION } from './router.js';
@@ -21,34 +30,19 @@ if (!echarts) throw new Error('echarts not loaded');
 
 registerTheme(echarts);
 
-// Wire risk table product click -> DOW chart filter
-var dowProductFilter = null;
-setProductClickHandler(async function (product) {
-  dowProductFilter = product;
-  var label = document.getElementById('dow-product-label');
-  if (label) {
-    if (product) { label.textContent = product; label.removeAttribute('hidden'); }
-    else { label.setAttribute('hidden', ''); }
-  }
-  if (!runtimes['cf-dow']) return;
-  if (product) {
-    await runtimes['cf-dow'].updateFilters({ product: { type: 'in', values: [product] } });
-  } else {
-    await runtimes['cf-dow'].updateFilters({});
-  }
-  await refreshDow();
-});
+// ---- State ----
 
-// State
-var runtimes = {};    // { cubeId: runtime }
+var runtimes = {};
 var storeList = [];
 var currentStore = null;
 var loadToken = 0;
 var endedYesterdayData = [];
 var startedYesterdayData = [];
-var endedCategoryFilter = null; // local filter for ended-yesterday pie chart
+var endedCategoryFilter = null;
+var lastWarningRows = null; // cached cf-warning rows, shared by stockout table + early warning
 
-// DOM refs
+// ---- DOM refs ----
+
 var dom = {
   overlay: document.getElementById('loading-overlay'),
   overlayText: document.querySelector('.loading-text'),
@@ -62,13 +56,12 @@ var dom = {
   kpiRow: document.getElementById('kpi-row'),
 };
 
+// ---- Helpers ----
+
 function setOverlay(show, text) {
   if (text) dom.overlayText.textContent = text;
-  if (show) {
-    dom.overlay.removeAttribute('hidden');
-  } else {
-    dom.overlay.setAttribute('hidden', '');
-  }
+  if (show) dom.overlay.removeAttribute('hidden');
+  else dom.overlay.setAttribute('hidden', '');
 }
 
 function showShimmer(elId) {
@@ -76,6 +69,19 @@ function showShimmer(elId) {
   if (el && !el.querySelector('.shimmer')) {
     el.innerHTML = '<div class="shimmer" style="margin:12px;min-height:120px;"></div>';
   }
+}
+
+function esc(v) {
+  if (v == null) return '\u2014';
+  return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function formatISKShort(v) {
+  if (v == null || isNaN(v)) return '\u2014';
+  v = Number(v);
+  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+  if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  return Math.round(v) + '';
 }
 
 // ---- Store Picker ----
@@ -99,19 +105,14 @@ async function showStorePicker() {
     btn.className = 'store-btn';
     btn.innerHTML = store.name + '<span class="store-btn-count">' + (store.count || 0) + ' products</span>';
     btn.dataset.store = store.name;
-    btn.addEventListener('click', onStoreClick);
+    btn.addEventListener('click', function (e) { setState({ store: e.currentTarget.dataset.store }); });
     dom.storeGrid.appendChild(btn);
   }
 
   dom.picker.removeAttribute('hidden');
 }
 
-function onStoreClick(e) {
-  var storeName = e.currentTarget.dataset.store;
-  setState({ store: storeName });
-}
-
-// ---- Store Selector Dropdown ----
+// ---- Store Selector ----
 
 function populateStoreSelector() {
   dom.storeSelector.innerHTML = '';
@@ -127,11 +128,8 @@ function populateStoreSelector() {
 dom.storeSelector.addEventListener('change', function () {
   var newStore = dom.storeSelector.value;
   if (newStore && newStore !== currentStore) {
-    // Clear all filters and set new store
     var patch = { store: newStore };
-    for (var param in PARAM_TO_DIMENSION) {
-      patch[param] = null;
-    }
+    for (var param in PARAM_TO_DIMENSION) patch[param] = null;
     setState(patch);
   }
 });
@@ -141,12 +139,9 @@ dom.storeSelector.addEventListener('change', function () {
 function renderFilterChips() {
   var state = getState();
   var chips = [];
-
   for (var param in PARAM_TO_DIMENSION) {
     var val = state[param];
-    if (!val) continue;
-    var label = param.charAt(0).toUpperCase() + param.slice(1);
-    chips.push({ param: param, label: label + ': ' + val });
+    if (val) chips.push({ param: param, label: param.charAt(0).toUpperCase() + param.slice(1) + ': ' + val });
   }
 
   dom.filterChips.innerHTML = '';
@@ -155,29 +150,20 @@ function renderFilterChips() {
     chip.className = 'filter-chip';
     chip.dataset.param = chips[i].param;
     chip.innerHTML = chips[i].label + ' <span class="chip-x">&times;</span>';
-    chip.addEventListener('click', onChipRemove);
+    chip.addEventListener('click', function (e) {
+      var p = {};
+      p[e.currentTarget.dataset.param] = null;
+      setState(p);
+    });
     dom.filterChips.appendChild(chip);
   }
 
-  if (chips.length > 0) {
-    dom.clearBtn.removeAttribute('hidden');
-  } else {
-    dom.clearBtn.setAttribute('hidden', '');
-  }
-}
-
-function onChipRemove(e) {
-  var param = e.currentTarget.dataset.param;
-  var patch = {};
-  patch[param] = null;
-  setState(patch);
+  dom.clearBtn[chips.length > 0 ? 'removeAttribute' : 'setAttribute']('hidden', '');
 }
 
 dom.clearBtn.addEventListener('click', function () {
   var patch = {};
-  for (var param in PARAM_TO_DIMENSION) {
-    patch[param] = null;
-  }
+  for (var param in PARAM_TO_DIMENSION) patch[param] = null;
   setState(patch);
 });
 
@@ -186,16 +172,10 @@ dom.clearBtn.addEventListener('click', function () {
 async function createWorker(cubeId, store, token) {
   var opts = buildWorkerOptions(cubeId, store);
   var runtime = await crossfilter.createStreamingDashboardWorker(opts);
-  if (token !== loadToken) {
-    await runtime.dispose();
-    return null;
-  }
+  if (token !== loadToken) { await runtime.dispose(); return null; }
 
   await runtime.ready;
-  if (token !== loadToken) {
-    await runtime.dispose();
-    return null;
-  }
+  if (token !== loadToken) { await runtime.dispose(); return null; }
 
   var config = getCubeConfig(cubeId);
   registerRuntime(cubeId, runtime, config.workerDimensions);
@@ -213,7 +193,6 @@ async function loadDashboard(store) {
   populateStoreSelector();
   setOverlay(true, 'Loading data for ' + store + '...');
 
-  // Show shimmers
   showShimmer('panel-trend');
   showShimmer('panel-category');
   showShimmer('panel-stockout-table');
@@ -223,7 +202,7 @@ async function loadDashboard(store) {
   showShimmer('panel-early-warning');
   dom.kpiRow.innerHTML = '<div class="shimmer" style="grid-column:1/-1;min-height:80px;"></div>';
 
-  // Create workers + fetch yesterday data in parallel
+  // All network requests in parallel: 3 workers + 2 yesterday fetches
   var results = await Promise.allSettled(
     ALL_CUBE_IDS.map(function (cubeId) {
       return createWorker(cubeId, store, token);
@@ -239,57 +218,130 @@ async function loadDashboard(store) {
   for (var i = 0; i < ALL_CUBE_IDS.length; ++i) {
     if (results[i].status === 'rejected' || !results[i].value) {
       failedCubes.push(ALL_CUBE_IDS[i]);
-      console.error('Worker creation failed for ' + ALL_CUBE_IDS[i] + ':',
-        results[i].status === 'rejected' ? results[i].reason : 'returned null');
+      console.error('Worker failed: ' + ALL_CUBE_IDS[i],
+        results[i].status === 'rejected' ? results[i].reason : 'null');
     }
   }
 
   if (failedCubes.length === ALL_CUBE_IDS.length) {
     setOverlay(false);
-    dom.kpiRow.innerHTML = '<div class="panel-error" style="grid-column:1/-1;">Failed to load any data for this store.</div>';
+    dom.kpiRow.innerHTML = '<div class="panel-error" style="grid-column:1/-1;">Failed to load data.</div>';
     return;
   }
 
   setOverlay(false);
 
-  // Apply initial filters from URL
   var state = getState();
   await dispatchFilters(state);
-
-  // Initial render
   await refreshAllPanels();
 }
 
-// ---- Panel Rendering ----
+// ---- Batched Panel Refresh ----
+//
+// Key optimization: each worker gets ONE query() call per refresh cycle.
+// cf-store: snapshot (KPIs) + 3 rowSets (stockout, forecast, risk) = 1 round-trip
+// cf-warning: 1 rows() call, result shared by stockout table + early warning
+// cf-dow: 1 rows() call
+
+// All fields needed from cf-store across all panels
+var STORE_FIELDS = [
+  'product', 'product_category', 'supplier', 'risk_score',
+  'avg_duration_days', 'median_duration_days', 'stddev_duration_days',
+  'total_expected_lost_sales', 'trend_signal', 'severity_trend',
+  'is_currently_active', 'dow_pattern', 'highest_risk_day',
+  'stockouts_per_month', 'total_stockouts', 'confirmed_stockouts',
+  'avg_days_between_stockouts', 'days_since_last',
+  'forecast_stockout_probability', 'forecast_warning',
+];
+
+var WARNING_FIELDS = [
+  'product', 'product_category', 'supplier',
+  'trend_signal', 'severity_trend', 'is_currently_active',
+  'risk_score', 'forecast_stockout_probability', 'forecast_warning',
+  'avg_duration_recent_half', 'avg_duration_older_half',
+  'frequency_recent_per_month', 'frequency_older_per_month',
+  'avg_impact_recent_half', 'avg_impact_older_half',
+];
+
+var DOW_FIELDS = [
+  'dow_mon_confirmed', 'dow_tue_confirmed', 'dow_wed_confirmed',
+  'dow_thu_confirmed', 'dow_fri_confirmed', 'dow_sat_confirmed', 'dow_sun_confirmed',
+  'dow_mon_probability', 'dow_tue_probability', 'dow_wed_probability',
+  'dow_thu_probability', 'dow_fri_probability', 'dow_sat_probability', 'dow_sun_probability',
+  'weekday_stockout_rate', 'weekend_stockout_rate', 'dow_pattern', 'highest_risk_day',
+];
 
 async function refreshAllPanels() {
-  await Promise.all([
-    refreshKpis(),
-    refreshStockoutTable(),
-    refreshForecast(),
-    refreshRiskChart(),
-    refreshEarlyWarning(),
-    refreshDow(),
-  ]);
+  // 3 worker queries in parallel (1 round-trip each)
+  var promises = [];
+
+  // cf-store: ONE query() with snapshot + 3 rowSets
+  if (runtimes['cf-store']) {
+    promises.push(
+      runtimes['cf-store'].query({
+        snapshot: {},
+        rowCount: true,
+        rowSets: {
+          stockout: { fields: STORE_FIELDS, limit: 200, sortBy: 'risk_score', direction: 'top', columnar: true },
+          forecast: { fields: STORE_FIELDS, limit: 200, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
+          risk:     { fields: STORE_FIELDS, limit: 50, sortBy: 'risk_score', direction: 'top', columnar: true },
+        },
+      }).catch(function (err) { console.error('cf-store query failed:', err); return null; })
+    );
+  } else {
+    promises.push(Promise.resolve(null));
+  }
+
+  // cf-warning: ONE rows() call, shared by stockout table merge + early warning
+  if (runtimes['cf-warning']) {
+    promises.push(
+      runtimes['cf-warning'].rows({
+        fields: WARNING_FIELDS, limit: 500, sortBy: 'risk_score', direction: 'top', columnar: true,
+      }).catch(function (err) { console.error('cf-warning query failed:', err); return null; })
+    );
+  } else {
+    promises.push(Promise.resolve(null));
+  }
+
+  // cf-dow: ONE rows() call
+  if (runtimes['cf-dow']) {
+    promises.push(
+      runtimes['cf-dow'].rows({
+        fields: DOW_FIELDS, limit: 5000, columnar: true,
+      }).catch(function (err) { console.error('cf-dow query failed:', err); return null; })
+    );
+  } else {
+    promises.push(Promise.resolve(null));
+  }
+
+  var results = await Promise.all(promises);
+  var storeResult = results[0];
+  var warningRows = results[1];
+  var dowRows = results[2];
+
+  // Cache warning rows for shared use
+  lastWarningRows = warningRows;
+
+  // Render all panels from the batched results (no more async, pure rendering)
+  if (storeResult) {
+    renderKpis(storeResult.snapshot, endedYesterdayData, startedYesterdayData);
+    renderStockoutTable(storeResult.rowSets.stockout, warningRows);
+    renderForecast(storeResult.rowSets.forecast);
+    renderRiskChart(storeResult.rowSets.risk, warningRows);
+  } else {
+    renderKpis(null, endedYesterdayData, startedYesterdayData);
+    document.getElementById('panel-stockout-table').innerHTML = '<div class="panel-empty">Data unavailable</div>';
+    document.getElementById('panel-forecast-table').innerHTML = '<div class="panel-empty">Data unavailable</div>';
+    document.getElementById('panel-risk').innerHTML = '<div class="panel-empty">Data unavailable</div>';
+  }
+
+  renderEarlyWarning(warningRows);
+  renderDowPattern(dowRows, echarts, THEME_NAME);
   refreshEndedYesterday();
   renderFilterChips();
 }
 
-async function refreshKpis() {
-  var storeSnapshot = null;
-
-  if (runtimes['cf-store']) {
-    try {
-      var storeResult = await runtimes['cf-store'].query({
-        snapshot: {},
-        rowCount: true,
-      });
-      storeSnapshot = storeResult.snapshot;
-    } catch (err) { console.error('KPI store query failed:', err); }
-  }
-
-  renderKpis(storeSnapshot, endedYesterdayData, startedYesterdayData);
-}
+// ---- Ended Yesterday (local data, no crossfilter) ----
 
 function refreshEndedYesterday() {
   renderEndedYesterdayTable(endedYesterdayData, endedCategoryFilter);
@@ -309,7 +361,8 @@ function renderEndedYesterdayTable(data, categoryFilter) {
   if (countEl) countEl.textContent = filtered.length + ' products';
 
   if (!filtered.length) {
-    el.innerHTML = '<div class="panel-empty">' + (categoryFilter ? 'No ended stockouts in ' + esc(categoryFilter) : 'No confirmed stockouts ended yesterday') + '</div>';
+    el.innerHTML = '<div class="panel-empty">' +
+      (categoryFilter ? 'No ended stockouts in ' + esc(categoryFilter) : 'No confirmed stockouts ended yesterday') + '</div>';
     return;
   }
 
@@ -344,7 +397,6 @@ function renderEndedCategoryPie(data) {
     return;
   }
 
-  // Count by category
   var counts = {};
   for (var i = 0; i < data.length; ++i) {
     var cat = data[i].category || 'Unknown';
@@ -352,21 +404,14 @@ function renderEndedCategoryPie(data) {
   }
 
   var pieData = [];
-  for (var key in counts) {
-    pieData.push({ name: key, value: counts[key] });
-  }
+  for (var key in counts) pieData.push({ name: key, value: counts[key] });
   pieData.sort(function (a, b) { return b.value - a.value; });
 
   if (!categoryPieInstance || categoryPieInstance.isDisposed()) {
     categoryPieInstance = echarts.init(el, THEME_NAME, { renderer: 'canvas' });
     categoryPieInstance.on('click', function (params) {
-      if (params.name === endedCategoryFilter) {
-        endedCategoryFilter = null; // toggle off
-      } else {
-        endedCategoryFilter = params.name;
-      }
+      endedCategoryFilter = params.name === endedCategoryFilter ? null : params.name;
       renderEndedYesterdayTable(endedYesterdayData, endedCategoryFilter);
-      // Re-render pie to show selection
       renderEndedCategoryPie(endedYesterdayData);
     });
   }
@@ -380,9 +425,7 @@ function renderEndedCategoryPie(data) {
       data: pieData.map(function (d) {
         var selected = d.name === endedCategoryFilter;
         return {
-          name: d.name,
-          value: d.value,
-          selected: selected,
+          name: d.name, value: d.value, selected: selected,
           itemStyle: selected ? { borderColor: '#e8edf3', borderWidth: 2 } : {},
         };
       }),
@@ -394,202 +437,60 @@ function renderEndedCategoryPie(data) {
   }, true);
 }
 
-function esc(v) {
-  if (v == null) return '\u2014';
-  return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+// ---- DOW product filter (from risk table click) ----
 
-function formatISKShort(v) {
-  if (v == null || isNaN(v)) return '\u2014';
-  v = Number(v);
-  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M';
-  if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + 'K';
-  return Math.round(v) + '';
-}
+var dowProductFilter = null;
 
-async function refreshStockoutTable() {
-  if (!runtimes['cf-store']) {
-    document.getElementById('panel-stockout-table').innerHTML = '<div class="panel-empty">Data unavailable</div>';
-    return;
+setProductClickHandler(async function (product) {
+  dowProductFilter = product;
+  var label = document.getElementById('dow-product-label');
+  if (label) {
+    if (product) { label.textContent = product; label.removeAttribute('hidden'); }
+    else { label.setAttribute('hidden', ''); }
   }
+  if (!runtimes['cf-dow']) return;
+  await runtimes['cf-dow'].updateFilters(product ? { product: { type: 'in', values: [product] } } : {});
+  // Re-fetch DOW only (1 round-trip)
   try {
-    // Fetch store data + warning trending data in parallel
-    var storeFields = [
-      'product', 'product_category', 'supplier', 'risk_score',
-      'avg_duration_days', 'median_duration_days', 'stddev_duration_days',
-      'total_expected_lost_sales', 'trend_signal', 'severity_trend',
-      'is_currently_active', 'dow_pattern', 'highest_risk_day',
-      'stockouts_per_month', 'total_stockouts', 'confirmed_stockouts',
-      'avg_days_between_stockouts', 'days_since_last',
-    ];
-    var warningFields = [
-      'product', 'avg_duration_recent_half', 'avg_duration_older_half',
-      'frequency_recent_per_month', 'frequency_older_per_month',
-      'avg_impact_recent_half', 'avg_impact_older_half',
-    ];
-
-    var promises = [
-      runtimes['cf-store'].rows({ fields: storeFields, limit: 200, sortBy: 'risk_score', direction: 'top', columnar: true }),
-    ];
-    if (runtimes['cf-warning']) {
-      promises.push(runtimes['cf-warning'].rows({ fields: warningFields, limit: 500, sortBy: 'risk_score', direction: 'top', columnar: true }));
-    }
-
-    var results = await Promise.all(promises);
-    renderStockoutTable(results[0], results[1] || null);
-  } catch (err) {
-    console.error('Stockout table query failed:', err);
-    document.getElementById('panel-stockout-table').innerHTML = '<div class="panel-error">Failed to load</div>';
-  }
-}
-
-async function refreshForecast() {
-  if (!runtimes['cf-store']) {
-    document.getElementById('panel-forecast-table').innerHTML = '<div class="panel-empty">Data unavailable</div>';
-    return;
-  }
-  try {
-    var forecastFields = [
-      'product', 'product_category', 'supplier', 'forecast_stockout_probability',
-      'days_since_last', 'stockouts_per_month', 'highest_risk_day',
-      'is_currently_active', 'forecast_warning', 'risk_score',
-      'avg_duration_days', 'trend_signal', 'dow_pattern',
-    ];
-    var result = await runtimes['cf-store'].rows({
-      fields: forecastFields,
-      limit: 200,
-      sortBy: 'forecast_stockout_probability',
-      direction: 'top',
-      columnar: true,
-    });
-    renderForecast(result);
-  } catch (err) {
-    console.error('Forecast query failed:', err);
-    document.getElementById('panel-forecast-table').innerHTML = '<div class="panel-error">Failed to load</div>';
-  }
-}
-
-async function refreshRiskChart() {
-  if (!runtimes['cf-store']) {
-    document.getElementById('panel-risk').innerHTML = '<div class="panel-empty">Data unavailable</div>';
-    return;
-  }
-  try {
-    var riskFields = [
-      'product', 'risk_score', 'is_currently_active',
-      'forecast_stockout_probability', 'forecast_warning',
-      'stockouts_per_month', 'avg_duration_days', 'median_duration_days',
-      'stddev_duration_days', 'days_since_last', 'confirmed_stockouts',
-      'dow_pattern', 'highest_risk_day', 'trend_signal',
-    ];
-    var promises = [
-      runtimes['cf-store'].rows({ fields: riskFields, limit: 50, sortBy: 'risk_score', direction: 'top', columnar: true }),
-    ];
-    if (runtimes['cf-warning']) {
-      promises.push(runtimes['cf-warning'].rows({
-        fields: ['product', 'avg_duration_recent_half', 'avg_duration_older_half',
-          'frequency_recent_per_month', 'frequency_older_per_month'],
-        limit: 500, sortBy: 'risk_score', direction: 'top', columnar: true,
-      }));
-    }
-    var results = await Promise.all(promises);
-    renderRiskChart(results[0], results[1] || null);
-  } catch (err) {
-    console.error('Risk table query failed:', err);
-    document.getElementById('panel-risk').innerHTML = '<div class="panel-error">Failed to load</div>';
-  }
-}
-
-async function refreshEarlyWarning() {
-  if (!runtimes['cf-warning']) {
-    document.getElementById('panel-early-warning').innerHTML = '<div class="panel-empty">Data unavailable</div>';
-    return;
-  }
-  try {
-    var result = await runtimes['cf-warning'].rows({
-      fields: [
-        'product', 'product_category', 'supplier',
-        'trend_signal', 'severity_trend', 'is_currently_active',
-        'risk_score', 'forecast_stockout_probability', 'forecast_warning',
-        'avg_duration_recent_half', 'avg_duration_older_half',
-        'frequency_recent_per_month', 'frequency_older_per_month',
-        'avg_impact_recent_half', 'avg_impact_older_half',
-      ],
-      limit: 500,
-      sortBy: 'risk_score',
-      direction: 'top',
-      columnar: true,
-    });
-    renderEarlyWarning(result);
-  } catch (err) {
-    console.error('Early warning query failed:', err);
-    document.getElementById('panel-early-warning').innerHTML = '<div class="panel-error">Failed to load</div>';
-  }
-}
-
-async function refreshDow() {
-  if (!runtimes['cf-dow']) {
-    document.getElementById('panel-dow').innerHTML = '<div class="panel-empty">Data unavailable</div>';
-    return;
-  }
-  try {
-    var result = await runtimes['cf-dow'].rows({
-      fields: [
-        'dow_mon_confirmed', 'dow_tue_confirmed', 'dow_wed_confirmed',
-        'dow_thu_confirmed', 'dow_fri_confirmed', 'dow_sat_confirmed', 'dow_sun_confirmed',
-        'dow_mon_probability', 'dow_tue_probability', 'dow_wed_probability',
-        'dow_thu_probability', 'dow_fri_probability', 'dow_sat_probability', 'dow_sun_probability',
-        'weekday_stockout_rate', 'weekend_stockout_rate', 'dow_pattern', 'highest_risk_day',
-      ],
-      limit: 5000,
-      columnar: true,
-    });
+    var result = await runtimes['cf-dow'].rows({ fields: DOW_FIELDS, limit: 5000, columnar: true });
     renderDowPattern(result, echarts, THEME_NAME);
   } catch (err) {
     console.error('DOW query failed:', err);
-    document.getElementById('panel-dow').innerHTML = '<div class="panel-error">Failed to load</div>';
   }
-}
+});
 
 // ---- State Change Handler ----
 
 onStateChange(async function (newState, prevState) {
-  // Store change -> full reload
   if (newState.store !== (prevState && prevState.store)) {
     if (!newState.store) {
-      // No store -> show picker
       await disposeAll();
       runtimes = {};
       dom.dashboard.setAttribute('hidden', '');
       showStorePicker();
       return;
     }
-    // New store -> dispose and reload
     if (categoryPieInstance) { categoryPieInstance.dispose(); categoryPieInstance = null; }
     disposeDow();
     endedCategoryFilter = null;
+    lastWarningRows = null;
     await disposeAll();
     runtimes = {};
     await loadDashboard(newState.store);
     return;
   }
 
-  // Filter change -> dispatch to runtimes
+  // Filter change: dispatch to all runtimes, then one batched refresh
   await dispatchFilters(newState);
   await refreshAllPanels();
 });
 
-// Wire panel refresh callback from filter-router
-onPanelRefresh(function () {
-  // Already handled by refreshAllPanels in state change handler
-});
+onPanelRefresh(function () {});
 
-// Resize handler for ECharts
+// ---- Resize ----
+
 window.addEventListener('resize', function () {
-  var dowEl = document.getElementById('panel-dow');
-  var catEl = document.getElementById('panel-category');
-
-  [dowEl, catEl].forEach(function (el) {
+  [document.getElementById('panel-dow'), document.getElementById('panel-category')].forEach(function (el) {
     if (el) {
       var instance = echarts.getInstanceByDom(el);
       if (instance) instance.resize();
@@ -605,13 +506,10 @@ window.addEventListener('resize', function () {
   if (!state.store) {
     await showStorePicker();
   } else {
-    // Load store list in background for the selector dropdown
     fetchStoreList().then(function (stores) {
       storeList = stores;
       populateStoreSelector();
-    }).catch(function (err) {
-      console.warn('Failed to load store list for dropdown:', err);
-    });
+    }).catch(function () {});
 
     await loadDashboard(state.store);
   }
