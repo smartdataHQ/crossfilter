@@ -1,12 +1,12 @@
 // demo-stockout/panels/dow-pattern.js
 
+import { columnarToRows, esc } from './helpers.js';
+import { colorFor } from '../config.js';
+
 var chartInstance = null;
 
 export function disposeDow() {
-  if (chartInstance) {
-    chartInstance.dispose();
-    chartInstance = null;
-  }
+  if (chartInstance) { chartInstance.dispose(); chartInstance = null; }
 }
 
 var DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -26,18 +26,15 @@ export function renderDowPattern(rowsResult, echarts, themeName) {
 
   var rows = columnarToRows(rowsResult);
   if (!rows.length) {
-    el.innerHTML = '<div class="panel-empty">No DOW data</div>';
+    el.innerHTML = '<div class="panel-empty">No <abbr title="Day of Week">DOW</abbr> data</div>';
     if (badgesEl) badgesEl.innerHTML = '';
     return;
   }
 
-  // Aggregate across all rows
   var confirmedTotals = [0, 0, 0, 0, 0, 0, 0];
   var probSums = [0, 0, 0, 0, 0, 0, 0];
-  var weekdayRateSum = 0;
-  var weekendRateSum = 0;
-  var patternCounts = {};
-  var riskDayCounts = {};
+  var weekdayRateSum = 0, weekendRateSum = 0;
+  var patternCounts = {}, riskDayCounts = {};
   var count = rows.length;
 
   for (var i = 0; i < rows.length; ++i) {
@@ -48,21 +45,12 @@ export function renderDowPattern(rowsResult, echarts, themeName) {
     }
     weekdayRateSum += Number(r.weekday_stockout_rate) || 0;
     weekendRateSum += Number(r.weekend_stockout_rate) || 0;
-
-    var pattern = r.dow_pattern;
-    if (pattern) patternCounts[pattern] = (patternCounts[pattern] || 0) + 1;
-    var riskDay = r.highest_risk_day;
-    if (riskDay) riskDayCounts[riskDay] = (riskDayCounts[riskDay] || 0) + 1;
+    if (r.dow_pattern) patternCounts[r.dow_pattern] = (patternCounts[r.dow_pattern] || 0) + 1;
+    if (r.highest_risk_day) riskDayCounts[r.highest_risk_day] = (riskDayCounts[r.highest_risk_day] || 0) + 1;
   }
 
   var probAvgs = probSums.map(function (s) { return count > 0 ? s / count : 0; });
-
-  // Color bars by probability
-  var barColors = probAvgs.map(function (p) {
-    if (p >= 0.5) return '#ff4d6a';
-    if (p >= 0.3) return '#ffb84d';
-    return '#00e68a';
-  });
+  var barColors = probAvgs.map(function (p) { return colorFor('forecast_stockout_probability', p); });
 
   if (!chartInstance || chartInstance.isDisposed()) {
     chartInstance = echarts.init(el, themeName, { renderer: 'canvas' });
@@ -74,9 +62,8 @@ export function renderDowPattern(rowsResult, echarts, themeName) {
       trigger: 'axis',
       formatter: function (params) {
         var idx = params[0].dataIndex;
-        return DAY_NAMES[idx] + '<br>' +
-          'Confirmed: ' + confirmedTotals[idx] + '<br>' +
-          'Avg Probability: ' + (probAvgs[idx] * 100).toFixed(1) + '%';
+        return DAY_NAMES[idx] + '<br>Confirmed: ' + confirmedTotals[idx] +
+          '<br><abbr title="Average Probability">Avg Prob</abbr>: ' + (probAvgs[idx] * 100).toFixed(1) + '%';
       },
     },
     xAxis: { type: 'category', data: DAY_NAMES },
@@ -90,7 +77,6 @@ export function renderDowPattern(rowsResult, echarts, themeName) {
     }],
   }, true);
 
-  // Render badges
   if (badgesEl) {
     var topPattern = mode(patternCounts);
     var topRiskDay = mode(riskDayCounts);
@@ -106,35 +92,9 @@ export function renderDowPattern(rowsResult, echarts, themeName) {
 }
 
 function mode(counts) {
-  var best = null;
-  var bestCount = 0;
+  var best = null, bestCount = 0;
   for (var key in counts) {
-    if (counts[key] > bestCount) {
-      bestCount = counts[key];
-      best = key;
-    }
+    if (counts[key] > bestCount) { bestCount = counts[key]; best = key; }
   }
   return best || '\u2014';
-}
-
-function columnarToRows(result) {
-  if (!result || typeof result !== 'object') return [];
-  if (result.columns && typeof result.columns === 'object') result = result.columns;
-  var keys = Object.keys(result);
-  if (!keys.length) return [];
-  var len = Array.isArray(result[keys[0]]) ? result[keys[0]].length : 0;
-  var rows = [];
-  for (var i = 0; i < len; ++i) {
-    var row = {};
-    for (var k = 0; k < keys.length; ++k) {
-      row[keys[k]] = result[keys[k]][i];
-    }
-    rows.push(row);
-  }
-  return rows;
-}
-
-function esc(v) {
-  if (v == null) return '\u2014';
-  return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
