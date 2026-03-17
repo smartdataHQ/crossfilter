@@ -1,6 +1,7 @@
 // demo-stockout/panels/dow-pattern.js
 
-import { columnarToRows, esc, probColor } from './helpers.js';
+import { columnarToRows, esc } from './helpers.js';
+import { colorFor } from '../config.js';
 
 var chartInstance = null;
 
@@ -49,7 +50,7 @@ export function renderDowPattern(rowsResult, echarts, themeName) {
   }
 
   var probAvgs = probSums.map(function (s) { return count > 0 ? s / count : 0; });
-  var barColors = probAvgs.map(function (p) { return probColor(p); });
+  var barColors = probAvgs.map(function (p) { return colorFor('forecast_stockout_probability', p); });
 
   if (!chartInstance || chartInstance.isDisposed()) {
     chartInstance = echarts.init(el, themeName, { renderer: 'canvas' });

@@ -1,21 +1,15 @@
 // demo-stockout/panels/risk-chart.js
 
-import { columnarToRows, esc, isActive, scoreBar, trendBadge, deltaCell, fmtDaysAgo, fmtDur, fmtFreq } from './helpers.js';
+import { columnarToRows, esc, isActive, scoreBar, fieldBadge, deltaCell, fmtDaysAgo } from './helpers.js';
 
 var onProductClick = null;
 var selectedProduct = null;
 
 export function setProductClickHandler(fn) { onProductClick = fn; }
 
-export function renderRiskChart(storeResult, warningResult) {
+export function renderRiskChart(storeResult) {
   var el = document.getElementById('panel-risk');
   if (!el) return;
-
-  var wMap = {};
-  if (warningResult) {
-    var wRows = columnarToRows(warningResult);
-    for (var w = 0; w < wRows.length; ++w) wMap[wRows[w].product] = wRows[w];
-  }
 
   var rows = columnarToRows(storeResult);
   rows = rows.filter(function (r) { return !isActive(r.is_currently_active); });
@@ -30,25 +24,26 @@ export function renderRiskChart(storeResult, warningResult) {
 
   var html = '<table class="tbl"><thead><tr>' +
     '<th title="Product name">Product</th>' +
-    '<th title="Composite risk score combining frequency, duration, impact, and trend">Risk Score</th>' +
-    '<th title="Probability of stockout in the next 3 days"><abbr title="3-Day Probability">3-Day Prob</abbr></th>' +
+    '<th title="Composite risk score">Risk Score</th>' +
+    '<th title="3-day stockout probability"><abbr title="3-Day Probability">3-Day Prob</abbr></th>' +
+    '<th title="Stockout character from Cube model">Pattern</th>' +
     '<th title="Days since last stockout ended">Last</th>' +
     '<th title="Are stockouts more frequent? Recent vs older half"><abbr title="Frequency Delta">Freq \u0394</abbr></th>' +
-    '<th title="Overall status: Worsening, Improving, or Stable">Status</th>' +
+    '<th title="Overall status from Cube model">Status</th>' +
     '</tr></thead><tbody>';
 
   for (var i = 0; i < rows.length; ++i) {
     var r = rows[i];
-    var w = wMap[r.product] || {};
     var sel = r.product === selectedProduct;
 
     html += '<tr data-product="' + esc(r.product) + '" class="risk-row' + (sel ? ' risk-selected' : '') + '" style="cursor:pointer">' +
       '<td class="val">' + esc(r.product) + '</td>' +
-      '<td>' + scoreBar(Number(r.risk_score) || 0, 'risk') + '</td>' +
-      '<td>' + scoreBar(Number(r.forecast_stockout_probability) || 0, 'prob') + '</td>' +
+      '<td>' + scoreBar(Number(r.risk_score) || 0, 'risk_score') + '</td>' +
+      '<td>' + scoreBar(Number(r.forecast_stockout_probability) || 0, 'forecast_stockout_probability') + '</td>' +
+      '<td>' + fieldBadge('stockout_pattern', r.stockout_pattern) + '</td>' +
       '<td>' + fmtDaysAgo(r.days_since_last) + '</td>' +
-      '<td>' + deltaCell(Number(w.frequency_recent_per_month), Number(w.frequency_older_per_month)) + '</td>' +
-      '<td>' + trendBadge(r.trend_signal) + '</td>' +
+      '<td>' + deltaCell(Number(r.frequency_recent_per_month), Number(r.frequency_older_per_month)) + '</td>' +
+      '<td>' + fieldBadge('trend_signal', r.trend_signal) + '</td>' +
       '</tr>';
   }
 

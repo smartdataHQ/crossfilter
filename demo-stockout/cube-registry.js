@@ -1,33 +1,40 @@
 // demo-stockout/cube-registry.js
 //
-// Cube configurations for multi-crossfilter stockout dashboard.
-// ALL stores loaded at once — sold_location is a crossfilter dimension
-// for instant client-side store switching via unified filter dispatch.
+// Two crossfilter workers, both from stockout_analysis:
+//   cf-main: all panels (KPIs, stockout table, forecast, risk, early warning)
+//   cf-dow:  DOW chart (independent product click filter)
 
 var CUBE_API = '/api/cube';
+var META_API = '/api/meta';
 var PARTITION = 'bonus.is';
+var CUBE_NAME = 'stockout_analysis';
 
 var WORKER_ASSETS = {
   arrowRuntimeUrl: '../node_modules/apache-arrow/Arrow.es2015.min.js',
   crossfilterUrl: '../crossfilter.js',
 };
 
-export var ALL_CUBE_IDS = ['cf-store', 'cf-warning', 'cf-dow'];
+export var ALL_CUBE_IDS = ['cf-main', 'cf-dow'];
 
-function cf(cube, field) { return cube + '.' + field; }
-function af(cube, field) { return cube + '__' + field; }
+function cf(field) { return CUBE_NAME + '.' + field; }
+function af(field) { return CUBE_NAME + '__' + field; }
 
 var CONFIGS = {
-  'cf-store': {
-    cubeName: 'stockout_store_dashboard',
+  'cf-main': {
     cubeQueryDimensions: [
       'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
       'is_currently_active', 'risk_tier', 'risk_score',
-      'forecast_stockout_probability', 'trend_signal', 'forecast_warning',
+      'forecast_stockout_probability', 'forecast_tier',
+      'trend_signal', 'severity_trend', 'stockout_pattern',
+      'forecast_warning',
       'avg_duration_days',
       'total_expected_lost_sales', 'days_since_last', 'stockouts_per_month',
       'highest_risk_day', 'signal_quality',
+      // Trending half-comparisons
+      'avg_duration_recent_half', 'avg_duration_older_half',
+      'frequency_recent_per_month', 'frequency_older_per_month',
+      'avg_impact_recent_half', 'avg_impact_older_half',
     ],
     cubeQueryMeasures: [
       'avg_availability', 'sum_active', 'worsening_count',
@@ -42,7 +49,9 @@ var CONFIGS = {
     workerDimensions: [
       'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
-      'is_currently_active', 'risk_tier', 'risk_score', 'forecast_stockout_probability',
+      'is_currently_active', 'risk_tier', 'risk_score',
+      'forecast_stockout_probability', 'forecast_tier',
+      'trend_signal', 'severity_trend', 'stockout_pattern',
     ],
     workerKpis: [
       { id: 'avgAvail', field: 'avg_availability', op: 'avg' },
@@ -53,44 +62,9 @@ var CONFIGS = {
       { id: 'lostSales', field: 'sum_expected_lost_sales', op: 'sum' },
       { id: 'count', field: 'count', op: 'sum' },
     ],
-    workerGroups: [
-      {
-        id: 'byCategory',
-        field: 'product_category',
-        metrics: [{ id: 'avgAvail', field: 'avg_availability', op: 'avg' }],
-      },
-    ],
-  },
-  'cf-warning': {
-    cubeName: 'stockout_early_warning',
-    cubeQueryDimensions: [
-      'sold_location',
-      'product', 'product_category', 'product_sub_category', 'supplier',
-      'trend_signal', 'severity_trend', 'risk_tier', 'risk_score',
-      'availability', 'avg_duration_recent_half', 'avg_duration_older_half',
-      'frequency_recent_per_month', 'frequency_older_per_month',
-      'avg_impact_recent_half', 'avg_impact_older_half',
-      'forecast_stockout_probability', 'forecast_warning',
-      'is_currently_active',
-    ],
-    cubeQueryMeasures: [
-      'count', 'worsening_count', 'critical_risk_count',
-      'avg_risk_score', 'sum_expected_lost_sales',
-    ],
-    numberFields: ['count', 'worsening_count', 'critical_risk_count'],
-    workerDimensions: [
-      'sold_location',
-      'product', 'product_category', 'product_sub_category', 'supplier',
-      'trend_signal', 'severity_trend', 'risk_tier', 'risk_score',
-    ],
-    workerKpis: [
-      { id: 'worsening', field: 'worsening_count', op: 'sum' },
-      { id: 'critical', field: 'critical_risk_count', op: 'sum' },
-    ],
     workerGroups: [],
   },
   'cf-dow': {
-    cubeName: 'stockout_dow_analysis',
     cubeQueryDimensions: [
       'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
@@ -121,47 +95,46 @@ export function getCubeConfig(cubeId) {
   return CONFIGS[cubeId] || null;
 }
 
-function buildRenameMap(cubeName, dimensions, measures) {
+export function fetchMeta() {
+  return fetch(META_API).then(function (res) {
+    if (!res.ok) throw new Error('Meta fetch failed: ' + res.status);
+    return res.json();
+  });
+}
+
+function buildRenameMap(dimensions, measures) {
   var rename = {};
   for (var i = 0; i < dimensions.length; ++i) {
-    var dim = dimensions[i];
-    rename[cf(cubeName, dim)] = dim;
-    rename[af(cubeName, dim)] = dim;
+    rename[cf(dimensions[i])] = dimensions[i];
+    rename[af(dimensions[i])] = dimensions[i];
   }
   for (var j = 0; j < measures.length; ++j) {
-    var meas = measures[j];
-    rename[cf(cubeName, meas)] = meas;
-    rename[af(cubeName, meas)] = meas;
+    rename[cf(measures[j])] = measures[j];
+    rename[af(measures[j])] = measures[j];
   }
   return rename;
 }
 
-// Build Cube.dev query — partition-only filter, no store filter, no limit
 export function buildCubeQuery(cubeId) {
   var config = CONFIGS[cubeId];
   if (!config) throw new Error('Unknown cube: ' + cubeId);
-
-  var cubeName = config.cubeName;
   return {
     format: 'arrow',
     query: {
-      dimensions: config.cubeQueryDimensions.map(function (d) { return cf(cubeName, d); }),
-      measures: config.cubeQueryMeasures.map(function (m) { return cf(cubeName, m); }),
-      filters: [
-        { member: cf(cubeName, 'partition'), operator: 'equals', values: [PARTITION] },
-      ],
+      dimensions: config.cubeQueryDimensions.map(cf),
+      measures: config.cubeQueryMeasures.map(cf),
+      filters: [{ member: cf('partition'), operator: 'equals', values: [PARTITION] }],
       limit: 1000000,
     },
   };
 }
 
-// Build worker options — no store parameter, all data loaded
 export function buildWorkerOptions(cubeId) {
   var config = CONFIGS[cubeId];
   if (!config) throw new Error('Unknown cube: ' + cubeId);
 
   var cubeQuery = buildCubeQuery(cubeId);
-  var rename = buildRenameMap(config.cubeName, config.cubeQueryDimensions, config.cubeQueryMeasures);
+  var rename = buildRenameMap(config.cubeQueryDimensions, config.cubeQueryMeasures);
 
   var transforms = {};
   if (config.numberFields) {
@@ -170,19 +143,13 @@ export function buildWorkerOptions(cubeId) {
     }
   }
 
-  var snapshotGroups = {};
-  for (var g = 0; g < config.workerGroups.length; ++g) {
-    var group = config.workerGroups[g];
-    snapshotGroups[group.id] = { includeTotals: true, nonEmptyKeys: true, sort: 'desc', limit: 50 };
-  }
-
   return Object.assign({}, WORKER_ASSETS, {
     batchCoalesceRows: 65536,
     dimensions: config.workerDimensions,
     emitSnapshots: true,
     kpis: config.workerKpis,
     groups: config.workerGroups,
-    snapshotGroups: snapshotGroups,
+    snapshotGroups: {},
     progressThrottleMs: 100,
     snapshotThrottleMs: 300,
     wasm: true,
@@ -200,16 +167,15 @@ export function buildWorkerOptions(cubeId) {
   });
 }
 
-// Fetch store list (lightweight JSON query)
 export function fetchStoreList() {
   return fetch(CUBE_API, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       query: {
-        dimensions: ['stockout_store_dashboard.sold_location'],
-        measures: ['stockout_store_dashboard.count'],
-        filters: [{ member: 'stockout_store_dashboard.partition', operator: 'equals', values: [PARTITION] }],
+        dimensions: [cf('sold_location')],
+        measures: [cf('count')],
+        filters: [{ member: cf('partition'), operator: 'equals', values: [PARTITION] }],
         limit: 1000,
         timeDimensions: [],
       },
@@ -219,17 +185,13 @@ export function fetchStoreList() {
     return res.json();
   }).then(function (json) {
     return (json.data || []).map(function (row) {
-      return {
-        name: row['stockout_store_dashboard.sold_location'],
-        count: row['stockout_store_dashboard.count'] || 0,
-      };
+      return { name: row[cf('sold_location')], count: row[cf('count')] || 0 };
     }).filter(function (s) { return s.name; }).sort(function (a, b) {
       return a.name.localeCompare(b.name);
     });
   });
 }
 
-// Fetch confirmed stockout events for yesterday — ALL stores
 function fetchEventsByDate(dateField, label) {
   var yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
@@ -241,10 +203,8 @@ function fetchEventsByDate(dateField, label) {
     body: JSON.stringify({
       query: {
         dimensions: [
-          'stockout_events.sold_location',
-          'stockout_events.product',
-          'stockout_events.product_category',
-          'stockout_events.supplier',
+          'stockout_events.sold_location', 'stockout_events.product',
+          'stockout_events.product_category', 'stockout_events.supplier',
           'stockout_events.duration_days',
         ],
         measures: ['stockout_events.total_expected_lost_sales'],

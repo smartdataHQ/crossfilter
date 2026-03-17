@@ -1,6 +1,7 @@
 // demo-stockout/panels/forecast.js
 
-import { columnarToRows, countedOptions, esc, isActive, scoreBar, trendBadge, probColor, fmtDaysAgo, fmtFreq } from './helpers.js';
+import { columnarToRows, countedOptions, esc, isActive, scoreBar, fieldBadge, fmtDaysAgo, fmtFreq } from './helpers.js';
+import { colorFor } from '../config.js';
 
 var allRows = [];
 var dayBtnsEl = null;
@@ -29,8 +30,11 @@ export function renderForecast(rowsResult) {
   supSelect = supSelect || document.getElementById('forecast-sup-filter');
 
   var rows = columnarToRows(rowsResult);
+  // Use forecast_tier from Cube instead of hardcoded threshold
   allRows = rows.filter(function (r) {
-    return !isActive(r.is_currently_active) && Number(r.forecast_stockout_probability) >= 0.3;
+    if (isActive(r.is_currently_active)) return false;
+    var tier = String(r.forecast_tier || '').toUpperCase();
+    return tier === 'CRITICAL' || tier === 'HIGH' || tier === 'MODERATE';
   });
   allRows.sort(function (a, b) {
     return (Number(b.forecast_stockout_probability) || 0) - (Number(a.forecast_stockout_probability) || 0);
@@ -43,7 +47,7 @@ export function renderForecast(rowsResult) {
   if (cardsEl) {
     cardsEl.innerHTML = allRows.slice(0, 4).map(function (r) {
       var prob = Number(r.forecast_stockout_probability) || 0;
-      var color = probColor(prob);
+      var color = colorFor('forecast_stockout_probability', prob);
       return '<div class="forecast-card">' +
         '<div class="forecast-card-title">' + esc(r.product) + '</div>' +
         '<div style="text-align:center;margin-top:8px">' +
@@ -77,16 +81,11 @@ function renderDayButtons() {
 
 function populateSelects(rows) {
   if (!catSelect || !supSelect) return;
-  var prevCat = catSelect.value;
-  var prevSup = supSelect.value;
-
+  var prevCat = catSelect.value, prevSup = supSelect.value;
   catSelect.innerHTML = '<option value="">All Categories (' + rows.length + ')</option>' + countedOptions(rows, 'product_category');
   supSelect.innerHTML = '<option value="">All Suppliers (' + rows.length + ')</option>' + countedOptions(rows, 'supplier');
-
-  catSelect.value = prevCat;
-  supSelect.value = prevSup;
-  catSelect.onchange = renderFiltered;
-  supSelect.onchange = renderFiltered;
+  catSelect.value = prevCat; supSelect.value = prevSup;
+  catSelect.onchange = renderFiltered; supSelect.onchange = renderFiltered;
 }
 
 function renderFiltered() {
@@ -96,12 +95,10 @@ function renderFiltered() {
 
   var catVal = catSelect ? catSelect.value : '';
   var supVal = supSelect ? supSelect.value : '';
-
   var filtered = allRows;
   if (selectedDay) filtered = filtered.filter(function (r) { return r.highest_risk_day === selectedDay; });
   if (catVal) filtered = filtered.filter(function (r) { return r.product_category === catVal; });
   if (supVal) filtered = filtered.filter(function (r) { return r.supplier === supVal; });
-
   if (countEl) countEl.textContent = filtered.length + ' at risk';
 
   if (!filtered.length) {
@@ -112,10 +109,10 @@ function renderFiltered() {
 
   var html = '<table class="tbl"><thead><tr>' +
     '<th title="Product name">Product</th>' +
-    '<th title="Probability of stockout in the next 3 days based on day-of-week history"><abbr title="3-Day Probability">3-Day Prob</abbr></th>' +
-    '<th title="Composite risk score combining frequency, duration, impact, and trend">Risk Score</th>' +
-    '<th title="Day of the week with highest stockout probability">Worst Day</th>' +
-    '<th title="Overall status: Worsening, Improving, or Stable">Status</th>' +
+    '<th title="3-day stockout probability from Cube forecast model"><abbr title="3-Day Probability">3-Day Prob</abbr></th>' +
+    '<th title="Composite risk score">Risk Score</th>' +
+    '<th title="Day with highest stockout probability">Worst Day</th>' +
+    '<th title="Overall status from Cube model">Status</th>' +
     '<th title="Days since last stockout ended">Last</th>' +
     '<th title="Historical stockout frequency"><abbr title="Frequency per Month">Freq/Mo</abbr></th>' +
     '</tr></thead><tbody>';
@@ -124,10 +121,10 @@ function renderFiltered() {
     var r = filtered[i];
     html += '<tr>' +
       '<td class="val">' + esc(r.product) + '</td>' +
-      '<td>' + scoreBar(Number(r.forecast_stockout_probability) || 0, 'prob') + '</td>' +
-      '<td>' + scoreBar(Number(r.risk_score) || 0, 'risk') + '</td>' +
+      '<td>' + scoreBar(Number(r.forecast_stockout_probability) || 0, 'forecast_stockout_probability') + '</td>' +
+      '<td>' + scoreBar(Number(r.risk_score) || 0, 'risk_score') + '</td>' +
       '<td>' + esc(r.highest_risk_day) + '</td>' +
-      '<td>' + trendBadge(r.trend_signal) + '</td>' +
+      '<td>' + fieldBadge('trend_signal', r.trend_signal) + '</td>' +
       '<td>' + fmtDaysAgo(r.days_since_last) + '</td>' +
       '<td>' + fmtFreq(r.stockouts_per_month) + '</td>' +
       '</tr>';

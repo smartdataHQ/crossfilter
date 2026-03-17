@@ -3,21 +3,18 @@
 // Multi-crossfilter stockout dashboard.
 //
 // Architecture:
-//   - 3 crossfilter workers load ALL stores at startup (one Arrow stream each)
-//   - sold_location is a crossfilter dimension in every worker
-//   - Selecting a store dispatches sold_location filter to all 3 runtimes
-//   - Store switching is instant (client-side filter, no re-fetch)
-//   - Yesterday data loaded once, filtered by store in JS
+//   - 2 crossfilter workers from stockout_analysis, load ALL stores at startup
+//   - sold_location is a crossfilter dimension — store switching is instant
+//   - Color/label config loaded from Cube /api/meta (Principle 6)
 //
-// Query batching:
-//   - cf-store:   1 query() with snapshot + 3 rowSets per refresh
-//   - cf-warning: 1 rows() call shared by stockout table + early warning
-//   - cf-dow:     1 rows() call
-//   - Total: 3 postMessage round-trips per refresh cycle
+// Query batching (2 postMessage round-trips per refresh):
+//   - cf-main: query({ snapshot, rowSets: { stockout, forecast, risk, warning } })
+//   - cf-dow:  rows({ fields, columnar: true })
 
 import { registerTheme, THEME_NAME } from './theme.js';
 import { getState, setState, onStateChange, PARAM_TO_DIMENSION } from './router.js';
-import { ALL_CUBE_IDS, buildWorkerOptions, fetchStoreList, fetchEndedYesterday, fetchStartedYesterday, getCubeConfig } from './cube-registry.js';
+import { ALL_CUBE_IDS, buildWorkerOptions, fetchStoreList, fetchEndedYesterday, fetchStartedYesterday, fetchMeta, getCubeConfig } from './cube-registry.js';
+import { loadMeta } from './config.js';
 import { registerRuntime, dispatchFilters, disposeAll, onPanelRefresh } from './filter-router.js';
 import { renderKpis } from './panels/kpis.js';
 import { renderStockoutTable } from './panels/stockout-table.js';
@@ -113,20 +110,20 @@ function buildStoreFacets() {
   return facets;
 }
 
-// Update active counts from cf-store data (called after workers ready)
+// Update active counts from cf-main data (called after workers ready)
 async function updateActiveFacets(facets) {
-  if (!runtimes['cf-store']) return facets;
+  if (!runtimes['cf-main']) return facets;
   try {
     // Temporarily clear store filter to get all-store data
-    await runtimes['cf-store'].updateFilters({});
-    var result = await runtimes['cf-store'].rows({
+    await runtimes['cf-main'].updateFilters({});
+    var result = await runtimes['cf-main'].rows({
       fields: ['sold_location', 'is_currently_active'],
       limit: 100000,
       columnar: true,
     });
     // Restore current filter
     if (currentStore) {
-      await runtimes['cf-store'].updateFilters({ sold_location: { type: 'in', values: [currentStore] } });
+      await runtimes['cf-main'].updateFilters({ sold_location: { type: 'in', values: [currentStore] } });
     }
     var cols = result && result.columns ? result.columns : result;
     if (cols && cols.sold_location) {
@@ -245,14 +242,14 @@ async function createWorkers() {
   dom.kpiRow.innerHTML = '<div class="shimmer" style="grid-column:1/-1;min-height:80px;"></div>';
 
   // Progress tracking (Principle 1: report progress for operations > 1s)
-  var progress = { workers: 0, extras: 0, total: ALL_CUBE_IDS.length + 3 };
+  var progress = { workers: 0, extras: 0, total: ALL_CUBE_IDS.length + 4 };
   function updateProgress(label) {
     var done = progress.workers + progress.extras;
     var pct = Math.round(done / progress.total * 100);
     setOverlay(true, label + ' (' + pct + '%)');
   }
 
-  // All network requests in parallel: 3 workers + 2 yesterday fetches + store list
+  // All network requests in parallel: 2 workers + meta + 2 yesterday fetches + store list
   var results = await Promise.allSettled(
     ALL_CUBE_IDS.map(function (cubeId) {
       var opts = buildWorkerOptions(cubeId);
@@ -269,6 +266,11 @@ async function createWorkers() {
         });
       });
     }).concat([
+      fetchMeta().then(function (meta) {
+        loadMeta(meta);
+        progress.extras++;
+        updateProgress('Config loaded from meta');
+      }),
       fetchEndedYesterday().then(function (data) {
         allEndedYesterday = data;
         progress.extras++;
@@ -314,23 +316,19 @@ async function createWorkers() {
 // ---- Batched Panel Refresh ----
 //
 // 3 worker round-trips per refresh:
-//   cf-store:   query({ snapshot, rowSets: { stockout, forecast, risk } })
-//   cf-warning: rows({ ... })
+//   cf-main:   query({ snapshot, rowSets: { stockout, forecast, risk } })
+//   cf-main: rows({ ... })
 //   cf-dow:     rows({ ... })
 
-var STORE_FIELDS = [
+// All fields needed from cf-main (stockout_analysis)
+var MAIN_FIELDS = [
   'product', 'product_category', 'supplier', 'risk_score',
   'avg_duration_days', 'total_expected_lost_sales', 'trend_signal',
+  'severity_trend', 'stockout_pattern', 'forecast_tier',
   'is_currently_active', 'highest_risk_day',
   'stockouts_per_month', 'days_since_last',
   'forecast_stockout_probability', 'forecast_warning',
-  'signal_quality',
-];
-
-var WARNING_FIELDS = [
-  'product', 'product_category', 'supplier',
-  'trend_signal', 'severity_trend', 'is_currently_active',
-  'risk_score', 'forecast_stockout_probability', 'forecast_warning',
+  // Trending half-comparisons (for delta columns)
   'avg_duration_recent_half', 'avg_duration_older_half',
   'frequency_recent_per_month', 'frequency_older_per_month',
   'avg_impact_recent_half', 'avg_impact_older_half',
@@ -349,35 +347,25 @@ async function refreshAllPanels() {
 
   var promises = [];
 
-  // cf-store: ONE query with snapshot + 3 rowSets
-  if (runtimes['cf-store']) {
+  // cf-main: ONE query with snapshot + 4 rowSets (1 postMessage round-trip)
+  if (runtimes['cf-main']) {
     promises.push(
-      runtimes['cf-store'].query({
+      runtimes['cf-main'].query({
         snapshot: {},
         rowCount: true,
         rowSets: {
-          stockout: { fields: STORE_FIELDS, limit: 500, sortBy: 'risk_score', direction: 'top', columnar: true },
-          forecast: { fields: STORE_FIELDS, limit: 500, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
-          risk:     { fields: STORE_FIELDS, limit: 200, sortBy: 'risk_score', direction: 'top', columnar: true },
+          stockout: { fields: MAIN_FIELDS, limit: 500, sortBy: 'risk_score', direction: 'top', columnar: true },
+          forecast: { fields: MAIN_FIELDS, limit: 500, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
+          risk:     { fields: MAIN_FIELDS, limit: 200, sortBy: 'risk_score', direction: 'top', columnar: true },
+          warning:  { fields: MAIN_FIELDS, limit: 1000, sortBy: 'risk_score', direction: 'top', columnar: true },
         },
-      }).catch(function (err) { console.error('cf-store query failed:', err); return null; })
+      }).catch(function (err) { console.error('cf-main query failed:', err); return null; })
     );
   } else {
     promises.push(Promise.resolve(null));
   }
 
-  // cf-warning: ONE rows() call
-  if (runtimes['cf-warning']) {
-    promises.push(
-      runtimes['cf-warning'].rows({
-        fields: WARNING_FIELDS, limit: 1000, sortBy: 'risk_score', direction: 'top', columnar: true,
-      }).catch(function (err) { console.error('cf-warning query failed:', err); return null; })
-    );
-  } else {
-    promises.push(Promise.resolve(null));
-  }
-
-  // cf-dow: ONE rows() call
+  // cf-dow: ONE rows() call (1 postMessage round-trip)
   if (runtimes['cf-dow']) {
     promises.push(
       runtimes['cf-dow'].rows({
@@ -389,27 +377,26 @@ async function refreshAllPanels() {
   }
 
   var results = await Promise.all(promises);
-  var storeResult = results[0];
-  var warningRows = results[1];
-  var dowRows = results[2];
+  var mainResult = results[0];
+  var dowRows = results[1];
 
   // Render all panels synchronously from batched results
   var ended = endedForStore();
   var started = startedForStore();
 
-  if (storeResult) {
-    renderKpis(storeResult.snapshot, ended, started);
-    renderStockoutTable(storeResult.rowSets.stockout);
-    renderForecast(storeResult.rowSets.forecast);
-    renderRiskChart(storeResult.rowSets.risk, warningRows);
+  if (mainResult) {
+    renderKpis(mainResult.snapshot, ended, started);
+    renderStockoutTable(mainResult.rowSets.stockout);
+    renderForecast(mainResult.rowSets.forecast);
+    renderRiskChart(mainResult.rowSets.risk);
+    renderEarlyWarning(mainResult.rowSets.warning);
   } else {
     renderKpis(null, ended, started);
     document.getElementById('panel-stockout-table').innerHTML = '<div class="panel-empty">Data unavailable</div>';
     document.getElementById('panel-forecast-table').innerHTML = '<div class="panel-empty">Data unavailable</div>';
     document.getElementById('panel-risk').innerHTML = '<div class="panel-empty">Data unavailable</div>';
+    document.getElementById('panel-early-warning').innerHTML = '<div class="panel-empty">Data unavailable</div>';
   }
-
-  renderEarlyWarning(warningRows);
   renderDowPattern(dowRows, echarts, THEME_NAME);
   refreshEndedYesterday();
   renderFilterChips();

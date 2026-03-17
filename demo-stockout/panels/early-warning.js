@@ -1,9 +1,9 @@
 // demo-stockout/panels/early-warning.js
 //
 // Products NOT stocked out, NOT high risk, but deteriorating.
-// Sortable column headers. Filtered by severity, category, supplier.
+// Sortable column headers. Uses Cube meta for all colors/labels.
 
-import { columnarToRows, countedOptions, esc, isActive, scoreBar, trendBadge, severityBadge, deltaCell } from './helpers.js';
+import { columnarToRows, countedOptions, esc, isActive, scoreBar, fieldBadge, deltaCell } from './helpers.js';
 
 var allRows = [];
 var sevSelect = null;
@@ -14,22 +14,19 @@ var sortDir = -1;
 
 var COLUMNS = [
   { key: 'product', label: 'Product', title: 'Product name', type: 'string' },
-  { key: 'trend_signal', label: 'Status', title: 'Overall status: Worsening, Improving, or Stable', type: 'trend' },
-  { key: 'severity_trend', label: 'Escalation', title: 'Is each stockout event getting more severe? Escalating = yes', type: 'severity' },
-  { key: 'risk_score', label: 'Risk Score', title: 'Composite risk score combining frequency, duration, impact, and trend', type: 'bar' },
-  { key: '_dur_delta', label: '<abbr title="Duration Delta">Dur \u0394</abbr>', title: 'Are stockouts lasting longer? Recent-half avg vs older-half', type: 'delta', recent: 'avg_duration_recent_half', older: 'avg_duration_older_half' },
-  { key: '_freq_delta', label: '<abbr title="Frequency Delta">Freq \u0394</abbr>', title: 'Are stockouts more frequent? Recent vs older half', type: 'delta', recent: 'frequency_recent_per_month', older: 'frequency_older_per_month' },
-  { key: '_impact_delta', label: '<abbr title="Impact Delta">Impact \u0394</abbr>', title: 'Is each stockout costlier? Recent lost-sales/day vs older', type: 'delta', recent: 'avg_impact_recent_half', older: 'avg_impact_older_half' },
-  { key: 'forecast_stockout_probability', label: '<abbr title="3-Day Probability">3-Day Prob</abbr>', title: 'Probability of stockout in the next 3 days', type: 'bar' },
+  { key: 'trend_signal', label: 'Status', title: 'Overall status from Cube model', type: 'field', field: 'trend_signal' },
+  { key: 'severity_trend', label: 'Escalation', title: 'Is each stockout getting more severe?', type: 'field', field: 'severity_trend' },
+  { key: 'risk_score', label: 'Risk Score', title: 'Composite risk score', type: 'bar', barField: 'risk_score' },
+  { key: '_dur_delta', label: '<abbr title="Duration Delta">Dur \u0394</abbr>', title: 'Are stockouts lasting longer?', type: 'delta', recent: 'avg_duration_recent_half', older: 'avg_duration_older_half' },
+  { key: '_freq_delta', label: '<abbr title="Frequency Delta">Freq \u0394</abbr>', title: 'Are stockouts more frequent?', type: 'delta', recent: 'frequency_recent_per_month', older: 'frequency_older_per_month' },
+  { key: '_impact_delta', label: '<abbr title="Impact Delta">Impact \u0394</abbr>', title: 'Is each stockout costlier?', type: 'delta', recent: 'avg_impact_recent_half', older: 'avg_impact_older_half' },
+  { key: 'forecast_stockout_probability', label: '<abbr title="3-Day Probability">3-Day Prob</abbr>', title: '3-day stockout probability', type: 'bar', barField: 'forecast_stockout_probability' },
 ];
 
 export function renderEarlyWarning(rowsResult) {
   var el = document.getElementById('panel-early-warning');
   if (!el) return;
-  if (!rowsResult) {
-    el.innerHTML = '<div class="panel-empty">Data unavailable</div>';
-    return;
-  }
+  if (!rowsResult) { el.innerHTML = '<div class="panel-empty">Data unavailable</div>'; return; }
 
   sevSelect = sevSelect || document.getElementById('warning-severity-filter');
   catSelect = catSelect || document.getElementById('warning-cat-filter');
@@ -51,13 +48,11 @@ export function renderEarlyWarning(rowsResult) {
 }
 
 function sortRows() {
-  var field = sortField;
-  var dir = sortDir;
   allRows.sort(function (a, b) {
-    var av = sortValue(a, field);
-    var bv = sortValue(b, field);
-    if (av < bv) return -1 * dir;
-    if (av > bv) return 1 * dir;
+    var av = sortValue(a, sortField);
+    var bv = sortValue(b, sortField);
+    if (av < bv) return -1 * sortDir;
+    if (av > bv) return 1 * sortDir;
     return 0;
   });
 }
@@ -84,15 +79,11 @@ function onHeaderClick(field) {
 function populateSelects(rows) {
   if (!sevSelect || !catSelect || !supSelect) return;
   var prevSev = sevSelect.value, prevCat = catSelect.value, prevSup = supSelect.value;
-
   sevSelect.innerHTML = '<option value="">All Severity (' + rows.length + ')</option>' + countedOptions(rows, 'severity_trend');
   catSelect.innerHTML = '<option value="">All Categories (' + rows.length + ')</option>' + countedOptions(rows, 'product_category');
   supSelect.innerHTML = '<option value="">All Suppliers (' + rows.length + ')</option>' + countedOptions(rows, 'supplier');
-
   sevSelect.value = prevSev; catSelect.value = prevCat; supSelect.value = prevSup;
-  sevSelect.onchange = renderFiltered;
-  catSelect.onchange = renderFiltered;
-  supSelect.onchange = renderFiltered;
+  sevSelect.onchange = renderFiltered; catSelect.onchange = renderFiltered; supSelect.onchange = renderFiltered;
 }
 
 function renderFiltered() {
@@ -103,12 +94,10 @@ function renderFiltered() {
   var sevVal = sevSelect ? sevSelect.value : '';
   var catVal = catSelect ? catSelect.value : '';
   var supVal = supSelect ? supSelect.value : '';
-
   var filtered = allRows;
   if (sevVal) filtered = filtered.filter(function (r) { return r.severity_trend === sevVal; });
   if (catVal) filtered = filtered.filter(function (r) { return r.product_category === catVal; });
   if (supVal) filtered = filtered.filter(function (r) { return r.supplier === supVal; });
-
   if (countEl) countEl.textContent = filtered.length + ' deteriorating';
 
   if (!filtered.length) {
@@ -144,9 +133,8 @@ function renderFiltered() {
 function renderCell(r, col) {
   switch (col.type) {
     case 'string': return '<td class="val">' + esc(r[col.key]) + '</td>';
-    case 'trend': return '<td>' + trendBadge(r[col.key]) + '</td>';
-    case 'severity': return '<td>' + severityBadge(r[col.key]) + '</td>';
-    case 'bar': return '<td>' + scoreBar(Number(r[col.key]) || 0, col.key === 'forecast_stockout_probability' ? 'prob' : 'risk') + '</td>';
+    case 'field': return '<td>' + fieldBadge(col.field, r[col.key]) + '</td>';
+    case 'bar': return '<td>' + scoreBar(Number(r[col.key]) || 0, col.barField) + '</td>';
     case 'delta': return '<td>' + deltaCell(r[col.recent], r[col.older]) + '</td>';
     default: return '<td>' + esc(r[col.key]) + '</td>';
   }
