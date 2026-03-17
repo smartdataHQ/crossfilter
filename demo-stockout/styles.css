@@ -627,6 +627,9 @@ body::before {
   color: var(--accent-red);
 }
 
+/* Selected row */
+.risk-selected td { background: var(--bg-hover) !important; border-left: 2px solid var(--accent-blue); }
+
 /* Delta arrows */
 .delta-up { color: var(--accent-red); }
 .delta-down { color: var(--accent-green); }

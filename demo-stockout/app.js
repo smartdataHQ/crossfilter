@@ -9,7 +9,7 @@ import { registerRuntime, dispatchFilters, disposeAll, onPanelRefresh } from './
 import { renderKpis } from './panels/kpis.js';
 import { renderStockoutTable } from './panels/stockout-table.js';
 import { renderForecast } from './panels/forecast.js';
-import { renderRiskChart } from './panels/risk-chart.js';
+import { renderRiskChart, setProductClickHandler } from './panels/risk-chart.js';
 import { renderEarlyWarning } from './panels/early-warning.js';
 import { renderDowPattern, disposeDow } from './panels/dow-pattern.js';
 
@@ -20,6 +20,24 @@ if (!crossfilter) throw new Error('crossfilter not loaded');
 if (!echarts) throw new Error('echarts not loaded');
 
 registerTheme(echarts);
+
+// Wire risk table product click -> DOW chart filter
+var dowProductFilter = null;
+setProductClickHandler(async function (product) {
+  dowProductFilter = product;
+  var label = document.getElementById('dow-product-label');
+  if (label) {
+    if (product) { label.textContent = product; label.removeAttribute('hidden'); }
+    else { label.setAttribute('hidden', ''); }
+  }
+  if (!runtimes['cf-dow']) return;
+  if (product) {
+    await runtimes['cf-dow'].updateFilters({ product: { type: 'in', values: [product] } });
+  } else {
+    await runtimes['cf-dow'].updateFilters({});
+  }
+  await refreshDow();
+});
 
 // State
 var runtimes = {};    // { cubeId: runtime }

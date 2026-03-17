@@ -3,6 +3,13 @@
 // Top 10 highest risk products NOT currently stocked out.
 // Table with inline risk bar, forecast, pattern label, and trending deltas.
 
+var onProductClick = null;
+var selectedProduct = null;
+
+export function setProductClickHandler(fn) {
+  onProductClick = fn;
+}
+
 export function renderRiskChart(storeResult, warningResult) {
   var el = document.getElementById('panel-risk');
   if (!el) return;
@@ -45,7 +52,8 @@ export function renderRiskChart(storeResult, warningResult) {
     var score = Number(r.risk_score) || 0;
     var forecast = Number(r.forecast_stockout_probability) || 0;
 
-    html += '<tr>' +
+    var isSelected = r.product === selectedProduct;
+    html += '<tr data-product="' + esc(r.product) + '" class="risk-row' + (isSelected ? ' risk-selected' : '') + '" style="cursor:pointer">' +
       '<td class="val">' + esc(r.product) + '</td>' +
       '<td>' + riskBar(score) + '</td>' +
       '<td>' + forecastCell(forecast, r.forecast_warning) + '</td>' +
@@ -58,6 +66,24 @@ export function renderRiskChart(storeResult, warningResult) {
 
   html += '</tbody></table>';
   el.innerHTML = html;
+
+  // Click handler for product rows
+  el.addEventListener('click', function (e) {
+    var tr = e.target.closest('tr[data-product]');
+    if (!tr) return;
+    var product = tr.dataset.product;
+    if (product === selectedProduct) {
+      selectedProduct = null; // toggle off
+    } else {
+      selectedProduct = product;
+    }
+    // Update row highlight
+    var allTr = el.querySelectorAll('tr.risk-row');
+    for (var j = 0; j < allTr.length; ++j) {
+      allTr[j].classList.toggle('risk-selected', allTr[j].dataset.product === selectedProduct);
+    }
+    if (onProductClick) onProductClick(selectedProduct);
+  });
 }
 
 // Inline horizontal bar for risk score
