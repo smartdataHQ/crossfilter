@@ -72,6 +72,12 @@ export function onStateChange(callback) {
 // Convert URL state to dashboard filter objects (for crossfilter runtime.updateFilters)
 export function buildDashboardFilters(state, runtimeDimensions) {
   var filters = {};
+
+  // Store filter → sold_location dimension (the global cross-crossfilter filter)
+  if (state.store && runtimeDimensions.includes('sold_location')) {
+    filters.sold_location = { type: 'in', values: [state.store] };
+  }
+
   for (var param in PARAM_TO_DIMENSION) {
     var dimName = PARAM_TO_DIMENSION[param];
     var val = state[param];
