@@ -192,10 +192,10 @@ export function fetchStoreList() {
   });
 }
 
-function fetchEventsByDate(dateField, label) {
-  var yesterday = new Date();
-  yesterday.setDate(yesterday.getDate() - 1);
-  var dateStr = yesterday.toISOString().slice(0, 10);
+function fetchEventsByDate(dateField, daysAgo, label) {
+  var d = new Date();
+  d.setDate(d.getDate() - daysAgo);
+  var dateStr = d.toISOString().slice(0, 10);
 
   return fetch(CUBE_API, {
     method: 'POST',
@@ -233,10 +233,9 @@ function fetchEventsByDate(dateField, label) {
   });
 }
 
-export function fetchEndedYesterday() {
-  return fetchEventsByDate('stockout_events.to_date', 'Ended yesterday');
-}
-
-export function fetchStartedYesterday() {
-  return fetchEventsByDate('stockout_events.from_date', 'Started yesterday');
-}
+// Yesterday (day -1)
+export function fetchEndedYesterday() { return fetchEventsByDate('stockout_events.to_date', 1, 'Ended yesterday'); }
+export function fetchStartedYesterday() { return fetchEventsByDate('stockout_events.from_date', 1, 'Started yesterday'); }
+// Day before yesterday (day -2) — for KPI trend comparison
+export function fetchEndedDayBefore() { return fetchEventsByDate('stockout_events.to_date', 2, 'Ended day before'); }
+export function fetchStartedDayBefore() { return fetchEventsByDate('stockout_events.from_date', 2, 'Started day before'); }

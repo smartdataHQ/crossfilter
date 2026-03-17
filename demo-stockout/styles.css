@@ -352,6 +352,12 @@ body::before {
   margin-top: 6px;
 }
 
+.kpi-trend {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+}
+
 /* Grid layout */
 .grid-2col {
   display: grid;

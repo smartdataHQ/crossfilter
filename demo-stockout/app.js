@@ -13,7 +13,7 @@
 
 import { registerTheme, THEME_NAME } from './theme.js';
 import { getState, setState, onStateChange, PARAM_TO_DIMENSION } from './router.js';
-import { ALL_CUBE_IDS, buildWorkerOptions, fetchStoreList, fetchEndedYesterday, fetchStartedYesterday, fetchMeta, getCubeConfig } from './cube-registry.js';
+import { ALL_CUBE_IDS, buildWorkerOptions, fetchStoreList, fetchEndedYesterday, fetchStartedYesterday, fetchEndedDayBefore, fetchStartedDayBefore, fetchMeta, getCubeConfig } from './cube-registry.js';
 import { loadMeta } from './config.js';
 import { registerRuntime, dispatchFilters, disposeAll, onPanelRefresh } from './filter-router.js';
 import { renderKpis } from './panels/kpis.js';
@@ -37,8 +37,10 @@ var runtimes = {};
 var storeList = [];
 var currentStore = null;
 var workersReady = false;
-var allEndedYesterday = [];   // all stores
-var allStartedYesterday = []; // all stores
+var allEndedYesterday = [];
+var allStartedYesterday = [];
+var allEndedDayBefore = [];   // for KPI trend comparison
+var allStartedDayBefore = [];
 var endedCategoryFilter = null;
 
 // ---- DOM ----
@@ -91,6 +93,16 @@ function endedForStore() {
 function startedForStore() {
   if (!currentStore) return allStartedYesterday;
   return allStartedYesterday.filter(function (r) { return r.store === currentStore; });
+}
+
+function endedDayBeforeForStore() {
+  if (!currentStore) return allEndedDayBefore;
+  return allEndedDayBefore.filter(function (r) { return r.store === currentStore; });
+}
+
+function startedDayBeforeForStore() {
+  if (!currentStore) return allStartedDayBefore;
+  return allStartedDayBefore.filter(function (r) { return r.store === currentStore; });
 }
 
 // Facet counts per store (for faceted selectors)
@@ -250,7 +262,7 @@ async function createWorkers() {
   dom.kpiRow.innerHTML = '<div class="shimmer" style="grid-column:1/-1;min-height:80px;"></div>';
 
   // Progress tracking (Principle 1: report progress for operations > 1s)
-  var progress = { workers: 0, extras: 0, total: ALL_CUBE_IDS.length + 4 };
+  var progress = { workers: 0, extras: 0, total: ALL_CUBE_IDS.length + 6 };
   function updateProgress(label) {
     var done = progress.workers + progress.extras;
     var pct = Math.round(done / progress.total * 100);
@@ -288,6 +300,16 @@ async function createWorkers() {
         allStartedYesterday = data;
         progress.extras++;
         updateProgress('Started yesterday: ' + data.length + ' events');
+      }),
+      fetchEndedDayBefore().then(function (data) {
+        allEndedDayBefore = data;
+        progress.extras++;
+        updateProgress('Ended day before: ' + data.length + ' events');
+      }),
+      fetchStartedDayBefore().then(function (data) {
+        allStartedDayBefore = data;
+        progress.extras++;
+        updateProgress('Started day before: ' + data.length + ' events');
       }),
       fetchStoreList().then(function (stores) {
         storeList = stores;
@@ -392,15 +414,17 @@ async function refreshAllPanels() {
   // Render all panels synchronously from batched results
   var ended = endedForStore();
   var started = startedForStore();
+  var endedPrev = endedDayBeforeForStore();
+  var startedPrev = startedDayBeforeForStore();
 
   if (mainResult) {
-    renderKpis(mainResult.snapshot, ended, started);
+    renderKpis(mainResult.snapshot, ended, started, endedPrev, startedPrev);
     renderStockoutTable(mainResult.rowSets.stockout);
     renderForecast(mainResult.rowSets.forecast);
     renderRiskChart(mainResult.rowSets.risk);
     renderEarlyWarning(mainResult.rowSets.warning);
   } else {
-    renderKpis(null, ended, started);
+    renderKpis(null, ended, started, endedPrev, startedPrev);
     document.getElementById('panel-stockout-table').innerHTML = '<div class="panel-empty">Data unavailable</div>';
     document.getElementById('panel-forecast-table').innerHTML = '<div class="panel-empty">Data unavailable</div>';
     document.getElementById('panel-risk').innerHTML = '<div class="panel-empty">Data unavailable</div>';
