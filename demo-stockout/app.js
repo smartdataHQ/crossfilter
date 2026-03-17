@@ -456,8 +456,8 @@ async function refreshRiskChart() {
   }
   try {
     var result = await runtimes['cf-store'].rows({
-      fields: ['product', 'risk_score', 'risk_tier'],
-      limit: 10,
+      fields: ['product', 'risk_score', 'risk_tier', 'is_currently_active'],
+      limit: 50,
       sortBy: 'risk_score',
       direction: 'top',
       columnar: true,

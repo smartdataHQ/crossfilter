@@ -14,12 +14,16 @@ export function renderRiskChart(rowsResult, echarts, themeName) {
   if (!el) return;
 
   var rows = columnarToRows(rowsResult);
+  // Exclude products already stocked out — they're not "at risk", they're active
+  rows = rows.filter(function (r) {
+    var v = r.is_currently_active;
+    return v !== 1 && v !== true && v !== 'true' && v !== '1';
+  });
   if (!rows.length) {
-    el.innerHTML = '<div class="panel-empty">No risk data</div>';
+    el.innerHTML = '<div class="panel-empty">No at-risk products (not currently stocked out)</div>';
     return;
   }
 
-  // Sort by risk_score desc, take top 10
   rows.sort(function (a, b) { return (b.risk_score || 0) - (a.risk_score || 0); });
   rows = rows.slice(0, 10);
   rows.reverse(); // For horizontal bar (bottom = highest)
