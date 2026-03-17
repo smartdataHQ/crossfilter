@@ -368,6 +368,8 @@ var MAIN_FIELDS = [
 var DOW_FIELDS = [
   'dow_mon_confirmed', 'dow_tue_confirmed', 'dow_wed_confirmed',
   'dow_thu_confirmed', 'dow_fri_confirmed', 'dow_sat_confirmed', 'dow_sun_confirmed',
+  'dow_mon_total', 'dow_tue_total', 'dow_wed_total',
+  'dow_thu_total', 'dow_fri_total', 'dow_sat_total', 'dow_sun_total',
   'dow_mon_probability', 'dow_tue_probability', 'dow_wed_probability',
   'dow_thu_probability', 'dow_fri_probability', 'dow_sat_probability', 'dow_sun_probability',
   'weekday_stockout_rate', 'weekend_stockout_rate', 'dow_pattern', 'highest_risk_day',
@@ -385,10 +387,10 @@ async function refreshAllPanels() {
         snapshot: {},
         rowCount: true,
         rowSets: {
-          stockout: { fields: MAIN_FIELDS, limit: 500, sortBy: 'risk_score', direction: 'top', columnar: true },
-          forecast: { fields: MAIN_FIELDS, limit: 500, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
-          risk:     { fields: MAIN_FIELDS, limit: 200, sortBy: 'risk_score', direction: 'top', columnar: true },
-          warning:  { fields: MAIN_FIELDS, limit: 1000, sortBy: 'risk_score', direction: 'top', columnar: true },
+          stockout: { fields: MAIN_FIELDS, sortBy: 'risk_score', direction: 'top', columnar: true },
+          forecast: { fields: MAIN_FIELDS, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
+          risk:     { fields: MAIN_FIELDS, sortBy: 'risk_score', direction: 'top', columnar: true },
+          warning:  { fields: MAIN_FIELDS, sortBy: 'risk_score', direction: 'top', columnar: true },
         },
       }).catch(function (err) { console.error('cf-main query failed:', err); return null; })
     );
@@ -523,24 +525,30 @@ function renderEndedCategoryPie(data) {
 
 // ---- DOW product filter (from risk table click) ----
 
+var dowSelectedProduct = null;
+
 setProductClickHandler(async function (product) {
+  dowSelectedProduct = product;
   var label = document.getElementById('dow-product-label');
   if (label) {
     if (product) { label.textContent = product; label.removeAttribute('hidden'); }
     else { label.setAttribute('hidden', ''); }
   }
+  await applyDowFilters();
+});
+
+async function applyDowFilters() {
   if (!runtimes['cf-dow']) return;
-  // Apply product filter ON TOP of existing store filter
   var state = getState();
   var filters = {};
   if (state.store) filters.sold_location = { type: 'in', values: [state.store] };
-  if (product) filters.product = { type: 'in', values: [product] };
+  if (dowSelectedProduct) filters.product = { type: 'in', values: [dowSelectedProduct] };
   await runtimes['cf-dow'].updateFilters(filters);
   try {
-    var result = await runtimes['cf-dow'].rows({ fields: DOW_FIELDS, limit: 50000, columnar: true });
+    var result = await runtimes['cf-dow'].rows({ fields: DOW_FIELDS, columnar: true });
     renderDowPattern(result, echarts, THEME_NAME);
   } catch (err) { console.error('DOW query failed:', err); }
-});
+}
 
 // ---- State Change Handler ----
 
@@ -564,6 +572,8 @@ onStateChange(async function (newState, prevState) {
 
   // Dispatch sold_location + other filters to ALL runtimes (instant, client-side)
   await dispatchFilters(newState);
+  // Re-apply DOW product filter (dispatchFilters overwrites cf-dow filters)
+  if (dowSelectedProduct) await applyDowFilters();
   await refreshAllPanels();
 });
 

@@ -71,6 +71,8 @@ var CONFIGS = {
       'dow_pattern', 'highest_risk_day',
       'dow_mon_confirmed', 'dow_tue_confirmed', 'dow_wed_confirmed',
       'dow_thu_confirmed', 'dow_fri_confirmed', 'dow_sat_confirmed', 'dow_sun_confirmed',
+      'dow_mon_total', 'dow_tue_total', 'dow_wed_total',
+      'dow_thu_total', 'dow_fri_total', 'dow_sat_total', 'dow_sun_total',
       'dow_mon_probability', 'dow_tue_probability', 'dow_wed_probability',
       'dow_thu_probability', 'dow_fri_probability', 'dow_sat_probability', 'dow_sun_probability',
       'weekday_stockout_rate', 'weekend_stockout_rate',
@@ -80,6 +82,8 @@ var CONFIGS = {
       'count',
       'dow_mon_confirmed', 'dow_tue_confirmed', 'dow_wed_confirmed',
       'dow_thu_confirmed', 'dow_fri_confirmed', 'dow_sat_confirmed', 'dow_sun_confirmed',
+      'dow_mon_total', 'dow_tue_total', 'dow_wed_total',
+      'dow_thu_total', 'dow_fri_total', 'dow_sat_total', 'dow_sun_total',
     ],
     workerDimensions: [
       'sold_location',
@@ -193,8 +197,9 @@ export function fetchStoreList() {
 }
 
 function fetchEventsByDate(dateField, daysAgo, label) {
-  var d = new Date();
-  d.setDate(d.getDate() - daysAgo);
+  // Use UTC to avoid browser-timezone off-by-one (Cube data is UTC-based)
+  var now = Date.now();
+  var d = new Date(now - daysAgo * 86400000);
   var dateStr = d.toISOString().slice(0, 10);
 
   return fetch(CUBE_API, {
