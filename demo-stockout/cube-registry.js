@@ -1,10 +1,10 @@
 // demo-stockout/cube-registry.js
 //
-// Defines 5 cube configurations: Cube.dev query builders, crossfilter worker configs,
-// and field rename maps. Also fetches /api/v1/meta for validation.
+// Cube configurations for multi-crossfilter stockout dashboard.
+// ALL stores loaded at once — sold_location is a crossfilter dimension
+// for instant client-side store switching via unified filter dispatch.
 
 var CUBE_API = '/api/cube';
-var META_API = '/api/meta';
 var PARTITION = 'bonus.is';
 
 var WORKER_ASSETS = {
@@ -14,7 +14,6 @@ var WORKER_ASSETS = {
 
 export var ALL_CUBE_IDS = ['cf-store', 'cf-warning', 'cf-dow'];
 
-// Build the Cube.dev field name from cube + field
 function cf(cube, field) { return cube + '.' + field; }
 function af(cube, field) { return cube + '__' + field; }
 
@@ -22,6 +21,7 @@ var CONFIGS = {
   'cf-store': {
     cubeName: 'stockout_store_dashboard',
     cubeQueryDimensions: [
+      'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
       'is_currently_active', 'risk_tier', 'risk_score',
       'forecast_stockout_probability', 'trend_signal', 'forecast_warning',
@@ -34,13 +34,13 @@ var CONFIGS = {
       'sum_confirmed_stockouts', 'sum_suspect_stockouts',
       'sum_expected_lost_sales', 'count', 'avg_risk_score', 'critical_risk_count',
     ],
-    // Uint64/Int64 Arrow fields that need number transform (BigInt -> Number)
     numberFields: [
       'is_currently_active', 'days_since_last',
       'sum_active', 'worsening_count', 'sum_confirmed_stockouts',
       'sum_suspect_stockouts', 'count', 'critical_risk_count',
     ],
     workerDimensions: [
+      'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
       'is_currently_active', 'risk_tier', 'risk_score', 'forecast_stockout_probability',
     ],
@@ -64,12 +64,14 @@ var CONFIGS = {
   'cf-warning': {
     cubeName: 'stockout_early_warning',
     cubeQueryDimensions: [
+      'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
       'trend_signal', 'severity_trend', 'risk_tier', 'risk_score',
       'availability', 'avg_duration_recent_half', 'avg_duration_older_half',
       'frequency_recent_per_month', 'frequency_older_per_month',
       'avg_impact_recent_half', 'avg_impact_older_half',
       'forecast_stockout_probability', 'forecast_warning',
+      'is_currently_active',
     ],
     cubeQueryMeasures: [
       'count', 'worsening_count', 'critical_risk_count',
@@ -77,6 +79,7 @@ var CONFIGS = {
     ],
     numberFields: ['count', 'worsening_count', 'critical_risk_count'],
     workerDimensions: [
+      'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
       'trend_signal', 'severity_trend', 'risk_tier', 'risk_score',
     ],
@@ -89,6 +92,7 @@ var CONFIGS = {
   'cf-dow': {
     cubeName: 'stockout_dow_analysis',
     cubeQueryDimensions: [
+      'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
       'dow_pattern', 'highest_risk_day',
       'dow_mon_confirmed', 'dow_tue_confirmed', 'dow_wed_confirmed',
@@ -104,6 +108,7 @@ var CONFIGS = {
       'dow_thu_confirmed', 'dow_fri_confirmed', 'dow_sat_confirmed', 'dow_sun_confirmed',
     ],
     workerDimensions: [
+      'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
       'dow_pattern', 'highest_risk_day',
     ],
@@ -116,105 +121,59 @@ export function getCubeConfig(cubeId) {
   return CONFIGS[cubeId] || null;
 }
 
-export function fetchMeta() {
-  return fetch(META_API).then(function (res) {
-    if (!res.ok) throw new Error('Meta fetch failed: ' + res.status);
-    return res.json();
-  });
-}
-
-function buildRenameMap(cubeName, dimensions, measures, timeDimensions) {
+function buildRenameMap(cubeName, dimensions, measures) {
   var rename = {};
   for (var i = 0; i < dimensions.length; ++i) {
     var dim = dimensions[i];
-    var fullCube = cf(cubeName, dim);
-    var fullArrow = af(cubeName, dim);
-    rename[fullCube] = dim;
-    rename[fullArrow] = dim;
+    rename[cf(cubeName, dim)] = dim;
+    rename[af(cubeName, dim)] = dim;
   }
   for (var j = 0; j < measures.length; ++j) {
     var meas = measures[j];
-    var fullCubeM = cf(cubeName, meas);
-    var fullArrowM = af(cubeName, meas);
-    rename[fullCubeM] = meas;
-    rename[fullArrowM] = meas;
-  }
-  if (timeDimensions) {
-    for (var k = 0; k < timeDimensions.length; ++k) {
-      var td = timeDimensions[k];
-      var baseDim = td.dimension.split('.')[1]; // e.g. observation_date
-      var gran = td.granularity;
-      // Cube returns time dimension as cube__field_granularity in Arrow
-      rename[af(cubeName, baseDim + '_' + gran)] = baseDim;
-      rename[cf(cubeName, baseDim + '.' + gran)] = baseDim;
-      rename[cf(cubeName, baseDim)] = baseDim;
-      rename[af(cubeName, baseDim)] = baseDim;
-    }
+    rename[cf(cubeName, meas)] = meas;
+    rename[af(cubeName, meas)] = meas;
   }
   return rename;
 }
 
-export function buildCubeQuery(cubeId, store) {
+// Build Cube.dev query — partition-only filter, no store filter, no limit
+export function buildCubeQuery(cubeId) {
   var config = CONFIGS[cubeId];
   if (!config) throw new Error('Unknown cube: ' + cubeId);
 
   var cubeName = config.cubeName;
-  var dimensions = config.cubeQueryDimensions.map(function (d) { return cf(cubeName, d); });
-  var measures = config.cubeQueryMeasures.map(function (m) { return cf(cubeName, m); });
-
-  var query = {
-    dimensions: dimensions,
-    measures: measures,
-    filters: [
-      { member: cf(cubeName, 'partition'), operator: 'equals', values: [PARTITION] },
-      { member: cf(cubeName, 'sold_location'), operator: 'equals', values: [store] },
-    ],
-    limit: 50000,
+  return {
+    format: 'arrow',
+    query: {
+      dimensions: config.cubeQueryDimensions.map(function (d) { return cf(cubeName, d); }),
+      measures: config.cubeQueryMeasures.map(function (m) { return cf(cubeName, m); }),
+      filters: [
+        { member: cf(cubeName, 'partition'), operator: 'equals', values: [PARTITION] },
+      ],
+      limit: 1000000,
+    },
   };
-
-  if (config.cubeTimeDimensions) {
-    query.timeDimensions = config.cubeTimeDimensions;
-  }
-
-  return { format: 'arrow', query: query };
 }
 
-export function buildWorkerOptions(cubeId, store) {
+// Build worker options — no store parameter, all data loaded
+export function buildWorkerOptions(cubeId) {
   var config = CONFIGS[cubeId];
   if (!config) throw new Error('Unknown cube: ' + cubeId);
 
-  var cubeQuery = buildCubeQuery(cubeId, store);
-  var rename = buildRenameMap(
-    config.cubeName,
-    config.cubeQueryDimensions,
-    config.cubeQueryMeasures,
-    config.cubeTimeDimensions
-  );
+  var cubeQuery = buildCubeQuery(cubeId);
+  var rename = buildRenameMap(config.cubeName, config.cubeQueryDimensions, config.cubeQueryMeasures);
 
   var transforms = {};
-  // Uint64/Int64 fields need number transform (BigInt -> Number)
   if (config.numberFields) {
     for (var n = 0; n < config.numberFields.length; ++n) {
       transforms[config.numberFields[n]] = 'number';
-    }
-  }
-  // Time dimensions need timestampMs transform
-  if (config.cubeTimeDimensions) {
-    for (var i = 0; i < config.cubeTimeDimensions.length; ++i) {
-      var baseDim = config.cubeTimeDimensions[i].dimension.split('.')[1];
-      transforms[baseDim] = 'timestampMs';
     }
   }
 
   var snapshotGroups = {};
   for (var g = 0; g < config.workerGroups.length; ++g) {
     var group = config.workerGroups[g];
-    snapshotGroups[group.id] = {
-      includeTotals: true,
-      nonEmptyKeys: true,
-      sort: 'desc',
-      limit: 50,
-    };
+    snapshotGroups[group.id] = { includeTotals: true, nonEmptyKeys: true, sort: 'desc', limit: 50 };
   }
 
   return Object.assign({}, WORKER_ASSETS, {
@@ -236,38 +195,30 @@ export function buildWorkerOptions(cubeId, store) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cubeQuery),
       },
-      projection: {
-        rename: rename,
-        transforms: transforms,
-      },
+      projection: { rename: rename, transforms: transforms },
     }],
   });
 }
 
-// Fetch store list via direct Cube query (JSON format, not Arrow)
+// Fetch store list (lightweight JSON query)
 export function fetchStoreList() {
-  var body = JSON.stringify({
-    query: {
-      dimensions: ['stockout_store_dashboard.sold_location'],
-      measures: ['stockout_store_dashboard.count'],
-      filters: [
-        { member: 'stockout_store_dashboard.partition', operator: 'equals', values: [PARTITION] },
-      ],
-      limit: 1000,
-      timeDimensions: [],
-    },
-  });
-
   return fetch(CUBE_API, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: body,
+    body: JSON.stringify({
+      query: {
+        dimensions: ['stockout_store_dashboard.sold_location'],
+        measures: ['stockout_store_dashboard.count'],
+        filters: [{ member: 'stockout_store_dashboard.partition', operator: 'equals', values: [PARTITION] }],
+        limit: 1000,
+        timeDimensions: [],
+      },
+    }),
   }).then(function (res) {
     if (!res.ok) throw new Error('Store list fetch failed: ' + res.status);
     return res.json();
   }).then(function (json) {
-    var data = json.data || [];
-    return data.map(function (row) {
+    return (json.data || []).map(function (row) {
       return {
         name: row['stockout_store_dashboard.sold_location'],
         count: row['stockout_store_dashboard.count'] || 0,
@@ -278,42 +229,40 @@ export function fetchStoreList() {
   });
 }
 
-// Fetch confirmed stockout events for a date field = yesterday
-function fetchEventsByDate(store, dateField, label) {
+// Fetch confirmed stockout events for yesterday — ALL stores
+function fetchEventsByDate(dateField, label) {
   var yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   var dateStr = yesterday.toISOString().slice(0, 10);
 
-  var body = JSON.stringify({
-    query: {
-      dimensions: [
-        'stockout_events.product',
-        'stockout_events.product_category',
-        'stockout_events.supplier',
-        'stockout_events.duration_days',
-      ],
-      measures: ['stockout_events.total_expected_lost_sales'],
-      filters: [
-        { member: 'stockout_events.partition', operator: 'equals', values: [PARTITION] },
-        { member: 'stockout_events.sold_location', operator: 'equals', values: [store] },
-        { member: dateField, operator: 'inDateRange', values: [dateStr, dateStr] },
-        { member: 'stockout_events.is_confirmed', operator: 'equals', values: ['1'] },
-      ],
-      limit: 500,
-    },
-  });
-
   return fetch(CUBE_API, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: body,
+    body: JSON.stringify({
+      query: {
+        dimensions: [
+          'stockout_events.sold_location',
+          'stockout_events.product',
+          'stockout_events.product_category',
+          'stockout_events.supplier',
+          'stockout_events.duration_days',
+        ],
+        measures: ['stockout_events.total_expected_lost_sales'],
+        filters: [
+          { member: 'stockout_events.partition', operator: 'equals', values: [PARTITION] },
+          { member: dateField, operator: 'inDateRange', values: [dateStr, dateStr] },
+          { member: 'stockout_events.is_confirmed', operator: 'equals', values: ['1'] },
+        ],
+        limit: 50000,
+      },
+    }),
   }).then(function (res) {
     if (!res.ok) throw new Error(label + ' fetch failed: ' + res.status);
     return res.json();
   }).then(function (json) {
-    var data = json.data || [];
-    return data.map(function (row) {
+    return (json.data || []).map(function (row) {
       return {
+        store: row['stockout_events.sold_location'],
         product: row['stockout_events.product'],
         category: row['stockout_events.product_category'],
         supplier: row['stockout_events.supplier'],
@@ -324,10 +273,10 @@ function fetchEventsByDate(store, dateField, label) {
   });
 }
 
-export function fetchEndedYesterday(store) {
-  return fetchEventsByDate(store, 'stockout_events.to_date', 'Ended yesterday');
+export function fetchEndedYesterday() {
+  return fetchEventsByDate('stockout_events.to_date', 'Ended yesterday');
 }
 
-export function fetchStartedYesterday(store) {
-  return fetchEventsByDate(store, 'stockout_events.from_date', 'Started yesterday');
+export function fetchStartedYesterday() {
+  return fetchEventsByDate('stockout_events.from_date', 'Started yesterday');
 }

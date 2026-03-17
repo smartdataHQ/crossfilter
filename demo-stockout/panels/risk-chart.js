@@ -103,17 +103,10 @@ function scoreBar(value, type) {
 
 function labelBadge(r) {
   var avg = Number(r.avg_duration_days) || 0;
-  var median = Number(r.median_duration_days) || 0;
-  var confirmed = Number(r.confirmed_stockouts) || 0;
   var freq = Number(r.stockouts_per_month) || 0;
-  var pattern = r.dow_pattern;
 
-  if (avg >= 3 || (median > 0 && avg > median * 2))
-    return '<span class="badge b-critical">Longer</span>';
-  if (confirmed >= 3 && pattern && pattern !== 'NO PATTERN')
-    return '<span class="badge b-stable">Seasonal</span>';
-  if (confirmed >= 3 && freq < 0.5)
-    return '<span class="badge b-low">Rare</span>';
+  if (avg >= 3) return '<span class="badge b-critical">Longer</span>';
+  if (freq < 0.5) return '<span class="badge b-low">Rare</span>';
   return '<span class="badge b-medium">Typical</span>';
 }
 

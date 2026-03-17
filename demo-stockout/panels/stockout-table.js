@@ -9,36 +9,17 @@ var allRows = [];
 var catSelect = null;
 var supSelect = null;
 
-export function renderStockoutTable(storeResult, warningResult) {
+export function renderStockoutTable(storeResult) {
   var el = document.getElementById('panel-stockout-table');
   if (!el) return;
 
   catSelect = catSelect || document.getElementById('stockout-cat-filter');
   supSelect = supSelect || document.getElementById('stockout-sup-filter');
 
-  // Build warning lookup by product name
-  var warningMap = {};
-  if (warningResult) {
-    var wRows = columnarToRows(warningResult);
-    for (var w = 0; w < wRows.length; ++w) {
-      warningMap[wRows[w].product] = wRows[w];
-    }
-  }
-
   var rows = columnarToRows(storeResult);
   allRows = rows.filter(function (r) {
     var v = r.is_currently_active;
     return v === 1 || v === true || v === 'true' || v === '1';
-  }).map(function (r) {
-    // Merge warning trending data
-    var w = warningMap[r.product] || {};
-    r.dur_recent = Number(w.avg_duration_recent_half) || null;
-    r.dur_older = Number(w.avg_duration_older_half) || null;
-    r.freq_recent = Number(w.frequency_recent_per_month) || null;
-    r.freq_older = Number(w.frequency_older_per_month) || null;
-    r.impact_recent = Number(w.avg_impact_recent_half) || null;
-    r.impact_older = Number(w.avg_impact_older_half) || null;
-    return r;
   });
   allRows.sort(function (a, b) { return (b.risk_score || 0) - (a.risk_score || 0); });
 
@@ -98,13 +79,11 @@ function renderFiltered() {
 
   var html = '<table class="tbl"><thead><tr>' +
     '<th title="Product name">Product</th>' +
-    '<th title="Stockout character: Longer than usual, Typical, Seasonal (DOW pattern), or Rare">Pattern</th>' +
-    '<th title="Average stockout duration for this product at this store">Avg Duration</th>' +
-    '<th title="Total estimated lost sales across all stockout events">Total Lost</th>' +
-    '<th title="Overall status: Active, Active &amp; Worsening, Worsening, Improving, or Stable">Status</th>' +
-    '<th title="Are stockouts lasting longer? Recent-half avg duration vs older-half. \u2191 = getting longer">Duration \u0394</th>' +
-    '<th title="Are stockouts more frequent? Recent stockouts/month vs older. \u2191 = more often">Frequency \u0394</th>' +
-    '<th title="Is each stockout costlier? Recent lost-sales/day vs older. \u2191 = higher impact">Impact \u0394</th>' +
+    '<th title="Stockout character: Longer, Typical, or Rare">Pattern</th>' +
+    '<th title="Average stockout duration for this product">Avg Duration</th>' +
+    '<th title="Total estimated lost sales">Total Lost</th>' +
+    '<th title="Overall status: Active, Worsening, Improving, or Stable">Status</th>' +
+    '<th title="Historical stockout frequency">Freq/Mo</th>' +
     '</tr></thead><tbody>';
 
   for (var i = 0; i < filtered.length; ++i) {
@@ -115,9 +94,7 @@ function renderFiltered() {
       '<td>' + fmtDur(r.avg_duration_days) + '</td>' +
       '<td>' + fmtISK(r.total_expected_lost_sales) + '</td>' +
       '<td>' + trendBadge(r.trend_signal) + '</td>' +
-      '<td>' + deltaCell(r.dur_recent, r.dur_older) + '</td>' +
-      '<td>' + deltaCell(r.freq_recent, r.freq_older) + '</td>' +
-      '<td>' + deltaCell(r.impact_recent, r.impact_older) + '</td>' +
+      '<td>' + fmtFreq(r.stockouts_per_month) + '</td>' +
       '</tr>';
   }
 
@@ -126,64 +103,22 @@ function renderFiltered() {
 }
 
 // --- Label logic ---
-//
-// Longer:   This product's stockouts tend to drag on. Triggered when:
-//           - avg_duration >= 3 days (absolute: these don't resolve quickly), OR
-//           - avg_duration > median * 2 (relative: some events are much longer than typical)
-//
-// Seasonal: Stockouts cluster on specific days of the week.
-//           Only from dow_pattern = WEEKEND-PRONE or WEEKDAY-PRONE,
-//           and only when there's enough history (confirmed >= 3).
-//
-// Rare:     This product rarely stocks out: < 0.5 times per month,
-//           with at least 3 confirmed events in history (otherwise insufficient data).
-//
-// Typical:  None of the above — normal duration, normal frequency, no DOW pattern.
+// Longer:  avg_duration >= 3 days
+// Rare:    stockouts_per_month < 0.5
+// Typical: none of the above
 
 function labelBadge(r) {
-  var labels = [];
-
   var avg = Number(r.avg_duration_days) || 0;
-  var median = Number(r.median_duration_days) || 0;
-  var confirmed = Number(r.confirmed_stockouts) || 0;
-
-  // Longer: stockouts that don't resolve quickly
-  if (avg >= 3 || (median > 0 && avg > median * 2)) {
-    labels.push('<span class="badge b-critical">Longer</span>');
-  }
-
-  // Seasonal: day-of-week clustering (need enough history to be meaningful)
-  var pattern = r.dow_pattern;
-  if (confirmed >= 3 && pattern && pattern !== 'NO PATTERN') {
-    labels.push('<span class="badge b-stable">Seasonal</span>');
-  }
-
-  // Rare: infrequent stockouts (need enough history to distinguish from "new")
   var freq = Number(r.stockouts_per_month) || 0;
-  if (confirmed >= 3 && freq < 0.5) {
-    labels.push('<span class="badge b-low">Rare</span>');
-  }
 
-  if (!labels.length) {
-    labels.push('<span class="badge b-medium">Typical</span>');
-  }
-
-  return labels.join(' ');
+  if (avg >= 3) return '<span class="badge b-critical">Longer</span>';
+  if (freq < 0.5) return '<span class="badge b-low">Rare</span>';
+  return '<span class="badge b-medium">Typical</span>';
 }
 
-// --- Delta cell: recent vs older half comparison ---
-function deltaCell(recent, older) {
-  if (recent == null || older == null) return '<span style="color:#4a5a6e">\u2014</span>';
-  var ratio = older > 0 ? recent / older : (recent > 0 ? 2 : 1);
-  var arrow, cls;
-  if (ratio > 1.2) {
-    arrow = '\u2191'; cls = 'delta-up';  // worsening (up = bad)
-  } else if (ratio < 0.8) {
-    arrow = '\u2193'; cls = 'delta-down'; // improving
-  } else {
-    arrow = '\u2192'; cls = 'delta-flat';
-  }
-  return '<span class="' + cls + '">' + arrow + ' ' + fmtNum(recent) + '</span>';
+function fmtFreq(v) {
+  if (v == null || isNaN(v)) return '\u2014';
+  return Number(v).toFixed(1) + '/mo';
 }
 
 // --- Helpers ---

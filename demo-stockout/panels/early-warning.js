@@ -24,6 +24,10 @@ var COLUMNS = [
 export function renderEarlyWarning(rowsResult) {
   var el = document.getElementById('panel-early-warning');
   if (!el) return;
+  if (!rowsResult) {
+    el.innerHTML = '<div class="panel-empty">Data unavailable</div>';
+    return;
+  }
 
   sevSelect = sevSelect || document.getElementById('warning-severity-filter');
   catSelect = catSelect || document.getElementById('warning-cat-filter');
