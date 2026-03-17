@@ -173,26 +173,34 @@ function showStorePicker() {
 // ---- Store Selector ----
 
 function populateStoreSelector() {
-  dom.storeSelector.innerHTML = '';
+  var list = document.getElementById('store-list');
+  if (!list) return;
+  list.innerHTML = '';
   for (var i = 0; i < storeList.length; ++i) {
     var name = storeList[i].name;
     var f = storeFacets[name] || { active: 0, ended: 0, started: 0 };
     var opt = document.createElement('option');
     opt.value = name;
-    opt.textContent = name + ' (' + f.active + '/' + f.ended + '/' + f.started + ')';
-    dom.storeSelector.appendChild(opt);
+    opt.label = name + ' (' + f.active + '/' + f.ended + '/' + f.started + ')';
+    list.appendChild(opt);
   }
   dom.storeSelector.value = currentStore || '';
 }
 
-dom.storeSelector.addEventListener('change', function () {
-  var newStore = dom.storeSelector.value;
-  if (newStore && newStore !== currentStore) {
-    var patch = { store: newStore };
+// Search-as-you-type store selection (Principle 4: searchable high-cardinality)
+dom.storeSelector.addEventListener('change', onStoreSearch);
+dom.storeSelector.addEventListener('input', onStoreSearch);
+
+function onStoreSearch() {
+  var val = dom.storeSelector.value;
+  // Only navigate if the value exactly matches a store name
+  var match = storeList.some(function (s) { return s.name === val; });
+  if (match && val !== currentStore) {
+    var patch = { store: val };
     for (var param in PARAM_TO_DIMENSION) patch[param] = null;
     setState(patch);
   }
-});
+}
 
 // ---- Filter Chips ----
 
@@ -328,6 +336,7 @@ var MAIN_FIELDS = [
   'is_currently_active', 'highest_risk_day',
   'stockouts_per_month', 'days_since_last',
   'forecast_stockout_probability', 'forecast_warning',
+  'forecast_tier', 'risk_tier',
   // Trending half-comparisons (for delta columns)
   'avg_duration_recent_half', 'avg_duration_older_half',
   'frequency_recent_per_month', 'frequency_older_per_month',

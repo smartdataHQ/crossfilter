@@ -1,10 +1,21 @@
 // demo-stockout/panels/stockout-table.js
 
-import { columnarToRows, countedOptions, esc, isActive, fieldBadge, fmtDur, fmtISK, fmtFreq } from './helpers.js';
+import { columnarToRows, countedOptions, esc, isActive, fieldBadge, fmtDur, fmtISK, fmtFreq, sortableHeader, attachSortHandlers } from './helpers.js';
 
 var allRows = [];
 var catSelect = null;
 var supSelect = null;
+var sortField = 'risk_score';
+var sortDir = -1;
+
+var COLUMNS = [
+  { key: 'product', label: 'Product', title: 'Product name' },
+  { key: 'stockout_pattern', label: 'Pattern', title: 'Stockout character from Cube model' },
+  { key: 'avg_duration_days', label: '<abbr title="Average Duration">Avg Dur</abbr>', title: 'Average stockout duration' },
+  { key: 'total_expected_lost_sales', label: '<abbr title="Total Lost Sales">Total Lost</abbr>', title: 'Total estimated lost sales' },
+  { key: 'trend_signal', label: 'Status', title: 'Overall status from Cube model' },
+  { key: 'stockouts_per_month', label: '<abbr title="Frequency per Month">Freq/Mo</abbr>', title: 'Historical stockout frequency' },
+];
 
 export function renderStockoutTable(storeResult) {
   var el = document.getElementById('panel-stockout-table');
@@ -15,9 +26,31 @@ export function renderStockoutTable(storeResult) {
 
   var rows = columnarToRows(storeResult);
   allRows = rows.filter(function (r) { return isActive(r.is_currently_active); });
-  allRows.sort(function (a, b) { return (b.risk_score || 0) - (a.risk_score || 0); });
+  sortRows();
 
   populateSelects(allRows);
+  renderFiltered();
+}
+
+function sortRows() {
+  var field = sortField;
+  var dir = sortDir;
+  allRows.sort(function (a, b) {
+    var av = a[field], bv = b[field];
+    if (typeof av === 'string') av = av.toLowerCase();
+    if (typeof bv === 'string') bv = bv.toLowerCase();
+    av = av == null ? '' : av;
+    bv = bv == null ? '' : bv;
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+}
+
+function onSort(field) {
+  if (sortField === field) sortDir *= -1;
+  else { sortField = field; sortDir = -1; }
+  sortRows();
   renderFiltered();
 }
 
@@ -47,15 +80,7 @@ function renderFiltered() {
     return;
   }
 
-  var html = '<table class="tbl"><thead><tr>' +
-    '<th title="Product name">Product</th>' +
-    '<th title="Stockout character from Cube model: Longer, Typical, or Rare">Pattern</th>' +
-    '<th title="Average stockout duration"><abbr title="Average Duration">Avg Dur</abbr></th>' +
-    '<th title="Total estimated lost sales"><abbr title="Total Lost Sales">Total Lost</abbr></th>' +
-    '<th title="Overall status from Cube model">Status</th>' +
-    '<th title="Historical stockout frequency"><abbr title="Frequency per Month">Freq/Mo</abbr></th>' +
-    '</tr></thead><tbody>';
-
+  var html = '<table class="tbl">' + sortableHeader(COLUMNS, sortField, sortDir) + '<tbody>';
   for (var i = 0; i < filtered.length; ++i) {
     var r = filtered[i];
     html += '<tr>' +
@@ -67,6 +92,6 @@ function renderFiltered() {
       '<td>' + fmtFreq(r.stockouts_per_month) + '</td>' +
       '</tr>';
   }
-
   el.innerHTML = html + '</tbody></table>';
+  attachSortHandlers(el, onSort);
 }

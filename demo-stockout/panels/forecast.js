@@ -1,6 +1,6 @@
 // demo-stockout/panels/forecast.js
 
-import { columnarToRows, countedOptions, esc, isActive, scoreBar, fieldBadge, fmtDaysAgo, fmtFreq } from './helpers.js';
+import { columnarToRows, countedOptions, esc, isActive, scoreBar, fieldBadge, fmtDaysAgo, fmtFreq, sortableHeader, attachSortHandlers } from './helpers.js';
 import { colorFor } from '../config.js';
 
 var allRows = [];
@@ -8,6 +8,8 @@ var dayBtnsEl = null;
 var catSelect = null;
 var supSelect = null;
 var selectedDay = '';
+var sortField = 'forecast_stockout_probability';
+var sortDir = -1;
 
 var NEXT_DAYS = (function () {
   var names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -20,6 +22,16 @@ var NEXT_DAYS = (function () {
   return result;
 })();
 
+var COLUMNS = [
+  { key: 'product', label: 'Product', title: 'Product name' },
+  { key: 'forecast_stockout_probability', label: '<abbr title="3-Day Probability">3-Day Prob</abbr>', title: '3-day stockout probability' },
+  { key: 'risk_score', label: 'Risk Score', title: 'Composite risk score' },
+  { key: 'highest_risk_day', label: 'Worst Day', title: 'Day with highest stockout probability' },
+  { key: 'trend_signal', label: 'Status', title: 'Overall status from Cube model' },
+  { key: 'days_since_last', label: 'Last', title: 'Days since last stockout ended' },
+  { key: 'stockouts_per_month', label: '<abbr title="Frequency per Month">Freq/Mo</abbr>', title: 'Historical stockout frequency' },
+];
+
 export function renderForecast(rowsResult) {
   var cardsEl = document.getElementById('panel-forecast-cards');
   var tableEl = document.getElementById('panel-forecast-table');
@@ -30,22 +42,20 @@ export function renderForecast(rowsResult) {
   supSelect = supSelect || document.getElementById('forecast-sup-filter');
 
   var rows = columnarToRows(rowsResult);
-  // Use forecast_tier from Cube instead of hardcoded threshold
   allRows = rows.filter(function (r) {
     if (isActive(r.is_currently_active)) return false;
     var tier = String(r.forecast_tier || '').toUpperCase();
     return tier === 'CRITICAL' || tier === 'HIGH' || tier === 'MODERATE';
   });
-  allRows.sort(function (a, b) {
-    return (Number(b.forecast_stockout_probability) || 0) - (Number(a.forecast_stockout_probability) || 0);
-  });
+  sortRows();
 
   renderDayButtons();
   populateSelects(allRows);
   renderFiltered();
 
   if (cardsEl) {
-    cardsEl.innerHTML = allRows.slice(0, 4).map(function (r) {
+    var top = allRows.slice(0, 4);
+    cardsEl.innerHTML = top.map(function (r) {
       var prob = Number(r.forecast_stockout_probability) || 0;
       var color = colorFor('forecast_stockout_probability', prob);
       return '<div class="forecast-card">' +
@@ -58,6 +68,28 @@ export function renderForecast(rowsResult) {
         '</div></div>';
     }).join('');
   }
+}
+
+function sortRows() {
+  var field = sortField;
+  var dir = sortDir;
+  allRows.sort(function (a, b) {
+    var av = a[field], bv = b[field];
+    if (typeof av === 'string') av = av.toLowerCase();
+    if (typeof bv === 'string') bv = bv.toLowerCase();
+    av = av == null ? '' : av;
+    bv = bv == null ? '' : bv;
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+}
+
+function onSort(field) {
+  if (sortField === field) sortDir *= -1;
+  else { sortField = field; sortDir = -1; }
+  sortRows();
+  renderFiltered();
 }
 
 function renderDayButtons() {
@@ -107,16 +139,7 @@ function renderFiltered() {
     return;
   }
 
-  var html = '<table class="tbl"><thead><tr>' +
-    '<th title="Product name">Product</th>' +
-    '<th title="3-day stockout probability from Cube forecast model"><abbr title="3-Day Probability">3-Day Prob</abbr></th>' +
-    '<th title="Composite risk score">Risk Score</th>' +
-    '<th title="Day with highest stockout probability">Worst Day</th>' +
-    '<th title="Overall status from Cube model">Status</th>' +
-    '<th title="Days since last stockout ended">Last</th>' +
-    '<th title="Historical stockout frequency"><abbr title="Frequency per Month">Freq/Mo</abbr></th>' +
-    '</tr></thead><tbody>';
-
+  var html = '<table class="tbl">' + sortableHeader(COLUMNS, sortField, sortDir) + '<tbody>';
   for (var i = 0; i < filtered.length; ++i) {
     var r = filtered[i];
     html += '<tr>' +
@@ -131,4 +154,5 @@ function renderFiltered() {
   }
 
   tableEl.innerHTML = html + '</tbody></table>';
+  attachSortHandlers(tableEl, onSort);
 }

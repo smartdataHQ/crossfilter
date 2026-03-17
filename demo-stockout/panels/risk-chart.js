@@ -1,39 +1,82 @@
 // demo-stockout/panels/risk-chart.js
 
-import { columnarToRows, esc, isActive, scoreBar, fieldBadge, deltaCell, fmtDaysAgo } from './helpers.js';
+import { columnarToRows, esc, isActive, scoreBar, fieldBadge, deltaCell, fmtDaysAgo, sortableHeader, attachSortHandlers } from './helpers.js';
 
 var onProductClick = null;
 var selectedProduct = null;
+var allRows = [];
+var sortField = 'risk_score';
+var sortDir = -1;
 
 export function setProductClickHandler(fn) { onProductClick = fn; }
+
+var COLUMNS = [
+  { key: 'product', label: 'Product', title: 'Product name' },
+  { key: 'risk_score', label: 'Risk Score', title: 'Composite risk score' },
+  { key: 'forecast_stockout_probability', label: '<abbr title="3-Day Probability">3-Day Prob</abbr>', title: '3-day stockout probability' },
+  { key: 'stockout_pattern', label: 'Pattern', title: 'Stockout character from Cube model' },
+  { key: 'days_since_last', label: 'Last', title: 'Days since last stockout ended' },
+  { key: '_freq_delta', label: '<abbr title="Frequency Delta">Freq \u0394</abbr>', title: 'Are stockouts more frequent? Recent vs older half' },
+  { key: 'trend_signal', label: 'Status', title: 'Overall status from Cube model' },
+];
 
 export function renderRiskChart(storeResult) {
   var el = document.getElementById('panel-risk');
   if (!el) return;
 
   var rows = columnarToRows(storeResult);
-  rows = rows.filter(function (r) { return !isActive(r.is_currently_active); });
+  allRows = rows.filter(function (r) { return !isActive(r.is_currently_active); });
+  sortRows();
+  allRows = allRows.slice(0, 10);
 
-  if (!rows.length) {
+  renderTable();
+}
+
+function sortRows() {
+  var field = sortField;
+  var dir = sortDir;
+  allRows.sort(function (a, b) {
+    var av, bv;
+    if (field === '_freq_delta') {
+      av = freqRatio(a); bv = freqRatio(b);
+    } else {
+      av = a[field]; bv = b[field];
+      if (typeof av === 'string') av = av.toLowerCase();
+      if (typeof bv === 'string') bv = bv.toLowerCase();
+    }
+    av = av == null ? '' : av;
+    bv = bv == null ? '' : bv;
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+}
+
+function freqRatio(r) {
+  var recent = Number(r.frequency_recent_per_month) || 0;
+  var older = Number(r.frequency_older_per_month) || 0;
+  return older > 0 ? recent / older : (recent > 0 ? 2 : 1);
+}
+
+function onSort(field) {
+  if (sortField === field) sortDir *= -1;
+  else { sortField = field; sortDir = -1; }
+  sortRows();
+  renderTable();
+}
+
+function renderTable() {
+  var el = document.getElementById('panel-risk');
+  if (!el) return;
+
+  if (!allRows.length) {
     el.innerHTML = '<div class="panel-empty">No at-risk products</div>';
     return;
   }
 
-  rows.sort(function (a, b) { return (b.risk_score || 0) - (a.risk_score || 0); });
-  rows = rows.slice(0, 10);
-
-  var html = '<table class="tbl"><thead><tr>' +
-    '<th title="Product name">Product</th>' +
-    '<th title="Composite risk score">Risk Score</th>' +
-    '<th title="3-day stockout probability"><abbr title="3-Day Probability">3-Day Prob</abbr></th>' +
-    '<th title="Stockout character from Cube model">Pattern</th>' +
-    '<th title="Days since last stockout ended">Last</th>' +
-    '<th title="Are stockouts more frequent? Recent vs older half"><abbr title="Frequency Delta">Freq \u0394</abbr></th>' +
-    '<th title="Overall status from Cube model">Status</th>' +
-    '</tr></thead><tbody>';
-
-  for (var i = 0; i < rows.length; ++i) {
-    var r = rows[i];
+  var html = '<table class="tbl">' + sortableHeader(COLUMNS, sortField, sortDir) + '<tbody>';
+  for (var i = 0; i < allRows.length; ++i) {
+    var r = allRows[i];
     var sel = r.product === selectedProduct;
 
     html += '<tr data-product="' + esc(r.product) + '" class="risk-row' + (sel ? ' risk-selected' : '') + '" style="cursor:pointer">' +
@@ -48,15 +91,16 @@ export function renderRiskChart(storeResult) {
   }
 
   el.innerHTML = html + '</tbody></table>';
+  attachSortHandlers(el, onSort);
 
   el.addEventListener('click', function (e) {
     var tr = e.target.closest('tr[data-product]');
     if (!tr) return;
     var product = tr.dataset.product;
     selectedProduct = product === selectedProduct ? null : product;
-    var allTr = el.querySelectorAll('tr.risk-row');
-    for (var j = 0; j < allTr.length; ++j) {
-      allTr[j].classList.toggle('risk-selected', allTr[j].dataset.product === selectedProduct);
+    var trs = el.querySelectorAll('tr.risk-row');
+    for (var j = 0; j < trs.length; ++j) {
+      trs[j].classList.toggle('risk-selected', trs[j].dataset.product === selectedProduct);
     }
     if (onProductClick) onProductClick(selectedProduct);
   });

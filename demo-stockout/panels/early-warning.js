@@ -3,7 +3,7 @@
 // Products NOT stocked out, NOT high risk, but deteriorating.
 // Sortable column headers. Uses Cube meta for all colors/labels.
 
-import { columnarToRows, countedOptions, esc, isActive, scoreBar, fieldBadge, deltaCell } from './helpers.js';
+import { columnarToRows, countedOptions, esc, isActive, scoreBar, fieldBadge, deltaCell, sortableHeader, attachSortHandlers } from './helpers.js';
 
 var allRows = [];
 var sevSelect = null;
@@ -35,8 +35,9 @@ export function renderEarlyWarning(rowsResult) {
   var rows = columnarToRows(rowsResult);
   allRows = rows.filter(function (r) {
     if (isActive(r.is_currently_active)) return false;
-    var score = Number(r.risk_score) || 0;
-    if (score >= 0.5) return false;
+    // Use Cube-defined risk_tier to exclude high-risk products (they belong in HIGHEST RISK)
+    var tier = String(r.risk_tier || '').toUpperCase();
+    if (tier === 'CRITICAL' || tier === 'HIGH') return false;
     var trend = String(r.trend_signal || '').toUpperCase();
     var severity = String(r.severity_trend || '').toUpperCase();
     return trend === 'WORSENING' || severity === 'ESCALATING' || severity === 'WORSENING';
@@ -106,13 +107,7 @@ function renderFiltered() {
     return;
   }
 
-  var header = '<table class="tbl"><thead><tr>';
-  for (var c = 0; c < COLUMNS.length; ++c) {
-    var col = COLUMNS[c];
-    var arrow = sortField === col.key ? (sortDir < 0 ? ' \u25bc' : ' \u25b2') : '';
-    header += '<th title="' + esc(col.title) + '" data-sort="' + col.key + '" class="sortable">' + col.label + arrow + '</th>';
-  }
-  header += '</tr></thead><tbody>';
+  var header = '<table class="tbl">' + sortableHeader(COLUMNS, sortField, sortDir) + '<tbody>';
 
   var body = '';
   for (var i = 0; i < filtered.length; ++i) {
@@ -124,10 +119,7 @@ function renderFiltered() {
 
   el.innerHTML = header + body + '</tbody></table>';
 
-  var ths = el.querySelectorAll('th.sortable');
-  for (var t = 0; t < ths.length; ++t) {
-    ths[t].addEventListener('click', function (e) { onHeaderClick(e.currentTarget.dataset.sort); });
-  }
+  attachSortHandlers(el, onHeaderClick);
 }
 
 function renderCell(r, col) {

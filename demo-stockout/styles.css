@@ -274,7 +274,7 @@ body::before {
 
 .btn[hidden] { display: none; }
 
-.store-select {
+.store-search {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -283,11 +283,11 @@ body::before {
   font-size: 12px;
   padding: 8px 12px;
   outline: none;
-  cursor: pointer;
-  min-width: 160px;
+  min-width: 200px;
 }
 
-.store-select option { background: var(--bg-card); }
+.store-search::placeholder { color: var(--text-muted); }
+.store-search:focus { border-color: var(--accent-blue); }
 
 /* KPI row */
 .kpi-row {

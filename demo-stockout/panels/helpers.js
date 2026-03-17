@@ -99,6 +99,26 @@ export function countedOptions(rows, field) {
   }).join('');
 }
 
+// ---- Sortable table header ----
+
+export function sortableHeader(columns, sortField, sortDir) {
+  var html = '<thead><tr>';
+  for (var c = 0; c < columns.length; ++c) {
+    var col = columns[c];
+    var arrow = sortField === col.key ? (sortDir < 0 ? ' \u25bc' : ' \u25b2') : '';
+    html += '<th title="' + esc(col.title || '') + '" data-sort="' + col.key + '" class="sortable">' +
+      col.label + arrow + '</th>';
+  }
+  return html + '</tr></thead>';
+}
+
+export function attachSortHandlers(el, callback) {
+  var ths = el.querySelectorAll('th.sortable');
+  for (var t = 0; t < ths.length; ++t) {
+    ths[t].addEventListener('click', function (e) { callback(e.currentTarget.dataset.sort); });
+  }
+}
+
 // ---- Escape HTML ----
 
 export function esc(v) {
