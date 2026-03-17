@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Store Manager — Stockout Intelligence</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div id="loading-overlay" class="loading-overlay">
+  <div class="loading-spinner"></div>
+  <div class="loading-text">Starting...</div>
+</div>
+
+<div id="store-picker" class="store-picker" hidden>
+  <div class="store-picker-inner">
+    <h1 class="picker-title">STORE OPERATIONS</h1>
+    <h2 class="picker-subtitle">Select Your Store</h2>
+    <div id="store-grid" class="store-grid"></div>
+  </div>
+</div>
+
+<div id="dashboard" class="dashboard" hidden>
+  <header class="header anim d1">
+    <div class="header-left">
+      <h1>STORE OPERATIONS</h1>
+      <h2>Essential Products <span id="store-name">—</span></h2>
+    </div>
+    <div class="header-right">
+      <div class="filter-bar">
+        <div id="filter-chips" class="filter-chips"></div>
+        <button id="clear-filters-btn" class="btn btn-ghost" hidden>Clear Filters</button>
+      </div>
+      <select id="store-selector" class="store-select"></select>
+    </div>
+  </header>
+
+  <section id="kpi-row" class="kpi-row anim d2"></section>
+
+  <div class="grid-2col">
+    <section class="card anim d3">
+      <div class="card-head"><span class="card-t">ENDED YESTERDAY</span> <span id="ended-count" class="card-tag"></span></div>
+      <div id="panel-trend" style="padding:0;height:auto;"></div>
+    </section>
+    <section class="card anim d3">
+      <div class="card-head"><span class="card-t">ENDED BY CATEGORY</span></div>
+      <div id="panel-category" class="chart-wrap"></div>
+    </section>
+  </div>
+
+  <section class="card anim d4">
+    <div class="card-head">
+      <span class="card-t">CURRENTLY STOCKED OUT</span>
+      <div class="card-filters">
+        <select id="stockout-cat-filter" class="filter-select"><option value="">All Categories</option></select>
+        <select id="stockout-sup-filter" class="filter-select"><option value="">All Suppliers</option></select>
+        <span id="stockout-count" class="card-tag"></span>
+      </div>
+    </div>
+    <div id="panel-stockout-table" class="table-scroll"></div>
+  </section>
+
+  <section class="card anim d5">
+    <div class="card-head">
+      <span class="card-t">AT RISK — NEXT 3 DAYS</span>
+      <div class="card-filters">
+        <select id="forecast-day-filter" class="filter-select"><option value="">All Days</option></select>
+        <select id="forecast-cat-filter" class="filter-select"><option value="">All Categories</option></select>
+        <select id="forecast-sup-filter" class="filter-select"><option value="">All Suppliers</option></select>
+        <span id="forecast-count" class="card-tag"></span>
+      </div>
+    </div>
+    <div id="panel-forecast-cards" class="forecast-cards"></div>
+    <div id="panel-forecast-table" class="table-scroll"></div>
+  </section>
+
+  <div class="grid-2col">
+    <section class="card anim d6">
+      <div class="card-head"><span class="card-t">HIGHEST RISK</span></div>
+      <div id="panel-risk" class="table-scroll"></div>
+    </section>
+    <section class="card anim d6">
+      <div class="card-head"><span class="card-t">DAY-OF-WEEK PATTERN</span> <span id="dow-product-label" class="card-tag" hidden></span></div>
+      <div id="panel-dow" class="chart-wrap"></div>
+      <div id="panel-dow-badges" class="dow-badges"></div>
+    </section>
+  </div>
+
+  <section class="card anim d7">
+    <div class="card-head">
+      <span class="card-t">EARLY WARNING — DETERIORATING</span>
+      <div class="card-filters">
+        <select id="warning-severity-filter" class="filter-select"><option value="">All Severity</option></select>
+        <select id="warning-cat-filter" class="filter-select"><option value="">All Categories</option></select>
+        <select id="warning-sup-filter" class="filter-select"><option value="">All Suppliers</option></select>
+        <span id="warning-count" class="card-tag tag-red"></span>
+      </div>
+    </div>
+    <div id="panel-early-warning" class="table-scroll"></div>
+  </section>
+</div>
+
+<script src="../crossfilter.js"></script>
+<script src="../node_modules/echarts/dist/echarts.min.js"></script>
+<script type="module" src="app.js"></script>
+
+</body>
+</html>
