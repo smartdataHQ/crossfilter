@@ -18,15 +18,25 @@ export function renderEarlyWarning(rowsResult) {
 
   var rows = columnarToRows(rowsResult);
 
-  // Only products NOT currently stocked out AND with worsening trend
+  // Early warning = NOT stocked out, NOT already high risk, but deteriorating.
+  // These are products heading toward trouble but not there yet.
   allRows = rows.filter(function (r) {
     var active = r.is_currently_active;
     if (active === 1 || active === true || active === 'true' || active === '1') return false;
+    // Exclude high-risk products (they belong in HIGHEST RISK table)
+    var score = Number(r.risk_score) || 0;
+    if (score >= 0.5) return false;
+    // Must show a worsening signal
     var trend = String(r.trend_signal || '').toUpperCase();
     var severity = String(r.severity_trend || '').toUpperCase();
     return trend === 'WORSENING' || severity === 'ESCALATING' || severity === 'WORSENING';
   });
-  allRows.sort(function (a, b) { return (Number(b.risk_score) || 0) - (Number(a.risk_score) || 0); });
+  // Sort by rate of deterioration: prioritize products where frequency is increasing fastest
+  allRows.sort(function (a, b) {
+    var aRatio = deteriorationRate(a);
+    var bRatio = deteriorationRate(b);
+    return bRatio - aRatio;
+  });
 
   populateSelects(allRows);
   renderFiltered();
@@ -117,6 +127,22 @@ function renderFiltered() {
 
   html += '</tbody></table>';
   el.innerHTML = html;
+}
+
+// Rate of deterioration: how fast is this product getting worse?
+// Combines frequency increase + duration increase + impact increase.
+function deteriorationRate(r) {
+  var freqR = Number(r.frequency_recent_per_month) || 0;
+  var freqO = Number(r.frequency_older_per_month) || 0;
+  var durR = Number(r.avg_duration_recent_half) || 0;
+  var durO = Number(r.avg_duration_older_half) || 0;
+  var impR = Number(r.avg_impact_recent_half) || 0;
+  var impO = Number(r.avg_impact_older_half) || 0;
+  var ratio = function (recent, older) {
+    if (older > 0) return recent / older;
+    return recent > 0 ? 2 : 1;
+  };
+  return ratio(freqR, freqO) + ratio(durR, durO) + ratio(impR, impO);
 }
 
 function riskBar(score) {
