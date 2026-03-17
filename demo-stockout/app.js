@@ -96,7 +96,55 @@ function startedForStore() {
   return allStartedYesterday.filter(function (r) { return r.store === currentStore; });
 }
 
+// Facet counts per store (for faceted selectors)
+function buildStoreFacets() {
+  var facets = {};
+  for (var i = 0; i < storeList.length; ++i) {
+    facets[storeList[i].name] = { active: 0, ended: 0, started: 0 };
+  }
+  for (var e = 0; e < allEndedYesterday.length; ++e) {
+    var s = allEndedYesterday[e].store;
+    if (facets[s]) facets[s].ended++;
+  }
+  for (var st = 0; st < allStartedYesterday.length; ++st) {
+    var s2 = allStartedYesterday[st].store;
+    if (facets[s2]) facets[s2].started++;
+  }
+  return facets;
+}
+
+// Update active counts from cf-store data (called after workers ready)
+async function updateActiveFacets(facets) {
+  if (!runtimes['cf-store']) return facets;
+  try {
+    // Temporarily clear store filter to get all-store data
+    await runtimes['cf-store'].updateFilters({});
+    var result = await runtimes['cf-store'].rows({
+      fields: ['sold_location', 'is_currently_active'],
+      limit: 100000,
+      columnar: true,
+    });
+    // Restore current filter
+    if (currentStore) {
+      await runtimes['cf-store'].updateFilters({ sold_location: { type: 'in', values: [currentStore] } });
+    }
+    var cols = result && result.columns ? result.columns : result;
+    if (cols && cols.sold_location) {
+      for (var i = 0; i < cols.sold_location.length; ++i) {
+        var loc = cols.sold_location[i];
+        var active = cols.is_currently_active[i];
+        if (facets[loc] && (active === 1 || active === true)) {
+          facets[loc].active++;
+        }
+      }
+    }
+  } catch (err) { console.error('Active facet query failed:', err); }
+  return facets;
+}
+
 // ---- Store Picker ----
+
+var storeFacets = {};
 
 function showStorePicker() {
   if (!storeList.length) {
@@ -108,9 +156,15 @@ function showStorePicker() {
   dom.storeGrid.innerHTML = '';
   for (var i = 0; i < storeList.length; ++i) {
     var store = storeList[i];
+    var f = storeFacets[store.name] || { active: 0, ended: 0, started: 0 };
     var btn = document.createElement('button');
     btn.className = 'store-btn';
-    btn.innerHTML = store.name + '<span class="store-btn-count">' + (store.count || 0) + ' products</span>';
+    btn.innerHTML = store.name +
+      '<span class="store-btn-facets">' +
+      '<span class="facet facet-red" title="Active stockouts">' + f.active + '</span>' +
+      '<span class="facet facet-green" title="Ended yesterday">' + f.ended + '</span>' +
+      '<span class="facet facet-amber" title="Started yesterday">' + f.started + '</span>' +
+      '</span>';
     btn.dataset.store = store.name;
     btn.addEventListener('click', function (e) { setState({ store: e.currentTarget.dataset.store }); });
     dom.storeGrid.appendChild(btn);
@@ -124,9 +178,11 @@ function showStorePicker() {
 function populateStoreSelector() {
   dom.storeSelector.innerHTML = '';
   for (var i = 0; i < storeList.length; ++i) {
+    var name = storeList[i].name;
+    var f = storeFacets[name] || { active: 0, ended: 0, started: 0 };
     var opt = document.createElement('option');
-    opt.value = storeList[i].name;
-    opt.textContent = storeList[i].name;
+    opt.value = name;
+    opt.textContent = name + ' (' + f.active + '/' + f.ended + '/' + f.started + ')';
     dom.storeSelector.appendChild(opt);
   }
   dom.storeSelector.value = currentStore || '';
@@ -247,6 +303,10 @@ async function createWorkers() {
   }
 
   workersReady = true;
+
+  // Build faceted store data (Principle 4: faceted selectors)
+  storeFacets = buildStoreFacets();
+  await updateActiveFacets(storeFacets);
   populateStoreSelector();
   setOverlay(false);
 }
