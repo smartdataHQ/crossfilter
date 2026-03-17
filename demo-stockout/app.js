@@ -488,8 +488,10 @@ async function refreshEarlyWarning() {
   try {
     var result = await runtimes['cf-warning'].rows({
       fields: [
-        'product', 'product_category', 'trend_signal', 'severity_trend',
-        'risk_score', 'risk_tier', 'avg_duration_recent_half', 'avg_duration_older_half',
+        'product', 'product_category', 'supplier',
+        'trend_signal', 'severity_trend', 'is_currently_active',
+        'risk_score', 'forecast_stockout_probability', 'forecast_warning',
+        'avg_duration_recent_half', 'avg_duration_older_half',
         'frequency_recent_per_month', 'frequency_older_per_month',
         'avg_impact_recent_half', 'avg_impact_older_half',
       ],

@@ -89,7 +89,15 @@
   </div>
 
   <section class="card anim d7">
-    <div class="card-head"><span class="card-t">EARLY WARNING — WORSENING</span> <span id="warning-count" class="card-tag tag-red"></span></div>
+    <div class="card-head">
+      <span class="card-t">EARLY WARNING — DETERIORATING</span>
+      <div class="card-filters">
+        <select id="warning-severity-filter" class="filter-select"><option value="">All Severity</option></select>
+        <select id="warning-cat-filter" class="filter-select"><option value="">All Categories</option></select>
+        <select id="warning-sup-filter" class="filter-select"><option value="">All Suppliers</option></select>
+        <span id="warning-count" class="card-tag tag-red"></span>
+      </div>
+    </div>
     <div id="panel-early-warning" class="table-scroll"></div>
   </section>
 </div>
