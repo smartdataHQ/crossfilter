@@ -55,7 +55,7 @@ var CONFIGS = {
     ],
     workerKpis: [
       { id: 'avgAvail', field: 'avg_availability', op: 'avg' },
-      { id: 'totalActive', field: 'sum_active', op: 'sum' },
+      { id: 'totalActive', field: 'is_currently_active', op: 'sum' },
       { id: 'worsening', field: 'worsening_count', op: 'sum' },
       { id: 'confirmed', field: 'sum_confirmed_stockouts', op: 'sum' },
       { id: 'suspect', field: 'sum_suspect_stockouts', op: 'sum' },
