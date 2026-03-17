@@ -98,17 +98,12 @@ function startedForStore() {
 
 // ---- Store Picker ----
 
-async function showStorePicker() {
-  setOverlay(true, 'Loading stores...');
-  try {
-    storeList = await fetchStoreList();
-  } catch (err) {
-    setOverlay(false);
+function showStorePicker() {
+  if (!storeList.length) {
+    dom.storeGrid.innerHTML = '<div class="panel-error">No stores loaded</div>';
     dom.picker.removeAttribute('hidden');
-    dom.storeGrid.innerHTML = '<div class="panel-error">Failed to load stores: ' + err.message + '</div>';
     return;
   }
-  setOverlay(false);
 
   dom.storeGrid.innerHTML = '';
   for (var i = 0; i < storeList.length; ++i) {
@@ -241,12 +236,11 @@ async function createWorkers() {
 
 var STORE_FIELDS = [
   'product', 'product_category', 'supplier', 'risk_score',
-  'avg_duration_days', 'median_duration_days', 'stddev_duration_days',
-  'total_expected_lost_sales', 'trend_signal', 'severity_trend',
-  'is_currently_active', 'dow_pattern', 'highest_risk_day',
-  'stockouts_per_month', 'total_stockouts', 'confirmed_stockouts',
-  'avg_days_between_stockouts', 'days_since_last',
+  'avg_duration_days', 'total_expected_lost_sales', 'trend_signal',
+  'is_currently_active', 'highest_risk_day',
+  'stockouts_per_month', 'days_since_last',
   'forecast_stockout_probability', 'forecast_warning',
+  'signal_quality',
 ];
 
 var WARNING_FIELDS = [
@@ -321,7 +315,7 @@ async function refreshAllPanels() {
 
   if (storeResult) {
     renderKpis(storeResult.snapshot, ended, started);
-    renderStockoutTable(storeResult.rowSets.stockout, warningRows);
+    renderStockoutTable(storeResult.rowSets.stockout);
     renderForecast(storeResult.rowSets.forecast);
     renderRiskChart(storeResult.rowSets.risk, warningRows);
   } else {

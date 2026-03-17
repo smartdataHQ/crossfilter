@@ -25,11 +25,9 @@ var CONFIGS = {
       'product', 'product_category', 'product_sub_category', 'supplier',
       'is_currently_active', 'risk_tier', 'risk_score',
       'forecast_stockout_probability', 'trend_signal', 'forecast_warning',
-      'avg_duration_days', 'median_duration_days', 'stddev_duration_days',
+      'avg_duration_days',
       'total_expected_lost_sales', 'days_since_last', 'stockouts_per_month',
-      'total_stockouts', 'confirmed_stockouts',
-      'highest_risk_day', 'signal_quality', 'severity_trend',
-      'dow_pattern', 'avg_days_between_stockouts',
+      'highest_risk_day', 'signal_quality',
     ],
     cubeQueryMeasures: [
       'avg_availability', 'sum_active', 'worsening_count',
