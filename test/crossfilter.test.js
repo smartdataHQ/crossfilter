@@ -5581,4 +5581,249 @@ describe("crossfilter", () => {
       correctGroupValue
     );
   });
+
+  // Task 1: codeCounts after remove
+  it("lazy codeCounts stay correct after data.remove()", function () {
+    var cf = crossfilter();
+    var dim = cf.dimension(function (d) { return d.type; });
+    var other = cf.dimension(function (d) { return d.val; });
+    cf.add([
+      { type: "a", val: 1 },
+      { type: "b", val: 2 },
+      { type: "a", val: 3 },
+      { type: "c", val: 4 },
+    ]);
+
+    // Filter to val < 3 (keeps val=1,2 passing), then remove those passing
+    other.filterRange([-Infinity, 3]);
+    cf.remove();
+    other.filterAll();
+
+    // After remove, only {type:"a",val:3} and {type:"c",val:4} remain
+    assert.equal(cf.size(), 2);
+
+    // filterExact should work correctly (uses codeCounts via lazyCodesSelectAllRows)
+    dim.filterExact("a");
+    assert.deepStrictEqual(cf.allFiltered(), [{ type: "a", val: 3 }]);
+    dim.filterAll();
+
+    // filterIn should work correctly
+    dim.filterIn(["a", "c"]);
+    assert.equal(cf.allFiltered().length, 2);
+    dim.filterAll();
+
+    // Append after remove should work
+    cf.add([{ type: "b", val: 5 }]);
+    assert.equal(cf.size(), 3);
+    dim.filterExact("b");
+    assert.deepStrictEqual(cf.allFiltered(), [{ type: "b", val: 5 }]);
+    dim.filterAll();
+  });
+
+  // Task 2: filterRange with non-coercible mixed types
+  it("lazy filterRange matches materialized behavior on non-coercible mixed types", function () {
+    // Force materialized path for comparison
+    var cfMat = crossfilter();
+    var dimMat = cfMat.dimension(function (d) { return d.val; });
+    cfMat.add([
+      { val: 0 },
+      { val: "a" },
+      { val: "m" },
+      { val: "zz" },
+    ]);
+    dimMat.filterFunction(function () { return true; });
+    dimMat.filterAll();
+    dimMat.filterRange([0, "z"]);
+    var matFiltered = cfMat.allFiltered();
+
+    // Lazy path
+    var cfLazy = crossfilter();
+    var dimLazy = cfLazy.dimension(function (d) { return d.val; });
+    cfLazy.add([
+      { val: 0 },
+      { val: "a" },
+      { val: "m" },
+      { val: "zz" },
+    ]);
+    dimLazy.filterRange([0, "z"]);
+    var lazyFiltered = cfLazy.allFiltered();
+
+    // compareNaturalOrder type rank: number(2) < string(4)
+    // So in natural order: 0 < "a" < "m" < "z" < "zz"
+    // Range [0, "z") includes: 0, "a", "m" — NOT "zz"
+    assert.deepStrictEqual(lazyFiltered, matFiltered);
+    dimLazy.filterAll();
+    dimMat.filterAll();
+  });
+
+  // Task 3: Phase 0 semantic parity tests
+  describe("lazy path semantic parity", () => {
+    // Helper: run the same operations on two crossfilters — one forced-materialized,
+    // one lazy — and compare results.
+    function comparePaths(records, dimAccessor, operations) {
+      // Lazy path
+      var cfLazy = crossfilter();
+      var dimLazy = cfLazy.dimension(dimAccessor);
+      cfLazy.add(records);
+
+      // Force materialization by using filterFunction (which always materializes)
+      var cfMat = crossfilter();
+      var dimMat = cfMat.dimension(dimAccessor);
+      cfMat.add(records);
+      dimMat.filterFunction(function () { return true; });
+      dimMat.filterAll();
+
+      operations(dimLazy, cfLazy, dimMat, cfMat);
+    }
+
+    it("filterExact matches on homogeneous strings", function () {
+      comparePaths(
+        [{ v: "a" }, { v: "b" }, { v: "c" }, { v: "a" }],
+        function (d) { return d.v; },
+        function (lazy, cfL, mat, cfM) {
+          lazy.filterExact("a");
+          mat.filterExact("a");
+          assert.deepStrictEqual(cfL.allFiltered(), cfM.allFiltered());
+          lazy.filterExact("z");
+          mat.filterExact("z");
+          assert.deepStrictEqual(cfL.allFiltered(), cfM.allFiltered());
+        }
+      );
+    });
+
+    it("filterExact(null) intentionally diverges from legacy bisect path", function () {
+      // The lazy path uses SameValueZero (Map lookup) where null !== 0.
+      // The materialized bisect path uses compareNaturalOrder where null and 0
+      // are equivalent via natural coercion. This is an intentional tightening:
+      // null means null in the lazy path.
+      var cf = crossfilter();
+      var dim = cf.dimension(function (d) { return d.v; });
+      cf.add([{ v: null }, { v: 0 }, { v: "" }, { v: false }, { v: null }]);
+      dim.filterExact(null);
+      var filtered = cf.allFiltered();
+      // Lazy path: only null records, not 0/false/""
+      assert.equal(filtered.length, 2);
+      assert.ok(filtered.every(function (d) { return d.v === null; }));
+      dim.filterAll();
+    });
+
+    it("filterIn matches on mixed present/absent values", function () {
+      comparePaths(
+        [{ v: "a" }, { v: "b" }, { v: "c" }],
+        function (d) { return d.v; },
+        function (lazy, cfL, mat, cfM) {
+          lazy.filterIn(["a", "c", "z"]);
+          mat.filterIn(["a", "c", "z"]);
+          assert.deepStrictEqual(cfL.allFiltered(), cfM.allFiltered());
+        }
+      );
+    });
+
+    it("filterRange matches on homogeneous numbers", function () {
+      comparePaths(
+        [{ v: 1 }, { v: 5 }, { v: 10 }, { v: 15 }, { v: 20 }],
+        function (d) { return d.v; },
+        function (lazy, cfL, mat, cfM) {
+          lazy.filterRange([5, 15]);
+          mat.filterRange([5, 15]);
+          assert.deepStrictEqual(cfL.allFiltered(), cfM.allFiltered());
+          lazy.filterRange([0, 100]);
+          mat.filterRange([0, 100]);
+          assert.deepStrictEqual(cfL.allFiltered(), cfM.allFiltered());
+          lazy.filterRange([50, 60]);
+          mat.filterRange([50, 60]);
+          assert.deepStrictEqual(cfL.allFiltered(), cfM.allFiltered());
+        }
+      );
+    });
+
+    it("filterRange matches on mixed number/non-coercible-string data", function () {
+      // Non-coercible strings ("a", "m", "zz") vs numbers — this is where
+      // raw JS comparison diverges from compareNaturalOrder (NaN vs typeRank).
+      comparePaths(
+        [{ v: 0 }, { v: 5 }, { v: "a" }, { v: "m" }, { v: "zz" }],
+        function (d) { return d.v; },
+        function (lazy, cfL, mat, cfM) {
+          lazy.filterRange([0, "z"]);
+          mat.filterRange([0, "z"]);
+          assert.deepStrictEqual(cfL.allFiltered(), cfM.allFiltered());
+        }
+      );
+    });
+
+    it("filterRange matches on mixed boolean/number/non-coercible-string data", function () {
+      comparePaths(
+        [{ v: true }, { v: 1 }, { v: "abc" }, { v: false }, { v: 0 }],
+        function (d) { return d.v; },
+        function (lazy, cfL, mat, cfM) {
+          lazy.filterRange([0, "b"]);
+          mat.filterRange([0, "b"]);
+          assert.deepStrictEqual(cfL.allFiltered(), cfM.allFiltered());
+        }
+      );
+    });
+
+    it("group().all() matches after filterExact", function () {
+      comparePaths(
+        [{ v: "a", n: 1 }, { v: "b", n: 2 }, { v: "a", n: 3 }],
+        function (d) { return d.v; },
+        function (lazy, cfL, mat, cfM) {
+          var gL = lazy.group().reduceSum(function (d) { return d.n; });
+          var gM = mat.group().reduceSum(function (d) { return d.n; });
+          assert.deepStrictEqual(gL.all(), gM.all());
+          lazy.filterExact("a");
+          mat.filterExact("a");
+          // Groups show all keys (own filter doesn't affect own groups)
+          assert.deepStrictEqual(gL.all(), gM.all());
+        }
+      );
+    });
+
+    it("groupAll().value() matches", function () {
+      comparePaths(
+        [{ v: "a", n: 10 }, { v: "b", n: 20 }, { v: "a", n: 30 }],
+        function (d) { return d.v; },
+        function (lazy, cfL, mat, cfM) {
+          var gaL = lazy.groupAll().reduceSum(function (d) { return d.n; });
+          var gaM = mat.groupAll().reduceSum(function (d) { return d.n; });
+          assert.equal(gaL.value(), gaM.value());
+        }
+      );
+    });
+
+    it("append after filter matches", function () {
+      comparePaths(
+        [{ v: "a" }, { v: "b" }],
+        function (d) { return d.v; },
+        function (lazy, cfL, mat, cfM) {
+          lazy.filterExact("a");
+          mat.filterExact("a");
+          cfL.add([{ v: "a" }, { v: "c" }]);
+          cfM.add([{ v: "a" }, { v: "c" }]);
+          assert.deepStrictEqual(cfL.allFiltered(), cfM.allFiltered());
+        }
+      );
+    });
+  });
+
+  // Task 4: groupAll incremental append
+  it("lazy groupAll handles incremental append without full rebuild", function () {
+    var cf = crossfilter();
+    var dim = cf.dimension(function (d) { return d.type; });
+    cf.add([{ type: "a", amount: 10 }]);
+    var ga = dim.groupAll().reduceSum(function (d) { return d.amount; });
+    assert.equal(ga.value(), 10);
+
+    // Append several batches — groupAll should not need lazyCodeToGroup
+    cf.add([{ type: "b", amount: 20 }]);
+    assert.equal(ga.value(), 30);
+    cf.add([{ type: "c", amount: 30 }]);
+    assert.equal(ga.value(), 60);
+
+    // Filter and append
+    dim.filterExact("a");
+    cf.add([{ type: "a", amount: 5 }]);
+    assert.equal(ga.value(), 65); // groupAll ignores own filter
+    dim.filterAll();
+  });
 });

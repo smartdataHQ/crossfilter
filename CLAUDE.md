@@ -20,7 +20,7 @@ Crossfilter2 is a JavaScript library for fast multidimensional filtering of larg
 - `index.js` — UMD build entry (adds `version` from package.json)
 - `main.js` — ESM entry (re-exports `src/index.js`)
 
-**Core (`src/index.js`):** Single ~1000-line file containing the `crossfilter()` factory and the `dimension()` / `group()` / `groupAll()` inner functions. All filtering state (bitmask filters, sorted indexes, data array) is closure-scoped inside the factory. This is the heart of the library.
+**Core (`src/index.js`):** Single ~3300-line file containing the `crossfilter()` factory and the `dimension()` / `group()` / `groupAll()` inner functions. All filtering state (bitmask filters, sorted indexes, data array) is closure-scoped inside the factory. This is the heart of the library. Includes a lazy WASM-encoded path that avoids materialization for simple property accessors (both string and function forms like `d => d.field`).
 
 **Key internal modules:**
 - `src/filter.js` — Typed-array filter bitmask (Uint8/16/32 based on dimension count)

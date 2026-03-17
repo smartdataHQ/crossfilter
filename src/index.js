@@ -572,6 +572,7 @@ function crossfilter() {
         filterInValues = null,
         exactRangeCache = new Map(),
         lazyFilterTargetCodes = null,
+        lazyFilterTargetCodesVersion = 0,
         lazyEncodedState = null,
         indexListeners = [], // when data is added
         dimensionGroups = [],
@@ -594,6 +595,36 @@ function crossfilter() {
         || valueType === 'boolean'
         || valueType === 'bigint';
     }
+
+    // ==========================================================================
+    // Lazy encoded dimension path — semantic safety contract
+    //
+    // The lazy path stores dimension values as integer codes and defers
+    // materialization of sorted values/index. All optimizations in this path
+    // must preserve these invariants:
+    //
+    // 1. ORDERING: filterRange must use compareNaturalOrder, not raw JS < / >=,
+    //    because mixed-type dimensions have type-rank ordering that differs
+    //    from JS coercion. The gate is hasLazyEncodedGroupingSupport().
+    //
+    // 2. EQUALITY: filterExact and filterIn use Map-based code lookup, which
+    //    uses SameValueZero. This differs from compareNaturalOrder for null/0
+    //    (they are distinct in SameValueZero but equivalent in natural order).
+    //    This is an intentional semantic tightening: null means null.
+    //
+    // 3. FILTER LIFECYCLE: reduce functions receive a third argument (noPrior)
+    //    that distinguishes "new data" from "filter toggle." The lazy path
+    //    must preserve this via resetNeeded + resetMany/resetOne, not by
+    //    skipping reduce calls.
+    //
+    // 4. NOTIFICATION: filter changes must fire onChange('filtered') even when
+    //    no filterListeners (groups) exist. Check callbacks.length too.
+    //
+    // 5. COUNTS: codeCounts must stay consistent through append, remove, and
+    //    compaction. lazyCodesSelectAllRows depends on accurate counts.
+    //
+    // When in doubt, materialize. The materialized path is always correct.
+    // ==========================================================================
 
     function createLazyEncodedState(sourceValues) {
       if (!accessorPath || iterable || !runtimeController.canUseWasmScan()) {
@@ -1019,7 +1050,11 @@ function crossfilter() {
       }
 
       if (lazyFilterTargetCodes) {
-        // Recompute range codes in case new values appeared in codeToValue
+        var currentCodeCount = lazyEncodedState.codeToValue.length;
+        if (currentCodeCount === lazyFilterTargetCodesVersion) {
+          return lazyFilterTargetCodes;
+        }
+        // New codes appeared — rescan
         var codeToValue = lazyEncodedState.codeToValue,
             rangeCodes = [],
             code,
@@ -1028,11 +1063,12 @@ function crossfilter() {
 
         for (code = 1; code < codeToValue.length; ++code) {
           v = codeToValue[code];
-          if (v >= range[0] && v < range[1]) {
+          if (compareNaturalOrder(v, range[0]) >= 0 && compareNaturalOrder(v, range[1]) < 0) {
             rangeCodes.push(code);
           }
         }
         lazyFilterTargetCodes = new Uint32Array(rangeCodes);
+        lazyFilterTargetCodesVersion = currentCodeCount;
         return lazyFilterTargetCodes;
       }
 
@@ -1078,8 +1114,14 @@ function crossfilter() {
       }
 
       currentSelected = ensureLazySelection(currentMatches, lazyEncodedState.selected);
-      nextSelected = new Uint8Array(n);
-      nextSelected.set(currentSelected);
+      if (currentSelected.length >= n) {
+        // Buffer is already large enough — reuse it directly.
+        nextSelected = currentSelected;
+      } else {
+        // Must grow — allocate exact size to preserve normalizeLazySelectionMask semantics.
+        nextSelected = new Uint8Array(n);
+        nextSelected.set(currentSelected);
+      }
       matches = runtimeController.findEncodedMatches(appendedCodes, targetCodes);
       nextMatches = new Uint32Array(matches.length);
 
@@ -1146,6 +1188,10 @@ function crossfilter() {
 
       lazyEncodedState.codes = nextCodes;
       lazyEncodedState.codesLength = nextLength;
+      lazyEncodedState.codeCounts = buildCodeCounts(
+        nextCodes.subarray(0, nextLength),
+        lazyEncodedState.codeToValue.length
+      );
       lazyEncodedState.matchIndices = nextMatchIndices;
       lazyEncodedState.selected = normalizeLazySelectionMask(nextSelected);
       lo0 = 0;
@@ -1813,6 +1859,7 @@ function crossfilter() {
     // Filters this dimension to select the exact value.
     function filterExact(value) {
       lazyFilterTargetCodes = null;
+      lazyFilterTargetCodesVersion = 0;
       if (lazyEncodedState && !values) {
         var exactCodes = encodeLazyFilterValues([value]);
         if (exactCodes) {
@@ -1835,6 +1882,7 @@ function crossfilter() {
 
     function filterIn(valuesToSelect) {
       lazyFilterTargetCodes = null;
+      lazyFilterTargetCodesVersion = 0;
       if (lazyEncodedState && !values) {
         var lazyExactFilterValues = normalizeExactFilterValues(valuesToSelect),
             lazyEncodedValues = encodeLazyFilterValues(lazyExactFilterValues);
@@ -1886,7 +1934,7 @@ function crossfilter() {
 
         for (rangeCode = 1; rangeCode < codeToValue.length; ++rangeCode) {
           rangeValue = codeToValue[rangeCode];
-          if (rangeValue >= range[0] && rangeValue < range[1]) {
+          if (compareNaturalOrder(rangeValue, range[0]) >= 0 && compareNaturalOrder(rangeValue, range[1]) < 0) {
             rangeCodes.push(rangeCode);
           }
         }
@@ -1898,6 +1946,7 @@ function crossfilter() {
         filterInValues = null;
         filterMode = 'bounds';
         lazyFilterTargetCodes = new Uint32Array(rangeCodes);
+        lazyFilterTargetCodesVersion = codeToValue.length;
         return applyLazyEncodedFilter(lazyFilterTargetCodes, 'bounds');
       }
 
@@ -1913,6 +1962,7 @@ function crossfilter() {
     // Clears any filters on this dimension.
     function filterAll() {
       lazyFilterTargetCodes = null;
+      lazyFilterTargetCodesVersion = 0;
       if (lazyEncodedState && !values) {
         filterValue = undefined;
         setFilterValuePresent(false);
@@ -1932,6 +1982,7 @@ function crossfilter() {
     // Filters this dimension using an arbitrary function.
     function filterFunction(f) {
       lazyFilterTargetCodes = null;
+      lazyFilterTargetCodesVersion = 0;
       if (lazyEncodedState && !values) {
         materializeLazyEncodedState();
       }
@@ -2279,7 +2330,14 @@ function crossfilter() {
       function add(newValues, newIndex, n0, n1, appendedCodes) {
 
         // Incremental lazy append: groups already exist, dimension is still encoded
-        if (appendedCodes && lazyCodeToGroup && lazyEncodedState && !values && k > 0) {
+        if (appendedCodes && lazyEncodedState && !values && k > 0) {
+          // groupAll (k=1, no groupIndex): just mark reset needed
+          if (groupAll) {
+            resetNeeded = true;
+            return;
+          }
+
+          if (lazyCodeToGroup) {
           var hasNewGroups = false,
               incrCode,
               incrI;
@@ -2304,6 +2362,7 @@ function crossfilter() {
             return;
           }
           // hasNewGroups: fall through to full lazy rebuild below
+          }
         }
 
         if (useLazyEncodedGrouping && lazyEncodedState && !values) {
