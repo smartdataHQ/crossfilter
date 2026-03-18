@@ -1,8 +1,94 @@
 # @smartdatahq/crossfilter
 
-Fast multidimensional filtering with Apache Arrow streaming, WASM-accelerated filters, and worker-backed dashboard runtimes.
+> **A streaming-first, zero-copy analytics engine for the browser.**
 
-Built on top of [crossfilter2](https://github.com/crossfilter/crossfilter), this fork adds Arrow IPC streaming ingest, a Web Worker dashboard runtime, declarative groups/KPIs, and optional WebAssembly filter acceleration.
+Crossfilter2 is already the fastest way to filter large datasets client-side. This fork turns it into a complete dashboard runtime — data streams in as Arrow IPC, decodes and filters inside a Web Worker (main thread never blocks), WASM accelerates the hot filter scan, and partial snapshots render the UI progressively before the download even finishes.
+
+### What this fork adds to crossfilter2
+
+| Layer | What changed | Why it matters |
+|-------|-------------|----------------|
+| **Ingest** | Columnar Arrow IPC streaming with batch coalescing (default 64K rows), multi-source lookup joins, projection/rename/type-coercion at ingest, Proxy-backed lazy row arrays that defer materialization via `COLUMNAR_BATCH_KEY` | Data goes from Cube.dev (or any Arrow source) straight into crossfilter's sorted indexes without ever building intermediate row objects — a 10K-row dataset allocates zero row objects until a panel actually reads one |
+| **Filtering** | Inline WASM module (no external `.wasm` file) with two scan paths: `filterInU32` for small target sets (k ≤ 4) and `markFilterInU32` with dense lookup for larger sets; automatic regex extraction of `d => d.field` and `function(d){ return d.field }` into string paths for WASM routing | Filter scans stay in linear WASM memory instead of JS object traversal — see [performance estimates](#performance-and-memory-estimates) below |
+| **Lazy encoded path** | Uint32 code encoding per dimension (code 0 = null, 1..n = distinct values), 2x-amortized codes buffer growth on append, incremental `codeCounts` updates, `filterRange` target-codes caching, `groupAll` O(1) fast path, scratch buffer reuse across filter cycles | Appends are O(batch) not O(n log n) — a 10K append into 90K existing records skips the full re-sort and re-reduce |
+| **Aggregation** | Declarative KPIs (`count`, `sum`, `avg`, `avgNonZero`), declarative groups with time bucketing (`minute`/`hour`/`day`/`week`/`month`), split-field groups for nested aggregates keyed by a secondary dimension, incremental group updates on append | One config object replaces dozens of imperative `dimension().group().reduce()` chains |
+| **Worker runtime** | `createStreamingDashboardWorker` owns fetch → decode → filter → reduce → postMessage with Transferable typed-array buffers (zero-copy back to main thread); `createDashboardRuntime` for synchronous fallback; single `query()` round-trip returns filters + snapshot + paged rows + optional `rowCount` and `bounds` | The main thread only renders; structured-clone overhead is eliminated for the largest payloads (column arrays) |
+| **Query model** | Declarative filters (`exact`, `in`, `range`), `isolatedFilters` for within-group filtering without affecting global state, `rowSets` for multiple named row slices per query, `bounds` queries for min/max, ad-hoc `groups` queries | One postMessage round-trip replaces what would otherwise be 4-8 separate calls |
+| **Progressive UI** | Partial snapshot emission during streaming load (throttled at 250ms default), separate fetch-percent and rows-loaded progress events (throttled at 100ms) | Charts and KPIs appear within seconds even on million-row datasets |
+| **Live mutation** | `append()` slots new rows into existing lazy indexes incrementally; `removeFiltered()` rebuilds `codeCounts` safely and re-filters | Dashboards stay live without full rebuild |
+| **Instance extensions** | `cf.allFilteredIndexes()`, `cf.isElementFiltered(index)`, `cf.takeColumns(indexes, fields)`, `cf.configureRuntime()` / `cf.runtimeInfo()` for per-instance WASM control | Columnar extraction and filter introspection without materializing rows |
+| **Demo** | Two production-grade stockout dashboards — a **store manager** view (7 panels, 3 coordinated crossfilter workers, ECharts, Cube.dev meta-driven colors) and an **operator** view (priority queue, focus panel, DOW guidance, category/trend charts) | Proves the architecture end-to-end: columnar-native rendering, URL-driven state, faceted store selector, peer comparison, isolated filters, sensitivity toggles |
+
+The original crossfilter API (`cf.dimension()`, `group.all()`, etc.) is fully preserved — everything above is additive.
+
+### Performance and memory estimates
+
+These are analytical estimates based on the architecture — not synthetic benchmarks. Actual results depend on dataset shape, dimension cardinality, and browser.
+
+#### Filter scan throughput (WASM vs JS)
+
+The WASM module operates on flat `Uint32Array` codes in linear memory. The JS fallback (`denseLookupMatches`) builds a marks array and iterates in JS. Both do the same work — the difference is memory access pattern and JIT overhead.
+
+| Operation | JS fallback | WASM (`markFilterInU32`) | Speedup estimate |
+|-----------|------------|--------------------------|------------------|
+| `filterIn` on 100K rows, 50 target values | ~2-4ms | ~0.5-1.5ms | ~2-3x |
+| `filterIn` on 1M rows, 50 target values | ~20-40ms | ~5-15ms | ~2-4x |
+| `filterExact` on 100K rows | ~0.5-1ms | ~0.2-0.5ms | ~2x |
+
+The small-target path (`filterInU32`, k ≤ 4) uses a tight O(n*k) nested loop — effective for `filterExact` and small `filterIn` sets where the marks array setup cost would dominate.
+
+#### Memory footprint per dimension
+
+| Component | Size for N rows | Example (100K rows) |
+|-----------|----------------|---------------------|
+| `codes` (Uint32Array, 2x capacity) | 4 × 2N bytes | 800 KB |
+| `codeCounts` (Uint32Array) | 4 × cardinality bytes | 4 KB (1000 distinct) |
+| `codeToValue` (Array) | ~50 × cardinality bytes | 50 KB |
+| `selected` (Uint8Array) | N bytes | 100 KB |
+| Filter bitmask (Uint8/16/32) | 1-4 × N bytes | 100-400 KB |
+| **Total per dimension** | **~6-10 bytes/row** | **~1 MB** |
+
+Adding a dimension costs ~6-10 bytes per row. The 32-dimension limit (bitmask width) means worst-case overhead is ~320 bytes/row.
+
+#### Row materialization savings
+
+In upstream crossfilter, every record is a JS object from the start. In this fork, columnar ingest creates Proxy-backed arrays — rows materialize only on access.
+
+| Scenario | Upstream (all rows as objects) | This fork (columnar + lazy) | Savings |
+|----------|-------------------------------|----------------------------|---------|
+| 10K rows, 20 fields, 50 visible | ~5 MB (10K objects × ~500 bytes) | ~25 KB (50 objects) + columnar arrays already in memory | ~5 MB heap, ~10K fewer GC objects |
+| 100K rows, 20 fields, 50 visible | ~50 MB | ~25 KB + columnar | ~50 MB heap |
+| 1M rows, 20 fields, 100 visible | ~500 MB | ~50 KB + columnar | ~500 MB heap |
+
+The columnar arrays themselves (one typed/string array per field) are the same size either way — the saving is entirely in not creating N row objects with N × fields property slots.
+
+#### Worker round-trip savings
+
+The demo's store manager dashboard previously used 4 identical `rowSets` (stockout, forecast, risk, warning) all requesting the same 20+ fields with limit 10,000. Consolidating to a single `rowSet` cuts structured-clone serialization by ~75% per refresh cycle.
+
+| Metric | Before (4 rowSets) | After (1 rowSet) | Savings |
+|--------|--------------------|--------------------|---------|
+| Structured-clone per refresh | ~4 × columnar payload | 1 × columnar payload | ~75% less serialization |
+| postMessage overhead | 4 typed-array transfers | 1 typed-array transfer | 3 fewer Transferable handoffs |
+
+#### Append performance (lazy path)
+
+| Operation | Upstream | This fork (lazy encoded) | Why |
+|-----------|----------|--------------------------|-----|
+| Append 10K rows to 90K | O(n log n) re-sort + full reduce | O(m) codes extension + incremental codeCounts | Codes buffer grows 2x amortized; existing sorted indexes untouched |
+| groupAll after append | O(n) full scan | O(1) mark update | Singleton groups skip sorted-key rebuild |
+
+#### Panel rendering optimizations (demo-stockout)
+
+| Optimization | Per-render savings estimate |
+|-------------|---------------------------|
+| Direct column rendering (skip `materializeRows`) | Avoid allocating N row objects per render cycle |
+| O(1) lookup predicates (vs `String().toUpperCase()`) | ~10-50 µs saved per 10K-row filter pass |
+| `colorFor()` memoization | Eliminates repeated meta lookup + threshold scan for same field/value pairs |
+| Single-pass `populateSelects` | 1 loop instead of 2 over the same index array |
+| Row-outer DOW loop (N×7 vs 7×N) | Better cache locality for columnar access |
+| Store filter caching | Avoids re-filtering 4 arrays on every render when store hasn't changed |
+| Day button class toggle | DOM class swap instead of full innerHTML rebuild on click |
 
 ## Installation
 
