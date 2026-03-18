@@ -256,7 +256,6 @@ function cacheDom() {
     eventPills: document.getElementById('event-pills'),
     filterChips: document.getElementById('filter-chips'),
     granularityButtons: Array.from(document.querySelectorAll('#granularity-selector .gran-btn')),
-    headerSubtitle: document.querySelector('.header-subtitle'),
     kpiLocations: document.getElementById('kpi-locations'),
     kpiRows: document.getElementById('kpi-rows'),
     kpiTimespan: document.getElementById('kpi-timespan'),
@@ -264,7 +263,7 @@ function cacheDom() {
     latencyDisplay: document.getElementById('latency-display'),
     loadTime: document.getElementById('load-time'),
     loadingOverlay: document.getElementById('loading-overlay'),
-    loadingText: document.querySelector('.loading-text'),
+    loadingText: document.querySelector('.loading-subtitle'),
     localitySortLabel: document.getElementById('locality-sort-label'),
     localitySortToggle: document.getElementById('locality-sort-toggle'),
     modeSelector: document.getElementById('mode-selector'),
@@ -397,8 +396,18 @@ function setKpiCard(card, value, label) {
 }
 
 function setLoading(visible, text) {
-  dom.loadingOverlay.style.display = visible ? 'flex' : 'none';
-  if (text) {
+  if (visible) {
+    dom.loadingOverlay.removeAttribute('hidden');
+    dom.loadingOverlay.classList.remove('fade-out');
+    dom.loadingOverlay.style.display = '';
+  } else {
+    dom.loadingOverlay.classList.add('fade-out');
+    setTimeout(function () {
+      dom.loadingOverlay.setAttribute('hidden', '');
+      dom.loadingOverlay.classList.remove('fade-out');
+    }, 500);
+  }
+  if (text && dom.loadingText) {
     dom.loadingText.textContent = text;
   }
 }
@@ -2614,6 +2623,14 @@ function attachControlListeners() {
       }
     });
   });
+
+  var devDrawerToggle = document.getElementById('dev-drawer-toggle');
+  var devDrawer = document.getElementById('dev-drawer');
+  if (devDrawerToggle && devDrawer) {
+    devDrawerToggle.addEventListener('click', function () {
+      devDrawer.open = !devDrawer.open;
+    });
+  }
 }
 
 function initStaticUi() {
@@ -2636,9 +2653,6 @@ function initStaticUi() {
     dom.removeFilteredBtn.textContent = 'Remove Excluded';
     dom.removeFilteredBtn.title = 'Delete rows currently excluded by the active filters';
   }
-  if (dom.headerSubtitle) {
-    dom.headerSubtitle.textContent = 'Interactive Demo';
-  }
   updateProgressBadge(null);
   setKpiCard(dom.kpiTotal, '—', 'Total Count');
   setKpiCard(dom.kpiLocations, '—', 'Visible Regions');
@@ -2656,6 +2670,7 @@ function initStaticUi() {
 async function start() {
   cacheDom();
   await hydrateInitialDataSource();
+  state.filters[FIELDS.event] = ['Stay Ended'];
   initStaticUi();
   attachControlListeners();
   if (state.dataSource === 'live') {
