@@ -90,7 +90,7 @@ var CONFIGS = {
     cubeQueryDimensions: [
       'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
-      'dow_pattern', 'highest_risk_day',
+      'dow_pattern', 'highest_risk_day', 'signal_quality',
       'dow_mon_confirmed', 'dow_tue_confirmed', 'dow_wed_confirmed',
       'dow_thu_confirmed', 'dow_fri_confirmed', 'dow_sat_confirmed', 'dow_sun_confirmed',
       'dow_mon_total', 'dow_tue_total', 'dow_wed_total',
@@ -113,7 +113,7 @@ var CONFIGS = {
     workerDimensions: [
       'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
-      'dow_pattern', 'highest_risk_day',
+      'dow_pattern', 'highest_risk_day', 'signal_quality',
     ],
     workerKpis: [],
     workerGroups: [],

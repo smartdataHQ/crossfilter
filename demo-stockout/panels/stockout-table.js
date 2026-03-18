@@ -1,8 +1,9 @@
 // demo-stockout/panels/stockout-table.js
 
-import { columnarToRows, countedOptions, esc, isActive, fieldBadge, fmtDur, fmtISK, fmtFreq, sortableHeader, attachSortHandlers } from './helpers.js';
+import { getColumns, filterIndices, sortIndices, countsToOptions, esc, isActive, fieldBadge, fmtDur, fmtISK, fmtFreq, sortableHeader, attachSortHandlers } from './helpers.js';
 
-var allRows = [];
+var columns = null;
+var allIndices = [];
 var catSelect = null;
 var supSelect = null;
 var sortField = 'risk_score';
@@ -29,55 +30,66 @@ export function renderStockoutTable(storeResult) {
   catSelect = catSelect || document.getElementById('stockout-cat-filter');
   supSelect = supSelect || document.getElementById('stockout-sup-filter');
 
-  var rows = columnarToRows(storeResult);
-  allRows = rows.filter(function (r) { return isActive(r.is_currently_active); });
-  sortRows();
-
-  populateSelects(allRows);
-  renderFiltered();
-}
-
-function sortRows() {
-  var field = sortField;
-  var dir = sortDir;
-  allRows.sort(function (a, b) {
-    var av = a[field], bv = b[field];
-    if (typeof av === 'string') av = av.toLowerCase();
-    if (typeof bv === 'string') bv = bv.toLowerCase();
-    av = av == null ? '' : av;
-    bv = bv == null ? '' : bv;
-    if (av < bv) return -1 * dir;
-    if (av > bv) return 1 * dir;
-    return 0;
+  var data = getColumns(storeResult);
+  columns = data.columns;
+  allIndices = filterIndices(columns, data.length, function (cols, i) {
+    return isActive(cols.is_currently_active ? cols.is_currently_active[i] : null);
   });
+  sortIndices(allIndices, columns, sortField, sortDir);
+
+  populateSelects();
+  renderFiltered();
 }
 
 function onSort(field) {
   if (sortField === field) sortDir *= -1;
   else { sortField = field; sortDir = -1; }
-  sortRows();
+  sortIndices(allIndices, columns, sortField, sortDir);
   renderFiltered();
 }
 
-function populateSelects(rows) {
-  if (!catSelect || !supSelect) return;
+function populateSelects() {
+  if (!catSelect || !supSelect || !columns) return;
   var prevCat = catSelect.value, prevSup = supSelect.value;
-  catSelect.innerHTML = '<option value="">All Categories (' + rows.length + ')</option>' + countedOptions(rows, 'product_category');
-  supSelect.innerHTML = '<option value="">All Suppliers (' + rows.length + ')</option>' + countedOptions(rows, 'supplier');
+  var catCol = columns.product_category, supCol = columns.supplier;
+  var catCounts = {}, supCounts = {};
+  for (var i = 0; i < allIndices.length; ++i) {
+    var idx = allIndices[i];
+    var cv = catCol ? catCol[idx] : null;
+    var sv = supCol ? supCol[idx] : null;
+    if (cv != null && cv !== '') catCounts[cv] = (catCounts[cv] || 0) + 1;
+    if (sv != null && sv !== '') supCounts[sv] = (supCounts[sv] || 0) + 1;
+  }
+  catSelect.innerHTML = '<option value="">All Categories (' + allIndices.length + ')</option>' + countsToOptions(catCounts);
+  supSelect.innerHTML = '<option value="">All Suppliers (' + allIndices.length + ')</option>' + countsToOptions(supCounts);
   catSelect.value = prevCat; supSelect.value = prevSup;
   catSelect.onchange = renderFiltered; supSelect.onchange = renderFiltered;
 }
 
+var panelEl = null;
+var stockoutCountEl = null;
+
 function renderFiltered() {
-  var el = document.getElementById('panel-stockout-table');
-  var countEl = document.getElementById('stockout-count');
-  if (!el) return;
+  panelEl = panelEl || document.getElementById('panel-stockout-table');
+  stockoutCountEl = stockoutCountEl || document.getElementById('stockout-count');
+  var el = panelEl;
+  var countEl = stockoutCountEl;
+  if (!el || !columns) return;
 
   var catVal = catSelect ? catSelect.value : '';
   var supVal = supSelect ? supSelect.value : '';
-  var filtered = allRows;
-  if (catVal) filtered = filtered.filter(function (r) { return r.product_category === catVal; });
-  if (supVal) filtered = filtered.filter(function (r) { return r.supplier === supVal; });
+  var filtered = allIndices;
+  if (catVal || supVal) {
+    var catCol = columns.product_category;
+    var supCol = columns.supplier;
+    filtered = [];
+    for (var f = 0; f < allIndices.length; ++f) {
+      var idx = allIndices[f];
+      if (catVal && catCol && catCol[idx] !== catVal) continue;
+      if (supVal && supCol && supCol[idx] !== supVal) continue;
+      filtered.push(idx);
+    }
+  }
   if (countEl) countEl.textContent = filtered.length + ' products';
 
   if (!filtered.length) {
@@ -85,16 +97,19 @@ function renderFiltered() {
     return;
   }
 
+  var cProduct = columns.product, cPattern = columns.stockout_pattern;
+  var cDur = columns.avg_duration_days, cLost = columns.total_expected_lost_sales;
+  var cTrend = columns.trend_signal, cFreq = columns.stockouts_per_month;
   var html = '<table class="tbl">' + sortableHeader(COLUMNS, sortField, sortDir) + '<tbody>';
   for (var i = 0; i < filtered.length; ++i) {
-    var r = filtered[i];
-    html += '<tr data-product="' + esc(r.product) + '" style="cursor:pointer">' +
-      '<td class="val">' + esc(r.product) + '</td>' +
-      '<td>' + fieldBadge('stockout_pattern', r.stockout_pattern) + '</td>' +
-      '<td>' + fmtDur(r.avg_duration_days) + '</td>' +
-      '<td>' + fmtISK(r.total_expected_lost_sales) + '</td>' +
-      '<td>' + fieldBadge('trend_signal', r.trend_signal) + '</td>' +
-      '<td>' + fmtFreq(r.stockouts_per_month) + '</td>' +
+    var idx = filtered[i];
+    html += '<tr data-product="' + esc(cProduct[idx]) + '" style="cursor:pointer">' +
+      '<td class="val">' + esc(cProduct[idx]) + '</td>' +
+      '<td>' + fieldBadge('stockout_pattern', cPattern[idx]) + '</td>' +
+      '<td>' + fmtDur(cDur[idx]) + '</td>' +
+      '<td>' + fmtISK(cLost[idx]) + '</td>' +
+      '<td>' + fieldBadge('trend_signal', cTrend[idx]) + '</td>' +
+      '<td>' + fmtFreq(cFreq[idx]) + '</td>' +
       '</tr>';
   }
   el.innerHTML = html + '</tbody></table>';

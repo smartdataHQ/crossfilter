@@ -10,16 +10,16 @@
 //   - sold_location is a crossfilter dimension — store switching is instant
 //   - Color/label config loaded from Cube /api/meta (Principle 6)
 //
-// Query batching (3 postMessage round-trips per refresh):
-//   - cf-main:  query({ snapshot, rowSets: { stockout, forecast, risk, warning } })
-//   - cf-dow:   rows({ fields, columnar: true })
-//   - cf-trend: query({ groups: { byStoreDay } }) — unfiltered by store for peer bands
+// Query batching (1 postMessage round-trip per worker per refresh):
+//   - cf-main:  query({ filters, snapshot, rowSets: { stockout, forecast, risk, warning } })
+//   - cf-dow:   query({ filters, rows: { ... } })
+//   - cf-trend: query({ filters, groups: { byStoreDay } }) — peer bands (no store filter)
 
 import { registerTheme, THEME_NAME } from './theme.js';
 import { getState, setState, onStateChange, PARAM_TO_DIMENSION, buildDashboardFilters } from './router.js';
 import { ALL_CUBE_IDS, buildWorkerOptions, fetchStoreList, fetchEndedYesterday, fetchStartedYesterday, fetchEndedDayBefore, fetchStartedDayBefore, fetchMeta, getCubeConfig } from './cube-registry.js';
 import { loadMeta, namedColor } from './config.js';
-import { registerRuntime, dispatchFilters, disposeAll, onPanelRefresh } from './filter-router.js';
+import { registerRuntime, disposeAll } from './filter-router.js';
 import { renderKpis } from './panels/kpis.js';
 import { renderStockoutTable, onProductClick } from './panels/stockout-table.js';
 import { renderForecast } from './panels/forecast.js';
@@ -49,6 +49,11 @@ var endedCategoryFilter = null;
 var benchmarkChart = null;
 var benchmarkGranularity = 'week';  // 'week' or 'month'
 var benchmarkMetric = 'availability';
+var BENCHMARK_METRIC_CONFIG = {
+  availability: { label: 'Availability %', unit: '%', invert: true, format: function (v) { return v.toFixed(1) + '%'; } },
+  events: { label: 'Stockout Events', unit: '', invert: false, format: function (v) { return Math.round(v); } },
+  duration: { label: 'Avg Duration (days)', unit: 'd', invert: false, format: function (v) { return v.toFixed(1) + 'd'; } },
+};
 var benchmarkProduct = null;
 var compareStores = [];  // stores to show as individual lines
 var COMPARE_COLORS = ['#b366ff', '#ff8c4d', '#00e6e6', '#e6e600', '#ff66b2'];
@@ -133,21 +138,21 @@ function buildStoreFacets() {
 }
 
 // Update active counts from cf-main data (called after workers ready)
+// Uses isolatedFilters to read all-store data without mutating persistent filter state.
 async function updateActiveFacets(facets) {
   if (!runtimes['cf-main']) return facets;
   try {
-    // Temporarily clear store filter to get all-store data
-    await runtimes['cf-main'].updateFilters({});
-    var result = await runtimes['cf-main'].rows({
-      fields: ['sold_location', 'is_currently_active'],
-      limit: 100000,
-      columnar: true,
+    var result = await runtimes['cf-main'].query({
+      isolatedFilters: {},
+      snapshot: false,
+      rows: {
+        fields: ['sold_location', 'is_currently_active'],
+        limit: 100000,
+        columnar: true,
+      },
     });
-    // Restore current filter
-    if (currentStore) {
-      await runtimes['cf-main'].updateFilters({ sold_location: { type: 'in', values: [currentStore] } });
-    }
-    var cols = result && result.columns ? result.columns : result;
+    var rows = result && result.rows;
+    var cols = rows && rows.columns ? rows.columns : rows;
     if (cols && cols.sold_location) {
       for (var i = 0; i < cols.sold_location.length; ++i) {
         var loc = cols.sold_location[i];
@@ -401,6 +406,11 @@ async function createWorkers() {
       var opts = buildWorkerOptions(cubeId);
       updateProgress('Connecting to ' + cubeId);
       return crossfilter.createStreamingDashboardWorker(opts).then(function (runtime) {
+        runtime.on('progress', function (p) {
+          var pct = p.fetch && p.fetch.percent ? Math.round(p.fetch.percent) : 0;
+          var loaded = p.load ? p.load.rowsLoaded : 0;
+          updateProgress(cubeId + ': ' + loaded + ' rows (' + pct + '%)');
+        });
         return runtime.ready.then(function (readyPayload) {
           progress.workers++;
           var rows = readyPayload && readyPayload.load ? readyPayload.load.rowsLoaded : '?';
@@ -484,7 +494,7 @@ var MAIN_FIELDS = [
   'is_currently_active', 'highest_risk_day',
   'stockouts_per_month', 'days_since_last',
   'forecast_stockout_probability', 'forecast_warning',
-  'forecast_tier', 'risk_tier',
+  'risk_tier',
   // Trending half-comparisons (for delta columns)
   'avg_duration_recent_half', 'avg_duration_older_half',
   'frequency_recent_per_month', 'frequency_older_per_month',
@@ -501,22 +511,26 @@ var DOW_FIELDS = [
   'weekday_stockout_rate', 'weekend_stockout_rate', 'dow_pattern', 'highest_risk_day',
 ];
 
-async function refreshAllPanels() {
+var refreshSeq = 0;
+
+async function refreshAllPanels(state) {
   if (!workersReady) return;
+  if (!state) state = getState();
+  var seq = ++refreshSeq;
 
   var promises = [];
 
-  // cf-main: ONE query with snapshot + 4 rowSets (1 postMessage round-trip)
+  // cf-main: filters + snapshot + 4 rowSets (1 postMessage round-trip)
   if (runtimes['cf-main']) {
+    var mainConfig = getCubeConfig('cf-main');
+    var mainFilters = buildDashboardFilters(state, mainConfig.workerDimensions);
     promises.push(
       runtimes['cf-main'].query({
+        filters: mainFilters,
         snapshot: {},
         rowCount: true,
         rowSets: {
-          stockout: { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
-          forecast: { fields: MAIN_FIELDS, limit: 10000, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
-          risk:     { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
-          warning:  { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
+          all: { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
         },
       }).catch(function (err) { console.error('cf-main query failed:', err); return null; })
     );
@@ -524,11 +538,23 @@ async function refreshAllPanels() {
     promises.push(Promise.resolve(null));
   }
 
-  // cf-dow: ONE rows() call (1 postMessage round-trip)
+  // cf-dow: filters + rows (1 postMessage round-trip)
   if (runtimes['cf-dow']) {
+    var dowConfig = getCubeConfig('cf-dow');
+    var dowFilters;
+    if (dowSelectedProduct) {
+      // Product isolation: only store + product, no other URL filters
+      dowFilters = {};
+      if (state.store) dowFilters.sold_location = { type: 'in', values: [state.store] };
+      dowFilters.product = { type: 'in', values: [dowSelectedProduct] };
+    } else {
+      dowFilters = buildDashboardFilters(state, dowConfig.workerDimensions);
+    }
     promises.push(
-      runtimes['cf-dow'].rows({
-        fields: DOW_FIELDS, limit: 50000, columnar: true,
+      runtimes['cf-dow'].query({
+        filters: dowFilters,
+        snapshot: false,
+        rows: { fields: DOW_FIELDS, limit: 50000, columnar: true },
       }).catch(function (err) { console.error('cf-dow query failed:', err); return null; })
     );
   } else {
@@ -536,8 +562,10 @@ async function refreshAllPanels() {
   }
 
   var results = await Promise.all(promises);
+  if (seq !== refreshSeq) return; // stale — newer refresh superseded this one
   var mainResult = results[0];
-  var dowRows = results[1];
+  var dowResult = results[1];
+  var dowRows = dowResult ? dowResult.rows : null;
 
   // Render all panels synchronously from batched results
   var ended = endedForStore();
@@ -547,10 +575,11 @@ async function refreshAllPanels() {
 
   if (mainResult) {
     renderKpis(mainResult.snapshot, ended, started, endedPrev, startedPrev);
-    renderStockoutTable(mainResult.rowSets.stockout);
-    renderForecast(mainResult.rowSets.forecast);
-    renderRiskChart(mainResult.rowSets.risk);
-    renderEarlyWarning(mainResult.rowSets.warning);
+    var mainRows = mainResult.rowSets.all;
+    renderStockoutTable(mainRows);
+    renderForecast(mainRows);
+    renderRiskChart(mainRows);
+    renderEarlyWarning(mainRows);
   } else {
     renderKpis(null, ended, started, endedPrev, startedPrev);
     document.getElementById('panel-stockout-table').innerHTML = '<div class="panel-empty">Data unavailable</div>';
@@ -561,7 +590,6 @@ async function refreshAllPanels() {
   renderDowPattern(dowRows, echarts, THEME_NAME);
   refreshEndedYesterday();
   renderFilterChips();
-  refreshBenchmarkChart();
 }
 
 // ---- Ended Yesterday (local data, filtered by store in JS) ----
@@ -810,12 +838,12 @@ function renderCompareChips() {
   btn.textContent = compareStores.length ? '+' : '+ Compare';
 }
 
-async function refreshBenchmarkChart() {
+async function refreshBenchmarkChart(state) {
   if (!runtimes['cf-trend'] || !currentStore) return;
+  if (!state) state = getState();
 
-  // Build isolated filter set: mirror all dashboard filters EXCEPT sold_location,
+  // Build filter set: mirror all dashboard filters EXCEPT sold_location,
   // override product with benchmarkProduct if set
-  var state = getState();
   var trendConfig = getCubeConfig('cf-trend');
   var benchmarkFilters = buildDashboardFilters(state, trendConfig.workerDimensions);
   delete benchmarkFilters.sold_location;
@@ -828,7 +856,7 @@ async function refreshBenchmarkChart() {
   var result;
   try {
     result = await runtimes['cf-trend'].query({
-      isolatedFilters: benchmarkFilters,
+      filters: benchmarkFilters,
       snapshot: false,
       groups: {
         byStoreDay: {
@@ -879,13 +907,7 @@ function renderBenchmarkChart(groupData) {
 
   var buckets = bucketDates(allDates, benchmarkGranularity);
 
-  // Metric config
-  var METRIC_CONFIG = {
-    availability: { label: 'Availability %', unit: '%', invert: true, format: function (v) { return v.toFixed(1) + '%'; } },
-    events: { label: 'Stockout Events', unit: '', invert: false, format: function (v) { return Math.round(v); } },
-    duration: { label: 'Avg Duration (days)', unit: 'd', invert: false, format: function (v) { return v.toFixed(1) + 'd'; } },
-  };
-  var mc = METRIC_CONFIG[benchmarkMetric] || METRIC_CONFIG.availability;
+  var mc = BENCHMARK_METRIC_CONFIG[benchmarkMetric] || BENCHMARK_METRIC_CONFIG.availability;
 
   var labels = [];
   var selectedLine = [];
@@ -1002,11 +1024,10 @@ function renderBenchmarkChart(groupData) {
       : storeCount + ' stores · ' + benchmarkGranularity + 'ly';
   }
 
-  if (benchmarkChart && !benchmarkChart.isDisposed()) {
-    benchmarkChart.dispose();
+  if (!benchmarkChart || benchmarkChart.isDisposed()) {
+    el.innerHTML = '';
+    benchmarkChart = echarts.init(el, THEME_NAME, { renderer: 'canvas' });
   }
-  el.innerHTML = '';
-  benchmarkChart = echarts.init(el, THEME_NAME, { renderer: 'canvas' });
 
   benchmarkChart.setOption({
     animation: false,
@@ -1205,16 +1226,35 @@ async function applyDowFilters() {
   var filters = {};
   if (state.store) filters.sold_location = { type: 'in', values: [state.store] };
   if (dowSelectedProduct) filters.product = { type: 'in', values: [dowSelectedProduct] };
-  await runtimes['cf-dow'].updateFilters(filters);
   try {
-    var result = await runtimes['cf-dow'].rows({ fields: DOW_FIELDS, limit: 50000, columnar: true });
-    renderDowPattern(result, echarts, THEME_NAME);
+    var result = await runtimes['cf-dow'].query({
+      filters: filters,
+      snapshot: false,
+      rows: { fields: DOW_FIELDS, limit: 50000, columnar: true },
+    });
+    renderDowPattern(result.rows, echarts, THEME_NAME);
   } catch (err) { console.error('DOW query failed:', err); }
 }
 
-// ---- State Change Handler ----
+// ---- State Change Handler (RAF-coalesced) ----
 
-onStateChange(async function (newState, prevState) {
+var pendingRefreshState = null;
+var pendingRaf = null;
+
+function scheduleRefresh(state) {
+  pendingRefreshState = state;
+  if (!pendingRaf) {
+    pendingRaf = requestAnimationFrame(function () {
+      pendingRaf = null;
+      var s = pendingRefreshState;
+      pendingRefreshState = null;
+      refreshAllPanels(s);
+      refreshBenchmarkChart(s);
+    });
+  }
+}
+
+onStateChange(function (newState, prevState) {
   // No store selected → show picker
   if (!newState.store) {
     dom.dashboard.setAttribute('hidden', '');
@@ -1235,14 +1275,8 @@ onStateChange(async function (newState, prevState) {
 
   if (!workersReady) return; // still loading
 
-  // Dispatch sold_location + other filters to ALL runtimes (instant, client-side)
-  await dispatchFilters(newState);
-  // Re-apply DOW product filter (dispatchFilters overwrites cf-dow filters)
-  if (dowSelectedProduct) await applyDowFilters();
-  await refreshAllPanels();
+  scheduleRefresh(newState);
 });
-
-onPanelRefresh(function () {});
 
 // ---- Resize ----
 
@@ -1270,8 +1304,8 @@ window.addEventListener('resize', function () {
     dom.picker.setAttribute('hidden', '');
     dom.dashboard.removeAttribute('hidden');
     populateStoreSelector();
-    await dispatchFilters(state);
-    await refreshAllPanels();
+    await refreshAllPanels(state);
+    refreshBenchmarkChart(state);
   } else {
     // No store → show picker
     populateStoreSelector();

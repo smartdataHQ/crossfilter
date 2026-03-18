@@ -1,9 +1,10 @@
 // demo-stockout/panels/forecast.js
 
-import { columnarToRows, countedOptions, esc, isActive, scoreBar, fieldBadge, fmtDaysAgo, fmtFreq, sortableHeader, attachSortHandlers } from './helpers.js';
+import { getColumns, filterIndices, sortIndices, countByColumn, countsToOptions, esc, isActive, scoreBar, fieldBadge, fmtDaysAgo, fmtFreq, sortableHeader, attachSortHandlers } from './helpers.js';
 import { colorFor } from '../config.js';
 
-var allRows = [];
+var columns = null;
+var allIndices = [];
 var dayBtnsEl = null;
 var catSelect = null;
 var supSelect = null;
@@ -21,6 +22,8 @@ var NEXT_DAYS = (function () {
   }
   return result;
 })();
+
+var FORECAST_TIERS = { CRITICAL: 1, Critical: 1, HIGH: 1, High: 1, MODERATE: 1, Moderate: 1 };
 
 var COLUMNS = [
   { key: 'product', label: 'Product', title: 'Product name' },
@@ -41,96 +44,119 @@ export function renderForecast(rowsResult) {
   catSelect = catSelect || document.getElementById('forecast-cat-filter');
   supSelect = supSelect || document.getElementById('forecast-sup-filter');
 
-  var rows = columnarToRows(rowsResult);
-  allRows = rows.filter(function (r) {
-    if (isActive(r.is_currently_active)) return false;
-    var tier = String(r.forecast_tier || '').toUpperCase();
-    return tier === 'CRITICAL' || tier === 'HIGH' || tier === 'MODERATE';
+  var data = getColumns(rowsResult);
+  columns = data.columns;
+  allIndices = filterIndices(columns, data.length, function (cols, i) {
+    if (isActive(cols.is_currently_active ? cols.is_currently_active[i] : null)) return false;
+    return FORECAST_TIERS[(cols.forecast_tier ? cols.forecast_tier[i] : '') || ''] === 1;
   });
-  sortRows();
+  sortIndices(allIndices, columns, sortField, sortDir);
 
   renderDayButtons();
-  populateSelects(allRows);
+  populateSelects();
   renderFiltered();
 
   if (cardsEl) {
-    var top = allRows.slice(0, 4);
-    cardsEl.innerHTML = top.map(function (r) {
-      var prob = Number(r.forecast_stockout_probability) || 0;
+    var cProd = columns.product, cProb = columns.forecast_stockout_probability;
+    var cardsHtml = '';
+    var topN = allIndices.length < 4 ? allIndices.length : 4;
+    for (var ci = 0; ci < topN; ++ci) {
+      var tidx = allIndices[ci];
+      var prob = +(cProb ? cProb[tidx] : 0) || 0;
       var color = colorFor('forecast_stockout_probability', prob);
-      return '<div class="forecast-card">' +
-        '<div class="forecast-card-title">' + esc(r.product) + '</div>' +
+      cardsHtml += '<div class="forecast-card">' +
+        '<div class="forecast-card-title">' + esc(cProd[tidx]) + '</div>' +
         '<div style="text-align:center;margin-top:8px">' +
         '<div style="font-family:var(--font-mono);font-size:24px;font-weight:700;color:' + color + '">' +
         Math.round(prob * 100) + '%</div>' +
         '<div style="font-family:var(--font-mono);font-size:9px;color:#4a5a6e;margin-top:4px">' +
         '<abbr title="3-day stockout probability">3-day prob</abbr></div>' +
         '</div></div>';
-    }).join('');
+    }
+    cardsEl.innerHTML = cardsHtml;
   }
-}
-
-function sortRows() {
-  var field = sortField;
-  var dir = sortDir;
-  allRows.sort(function (a, b) {
-    var av = a[field], bv = b[field];
-    if (typeof av === 'string') av = av.toLowerCase();
-    if (typeof bv === 'string') bv = bv.toLowerCase();
-    av = av == null ? '' : av;
-    bv = bv == null ? '' : bv;
-    if (av < bv) return -1 * dir;
-    if (av > bv) return 1 * dir;
-    return 0;
-  });
 }
 
 function onSort(field) {
   if (sortField === field) sortDir *= -1;
   else { sortField = field; sortDir = -1; }
-  sortRows();
+  sortIndices(allIndices, columns, sortField, sortDir);
   renderFiltered();
 }
 
+var dayBtnsBuilt = false;
+
 function renderDayButtons() {
-  if (!dayBtnsEl) return;
+  if (!dayBtnsEl || !columns) return;
+  var dayCounts = countByColumn(columns, allIndices, 'highest_risk_day');
   var html = '<button class="day-btn' + (!selectedDay ? ' day-active' : '') + '" data-day="">All</button>';
   for (var i = 0; i < NEXT_DAYS.length; ++i) {
     var day = NEXT_DAYS[i];
-    var count = allRows.filter(function (r) { return r.highest_risk_day === day; }).length;
+    var count = dayCounts[day] || 0;
     html += '<button class="day-btn' + (selectedDay === day ? ' day-active' : '') +
       '" data-day="' + day + '">' + day + ' (' + count + ')</button>';
   }
   dayBtnsEl.innerHTML = html;
-  dayBtnsEl.onclick = function (e) {
-    var btn = e.target.closest('.day-btn');
-    if (!btn) return;
-    selectedDay = btn.dataset.day;
-    renderDayButtons();
-    renderFiltered();
-  };
+  if (!dayBtnsBuilt) {
+    dayBtnsBuilt = true;
+    dayBtnsEl.onclick = function (e) {
+      var btn = e.target.closest('.day-btn');
+      if (!btn) return;
+      selectedDay = btn.dataset.day;
+      var btns = dayBtnsEl.querySelectorAll('.day-btn');
+      for (var j = 0; j < btns.length; ++j) {
+        if (btns[j].dataset.day === selectedDay) btns[j].classList.add('day-active');
+        else btns[j].classList.remove('day-active');
+      }
+      renderFiltered();
+    };
+  }
 }
 
-function populateSelects(rows) {
-  if (!catSelect || !supSelect) return;
+function populateSelects() {
+  if (!catSelect || !supSelect || !columns) return;
   var prevCat = catSelect.value, prevSup = supSelect.value;
-  catSelect.innerHTML = '<option value="">All Categories (' + rows.length + ')</option>' + countedOptions(rows, 'product_category');
-  supSelect.innerHTML = '<option value="">All Suppliers (' + rows.length + ')</option>' + countedOptions(rows, 'supplier');
+  var catCol = columns.product_category, supCol = columns.supplier;
+  var catCounts = {}, supCounts = {};
+  for (var i = 0; i < allIndices.length; ++i) {
+    var idx = allIndices[i];
+    var cv = catCol ? catCol[idx] : null;
+    var sv = supCol ? supCol[idx] : null;
+    if (cv != null && cv !== '') catCounts[cv] = (catCounts[cv] || 0) + 1;
+    if (sv != null && sv !== '') supCounts[sv] = (supCounts[sv] || 0) + 1;
+  }
+  catSelect.innerHTML = '<option value="">All Categories (' + allIndices.length + ')</option>' + countsToOptions(catCounts);
+  supSelect.innerHTML = '<option value="">All Suppliers (' + allIndices.length + ')</option>' + countsToOptions(supCounts);
   catSelect.value = prevCat; supSelect.value = prevSup;
   catSelect.onchange = renderFiltered; supSelect.onchange = renderFiltered;
 }
 
+var forecastTableEl = null;
+var forecastCountEl = null;
+
 function renderFiltered() {
-  var tableEl = document.getElementById('panel-forecast-table');
-  var countEl = document.getElementById('forecast-count');
-  if (!tableEl) return;
+  forecastTableEl = forecastTableEl || document.getElementById('panel-forecast-table');
+  forecastCountEl = forecastCountEl || document.getElementById('forecast-count');
+  var tableEl = forecastTableEl;
+  var countEl = forecastCountEl;
+  if (!tableEl || !columns) return;
 
   var catVal = catSelect ? catSelect.value : '';
   var supVal = supSelect ? supSelect.value : '';
-  var filtered = allRows;
-  if (selectedDay) filtered = filtered.filter(function (r) { return r.highest_risk_day === selectedDay; });
-  if (catVal) filtered = filtered.filter(function (r) { return r.product_category === catVal; });
-  if (supVal) filtered = filtered.filter(function (r) { return r.supplier === supVal; });
+  var filtered = allIndices;
+  if (selectedDay || catVal || supVal) {
+    var dayCol = columns.highest_risk_day;
+    var catCol = columns.product_category;
+    var supCol = columns.supplier;
+    filtered = [];
+    for (var f = 0; f < allIndices.length; ++f) {
+      var idx = allIndices[f];
+      if (selectedDay && dayCol && dayCol[idx] !== selectedDay) continue;
+      if (catVal && catCol && catCol[idx] !== catVal) continue;
+      if (supVal && supCol && supCol[idx] !== supVal) continue;
+      filtered.push(idx);
+    }
+  }
   if (countEl) countEl.textContent = filtered.length + ' at risk';
 
   if (!filtered.length) {
@@ -139,17 +165,21 @@ function renderFiltered() {
     return;
   }
 
+  var cProduct = columns.product, cProb = columns.forecast_stockout_probability;
+  var cRisk = columns.risk_score, cDay = columns.highest_risk_day;
+  var cTrend = columns.trend_signal, cLast = columns.days_since_last;
+  var cFreq = columns.stockouts_per_month;
   var html = '<table class="tbl">' + sortableHeader(COLUMNS, sortField, sortDir) + '<tbody>';
   for (var i = 0; i < filtered.length; ++i) {
-    var r = filtered[i];
+    var idx = filtered[i];
     html += '<tr>' +
-      '<td class="val">' + esc(r.product) + '</td>' +
-      '<td>' + scoreBar(Number(r.forecast_stockout_probability) || 0, 'forecast_stockout_probability') + '</td>' +
-      '<td>' + scoreBar(Number(r.risk_score) || 0, 'risk_score') + '</td>' +
-      '<td>' + esc(r.highest_risk_day) + '</td>' +
-      '<td>' + fieldBadge('trend_signal', r.trend_signal) + '</td>' +
-      '<td>' + fmtDaysAgo(r.days_since_last) + '</td>' +
-      '<td>' + fmtFreq(r.stockouts_per_month) + '</td>' +
+      '<td class="val">' + esc(cProduct[idx]) + '</td>' +
+      '<td>' + scoreBar(+(cProb[idx]) || 0, 'forecast_stockout_probability') + '</td>' +
+      '<td>' + scoreBar(+(cRisk[idx]) || 0, 'risk_score') + '</td>' +
+      '<td>' + esc(cDay[idx]) + '</td>' +
+      '<td>' + fieldBadge('trend_signal', cTrend[idx]) + '</td>' +
+      '<td>' + fmtDaysAgo(cLast[idx]) + '</td>' +
+      '<td>' + fmtFreq(cFreq[idx]) + '</td>' +
       '</tr>';
   }
 

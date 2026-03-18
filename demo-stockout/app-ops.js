@@ -16,8 +16,9 @@ import {
   getCubeConfig,
 } from './cube-registry-ops.js';
 import { loadMeta, colorFor, namedColor } from './config.js';
-import { registerRuntime, dispatchFilters } from './filter-router.js';
-import { columnarToRows, esc, isActive, fieldBadge, fmtDur, fmtFreq, fmtISK, scoreBar } from './panels/helpers.js';
+import { registerRuntime } from './filter-router.js';
+import { buildDashboardFilters } from './router.js';
+import { getColumns, filterIndices, sortIndices, materializeRows, esc, isActive, fieldBadge, fmtDur, fmtFreq, fmtISK, scoreBar } from './panels/helpers.js';
 
 var crossfilter = globalThis.crossfilter;
 var echarts = globalThis.echarts;
@@ -147,24 +148,35 @@ function trendIndicator(current, previous, invertGood) {
   return '<span class="kpi-trend" style="color:' + color + '">' + arrow + ' ' + Math.abs(diff) + ' vs day before</span>';
 }
 
+var _storeFilterCache = {};
+
 function endedForStore() {
   if (!currentStore) return allEndedYesterday;
-  return allEndedYesterday.filter(function (row) { return row.store === currentStore; });
+  if (_storeFilterCache.store === currentStore && _storeFilterCache.ended) return _storeFilterCache.ended;
+  _storeFilterCache.store = currentStore;
+  _storeFilterCache.ended = allEndedYesterday.filter(function (row) { return row.store === currentStore; });
+  return _storeFilterCache.ended;
 }
 
 function startedForStore() {
   if (!currentStore) return allStartedYesterday;
-  return allStartedYesterday.filter(function (row) { return row.store === currentStore; });
+  if (_storeFilterCache.store === currentStore && _storeFilterCache.started) return _storeFilterCache.started;
+  _storeFilterCache.started = allStartedYesterday.filter(function (row) { return row.store === currentStore; });
+  return _storeFilterCache.started;
 }
 
 function endedDayBeforeForStore() {
   if (!currentStore) return allEndedDayBefore;
-  return allEndedDayBefore.filter(function (row) { return row.store === currentStore; });
+  if (_storeFilterCache.store === currentStore && _storeFilterCache.endedPrev) return _storeFilterCache.endedPrev;
+  _storeFilterCache.endedPrev = allEndedDayBefore.filter(function (row) { return row.store === currentStore; });
+  return _storeFilterCache.endedPrev;
 }
 
 function startedDayBeforeForStore() {
   if (!currentStore) return allStartedDayBefore;
-  return allStartedDayBefore.filter(function (row) { return row.store === currentStore; });
+  if (_storeFilterCache.store === currentStore && _storeFilterCache.startedPrev) return _storeFilterCache.startedPrev;
+  _storeFilterCache.startedPrev = allStartedDayBefore.filter(function (row) { return row.store === currentStore; });
+  return _storeFilterCache.startedPrev;
 }
 
 function buildStoreFacets() {
@@ -184,22 +196,23 @@ function buildStoreFacets() {
 async function updateActiveFacets(facets) {
   if (!runtimes['cf-main']) return facets;
   try {
-    await runtimes['cf-main'].updateFilters({});
-    var result = await runtimes['cf-main'].rows({
-      fields: ['sold_location', 'is_currently_active'],
-      limit: 100000,
-      columnar: true,
+    var result = await runtimes['cf-main'].query({
+      isolatedFilters: {},
+      snapshot: false,
+      rows: {
+        fields: ['sold_location', 'is_currently_active'],
+        limit: 100000,
+        columnar: true,
+      },
     });
-    var cols = result && result.columns ? result.columns : result;
+    var rows = result && result.rows;
+    var cols = rows && rows.columns ? rows.columns : rows;
     if (cols && cols.sold_location) {
       for (var i = 0; i < cols.sold_location.length; ++i) {
         if (facets[cols.sold_location[i]] && isActive(cols.is_currently_active[i])) {
           facets[cols.sold_location[i]].active++;
         }
       }
-    }
-    if (currentStore) {
-      await runtimes['cf-main'].updateFilters({ sold_location: { type: 'in', values: [currentStore] } });
     }
   } catch (err) {
     console.error('Active facet query failed:', err);
@@ -334,6 +347,11 @@ async function createWorkers() {
       var opts = buildWorkerOptions(cubeId);
       updateProgress('Connecting to ' + cubeId);
       return crossfilter.createStreamingDashboardWorker(opts).then(function (runtime) {
+        runtime.on('progress', function (p) {
+          var pct = p.fetch && p.fetch.percent ? Math.round(p.fetch.percent) : 0;
+          var loaded = p.load ? p.load.rowsLoaded : 0;
+          updateProgress(cubeId + ': ' + loaded + ' rows (' + pct + '%)');
+        });
         return runtime.ready.then(function (readyPayload) {
           progress.workers++;
           var rows = readyPayload && readyPayload.load ? readyPayload.load.rowsLoaded : '?';
@@ -411,6 +429,30 @@ function isWatch(row) {
   return trend === 'WORSENING' || trend === 'ACTIVE & WORSENING' || severity === 'ESCALATING' || severity === 'WORSENING';
 }
 
+function isActiveCol(cols, i) {
+  return isActive(cols.is_currently_active ? cols.is_currently_active[i] : null);
+}
+
+var HIGH_TIER_LOOKUP = { CRITICAL: 1, Critical: 1, HIGH: 1, High: 1 };
+var WORSENING_LOOKUP = { WORSENING: 1, Worsening: 1, 'ACTIVE & WORSENING': 1, 'Active & Worsening': 1 };
+var ESCALATING_LOOKUP = { ESCALATING: 1, Escalating: 1, WORSENING: 1, Worsening: 1 };
+
+function isLikelyNextCol(cols, i) {
+  if (isActiveCol(cols, i)) return false;
+  return HIGH_TIER_LOOKUP[(cols.forecast_tier ? cols.forecast_tier[i] : '') || ''] === 1;
+}
+
+function isWatchCol(cols, i) {
+  if (isActiveCol(cols, i)) return false;
+  var trend = (cols.trend_signal ? cols.trend_signal[i] : '') || '';
+  var severity = (cols.severity_trend ? cols.severity_trend[i] : '') || '';
+  return WORSENING_LOOKUP[trend] === 1 || ESCALATING_LOOKUP[severity] === 1;
+}
+
+function isActionableCol(cols, i) {
+  return isActiveCol(cols, i) || isLikelyNextCol(cols, i) || isWatchCol(cols, i);
+}
+
 function compareDesc(a, b, field) {
   return (Number(b[field]) || 0) - (Number(a[field]) || 0);
 }
@@ -448,12 +490,43 @@ function collectMatching(rows, predicate, compareFn) {
   return out;
 }
 
+function collectMatchingIndices(columns, allIdx, predicateFn, sortField, sortDir) {
+  var productCol = columns.product;
+  var seen = {};
+  var out = [];
+  for (var i = 0; i < allIdx.length; ++i) {
+    var idx = allIdx[i];
+    var key = productCol ? productCol[idx] : ('row-' + idx);
+    if (seen[key] || !predicateFn(columns, idx)) continue;
+    seen[key] = true;
+    out.push(idx);
+  }
+  if (sortField) sortIndices(out, columns, sortField, sortDir || -1);
+  return out;
+}
+
 function uniqueCount(rows, predicate) {
   var seen = {};
   var count = 0;
   for (var i = 0; i < rows.length; ++i) {
     if (!predicate(rows[i])) continue;
     var key = rows[i].product || ('row-' + i);
+    if (!seen[key]) {
+      seen[key] = true;
+      count++;
+    }
+  }
+  return count;
+}
+
+function uniqueCountColumnar(columns, indices, predicateFn) {
+  var productCol = columns.product;
+  var seen = {};
+  var count = 0;
+  for (var i = 0; i < indices.length; ++i) {
+    var idx = indices[i];
+    if (!predicateFn(columns, idx)) continue;
+    var key = productCol ? productCol[idx] : ('row-' + idx);
     if (!seen[key]) {
       seen[key] = true;
       count++;
@@ -474,6 +547,30 @@ function productLookup(rows) {
   return lookup;
 }
 
+function buildProductLookupColumnar(columns, length) {
+  var productCol = columns.product;
+  if (!productCol) return {};
+  // Build index map: first occurrence of each product
+  var indexMap = {};
+  for (var i = 0; i < length; ++i) {
+    var key = productCol[i];
+    if (!(key in indexMap)) indexMap[key] = i;
+  }
+  return {
+    _cols: columns,
+    _map: indexMap,
+    get: function (product) {
+      var idx = this._map[product];
+      if (idx == null) return null;
+      // Lazily materialize single row on demand
+      return materializeRows(this._cols, [idx])[0];
+    },
+    has: function (product) {
+      return product in this._map;
+    },
+  };
+}
+
 function queueRowsForView(viewModel, view) {
   if (!viewModel) return [];
   if (view === 'active') return viewModel.activeRows;
@@ -484,15 +581,17 @@ function queueRowsForView(viewModel, view) {
 
 function pickDefaultFocus(viewModel) {
   if (!viewModel) return null;
-  var candidates = viewModel.actionableRows && viewModel.actionableRows.length
-    ? viewModel.actionableRows
-    : viewModel.allRows;
-  return candidates && candidates.length ? candidates[0].product : null;
+  if (viewModel.actionableRows && viewModel.actionableRows.length) {
+    return viewModel.actionableRows[0].product;
+  }
+  // Fallback: read first product directly from columns (no materialization)
+  var cols = viewModel.columns;
+  return cols && cols.product && viewModel.allLength > 0 ? cols.product[0] : null;
 }
 
 function ensureLocalFocus(viewModel) {
   var lookup = viewModel ? viewModel.byProduct : null;
-  if (localState.focusProduct && lookup && lookup[localState.focusProduct]) return;
+  if (localState.focusProduct && lookup && lookup.has(localState.focusProduct)) return;
   localState.focusProduct = pickDefaultFocus(viewModel);
 }
 
@@ -534,20 +633,17 @@ function kpiCard(label, value, cardClass, valueClass, sub, trend) {
     '</div>';
 }
 
-function renderOperatorKpis(snapshot, allRows, ended, started, endedPrev, startedPrev) {
-  var activeCount = snapshot && snapshot.kpis ? Number(snapshot.kpis.totalActive) || 0 : uniqueCount(allRows, function (row) {
-    return isActive(row.is_currently_active);
-  });
-  var nextCount = uniqueCount(allRows, isLikelyNext);
-  var watchCount = uniqueCount(allRows, isWatch);
+function renderOperatorKpis(snapshot, activeRows, nextRows, watchRows, ended, started, endedPrev, startedPrev) {
+  var activeCount = snapshot && snapshot.kpis ? Number(snapshot.kpis.totalActive) || 0 : activeRows.length;
+  var nextCount = nextRows.length;
+  var watchCount = watchRows.length;
   var startedCount = started.length;
   var endedCount = ended.length;
 
-  var activeTop = takeMatching(allRows.slice().sort(function (a, b) { return compareDesc(a, b, 'avg_impact_recent_half'); }), [], function (row) {
-    return isActive(row.is_currently_active);
-  }, 1)[0];
-  var nextTop = takeMatching(allRows.slice().sort(function (a, b) { return compareDesc(a, b, 'forecast_stockout_probability'); }), [], isLikelyNext, 1)[0];
-  var watchTop = takeMatching(allRows, [], isWatch, 1)[0];
+  // Top items are already sorted — just take the first from each pre-built array
+  var activeTop = activeRows.length ? activeRows[0] : null;
+  var nextTop = nextRows.length ? nextRows[0] : null;
+  var watchTop = watchRows.length ? watchRows[0] : null;
 
   dom.kpiRow.innerHTML = [
     kpiCard(
@@ -868,7 +964,7 @@ function renderCategoryPressure(groupResult) {
     return;
   }
 
-  var focusRow = latestViewModel && latestViewModel.byProduct ? latestViewModel.byProduct[localState.focusProduct] : null;
+  var focusRow = latestViewModel && latestViewModel.byProduct ? latestViewModel.byProduct.get(localState.focusProduct) : null;
   var selectedCategory = focusRow ? focusRow.product_category : null;
   var categories = entries.map(function (entry) { return entry.key; });
   var activeVals = entries.map(function (entry) {
@@ -948,7 +1044,7 @@ function renderFocusPanel(viewModel) {
   var tag = document.getElementById('focus-bucket');
   if (!el) return;
 
-  var row = viewModel && viewModel.byProduct ? viewModel.byProduct[localState.focusProduct] : null;
+  var row = viewModel && viewModel.byProduct ? viewModel.byProduct.get(localState.focusProduct) : null;
   if (!row) {
     el.innerHTML = '<div class="focus-empty">Select a product to inspect why it is here.</div>';
     if (tag) {
@@ -1078,13 +1174,19 @@ function renderDowGuidance(rowsResult) {
     }
   }
 
-  var rows = columnarToRows(rowsResult);
-  if (localState.focusProduct) {
-    rows = rows.filter(function (row) { return row.product === localState.focusProduct; });
+  var colData = getColumns(rowsResult);
+  var cols = colData.columns;
+  var len = colData.length;
+  var indices = null;
+  var useAll = true;
+  if (localState.focusProduct && cols.product) {
+    var fpProductCol = cols.product;
+    indices = filterIndices(cols, len, function (c, i) { return fpProductCol[i] === localState.focusProduct; });
+    if (indices.length) useAll = false;
   }
-  if (!rows.length) rows = columnarToRows(rowsResult);
 
-  if (!rows.length) {
+  var iterLen = useAll ? len : indices.length;
+  if (!iterLen) {
     if (dowChart && !dowChart.isDisposed()) dowChart.dispose();
     dowChart = null;
     el.innerHTML = '<div class="panel-empty">No day-of-week guidance in this view</div>';
@@ -1107,13 +1209,21 @@ function renderDowGuidance(rowsResult) {
   var patternCounts = {};
   var topDayCounts = {};
 
-  for (var i = 0; i < rows.length; ++i) {
+  var patCol = cols.dow_pattern;
+  var riskDayCol = cols.highest_risk_day;
+  // Single-pass row-first iteration (better cache locality than day-first)
+  for (var i = 0; i < iterLen; ++i) {
+    var idx = useAll ? i : indices[i];
     for (var d = 0; d < 7; ++d) {
-      confirmed[d] += Number(rows[i][confirmedFields[d]]) || 0;
-      totals[d] += Number(rows[i][totalFields[d]]) || 0;
+      var confCol = cols[confirmedFields[d]];
+      var totCol = cols[totalFields[d]];
+      confirmed[d] += +(confCol ? confCol[idx] : 0) || 0;
+      totals[d] += +(totCol ? totCol[idx] : 0) || 0;
     }
-    if (rows[i].dow_pattern) patternCounts[rows[i].dow_pattern] = (patternCounts[rows[i].dow_pattern] || 0) + 1;
-    if (rows[i].highest_risk_day) topDayCounts[rows[i].highest_risk_day] = (topDayCounts[rows[i].highest_risk_day] || 0) + 1;
+    var pat = patCol ? patCol[idx] : null;
+    var rday = riskDayCol ? riskDayCol[idx] : null;
+    if (pat) patternCounts[pat] = (patternCounts[pat] || 0) + 1;
+    if (rday) topDayCounts[rday] = (topDayCounts[rday] || 0) + 1;
   }
 
   var probabilities = confirmed.map(function (value, idx) {
@@ -1181,10 +1291,14 @@ function mode(counts) {
   return best || '\u2014';
 }
 
+var BUCKET_ACTIVE = { id: 'active', label: 'Act Now', order: 0 };
+var BUCKET_NEXT = { id: 'next', label: 'Likely Next', order: 1 };
+var BUCKET_WATCH = { id: 'watch', label: 'Watch List', order: 2 };
+
 function queueBucket(row) {
-  if (isActive(row.is_currently_active)) return { id: 'active', label: 'Act Now', order: 0 };
-  if (isLikelyNext(row)) return { id: 'next', label: 'Likely Next', order: 1 };
-  if (isWatch(row)) return { id: 'watch', label: 'Watch List', order: 2 };
+  if (isActive(row.is_currently_active)) return BUCKET_ACTIVE;
+  if (isLikelyNext(row)) return BUCKET_NEXT;
+  if (isWatch(row)) return BUCKET_WATCH;
   return null;
 }
 
@@ -1234,7 +1348,8 @@ function renderPriorityQueue(viewModel) {
   if (!el) return;
 
   var actionable = queueRowsForView(viewModel, localState.queueView);
-  actionable = sortQueue(actionable);
+  // actionableRows is pre-sorted; sub-views are already sorted by their sort key
+  if (localState.queueView === 'all') actionable = sortQueue(actionable);
 
   if (countEl) {
     countEl.textContent = fmtCount(actionable.length) + (localState.queueView === 'all' ? ' flagged' : ' in view');
@@ -1298,12 +1413,24 @@ function sumSlice(values, start, end) {
   return sum;
 }
 
-async function refreshAllPanels() {
+var refreshSeq = 0;
+
+async function refreshAllPanels(state) {
   if (!workersReady) return;
+  if (!state) state = getState();
+  var seq = ++refreshSeq;
+
+  var mainFilters = runtimes['cf-main']
+    ? buildDashboardFilters(state, getCubeConfig('cf-main').workerDimensions) : null;
+  var dowFilters = runtimes['cf-dow']
+    ? buildDashboardFilters(state, getCubeConfig('cf-dow').workerDimensions) : null;
+  var trendFilters = runtimes['cf-trend']
+    ? buildDashboardFilters(state, getCubeConfig('cf-trend').workerDimensions) : null;
 
   var results = await Promise.all([
     runtimes['cf-main']
       ? runtimes['cf-main'].query({
+          filters: mainFilters,
           snapshot: { groups: false },
           groups: {
             byCategory: {
@@ -1328,17 +1455,22 @@ async function refreshAllPanels() {
         })
       : Promise.resolve(null),
     runtimes['cf-dow']
-      ? runtimes['cf-dow'].rows({
-          fields: DOW_FIELDS,
-          limit: 50000,
-          columnar: true,
+      ? runtimes['cf-dow'].query({
+          filters: dowFilters,
+          snapshot: false,
+          rows: {
+            fields: DOW_FIELDS,
+            limit: 50000,
+            columnar: true,
+          },
         }).catch(function (err) {
-          console.error('cf-dow rows failed:', err);
+          console.error('cf-dow query failed:', err);
           return null;
         })
       : Promise.resolve(null),
     runtimes['cf-trend']
       ? runtimes['cf-trend'].query({
+          filters: trendFilters,
           snapshot: false,
           groups: {
             days: {
@@ -1352,9 +1484,11 @@ async function refreshAllPanels() {
         })
       : Promise.resolve(null),
   ]);
+  if (seq !== refreshSeq) return;
 
   var mainResult = results[0];
-  var dowResult = results[1];
+  var dowRaw = results[1];
+  var dowResult = dowRaw ? dowRaw.rows : null;
   var trendResult = results[2];
 
   var ended = endedForStore();
@@ -1362,27 +1496,39 @@ async function refreshAllPanels() {
   var endedPrev = endedDayBeforeForStore();
   var startedPrev = startedDayBeforeForStore();
 
-  var allRows = mainResult ? columnarToRows(mainResult.rowSets.all) : [];
-  var activeRows = collectMatching(allRows, function (row) {
-    return isActive(row.is_currently_active);
-  }, function (a, b) {
-    return compareDesc(a, b, 'avg_impact_recent_half') || compareDesc(a, b, 'risk_score');
-  });
-  var nextRows = collectMatching(allRows, isLikelyNext, function (a, b) {
-    return compareDesc(a, b, 'forecast_stockout_probability') || compareDesc(a, b, 'avg_impact_recent_half');
-  });
-  var watchRows = collectMatching(allRows, isWatch, function (a, b) {
-    return compareDesc(a, b, 'risk_score') || compareDesc(a, b, 'avg_impact_recent_half');
-  });
+  var colData = mainResult ? getColumns(mainResult.rowSets.all) : { columns: {}, length: 0 };
+  var allCols = colData.columns;
+  var allLen = colData.length;
 
-  var actionableRows = sortQueue(collectMatching(allRows, function (row) {
-    return !!queueBucket(row);
-  }));
+  // Single-pass categorization: classify every index into active/next/watch in one scan
+  var activeIdx = [], nextIdx = [], watchIdx = [];
+  var productCol = allCols.product;
+  var seenActive = {}, seenNext = {}, seenWatch = {};
+  for (var ci = 0; ci < allLen; ++ci) {
+    var pkey = productCol ? productCol[ci] : ('row-' + ci);
+    if (isActiveCol(allCols, ci)) {
+      if (!seenActive[pkey]) { seenActive[pkey] = true; activeIdx.push(ci); }
+    } else if (isLikelyNextCol(allCols, ci)) {
+      if (!seenNext[pkey]) { seenNext[pkey] = true; nextIdx.push(ci); }
+    } else if (isWatchCol(allCols, ci)) {
+      if (!seenWatch[pkey]) { seenWatch[pkey] = true; watchIdx.push(ci); }
+    }
+  }
+  sortIndices(activeIdx, allCols, 'avg_impact_recent_half', -1);
+  sortIndices(nextIdx, allCols, 'forecast_stockout_probability', -1);
+  sortIndices(watchIdx, allCols, 'risk_score', -1);
+
+  var activeRows = materializeRows(allCols, activeIdx);
+  var nextRows = materializeRows(allCols, nextIdx);
+  var watchRows = materializeRows(allCols, watchIdx);
+  // Build actionable from already-materialized subsets instead of re-scanning + re-materializing
+  var actionableRows = sortQueue(activeRows.concat(nextRows, watchRows));
 
   latestViewModel = {
     snapshot: mainResult ? mainResult.snapshot : null,
-    allRows: allRows,
-    byProduct: productLookup(allRows),
+    columns: allCols,
+    allLength: allLen,
+    byProduct: buildProductLookupColumnar(allCols, allLen),
     actionableRows: actionableRows,
     activeRows: activeRows,
     nextRows: nextRows,
@@ -1397,7 +1543,7 @@ async function refreshAllPanels() {
   };
 
   ensureLocalFocus(latestViewModel);
-  renderOperatorKpis(mainResult ? mainResult.snapshot : null, allRows, ended, started, endedPrev, startedPrev);
+  renderOperatorKpis(mainResult ? mainResult.snapshot : null, activeRows, nextRows, watchRows, ended, started, endedPrev, startedPrev);
   renderActionOverview(latestViewModel);
   renderTrendChart(trendResult && trendResult.groups ? trendResult.groups.days : null);
   renderCategoryPressure(mainResult && mainResult.groups ? mainResult.groups.byCategory : null);
@@ -1409,7 +1555,22 @@ async function refreshAllPanels() {
   renderFilterChips();
 }
 
-onStateChange(async function (newState, prevState) {
+var pendingRefreshState = null;
+var pendingRaf = null;
+
+function scheduleRefresh(state) {
+  pendingRefreshState = state;
+  if (!pendingRaf) {
+    pendingRaf = requestAnimationFrame(function () {
+      pendingRaf = null;
+      var s = pendingRefreshState;
+      pendingRefreshState = null;
+      refreshAllPanels(s);
+    });
+  }
+}
+
+onStateChange(function (newState, prevState) {
   if (!newState.store) {
     latestViewModel = null;
     localState.focusProduct = null;
@@ -1421,6 +1582,7 @@ onStateChange(async function (newState, prevState) {
   dom.picker.setAttribute('hidden', '');
   dom.dashboard.removeAttribute('hidden');
   currentStore = newState.store;
+  _storeFilterCache = {};
   dom.storeName.textContent = currentStore;
   dom.storeSelector.value = currentStore;
 
@@ -1430,8 +1592,7 @@ onStateChange(async function (newState, prevState) {
     localState.queueView = 'all';
   }
 
-  await dispatchFilters(newState);
-  await refreshAllPanels();
+  scheduleRefresh(newState);
 });
 
 window.addEventListener('resize', function () {
@@ -1446,13 +1607,13 @@ window.addEventListener('resize', function () {
   var state = getState();
   if (state.store) {
     currentStore = state.store;
+    _storeFilterCache = {};
     dom.storeName.textContent = currentStore;
     dom.storeSelector.value = currentStore;
     dom.picker.setAttribute('hidden', '');
     dom.dashboard.removeAttribute('hidden');
     populateStoreSelector();
-    await dispatchFilters(state);
-    await refreshAllPanels();
+    await refreshAllPanels(state);
   } else {
     populateStoreSelector();
     showStorePicker();

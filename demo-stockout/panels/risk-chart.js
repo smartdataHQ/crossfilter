@@ -1,9 +1,11 @@
 // demo-stockout/panels/risk-chart.js
 
-import { columnarToRows, esc, isActive, scoreBar, fieldBadge, deltaCell, fmtDaysAgo, sortableHeader, attachSortHandlers } from './helpers.js';
+import { getColumns, filterIndices, sortIndices, materializeRows, esc, isActive, scoreBar, fieldBadge, deltaCell, fmtDaysAgo, sortableHeader, attachSortHandlers } from './helpers.js';
 
 var onProductClick = null;
 var selectedProduct = null;
+var columns = null;
+var allIndices = [];
 var allRows = [];
 var sortField = 'risk_score';
 var sortDir = -1;
@@ -24,44 +26,41 @@ export function renderRiskChart(storeResult) {
   var el = document.getElementById('panel-risk');
   if (!el) return;
 
-  var rows = columnarToRows(storeResult);
-  allRows = rows.filter(function (r) { return !isActive(r.is_currently_active); });
-  sortRows();
-  allRows = allRows.slice(0, 10);
+  var data = getColumns(storeResult);
+  columns = data.columns;
+  allIndices = filterIndices(columns, data.length, function (cols, i) {
+    return !isActive(cols.is_currently_active ? cols.is_currently_active[i] : null);
+  });
+  sortCurrentField();
+  allIndices = allIndices.slice(0, 10);
+  allRows = materializeRows(columns, allIndices);
 
   renderTable();
 }
 
-function sortRows() {
-  var field = sortField;
-  var dir = sortDir;
-  allRows.sort(function (a, b) {
-    var av, bv;
-    if (field === '_freq_delta') {
-      av = freqRatio(a); bv = freqRatio(b);
-    } else {
-      av = a[field]; bv = b[field];
-      if (typeof av === 'string') av = av.toLowerCase();
-      if (typeof bv === 'string') bv = bv.toLowerCase();
-    }
-    av = av == null ? '' : av;
-    bv = bv == null ? '' : bv;
-    if (av < bv) return -1 * dir;
-    if (av > bv) return 1 * dir;
-    return 0;
-  });
-}
-
-function freqRatio(r) {
-  var recent = Number(r.frequency_recent_per_month) || 0;
-  var older = Number(r.frequency_older_per_month) || 0;
-  return older > 0 ? recent / older : (recent > 0 ? 2 : 1);
+function sortCurrentField() {
+  if (sortField === '_freq_delta') {
+    var recentCol = columns.frequency_recent_per_month;
+    var olderCol = columns.frequency_older_per_month;
+    allIndices.sort(function (a, b) {
+      var ar = Number(recentCol ? recentCol[a] : 0) || 0;
+      var ao = Number(olderCol ? olderCol[a] : 0) || 0;
+      var av = ao > 0 ? ar / ao : (ar > 0 ? 2 : 1);
+      var br = Number(recentCol ? recentCol[b] : 0) || 0;
+      var bo = Number(olderCol ? olderCol[b] : 0) || 0;
+      var bv = bo > 0 ? br / bo : (br > 0 ? 2 : 1);
+      return (av - bv) * sortDir;
+    });
+  } else {
+    sortIndices(allIndices, columns, sortField, sortDir);
+  }
 }
 
 function onSort(field) {
   if (sortField === field) sortDir *= -1;
   else { sortField = field; sortDir = -1; }
-  sortRows();
+  sortCurrentField();
+  allRows = materializeRows(columns, allIndices);
   renderTable();
 }
 
