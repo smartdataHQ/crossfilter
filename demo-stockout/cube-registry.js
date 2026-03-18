@@ -1,8 +1,9 @@
 // demo-stockout/cube-registry.js
 //
-// Two crossfilter workers, both from stockout_analysis:
-//   cf-main: all panels (KPIs, stockout table, forecast, risk, early warning)
-//   cf-dow:  DOW chart (independent product click filter)
+// Three crossfilter workers:
+//   cf-main:  stockout_analysis — KPIs, stockout table, forecast, risk, early warning
+//   cf-dow:   stockout_analysis — DOW chart (independent product click filter)
+//   cf-trend: stockout_availability — benchmark comparison chart (60-day time series)
 
 var CUBE_API = '/api/cube';
 var META_API = '/api/meta';
@@ -14,7 +15,7 @@ var WORKER_ASSETS = {
   crossfilterUrl: '../crossfilter.js',
 };
 
-export var ALL_CUBE_IDS = ['cf-main', 'cf-dow'];
+export var ALL_CUBE_IDS = ['cf-main', 'cf-dow', 'cf-trend'];
 
 function cf(field) { return CUBE_NAME + '.' + field; }
 function af(field) { return CUBE_NAME + '__' + field; }
@@ -52,6 +53,7 @@ var CONFIGS = {
       'is_currently_active', 'risk_tier', 'risk_score',
       'forecast_stockout_probability', 'forecast_tier',
       'trend_signal', 'severity_trend', 'stockout_pattern',
+      'signal_quality',
     ],
     workerKpis: [
       { id: 'avgAvail', field: 'avg_availability', op: 'avg' },
@@ -68,6 +70,7 @@ var CONFIGS = {
     cubeQueryDimensions: [
       'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
+      'signal_quality',
       'dow_pattern', 'highest_risk_day',
       'dow_mon_confirmed', 'dow_tue_confirmed', 'dow_wed_confirmed',
       'dow_thu_confirmed', 'dow_fri_confirmed', 'dow_sat_confirmed', 'dow_sun_confirmed',
@@ -88,10 +91,57 @@ var CONFIGS = {
     workerDimensions: [
       'sold_location',
       'product', 'product_category', 'product_sub_category', 'supplier',
+      'signal_quality',
       'dow_pattern', 'highest_risk_day',
     ],
     workerKpis: [],
     workerGroups: [],
+  },
+  'cf-trend': {
+    cubeName: 'stockout_availability',
+    dateRangeDays: 420,  // 60 weeks; display trimmed to 52 in the chart
+    cubeQueryDimensions: [
+      'sold_location',
+      'product', 'product_category', 'product_sub_category', 'supplier',
+      'is_confirmed',
+      'observation_date',
+    ],
+    cubeQueryMeasures: [
+      'stockout_events',
+      'products_affected',
+      'total_expected_lost_sales',
+      'avg_event_duration_days',
+    ],
+    numberFields: [
+      'observation_date',
+      'is_confirmed',
+      'stockout_events',
+      'products_affected',
+      'total_expected_lost_sales',
+      'avg_event_duration_days',
+    ],
+    workerDimensions: [
+      'sold_location',
+      'product', 'product_category', 'product_sub_category', 'supplier',
+      'is_confirmed',
+      'observation_date',
+    ],
+    workerKpis: [],
+    workerGroups: [
+      {
+        id: 'byStoreDay',
+        field: 'observation_date',
+        bucket: { type: 'timeBucket', granularity: 'week' },
+        splitField: 'sold_location',
+        metrics: [
+          { id: 'events', field: 'stockout_events', op: 'sum' },
+          { id: 'products', field: 'products_affected', op: 'sum' },
+          { id: 'lostSales', field: 'total_expected_lost_sales', op: 'sum' },
+          { id: 'duration', field: 'avg_event_duration_days', op: 'avg' },
+          { id: 'days', op: 'count' },
+        ],
+      },
+    ],
   },
 };
 
@@ -106,28 +156,55 @@ export function fetchMeta() {
   });
 }
 
-function buildRenameMap(dimensions, measures) {
+function buildRenameMap(dimensions, measures, cubeName) {
+  var name = cubeName || CUBE_NAME;
+  function member(field) { return name + '.' + field; }
+  function alias(field) { return name + '__' + field; }
   var rename = {};
   for (var i = 0; i < dimensions.length; ++i) {
-    rename[cf(dimensions[i])] = dimensions[i];
-    rename[af(dimensions[i])] = dimensions[i];
+    rename[member(dimensions[i])] = dimensions[i];
+    rename[alias(dimensions[i])] = dimensions[i];
   }
   for (var j = 0; j < measures.length; ++j) {
-    rename[cf(measures[j])] = measures[j];
-    rename[af(measures[j])] = measures[j];
+    rename[member(measures[j])] = measures[j];
+    rename[alias(measures[j])] = measures[j];
   }
   return rename;
+}
+
+function rangeDaysUtc(days) {
+  var now = new Date();
+  var end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  var start = new Date(end.getTime() - (days - 1) * 86400000);
+  return [start.toISOString().slice(0, 10), end.toISOString().slice(0, 10)];
 }
 
 export function buildCubeQuery(cubeId) {
   var config = CONFIGS[cubeId];
   if (!config) throw new Error('Unknown cube: ' + cubeId);
+
+  var cubeName = config.cubeName || CUBE_NAME;
+  function member(field) { return cubeName + '.' + field; }
+
+  var filters = [
+    { member: member('partition'), operator: 'equals', values: [PARTITION] },
+  ];
+
+  if (config.dateRangeDays) {
+    var range = rangeDaysUtc(config.dateRangeDays);
+    filters.push({
+      member: member('observation_date'),
+      operator: 'inDateRange',
+      values: range,
+    });
+  }
+
   return {
     format: 'arrow',
     query: {
-      dimensions: config.cubeQueryDimensions.map(cf),
-      measures: config.cubeQueryMeasures.map(cf),
-      filters: [{ member: cf('partition'), operator: 'equals', values: [PARTITION] }],
+      dimensions: config.cubeQueryDimensions.map(member),
+      measures: config.cubeQueryMeasures.map(member),
+      filters: filters,
       limit: 1000000,
     },
   };
@@ -138,7 +215,8 @@ export function buildWorkerOptions(cubeId) {
   if (!config) throw new Error('Unknown cube: ' + cubeId);
 
   var cubeQuery = buildCubeQuery(cubeId);
-  var rename = buildRenameMap(config.cubeQueryDimensions, config.cubeQueryMeasures);
+  var cubeName = config.cubeName || CUBE_NAME;
+  var rename = buildRenameMap(config.cubeQueryDimensions, config.cubeQueryMeasures, cubeName);
 
   var transforms = {};
   if (config.numberFields) {

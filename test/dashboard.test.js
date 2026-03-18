@@ -795,4 +795,117 @@ describe("dashboard runtime", () => {
       workerFactory: createStubWorker,
     })).toThrow("requires non-empty `lookup.keyFields` and `lookup.valueFields`");
   });
+
+  it("splitField produces nested aggregates keyed by split dimension", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["date", "store", "product"],
+      groups: [
+        {
+          field: "date",
+          id: "byDate",
+          splitField: "store",
+          metrics: [
+            { id: "events", field: "qty", op: "sum" },
+            { id: "rows", op: "count" },
+          ],
+        },
+      ],
+      records: [
+        { date: "2026-01-01", store: "A", product: "X", qty: 10 },
+        { date: "2026-01-01", store: "A", product: "Y", qty: 5 },
+        { date: "2026-01-01", store: "B", product: "X", qty: 7 },
+        { date: "2026-01-02", store: "A", product: "X", qty: 3 },
+        { date: "2026-01-02", store: "B", product: "X", qty: 8 },
+      ],
+    });
+
+    const snapshot = runtime.snapshot();
+    const entries = snapshot.groups.byDate;
+
+    expect(entries).toHaveLength(2);
+
+    const day1 = entries.find(e => e.key === "2026-01-01");
+    expect(day1.value).toEqual({
+      A: { events: 15, rows: 2 },
+      B: { events: 7, rows: 1 },
+    });
+
+    const day2 = entries.find(e => e.key === "2026-01-02");
+    expect(day2.value).toEqual({
+      A: { events: 3, rows: 1 },
+      B: { events: 8, rows: 1 },
+    });
+  });
+
+  it("splitField excludes empty buckets after filtering", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["date", "store", "product"],
+      groups: [
+        {
+          field: "date",
+          id: "byDate",
+          splitField: "store",
+          metrics: [{ id: "events", field: "qty", op: "sum" }],
+        },
+      ],
+      records: [
+        { date: "2026-01-01", store: "A", product: "X", qty: 10 },
+        { date: "2026-01-01", store: "B", product: "Y", qty: 7 },
+        { date: "2026-01-01", store: "C", product: "X", qty: 3 },
+      ],
+    });
+
+    // Filter to product X — store B should disappear (has no X)
+    runtime.updateFilters({ product: { type: "in", values: ["X"] } });
+
+    const entries = runtime.snapshot().groups.byDate;
+    const day1 = entries.find(e => e.key === "2026-01-01");
+
+    expect(day1.value).toEqual({
+      A: { events: 10 },
+      C: { events: 3 },
+    });
+    expect(day1.value).not.toHaveProperty("B");
+  });
+
+  it("isolatedFilters temporarily overrides filters and restores them", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["country", "event"],
+      groups: [
+        {
+          field: "country",
+          id: "countries",
+          metrics: [{ id: "rows", op: "count" }],
+        },
+      ],
+      kpis: [{ id: "rows", op: "count" }],
+      records: [
+        { country: "IS", event: "stay" },
+        { country: "IS", event: "trip" },
+        { country: "UK", event: "stay" },
+        { country: "US", event: "alert" },
+      ],
+    });
+
+    // Set a persistent filter
+    runtime.updateFilters({ country: { type: "in", values: ["IS"] } });
+    expect(runtime.snapshot().kpis.rows).toBe(2);
+
+    // Query with isolated filters — different filter, should not persist
+    const result = runtime.query({
+      isolatedFilters: { event: { type: "in", values: ["stay"] } },
+      snapshot: {},
+    });
+
+    // Isolated query sees stay events across all countries
+    expect(result.snapshot.kpis.rows).toBe(2); // IS+UK stay
+
+    // Original filter should be restored — KPI reflects country=IS
+    const afterSnap = runtime.snapshot();
+    expect(afterSnap.kpis.rows).toBe(2);
+
+    // Double-check: a fresh query without isolatedFilters should also see IS-only
+    const freshResult = runtime.query({ snapshot: {} });
+    expect(freshResult.snapshot.kpis.rows).toBe(2);
+  });
 });

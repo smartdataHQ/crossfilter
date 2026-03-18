@@ -110,7 +110,7 @@ function resolveGroupAccessor(spec) {
   };
 }
 
-function buildMetricReducer(metrics) {
+function buildMetricReducer(metrics, splitField) {
   var metricSpec = metrics.map(function(metric) {
     return {
       field: metric.field || null,
@@ -119,17 +119,170 @@ function buildMetricReducer(metrics) {
     };
   });
 
-  function initial() {
-    var state = {};
-
+  function initBucket() {
+    var bucket = {};
     for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
       var metric = metrics[metricIndex];
       if (metric.op === "avg" || metric.op === "avgNonZero") {
-        state[metric.id] = { count: 0, sum: 0 };
+        bucket[metric.id] = { count: 0, sum: 0 };
       } else {
-        state[metric.id] = 0;
+        bucket[metric.id] = 0;
       }
     }
+    return bucket;
+  }
+
+  function isBucketEmpty(bucket) {
+    for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
+      var metric = metrics[metricIndex];
+      var value = bucket[metric.id];
+      if (metric.op === "avg" || metric.op === "avgNonZero") {
+        if (value && value.count > 0) return false;
+      } else if (metric.op === "count") {
+        if (value > 0) return false;
+      } else {
+        if (value !== 0) return false;
+      }
+    }
+    return true;
+  }
+
+  function addToBucket(bucket, row) {
+    for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
+      var metric = metrics[metricIndex];
+      var value;
+
+      switch (metric.op) {
+        case "count":
+          bucket[metric.id] += 1;
+          break;
+        case "sum":
+          value = row[metric.field];
+          if (isFiniteNumber(value)) {
+            bucket[metric.id] += value;
+          }
+          break;
+        case "avg":
+          value = row[metric.field];
+          if (isFiniteNumber(value)) {
+            bucket[metric.id].sum += value;
+            bucket[metric.id].count += 1;
+          }
+          break;
+        case "avgNonZero":
+          value = row[metric.field];
+          if (isFiniteNumber(value) && value !== 0) {
+            bucket[metric.id].sum += value;
+            bucket[metric.id].count += 1;
+          }
+          break;
+      }
+    }
+  }
+
+  function removeFromBucket(bucket, row) {
+    for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
+      var metric = metrics[metricIndex];
+      var value;
+
+      switch (metric.op) {
+        case "count":
+          bucket[metric.id] -= 1;
+          break;
+        case "sum":
+          value = row[metric.field];
+          if (isFiniteNumber(value)) {
+            bucket[metric.id] -= value;
+          }
+          break;
+        case "avg":
+          value = row[metric.field];
+          if (isFiniteNumber(value)) {
+            bucket[metric.id].sum -= value;
+            bucket[metric.id].count -= 1;
+          }
+          break;
+        case "avgNonZero":
+          value = row[metric.field];
+          if (isFiniteNumber(value) && value !== 0) {
+            bucket[metric.id].sum -= value;
+            bucket[metric.id].count -= 1;
+          }
+          break;
+      }
+    }
+  }
+
+  function finalizeBucket(bucket) {
+    var result = {};
+    for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
+      var metric = metrics[metricIndex];
+      var value = bucket[metric.id];
+      if (metric.op === "avg" || metric.op === "avgNonZero") {
+        result[metric.id] = value.count ? value.sum / value.count : null;
+      } else {
+        result[metric.id] = value;
+      }
+    }
+    return result;
+  }
+
+  // ---- Split-field path: nested aggregates keyed by splitField value ----
+
+  if (splitField) {
+    var splitInitial = function() {
+      var state = {};
+      Object.defineProperties(state, {
+        __cache: { configurable: true, enumerable: false, value: null, writable: true },
+        __cacheVersion: { configurable: true, enumerable: false, value: -1, writable: true },
+        __version: { configurable: true, enumerable: false, value: 0, writable: true }
+      });
+      return state;
+    };
+
+    var splitAdd = function(state, row) {
+      var splitKey = row[splitField];
+      if (splitKey == null || splitKey === "") splitKey = "__unknown__";
+      if (!state[splitKey]) state[splitKey] = initBucket();
+      addToBucket(state[splitKey], row);
+      state.__version += 1;
+      return state;
+    };
+
+    var splitRemove = function(state, row) {
+      var splitKey = row[splitField];
+      if (splitKey == null || splitKey === "") splitKey = "__unknown__";
+      if (state[splitKey]) removeFromBucket(state[splitKey], row);
+      state.__version += 1;
+      return state;
+    };
+
+    var splitFinalize = function(state) {
+      if (state.__cacheVersion === state.__version && state.__cache) {
+        return state.__cache;
+      }
+      var result = {};
+      for (var key in state) {
+        var bucket = state[key];
+        // Skip buckets reduced to zero (filtered-out stores)
+        if (isBucketEmpty(bucket)) continue;
+        result[key] = finalizeBucket(bucket);
+      }
+      state.__cache = result;
+      state.__cacheVersion = state.__version;
+      return result;
+    };
+
+    // Do NOT attach _xfilterMetricSpec — the metricSpec fast path in
+    // crossfilter core bypasses custom reducers, which we need for split.
+
+    return { add: splitAdd, finalize: splitFinalize, initial: splitInitial, remove: splitRemove };
+  }
+
+  // ---- Standard path: flat metrics ----
+
+  function initial() {
+    var state = initBucket();
 
     Object.defineProperties(state, {
       __cache: {
@@ -156,73 +309,13 @@ function buildMetricReducer(metrics) {
   }
 
   function add(state, row) {
-    for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
-      var metric = metrics[metricIndex];
-      var value;
-
-      switch (metric.op) {
-        case "count":
-          state[metric.id] += 1;
-          break;
-        case "sum":
-          value = row[metric.field];
-          if (isFiniteNumber(value)) {
-            state[metric.id] += value;
-          }
-          break;
-        case "avg":
-          value = row[metric.field];
-          if (isFiniteNumber(value)) {
-            state[metric.id].sum += value;
-            state[metric.id].count += 1;
-          }
-          break;
-        case "avgNonZero":
-          value = row[metric.field];
-          if (isFiniteNumber(value) && value !== 0) {
-            state[metric.id].sum += value;
-            state[metric.id].count += 1;
-          }
-          break;
-      }
-    }
-
+    addToBucket(state, row);
     state.__version += 1;
     return state;
   }
 
   function remove(state, row) {
-    for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
-      var metric = metrics[metricIndex];
-      var value;
-
-      switch (metric.op) {
-        case "count":
-          state[metric.id] -= 1;
-          break;
-        case "sum":
-          value = row[metric.field];
-          if (isFiniteNumber(value)) {
-            state[metric.id] -= value;
-          }
-          break;
-        case "avg":
-          value = row[metric.field];
-          if (isFiniteNumber(value)) {
-            state[metric.id].sum -= value;
-            state[metric.id].count -= 1;
-          }
-          break;
-        case "avgNonZero":
-          value = row[metric.field];
-          if (isFiniteNumber(value) && value !== 0) {
-            state[metric.id].sum -= value;
-            state[metric.id].count -= 1;
-          }
-          break;
-      }
-    }
-
+    removeFromBucket(state, row);
     state.__version += 1;
     return state;
   }
@@ -232,18 +325,7 @@ function buildMetricReducer(metrics) {
       return state.__cache;
     }
 
-    var result = {};
-
-    for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
-      var metric = metrics[metricIndex];
-      var value = state[metric.id];
-
-      if (metric.op === "avg" || metric.op === "avgNonZero") {
-        result[metric.id] = value.count ? value.sum / value.count : null;
-      } else {
-        result[metric.id] = value;
-      }
-    }
+    var result = finalizeBucket(state);
 
     state.__cache = result;
     state.__cacheVersion = state.__version;
@@ -302,6 +384,14 @@ function normalizeFilter(filter) {
   }
 
   throw new Error("Unsupported dashboard filter type: " + filter.type);
+}
+
+function shallowCopy(obj) {
+  var copy = {};
+  for (var key in obj) {
+    copy[key] = obj[key];
+  }
+  return copy;
 }
 
 function normalizeFilterState(filters) {
@@ -457,8 +547,9 @@ function createGroupRuntime(dimension, spec, index) {
   var metrics = normalizeMetrics(spec.metrics, spec.id || "group_" + index);
   var metricsById = {};
   var metricIndex;
-  var nativeSumMetric = getNativeSumMetric(metrics);
-  var reducer = nativeSumMetric ? null : buildMetricReducer(metrics);
+  var splitField = spec.splitField || null;
+  var nativeSumMetric = splitField ? null : getNativeSumMetric(metrics);
+  var reducer = nativeSumMetric ? null : buildMetricReducer(metrics, splitField);
   var groupAccessor = resolveGroupAccessor(spec);
   var group = groupAccessor ? dimension.group(groupAccessor) : dimension.group();
   var visibleMetric = null;
@@ -488,6 +579,22 @@ function createGroupRuntime(dimension, spec, index) {
     }
     if (nativeSumMetric) {
       return metric.id === nativeSumMetric.id ? value : 0;
+    }
+    if (splitField) {
+      // Sum the metric across all split buckets for comparability
+      var total = 0;
+      for (var splitKey in value) {
+        var bucket = value[splitKey];
+        if (bucket && bucket[metric.id] != null) {
+          var bv = bucket[metric.id];
+          if (typeof bv === "object" && bv.count != null) {
+            total += bv.sum || 0;
+          } else {
+            total += bv;
+          }
+        }
+      }
+      return total;
     }
     return value ? value[metric.id] : 0;
   }
@@ -1068,7 +1175,12 @@ export function createDashboardRuntime(crossfilter, options) {
 
   function queryRuntime(request) {
     request = request || {};
-    if (request.filters) {
+
+    var savedFilters = null;
+    if (request.isolatedFilters) {
+      savedFilters = shallowCopy(currentFilters);
+      updateFilters(request.isolatedFilters);
+    } else if (request.filters) {
       updateFilters(request.filters);
     }
 
@@ -1091,6 +1203,10 @@ export function createDashboardRuntime(crossfilter, options) {
 
     if (request.rowSets) {
       response.rowSets = readRowSets(request.rowSets);
+    }
+
+    if (savedFilters) {
+      updateFilters(savedFilters);
     }
 
     return response;

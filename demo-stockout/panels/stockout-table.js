@@ -7,6 +7,11 @@ var catSelect = null;
 var supSelect = null;
 var sortField = 'risk_score';
 var sortDir = -1;
+var productClickCallback = null;
+
+export function onProductClick(callback) {
+  productClickCallback = callback;
+}
 
 var COLUMNS = [
   { key: 'product', label: 'Product', title: 'Product name' },
@@ -83,7 +88,7 @@ function renderFiltered() {
   var html = '<table class="tbl">' + sortableHeader(COLUMNS, sortField, sortDir) + '<tbody>';
   for (var i = 0; i < filtered.length; ++i) {
     var r = filtered[i];
-    html += '<tr>' +
+    html += '<tr data-product="' + esc(r.product) + '" style="cursor:pointer">' +
       '<td class="val">' + esc(r.product) + '</td>' +
       '<td>' + fieldBadge('stockout_pattern', r.stockout_pattern) + '</td>' +
       '<td>' + fmtDur(r.avg_duration_days) + '</td>' +
@@ -94,4 +99,17 @@ function renderFiltered() {
   }
   el.innerHTML = html + '</tbody></table>';
   attachSortHandlers(el, onSort);
+  ensureProductClickHandler(el);
+}
+
+var productClickBound = false;
+
+function ensureProductClickHandler(el) {
+  if (productClickBound) return;
+  productClickBound = true;
+  el.addEventListener('click', function (e) {
+    var tr = e.target.closest('tr[data-product]');
+    if (!tr) return;
+    if (productClickCallback) productClickCallback(tr.dataset.product);
+  });
 }

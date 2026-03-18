@@ -146,7 +146,11 @@ function serveStatic(req, res) {
       return;
     }
     var ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Content-Length': stat.size });
+    res.writeHead(200, {
+      'Cache-Control': 'no-store',
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Content-Length': stat.size,
+    });
     if (req.method === 'HEAD') { res.end(); return; }
     fs.createReadStream(filePath).pipe(res);
   });
