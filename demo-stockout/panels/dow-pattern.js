@@ -31,8 +31,13 @@ export function renderDowPattern(rowsResult, echarts, themeName) {
     return;
   }
 
+  var TOTAL_FIELDS = [
+    'dow_mon_total', 'dow_tue_total', 'dow_wed_total',
+    'dow_thu_total', 'dow_fri_total', 'dow_sat_total', 'dow_sun_total',
+  ];
+
   var confirmedTotals = [0, 0, 0, 0, 0, 0, 0];
-  var probSums = [0, 0, 0, 0, 0, 0, 0];
+  var observedTotals = [0, 0, 0, 0, 0, 0, 0];
   var weekdayRateSum = 0, weekendRateSum = 0;
   var patternCounts = {}, riskDayCounts = {};
   var count = rows.length;
@@ -41,7 +46,7 @@ export function renderDowPattern(rowsResult, echarts, themeName) {
     var r = rows[i];
     for (var d = 0; d < 7; ++d) {
       confirmedTotals[d] += Number(r[CONFIRMED_FIELDS[d]]) || 0;
-      probSums[d] += Number(r[PROB_FIELDS[d]]) || 0;
+      observedTotals[d] += Number(r[TOTAL_FIELDS[d]]) || 0;
     }
     weekdayRateSum += Number(r.weekday_stockout_rate) || 0;
     weekendRateSum += Number(r.weekend_stockout_rate) || 0;
@@ -49,7 +54,10 @@ export function renderDowPattern(rowsResult, echarts, themeName) {
     if (r.highest_risk_day) riskDayCounts[r.highest_risk_day] = (riskDayCounts[r.highest_risk_day] || 0) + 1;
   }
 
-  var probAvgs = probSums.map(function (s) { return count > 0 ? s / count : 0; });
+  // Weighted probability: total confirmed / total observed (not avg of per-product probs)
+  var probAvgs = confirmedTotals.map(function (c, idx) {
+    return observedTotals[idx] > 0 ? c / observedTotals[idx] : 0;
+  });
   var barColors = probAvgs.map(function (p) { return colorFor('forecast_stockout_probability', p); });
 
   if (!chartInstance || chartInstance.isDisposed()) {

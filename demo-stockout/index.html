@@ -30,26 +30,45 @@
     </div>
     <div class="header-right">
       <div class="filter-bar">
+        <div id="sensitivity-toggle" class="gran-btns">
+          <button class="gran-btn gran-active" data-sens="">All Events</button>
+          <button class="gran-btn" data-sens="confirmed">Confirmed</button>
+          <button class="gran-btn" data-sens="high">High Confidence</button>
+        </div>
         <div id="filter-chips" class="filter-chips"></div>
         <button id="clear-filters-btn" class="btn btn-ghost" hidden>Clear Filters</button>
       </div>
-      <input id="store-selector" class="store-search" list="store-list" placeholder="Search stores...">
-      <datalist id="store-list"></datalist>
+      <div class="store-selector-wrap">
+        <input id="store-selector" class="store-search" placeholder="Search stores..." autocomplete="off">
+        <div id="store-dropdown" class="store-dropdown" hidden></div>
+      </div>
     </div>
   </header>
 
   <section id="kpi-row" class="kpi-row anim d2"></section>
 
-  <div class="grid-2col">
-    <section class="card anim d3">
-      <div class="card-head"><span class="card-t">ENDED YESTERDAY</span> <span id="ended-count" class="card-tag"></span></div>
-      <div id="panel-trend" style="padding:0;height:auto;"></div>
-    </section>
-    <section class="card anim d3">
-      <div class="card-head"><span class="card-t">ENDED BY CATEGORY</span></div>
-      <div id="panel-category" class="chart-wrap"></div>
-    </section>
-  </div>
+  <section class="card anim d3">
+    <div class="card-head">
+      <span class="card-t">PEER COMPARISON</span>
+      <div class="card-filters">
+        <div id="benchmark-metric" class="gran-btns">
+          <button class="gran-btn gran-active" data-metric="availability">Availability %</button>
+          <button class="gran-btn" data-metric="events">Stockouts</button>
+          <button class="gran-btn" data-metric="duration">Avg Duration</button>
+        </div>
+        <div id="benchmark-granularity" class="gran-btns">
+          <button class="gran-btn gran-active" data-gran="week">Week</button>
+          <button class="gran-btn" data-gran="month">Month</button>
+        </div>
+        <span id="benchmark-context" class="card-tag"></span>
+        <div id="compare-control" class="compare-wrap">
+          <button id="compare-btn" class="btn btn-ghost compare-btn">+ Compare</button>
+          <div id="compare-dropdown" class="store-dropdown compare-dropdown" hidden></div>
+        </div>
+      </div>
+    </div>
+    <div id="panel-benchmark" class="chart-wrap chart-wrap-benchmark"></div>
+  </section>
 
   <section class="card anim d4">
     <div class="card-head">
@@ -89,7 +108,18 @@
     </section>
   </div>
 
-  <section class="card anim d7">
+  <div class="grid-2col">
+    <section class="card anim d7">
+      <div class="card-head"><span class="card-t">ENDED YESTERDAY</span> <span id="ended-count" class="card-tag"></span></div>
+      <div id="panel-trend" style="padding:0;height:auto;"></div>
+    </section>
+    <section class="card anim d7">
+      <div class="card-head"><span class="card-t">ENDED BY CATEGORY</span></div>
+      <div id="panel-category" class="chart-wrap"></div>
+    </section>
+  </div>
+
+  <section class="card anim d8">
     <div class="card-head">
       <span class="card-t">EARLY WARNING — DETERIORATING</span>
       <div class="card-filters">

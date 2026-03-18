@@ -93,7 +93,10 @@ function renderTable() {
   el.innerHTML = html + '</tbody></table>';
   attachSortHandlers(el, onSort);
 
-  el.addEventListener('click', function (e) {
+  // Use onclick assignment (not addEventListener) to avoid stacking handlers on re-render
+  el.onclick = function (e) {
+    // Ignore sort header clicks
+    if (e.target.closest('th')) return;
     var tr = e.target.closest('tr[data-product]');
     if (!tr) return;
     var product = tr.dataset.product;
@@ -103,5 +106,5 @@ function renderTable() {
       trs[j].classList.toggle('risk-selected', trs[j].dataset.product === selectedProduct);
     }
     if (onProductClick) onProductClick(selectedProduct);
-  });
+  };
 }

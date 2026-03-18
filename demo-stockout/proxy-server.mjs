@@ -119,8 +119,25 @@ function proxyToCube(req, res, method, cubePath, body) {
   proxyReq.end();
 }
 
+// Only serve files under allowed paths (never .env, .git, etc.)
+var ALLOWED_PREFIXES = ['/demo-stockout/', '/crossfilter.js', '/crossfilter.min.js', '/node_modules/'];
+
 function serveStatic(req, res) {
-  var filePath = path.join(ROOT, decodeURIComponent(req.url.split('?')[0]));
+  var urlPath = decodeURIComponent(req.url.split('?')[0]);
+  // Block dotfiles and traversal
+  if (urlPath.indexOf('/.') >= 0 || urlPath.indexOf('..') >= 0) {
+    res.writeHead(403, { 'Content-Type': 'text/plain' });
+    res.end('Forbidden');
+    return;
+  }
+  // Only serve from allowed prefixes
+  var allowed = ALLOWED_PREFIXES.some(function (p) { return urlPath.startsWith(p); });
+  if (!allowed) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
+    return;
+  }
+  var filePath = path.join(ROOT, urlPath);
   if (filePath.endsWith('/')) filePath += 'index.html';
   fs.stat(filePath, function (err, stat) {
     if (err || !stat.isFile()) {
@@ -129,7 +146,11 @@ function serveStatic(req, res) {
       return;
     }
     var ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Content-Length': stat.size });
+    res.writeHead(200, {
+      'Cache-Control': 'no-store',
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Content-Length': stat.size,
+    });
     if (req.method === 'HEAD') { res.end(); return; }
     fs.createReadStream(filePath).pipe(res);
   });
@@ -163,7 +184,7 @@ var server = http.createServer(function (req, res) {
 
 server.timeout = 300000;
 server.keepAliveTimeout = 300000;
-server.listen(PORT, function () {
+server.listen(PORT, '127.0.0.1', function () {
   console.log('Stockout dashboard dev server at http://localhost:' + PORT + '/');
   console.log('  Static: ' + ROOT);
   console.log('  Proxy: POST /api/cube -> https://' + CUBE_HOST + CUBE_LOAD_PATH);

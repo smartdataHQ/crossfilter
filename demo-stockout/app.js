@@ -3,21 +3,25 @@
 // Multi-crossfilter stockout dashboard.
 //
 // Architecture:
-//   - 2 crossfilter workers from stockout_analysis, load ALL stores at startup
+//   - 3 crossfilter workers, load ALL stores at startup
+//     cf-main (stockout_analysis): KPIs, tables, forecast, risk, early warning
+//     cf-dow  (stockout_analysis): DOW chart (independent product click filter)
+//     cf-trend (stockout_availability): benchmark peer-comparison chart
 //   - sold_location is a crossfilter dimension — store switching is instant
 //   - Color/label config loaded from Cube /api/meta (Principle 6)
 //
-// Query batching (2 postMessage round-trips per refresh):
-//   - cf-main: query({ snapshot, rowSets: { stockout, forecast, risk, warning } })
-//   - cf-dow:  rows({ fields, columnar: true })
+// Query batching (3 postMessage round-trips per refresh):
+//   - cf-main:  query({ snapshot, rowSets: { stockout, forecast, risk, warning } })
+//   - cf-dow:   rows({ fields, columnar: true })
+//   - cf-trend: query({ groups: { byStoreDay } }) — unfiltered by store for peer bands
 
 import { registerTheme, THEME_NAME } from './theme.js';
-import { getState, setState, onStateChange, PARAM_TO_DIMENSION } from './router.js';
+import { getState, setState, onStateChange, PARAM_TO_DIMENSION, buildDashboardFilters } from './router.js';
 import { ALL_CUBE_IDS, buildWorkerOptions, fetchStoreList, fetchEndedYesterday, fetchStartedYesterday, fetchEndedDayBefore, fetchStartedDayBefore, fetchMeta, getCubeConfig } from './cube-registry.js';
-import { loadMeta } from './config.js';
+import { loadMeta, namedColor } from './config.js';
 import { registerRuntime, dispatchFilters, disposeAll, onPanelRefresh } from './filter-router.js';
 import { renderKpis } from './panels/kpis.js';
-import { renderStockoutTable } from './panels/stockout-table.js';
+import { renderStockoutTable, onProductClick } from './panels/stockout-table.js';
 import { renderForecast } from './panels/forecast.js';
 import { renderRiskChart, setProductClickHandler } from './panels/risk-chart.js';
 import { renderEarlyWarning } from './panels/early-warning.js';
@@ -42,6 +46,12 @@ var allStartedYesterday = [];
 var allEndedDayBefore = [];   // for KPI trend comparison
 var allStartedDayBefore = [];
 var endedCategoryFilter = null;
+var benchmarkChart = null;
+var benchmarkGranularity = 'week';  // 'week' or 'month'
+var benchmarkMetric = 'availability';
+var benchmarkProduct = null;
+var compareStores = [];  // stores to show as individual lines
+var COMPARE_COLORS = ['#b366ff', '#ff8c4d', '#00e6e6', '#e6e600', '#ff66b2'];
 
 // ---- DOM ----
 
@@ -182,37 +192,123 @@ function showStorePicker() {
   dom.picker.removeAttribute('hidden');
 }
 
-// ---- Store Selector ----
+// ---- Store Selector (custom dropdown) ----
+
+var storeDropdown = document.getElementById('store-dropdown');
+var storeDropdownActive = -1;
+var storeDropdownItems = [];
 
 function populateStoreSelector() {
-  var list = document.getElementById('store-list');
-  if (!list) return;
-  list.innerHTML = '';
-  for (var i = 0; i < storeList.length; ++i) {
-    var name = storeList[i].name;
-    var f = storeFacets[name] || { active: 0, ended: 0, started: 0 };
-    var opt = document.createElement('option');
-    opt.value = name;
-    opt.label = name + ' (' + f.active + '/' + f.ended + '/' + f.started + ')';
-    list.appendChild(opt);
-  }
   dom.storeSelector.value = currentStore || '';
 }
 
-// Search-as-you-type store selection (Principle 4: searchable high-cardinality)
-dom.storeSelector.addEventListener('change', onStoreSearch);
-dom.storeSelector.addEventListener('input', onStoreSearch);
+function renderStoreDropdown(query) {
+  if (!storeDropdown) return;
+  var q = (query || '').toLowerCase();
+  var matched = [];
+  var rest = [];
 
-function onStoreSearch() {
-  var val = dom.storeSelector.value;
-  // Only navigate if the value exactly matches a store name
-  var match = storeList.some(function (s) { return s.name === val; });
-  if (match && val !== currentStore) {
-    var patch = { store: val };
+  for (var i = 0; i < storeList.length; ++i) {
+    var name = storeList[i].name;
+    if (q && name.toLowerCase().indexOf(q) >= 0) {
+      matched.push(name);
+    } else {
+      rest.push(name);
+    }
+  }
+
+  // Matched items first (alphabetically), then all others alphabetically
+  matched.sort(function (a, b) { return a.localeCompare(b); });
+  rest.sort(function (a, b) { return a.localeCompare(b); });
+  storeDropdownItems = matched.concat(rest);
+
+  var html = '';
+  for (var j = 0; j < storeDropdownItems.length; ++j) {
+    var storeName = storeDropdownItems[j];
+    var f = storeFacets[storeName] || { active: 0, ended: 0, started: 0 };
+    var isMatch = q && storeName.toLowerCase().indexOf(q) >= 0;
+    var isCurrent = storeName === currentStore;
+    var cls = 'store-opt';
+    if (isMatch) cls += ' store-opt-match';
+    if (isCurrent) cls += ' store-opt-current';
+    if (j === storeDropdownActive) cls += ' store-opt-active';
+    html += '<div class="' + cls + '" data-store="' + esc(storeName) + '">' +
+      esc(storeName) +
+      '<span class="store-opt-facets">' +
+      '<span class="facet facet-red">' + f.active + '</span>' +
+      '<span class="facet facet-green">' + f.ended + '</span>' +
+      '<span class="facet facet-amber">' + f.started + '</span>' +
+      '</span></div>';
+  }
+  storeDropdown.innerHTML = html;
+  storeDropdown.removeAttribute('hidden');
+
+  // Scroll active item into view
+  if (storeDropdownActive >= 0) {
+    var activeEl = storeDropdown.children[storeDropdownActive];
+    if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function selectStore(name) {
+  closeStoreDropdown();
+  if (name && name !== currentStore) {
+    var patch = { store: name };
     for (var param in PARAM_TO_DIMENSION) patch[param] = null;
     setState(patch);
   }
 }
+
+function closeStoreDropdown() {
+  if (storeDropdown) storeDropdown.setAttribute('hidden', '');
+  storeDropdownActive = -1;
+  storeDropdownItems = [];
+}
+
+dom.storeSelector.addEventListener('focus', function () {
+  storeDropdownActive = -1;
+  renderStoreDropdown(dom.storeSelector.value);
+});
+
+dom.storeSelector.addEventListener('input', function () {
+  storeDropdownActive = -1;
+  renderStoreDropdown(dom.storeSelector.value);
+});
+
+dom.storeSelector.addEventListener('keydown', function (e) {
+  if (!storeDropdownItems.length) return;
+
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    storeDropdownActive = Math.min(storeDropdownActive + 1, storeDropdownItems.length - 1);
+    renderStoreDropdown(dom.storeSelector.value);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    storeDropdownActive = Math.max(storeDropdownActive - 1, 0);
+    renderStoreDropdown(dom.storeSelector.value);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (storeDropdownActive >= 0 && storeDropdownItems[storeDropdownActive]) {
+      selectStore(storeDropdownItems[storeDropdownActive]);
+    }
+  } else if (e.key === 'Escape') {
+    closeStoreDropdown();
+    dom.storeSelector.blur();
+  }
+});
+
+if (storeDropdown) {
+  storeDropdown.addEventListener('click', function (e) {
+    var opt = e.target.closest('.store-opt');
+    if (opt) selectStore(opt.dataset.store);
+  });
+}
+
+document.addEventListener('click', function (e) {
+  if (!e.target.closest('.store-selector-wrap')) {
+    closeStoreDropdown();
+  }
+});
 
 // ---- Filter Chips ----
 
@@ -247,11 +343,41 @@ dom.clearBtn.addEventListener('click', function () {
   setState(patch);
 });
 
+// ---- Sensitivity Toggle ----
+
+(function () {
+  var wrap = document.getElementById('sensitivity-toggle');
+  if (!wrap) return;
+
+  // Sync button state from URL on load
+  var initState = getState();
+  if (initState.sensitivity) {
+    var btns = wrap.querySelectorAll('.gran-btn');
+    for (var i = 0; i < btns.length; ++i) {
+      btns[i].classList.toggle('gran-active', (btns[i].dataset.sens || '') === (initState.sensitivity || ''));
+    }
+  }
+
+  wrap.addEventListener('click', function (e) {
+    var btn = e.target.closest('.gran-btn');
+    if (!btn) return;
+    var sens = btn.dataset.sens || null;
+    var current = getState().sensitivity || null;
+    if (sens === current) return;
+    var btns = wrap.querySelectorAll('.gran-btn');
+    for (var i = 0; i < btns.length; ++i) {
+      btns[i].classList.toggle('gran-active', (btns[i].dataset.sens || '') === (sens || ''));
+    }
+    setState({ sensitivity: sens });
+  });
+})();
+
 // ---- Worker Creation (once, all stores) ----
 
 async function createWorkers() {
   setOverlay(true, 'Starting...');
 
+  showShimmer('panel-benchmark');
   showShimmer('panel-trend');
   showShimmer('panel-category');
   showShimmer('panel-stockout-table');
@@ -368,6 +494,8 @@ var MAIN_FIELDS = [
 var DOW_FIELDS = [
   'dow_mon_confirmed', 'dow_tue_confirmed', 'dow_wed_confirmed',
   'dow_thu_confirmed', 'dow_fri_confirmed', 'dow_sat_confirmed', 'dow_sun_confirmed',
+  'dow_mon_total', 'dow_tue_total', 'dow_wed_total',
+  'dow_thu_total', 'dow_fri_total', 'dow_sat_total', 'dow_sun_total',
   'dow_mon_probability', 'dow_tue_probability', 'dow_wed_probability',
   'dow_thu_probability', 'dow_fri_probability', 'dow_sat_probability', 'dow_sun_probability',
   'weekday_stockout_rate', 'weekend_stockout_rate', 'dow_pattern', 'highest_risk_day',
@@ -385,10 +513,10 @@ async function refreshAllPanels() {
         snapshot: {},
         rowCount: true,
         rowSets: {
-          stockout: { fields: MAIN_FIELDS, limit: 500, sortBy: 'risk_score', direction: 'top', columnar: true },
-          forecast: { fields: MAIN_FIELDS, limit: 500, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
-          risk:     { fields: MAIN_FIELDS, limit: 200, sortBy: 'risk_score', direction: 'top', columnar: true },
-          warning:  { fields: MAIN_FIELDS, limit: 1000, sortBy: 'risk_score', direction: 'top', columnar: true },
+          stockout: { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
+          forecast: { fields: MAIN_FIELDS, limit: 10000, sortBy: 'forecast_stockout_probability', direction: 'top', columnar: true },
+          risk:     { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
+          warning:  { fields: MAIN_FIELDS, limit: 10000, sortBy: 'risk_score', direction: 'top', columnar: true },
         },
       }).catch(function (err) { console.error('cf-main query failed:', err); return null; })
     );
@@ -433,6 +561,7 @@ async function refreshAllPanels() {
   renderDowPattern(dowRows, echarts, THEME_NAME);
   refreshEndedYesterday();
   renderFilterChips();
+  refreshBenchmarkChart();
 }
 
 // ---- Ended Yesterday (local data, filtered by store in JS) ----
@@ -521,26 +650,567 @@ function renderEndedCategoryPie(data) {
   }, true);
 }
 
+// ---- Benchmark Chart ----
+
+var lastBenchmarkGroupData = null;
+
+// Granularity toggle — only re-renders, no re-query needed (data is daily)
+(function () {
+  var wrap = document.getElementById('benchmark-granularity');
+  if (!wrap) return;
+  wrap.addEventListener('click', function (e) {
+    var btn = e.target.closest('.gran-btn');
+    if (!btn) return;
+    var gran = btn.dataset.gran;
+    if (gran === benchmarkGranularity) return;
+    benchmarkGranularity = gran;
+    var btns = wrap.querySelectorAll('.gran-btn');
+    for (var i = 0; i < btns.length; ++i) {
+      btns[i].classList.toggle('gran-active', btns[i].dataset.gran === gran);
+    }
+    if (lastBenchmarkGroupData) renderBenchmarkChart(lastBenchmarkGroupData);
+  });
+})();
+
+// Metric toggle — switches between availability %, stockout events, avg duration
+(function () {
+  var wrap = document.getElementById('benchmark-metric');
+  if (!wrap) return;
+  wrap.addEventListener('click', function (e) {
+    var btn = e.target.closest('.gran-btn');
+    if (!btn) return;
+    var metric = btn.dataset.metric;
+    if (metric === benchmarkMetric) return;
+    benchmarkMetric = metric;
+    var btns = wrap.querySelectorAll('.gran-btn');
+    for (var i = 0; i < btns.length; ++i) {
+      btns[i].classList.toggle('gran-active', btns[i].dataset.metric === metric);
+    }
+    if (lastBenchmarkGroupData) renderBenchmarkChart(lastBenchmarkGroupData);
+  });
+})();
+
+// ---- Compare stores picker ----
+
+var hoverStore = null;
+
+(function () {
+  var wrap = document.getElementById('compare-control');
+  var btn = document.getElementById('compare-btn');
+  var dropdown = document.getElementById('compare-dropdown');
+  if (!btn || !dropdown || !wrap) return;
+
+  function openDropdown() {
+    renderCompareDropdown();
+    dropdown.removeAttribute('hidden');
+  }
+
+  function closeDropdown() {
+    dropdown.setAttribute('hidden', '');
+    // Clear hover preview
+    if (hoverStore) {
+      hoverStore = null;
+      if (lastBenchmarkGroupData) renderBenchmarkChart(lastBenchmarkGroupData);
+    }
+  }
+
+  function toggleDropdown(e) {
+    e.stopPropagation();
+    if (dropdown.hasAttribute('hidden')) openDropdown();
+    else closeDropdown();
+  }
+
+  btn.addEventListener('click', toggleDropdown);
+
+  // Chip clicks also open dropdown
+  wrap.addEventListener('click', function (e) {
+    var chip = e.target.closest('.compare-chip');
+    if (!chip) return;
+    e.stopPropagation();
+    openDropdown();
+  });
+
+  dropdown.addEventListener('click', function (e) {
+    var opt = e.target.closest('.store-opt');
+    if (!opt) return;
+    var store = opt.dataset.store;
+    var idx = compareStores.indexOf(store);
+    if (idx >= 0) {
+      compareStores.splice(idx, 1);
+    } else if (compareStores.length < COMPARE_COLORS.length) {
+      compareStores.push(store);
+    }
+    hoverStore = null;
+    renderCompareDropdown();
+    renderCompareChips();
+    if (lastBenchmarkGroupData) renderBenchmarkChart(lastBenchmarkGroupData);
+  });
+
+  dropdown.addEventListener('mouseover', function (e) {
+    var opt = e.target.closest('.store-opt');
+    if (!opt) return;
+    var store = opt.dataset.store;
+    if (store !== hoverStore && compareStores.indexOf(store) < 0) {
+      hoverStore = store;
+      if (lastBenchmarkGroupData) renderBenchmarkChart(lastBenchmarkGroupData);
+    }
+  });
+
+  dropdown.addEventListener('mouseleave', function () {
+    if (hoverStore) {
+      hoverStore = null;
+      if (lastBenchmarkGroupData) renderBenchmarkChart(lastBenchmarkGroupData);
+    }
+  });
+
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest('.compare-wrap')) closeDropdown();
+  });
+})();
+
+function renderCompareDropdown() {
+  var dropdown = document.getElementById('compare-dropdown');
+  if (!dropdown) return;
+  var html = '';
+  for (var i = 0; i < storeList.length; ++i) {
+    var name = storeList[i].name;
+    if (name === currentStore) continue;
+    var isCompared = compareStores.indexOf(name) >= 0;
+    var colorIdx = isCompared ? compareStores.indexOf(name) : -1;
+    var cls = 'store-opt' + (isCompared ? ' store-opt-compared' : '');
+    var colorDot = colorIdx >= 0
+      ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + COMPARE_COLORS[colorIdx % COMPARE_COLORS.length] + ';margin-right:6px"></span>'
+      : '';
+    html += '<div class="' + cls + '" data-store="' + esc(name) + '">' + colorDot + esc(name) + '</div>';
+  }
+  dropdown.innerHTML = html;
+}
+
+function renderCompareChips() {
+  var wrap = document.getElementById('compare-control');
+  if (!wrap) return;
+  // Remove old chips
+  var oldChips = wrap.querySelectorAll('.compare-chip');
+  for (var i = 0; i < oldChips.length; ++i) oldChips[i].remove();
+
+  // Insert chips before the button
+  var btn = document.getElementById('compare-btn');
+  for (var j = 0; j < compareStores.length; ++j) {
+    var color = COMPARE_COLORS[j % COMPARE_COLORS.length];
+    var chip = document.createElement('button');
+    chip.className = 'compare-chip';
+    chip.dataset.store = compareStores[j];
+    chip.style.background = color + '22';
+    chip.style.color = color;
+    chip.innerHTML = esc(compareStores[j]) + ' <span class="chip-x">&times;</span>';
+    wrap.insertBefore(chip, btn);
+  }
+
+  // Update button text
+  btn.textContent = compareStores.length ? '+' : '+ Compare';
+}
+
+async function refreshBenchmarkChart() {
+  if (!runtimes['cf-trend'] || !currentStore) return;
+
+  // Build isolated filter set: mirror all dashboard filters EXCEPT sold_location,
+  // override product with benchmarkProduct if set
+  var state = getState();
+  var trendConfig = getCubeConfig('cf-trend');
+  var benchmarkFilters = buildDashboardFilters(state, trendConfig.workerDimensions);
+  delete benchmarkFilters.sold_location;
+  if (benchmarkProduct) {
+    benchmarkFilters.product = { type: 'in', values: [benchmarkProduct] };
+  } else {
+    delete benchmarkFilters.product;
+  }
+
+  var result;
+  try {
+    result = await runtimes['cf-trend'].query({
+      isolatedFilters: benchmarkFilters,
+      snapshot: false,
+      groups: {
+        byStoreDay: {
+          sort: 'natural',
+          limit: null,
+          includeTotals: false,
+        },
+      },
+    });
+  } catch (err) {
+    console.error('cf-trend benchmark query failed:', err);
+    return;
+  }
+
+  lastBenchmarkGroupData = result && result.groups ? result.groups.byStoreDay : null;
+  renderBenchmarkChart(lastBenchmarkGroupData);
+}
+
+function renderBenchmarkChart(groupData) {
+  var el = document.getElementById('panel-benchmark');
+  var contextTag = document.getElementById('benchmark-context');
+  if (!el) return;
+
+  var entries = groupData && groupData.entries ? groupData.entries : groupData || [];
+  if (!entries.length) {
+    if (benchmarkChart && !benchmarkChart.isDisposed()) benchmarkChart.dispose();
+    benchmarkChart = null;
+    el.innerHTML = '<div class="panel-empty">No time-series data for comparison</div>';
+    if (contextTag) contextTag.textContent = '';
+    return;
+  }
+
+  // Each entry: { key: timestamp, value: { "Store A": { events, products, lostSales, duration, days }, ... } }
+  // Collect per-store daily metric values from the split group
+  var storeDaily = {};
+  var allDates = [];
+
+  for (var i = 0; i < entries.length; ++i) {
+    var dateKey = Number(entries[i].key);
+    allDates.push(dateKey);
+    var splits = entries[i].value;
+    if (!splits) continue;
+    for (var store in splits) {
+      if (!storeDaily[store]) storeDaily[store] = {};
+      storeDaily[store][dateKey] = splits[store];
+    }
+  }
+
+  var buckets = bucketDates(allDates, benchmarkGranularity);
+
+  // Metric config
+  var METRIC_CONFIG = {
+    availability: { label: 'Availability %', unit: '%', invert: true, format: function (v) { return v.toFixed(1) + '%'; } },
+    events: { label: 'Stockout Events', unit: '', invert: false, format: function (v) { return Math.round(v); } },
+    duration: { label: 'Avg Duration (days)', unit: 'd', invert: false, format: function (v) { return v.toFixed(1) + 'd'; } },
+  };
+  var mc = METRIC_CONFIG[benchmarkMetric] || METRIC_CONFIG.availability;
+
+  var labels = [];
+  var selectedLine = [];
+  var avgLine = [];
+  var bandLower = [];
+  var bandUpper = [];
+  var compareLines = {};
+  var allCompareNames = compareStores.slice();
+  if (hoverStore && compareStores.indexOf(hoverStore) < 0) allCompareNames.push(hoverStore);
+  for (var ci = 0; ci < allCompareNames.length; ++ci) {
+    compareLines[allCompareNames[ci]] = [];
+  }
+  var storeNames = Object.keys(storeDaily);
+  var storeCount = storeNames.length;
+
+  for (var b = 0; b < buckets.length; ++b) {
+    var bucket = buckets[b];
+    labels.push(bucket.label);
+    var daysInBucket = bucket.dates.length;
+
+    var storeValues = [];
+    var selectedValue = 0;
+    var compareValues = {};
+
+    for (var s = 0; s < storeNames.length; ++s) {
+      var storeName = storeNames[s];
+      var val = computeStoreMetric(storeDaily[storeName], bucket.dates);
+      storeValues.push(val);
+      if (storeName === currentStore) selectedValue = val;
+      if (allCompareNames.indexOf(storeName) >= 0) compareValues[storeName] = val;
+    }
+
+    // For availability: higher = better, so best = max, worst = min
+    // For events/duration: lower = better, so best = min, worst = max
+    storeValues.sort(function (a, b2) { return a - b2; });
+    var sum = 0;
+    for (var t = 0; t < storeValues.length; ++t) sum += storeValues[t];
+    var avg = storeCount > 0 ? sum / storeCount : 0;
+
+    selectedLine.push(Math.round(selectedValue * 100) / 100);
+    avgLine.push(Math.round(avg * 100) / 100);
+
+    bandLower.push(storeValues[0] || 0);
+    bandUpper.push(storeValues[storeValues.length - 1] || 0);
+
+    for (var cs = 0; cs < allCompareNames.length; ++cs) {
+      var csName = allCompareNames[cs];
+      compareLines[csName].push(Math.round((compareValues[csName] || 0) * 100) / 100);
+    }
+  }
+
+  function computeStoreMetric(storeData, dates) {
+    if (benchmarkMetric === 'availability') {
+      // Availability = 100 * (1 - products_affected / (160 * observation_days))
+      // 'days' metric counts actual observation rows (one per product-day with a stockout)
+      // 'products' sums distinct products affected per observation day
+      // For a proper ratio: products / days gives avg products stocked out per day
+      var totalProducts = 0;
+      var observationDays = 0;
+      for (var d = 0; d < dates.length; ++d) {
+        var entry = storeData ? storeData[dates[d]] : null;
+        if (entry) {
+          totalProducts += Number(entry.products) || 0;
+          observationDays += Number(entry.days) || 0;
+        }
+      }
+      // Each observation day has up to 160 products; 'days' counts product-day observations
+      // so products/days is meaningless. Instead: products = sum of distinct products per week.
+      // For weekly bucket: products = sum of daily distinct-product counts across the week.
+      // Approximate daily avg: products / 7 (for a full week)
+      var weeksInBucket = dates.length;
+      var calendarDays = weeksInBucket * 7;
+      if (!calendarDays) return 100;
+      return 100 * (1 - totalProducts / (160 * calendarDays));
+    }
+    if (benchmarkMetric === 'duration') {
+      var durSum = 0;
+      var durCount = 0;
+      for (var d = 0; d < dates.length; ++d) {
+        var entry = storeData ? storeData[dates[d]] : null;
+        if (entry && entry.duration != null) {
+          durSum += Number(entry.duration) || 0;
+          durCount += 1;
+        }
+      }
+      return durCount > 0 ? durSum / durCount : 0;
+    }
+    // events (default)
+    var total = 0;
+    for (var d = 0; d < dates.length; ++d) {
+      var entry = storeData ? storeData[dates[d]] : null;
+      if (entry) total += Number(entry.events) || 0;
+    }
+    return total;
+  }
+
+  // Trim to last 52 weeks (discard leading partial/warm-up weeks)
+  var maxBuckets = benchmarkGranularity === 'month' ? 12 : 52;
+  if (labels.length > maxBuckets) {
+    var trim = labels.length - maxBuckets;
+    labels = labels.slice(trim);
+    selectedLine = selectedLine.slice(trim);
+    avgLine = avgLine.slice(trim);
+    bandLower = bandLower.slice(trim);
+    bandUpper = bandUpper.slice(trim);
+    for (var tc = 0; tc < allCompareNames.length; ++tc) {
+      compareLines[allCompareNames[tc]] = compareLines[allCompareNames[tc]].slice(trim);
+    }
+  }
+
+  if (contextTag) {
+    contextTag.textContent = benchmarkProduct
+      ? benchmarkProduct
+      : storeCount + ' stores · ' + benchmarkGranularity + 'ly';
+  }
+
+  if (benchmarkChart && !benchmarkChart.isDisposed()) {
+    benchmarkChart.dispose();
+  }
+  el.innerHTML = '';
+  benchmarkChart = echarts.init(el, THEME_NAME, { renderer: 'canvas' });
+
+  benchmarkChart.setOption({
+    animation: false,
+    grid: { left: 50, right: 24, top: 36, bottom: 40 },
+    legend: {
+      top: 0,
+      itemWidth: 10,
+      itemHeight: 10,
+      data: ['Your Store', 'Avg Store', 'Best Store', 'Worst Store'].concat(allCompareNames),
+    },
+    tooltip: {
+      trigger: 'axis',
+      formatter: function (params) {
+        var idx = params[0].dataIndex;
+        var best = mc.invert ? bandUpper[idx] : bandLower[idx];
+        var worst = mc.invert ? bandLower[idx] : bandUpper[idx];
+        var tip = '<b>' + labels[idx] + '</b> — ' + mc.label + '<br>';
+        tip += '<span style="color:' + namedColor('blue') + '">\u25cf</span> Your Store: ' + mc.format(selectedLine[idx]) + '<br>';
+        tip += '<span style="color:' + namedColor('muted') + '">\u25cf</span> Avg Store: ' + mc.format(avgLine[idx]) + '<br>';
+        tip += '<span style="color:' + namedColor('green') + '">\u25cf</span> Best Store: ' + mc.format(best) + '<br>';
+        tip += '<span style="color:' + namedColor('red') + '">\u25cf</span> Worst Store: ' + mc.format(worst);
+        for (var ci = 0; ci < allCompareNames.length; ++ci) {
+          var isHov = allCompareNames[ci] === hoverStore && compareStores.indexOf(allCompareNames[ci]) < 0;
+          var cColor = isHov ? namedColor('purple') : COMPARE_COLORS[ci % COMPARE_COLORS.length];
+          var cVal = compareLines[allCompareNames[ci]] ? compareLines[allCompareNames[ci]][idx] : 0;
+          tip += '<br><span style="color:' + cColor + '">\u25cf</span> ' + allCompareNames[ci] + ': ' + mc.format(cVal);
+        }
+        return tip;
+      },
+    },
+    xAxis: {
+      type: 'category',
+      data: labels,
+      boundaryGap: false,
+    },
+    yAxis: (function () {
+      // Auto-zoom: compute tight Y range from all visible series
+      var allVals = selectedLine.concat(avgLine, bandLower, bandUpper);
+      var dataMin = Math.min.apply(null, allVals);
+      var dataMax = Math.max.apply(null, allVals);
+      var padding = (dataMax - dataMin) * 0.1 || 1;
+      var yMin = Math.floor(dataMin - padding);
+      var yMax = Math.ceil(dataMax + padding);
+      if (benchmarkMetric === 'availability') {
+        yMax = Math.min(yMax, 100);
+        yMin = Math.max(yMin, 0);
+      } else {
+        yMin = Math.max(yMin, 0);
+      }
+      return {
+        type: 'value',
+        name: mc.label,
+        nameTextStyle: { fontSize: 10 },
+        min: yMin,
+        max: yMax,
+        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } },
+        axisLabel: benchmarkMetric === 'availability' ? { formatter: '{value}%' } : {},
+      };
+    })(),
+    series: [
+      // Band: best store baseline (invisible)
+      {
+        name: 'Best Store',
+        type: 'line',
+        stack: 'band',
+        symbol: 'none',
+        itemStyle: { color: namedColor('green') },
+        lineStyle: { width: 1, color: namedColor('green'), opacity: 0.3 },
+        areaStyle: { opacity: 0 },
+        data: bandLower,
+      },
+      // Band: gap from best to worst (shaded — higher = worse)
+      {
+        name: 'Worst Store',
+        type: 'line',
+        stack: 'band',
+        symbol: 'none',
+        itemStyle: { color: namedColor('red') },
+        lineStyle: { width: 1, color: namedColor('red'), opacity: 0.3 },
+        areaStyle: {
+          color: mc.invert ? {
+            type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: 'rgba(0,230,138,0.06)' },
+              { offset: 1, color: 'rgba(255,77,106,0.12)' },
+            ],
+          } : {
+            type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: 'rgba(255,77,106,0.12)' },
+              { offset: 1, color: 'rgba(0,230,138,0.06)' },
+            ],
+          },
+        },
+        data: bandUpper.map(function (v, idx) { return v - bandLower[idx]; }),
+      },
+      // Average store line
+      {
+        name: 'Avg Store',
+        type: 'line',
+        smooth: true,
+        symbol: 'none',
+        itemStyle: { color: namedColor('muted') },
+        lineStyle: { width: 1.5, color: namedColor('muted'), type: 'dashed' },
+        data: avgLine,
+      },
+      // Selected store line
+      {
+        name: 'Your Store',
+        type: 'line',
+        smooth: true,
+        symbol: 'none',
+        itemStyle: { color: namedColor('blue') },
+        lineStyle: { width: 3, color: namedColor('blue') },
+        data: selectedLine,
+      },
+    ].concat(allCompareNames.map(function (csName, idx) {
+      var isHover = csName === hoverStore && compareStores.indexOf(csName) < 0;
+      var color = isHover ? namedColor('purple') : COMPARE_COLORS[idx % COMPARE_COLORS.length];
+      return {
+        name: csName,
+        type: 'line',
+        smooth: true,
+        symbol: 'none',
+        itemStyle: { color: color },
+        lineStyle: { width: isHover ? 2 : 2, color: color, type: isHover ? 'dashed' : 'solid' },
+        data: compareLines[csName] || [],
+      };
+    })),
+  }, true);
+}
+
+function bucketDates(sortedDates, granularity) {
+  var buckets = [];
+  var currentBucket = null;
+
+  for (var i = 0; i < sortedDates.length; ++i) {
+    var ts = sortedDates[i];
+    var d = new Date(ts);
+    var label;
+    var bucketKey;
+
+    if (granularity === 'month') {
+      label = String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + d.getUTCFullYear();
+      bucketKey = label;
+    } else {
+      // week — group entries are already weekly (Monday-bucketed)
+      label = 'W ' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + String(d.getUTCDate()).padStart(2, '0');
+      bucketKey = ts;
+    }
+
+    if (!currentBucket || currentBucket.key !== bucketKey) {
+      currentBucket = { key: bucketKey, label: label, dates: [] };
+      buckets.push(currentBucket);
+    }
+    currentBucket.dates.push(ts);
+  }
+
+  return buckets;
+}
+
+// ---- Product click (stockout table → benchmark chart) ----
+
+onProductClick(function (product) {
+  benchmarkProduct = benchmarkProduct === product ? null : product;
+  highlightStockoutRow(benchmarkProduct);
+  refreshBenchmarkChart();
+});
+
+function highlightStockoutRow(product) {
+  var el = document.getElementById('panel-stockout-table');
+  if (!el) return;
+  var rows = el.querySelectorAll('tr[data-product]');
+  for (var i = 0; i < rows.length; ++i) {
+    rows[i].classList.toggle('risk-selected', rows[i].dataset.product === product);
+  }
+}
+
 // ---- DOW product filter (from risk table click) ----
 
+var dowSelectedProduct = null;
+
 setProductClickHandler(async function (product) {
+  dowSelectedProduct = product;
   var label = document.getElementById('dow-product-label');
   if (label) {
     if (product) { label.textContent = product; label.removeAttribute('hidden'); }
     else { label.setAttribute('hidden', ''); }
   }
+  await applyDowFilters();
+});
+
+async function applyDowFilters() {
   if (!runtimes['cf-dow']) return;
-  // Apply product filter ON TOP of existing store filter
   var state = getState();
   var filters = {};
   if (state.store) filters.sold_location = { type: 'in', values: [state.store] };
-  if (product) filters.product = { type: 'in', values: [product] };
+  if (dowSelectedProduct) filters.product = { type: 'in', values: [dowSelectedProduct] };
   await runtimes['cf-dow'].updateFilters(filters);
   try {
     var result = await runtimes['cf-dow'].rows({ fields: DOW_FIELDS, limit: 50000, columnar: true });
     renderDowPattern(result, echarts, THEME_NAME);
   } catch (err) { console.error('DOW query failed:', err); }
-});
+}
 
 // ---- State Change Handler ----
 
@@ -559,11 +1229,16 @@ onStateChange(async function (newState, prevState) {
   dom.storeName.textContent = currentStore;
   dom.storeSelector.value = currentStore;
   endedCategoryFilter = null;
+  benchmarkProduct = null;
+  compareStores = [];
+  renderCompareChips();
 
   if (!workersReady) return; // still loading
 
   // Dispatch sold_location + other filters to ALL runtimes (instant, client-side)
   await dispatchFilters(newState);
+  // Re-apply DOW product filter (dispatchFilters overwrites cf-dow filters)
+  if (dowSelectedProduct) await applyDowFilters();
   await refreshAllPanels();
 });
 
@@ -572,7 +1247,7 @@ onPanelRefresh(function () {});
 // ---- Resize ----
 
 window.addEventListener('resize', function () {
-  [document.getElementById('panel-dow'), document.getElementById('panel-category')].forEach(function (el) {
+  [document.getElementById('panel-benchmark'), document.getElementById('panel-dow'), document.getElementById('panel-category')].forEach(function (el) {
     if (el) {
       var instance = echarts.getInstanceByDom(el);
       if (instance) instance.resize();

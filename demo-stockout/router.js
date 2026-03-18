@@ -31,6 +31,11 @@ export function parseHash(hash) {
       state[param] = val || null;
     }
   }
+
+  // Sensitivity param (not a standard dimension mapping)
+  var sens = params.get('sensitivity');
+  state.sensitivity = sens === 'confirmed' || sens === 'high' ? sens : null;
+
   return state;
 }
 
@@ -40,6 +45,7 @@ export function serializeHash(state) {
   for (var param in PARAM_TO_DIMENSION) {
     if (state[param]) params.set(param, state[param]);
   }
+  if (state.sensitivity) params.set('sensitivity', state.sensitivity);
   var str = params.toString();
   return str ? '#' + str : '#';
 }
@@ -69,6 +75,19 @@ export function onStateChange(callback) {
   };
 }
 
+// Sensitivity filter: maps one URL param to different dimensions per runtime
+// 'all' = no filter, 'confirmed' = confirmed only, 'high' = high confidence only
+var SENSITIVITY_MAPPINGS = {
+  confirmed: {
+    signal_quality: { type: 'in', values: ['HIGH CONFIDENCE', 'MIXED'] },
+    is_confirmed: { type: 'in', values: [true, 1] },
+  },
+  high: {
+    signal_quality: { type: 'in', values: ['HIGH CONFIDENCE'] },
+    is_confirmed: { type: 'in', values: [true, 1] },
+  },
+};
+
 // Convert URL state to dashboard filter objects (for crossfilter runtime.updateFilters)
 export function buildDashboardFilters(state, runtimeDimensions) {
   var filters = {};
@@ -88,6 +107,19 @@ export function buildDashboardFilters(state, runtimeDimensions) {
       filters[dimName] = { type: 'in', values: val.split(',') };
     }
   }
+
+  // Sensitivity filter — maps to different dimensions per runtime
+  var sens = state.sensitivity;
+  if (sens && SENSITIVITY_MAPPINGS[sens]) {
+    var mapping = SENSITIVITY_MAPPINGS[sens];
+    for (var dimName in mapping) {
+      if (runtimeDimensions.includes(dimName)) {
+        filters[dimName] = mapping[dimName];
+        break;  // apply first matching dimension only
+      }
+    }
+  }
+
   return filters;
 }
 
