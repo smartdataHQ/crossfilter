@@ -1,6 +1,6 @@
 // demo-stockout/panels/dow-pattern.js
 
-import { columnarToRows, esc } from './helpers.js';
+import { getColumns, esc } from './helpers.js';
 import { colorFor } from '../config.js';
 
 var chartInstance = null;
@@ -18,40 +18,59 @@ var PROB_FIELDS = [
   'dow_mon_probability', 'dow_tue_probability', 'dow_wed_probability',
   'dow_thu_probability', 'dow_fri_probability', 'dow_sat_probability', 'dow_sun_probability',
 ];
+var TOTAL_FIELDS = [
+  'dow_mon_total', 'dow_tue_total', 'dow_wed_total',
+  'dow_thu_total', 'dow_fri_total', 'dow_sat_total', 'dow_sun_total',
+];
+
+var dowEl = null;
+var dowBadgesEl = null;
 
 export function renderDowPattern(rowsResult, echarts, themeName) {
-  var el = document.getElementById('panel-dow');
-  var badgesEl = document.getElementById('panel-dow-badges');
+  dowEl = dowEl || document.getElementById('panel-dow');
+  dowBadgesEl = dowBadgesEl || document.getElementById('panel-dow-badges');
+  var el = dowEl;
+  var badgesEl = dowBadgesEl;
   if (!el) return;
 
-  var rows = columnarToRows(rowsResult);
-  if (!rows.length) {
+  var data = getColumns(rowsResult);
+  var cols = data.columns;
+  var len = data.length;
+  if (!len) {
     el.innerHTML = '<div class="panel-empty">No <abbr title="Day of Week">DOW</abbr> data</div>';
     if (badgesEl) badgesEl.innerHTML = '';
     return;
   }
 
-  var TOTAL_FIELDS = [
-    'dow_mon_total', 'dow_tue_total', 'dow_wed_total',
-    'dow_thu_total', 'dow_fri_total', 'dow_sat_total', 'dow_sun_total',
-  ];
-
   var confirmedTotals = [0, 0, 0, 0, 0, 0, 0];
   var observedTotals = [0, 0, 0, 0, 0, 0, 0];
   var weekdayRateSum = 0, weekendRateSum = 0;
   var patternCounts = {}, riskDayCounts = {};
-  var count = rows.length;
+  var count = len;
 
-  for (var i = 0; i < rows.length; ++i) {
-    var r = rows[i];
-    for (var d = 0; d < 7; ++d) {
-      confirmedTotals[d] += Number(r[CONFIRMED_FIELDS[d]]) || 0;
-      observedTotals[d] += Number(r[TOTAL_FIELDS[d]]) || 0;
+  var weekdayCol = cols.weekday_stockout_rate;
+  var weekendCol = cols.weekend_stockout_rate;
+  var patternCol = cols.dow_pattern;
+  var riskDayCol = cols.highest_risk_day;
+
+  var confCols = new Array(7), totCols = new Array(7);
+  for (var d = 0; d < 7; ++d) {
+    confCols[d] = cols[CONFIRMED_FIELDS[d]];
+    totCols[d] = cols[TOTAL_FIELDS[d]];
+  }
+  for (var i = 0; i < len; ++i) {
+    for (var dd = 0; dd < 7; ++dd) {
+      confirmedTotals[dd] += +(confCols[dd] ? confCols[dd][i] : 0) || 0;
+      observedTotals[dd] += +(totCols[dd] ? totCols[dd][i] : 0) || 0;
     }
-    weekdayRateSum += Number(r.weekday_stockout_rate) || 0;
-    weekendRateSum += Number(r.weekend_stockout_rate) || 0;
-    if (r.dow_pattern) patternCounts[r.dow_pattern] = (patternCounts[r.dow_pattern] || 0) + 1;
-    if (r.highest_risk_day) riskDayCounts[r.highest_risk_day] = (riskDayCounts[r.highest_risk_day] || 0) + 1;
+  }
+  for (var j = 0; j < len; ++j) {
+    weekdayRateSum += Number(weekdayCol ? weekdayCol[j] : 0) || 0;
+    weekendRateSum += Number(weekendCol ? weekendCol[j] : 0) || 0;
+    var pat = patternCol ? patternCol[j] : null;
+    var rday = riskDayCol ? riskDayCol[j] : null;
+    if (pat) patternCounts[pat] = (patternCounts[pat] || 0) + 1;
+    if (rday) riskDayCounts[rday] = (riskDayCounts[rday] || 0) + 1;
   }
 
   // Weighted probability: total confirmed / total observed (not avg of per-product probs)

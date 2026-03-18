@@ -17,10 +17,12 @@ var NAMED_COLORS = {
 
 // Loaded from /api/meta — keyed by short field name
 var fieldMeta = {};
+var colorCache = {};
 
 // Load meta from Cube API and extract color rules
 export function loadMeta(metaResponse) {
   if (!metaResponse || !metaResponse.cubes) return;
+  colorCache = {};
   for (var i = 0; i < metaResponse.cubes.length; ++i) {
     var cube = metaResponse.cubes[i];
     var dims = cube.dimensions || [];
@@ -33,8 +35,16 @@ export function loadMeta(metaResponse) {
   }
 }
 
-// Get the color for a field value using meta rules
+// Get the color for a field value using meta rules (memoized)
 export function colorFor(field, value) {
+  var key = field + '\0' + value;
+  if (key in colorCache) return colorCache[key];
+  var result = _colorForUncached(field, value);
+  colorCache[key] = result;
+  return result;
+}
+
+function _colorForUncached(field, value) {
   var meta = fieldMeta[field];
   if (!meta) return NAMED_COLORS.muted;
 

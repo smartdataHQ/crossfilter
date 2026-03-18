@@ -3,14 +3,19 @@
 // Products NOT stocked out, NOT high risk, but deteriorating.
 // Sortable column headers. Uses Cube meta for all colors/labels.
 
-import { columnarToRows, countedOptions, esc, isActive, scoreBar, fieldBadge, deltaCell, sortableHeader, attachSortHandlers } from './helpers.js';
+import { getColumns, filterIndices, sortIndices, countsToOptions, esc, isActive, scoreBar, fieldBadge, deltaCell, sortableHeader, attachSortHandlers } from './helpers.js';
 
-var allRows = [];
+var columns = null;
+var allIndices = [];
 var sevSelect = null;
 var catSelect = null;
 var supSelect = null;
 var sortField = 'risk_score';
 var sortDir = -1;
+
+var HIGH_RISK_TIER = { CRITICAL: 1, Critical: 1, HIGH: 1, High: 1 };
+var WORSENING_SIGNAL = { WORSENING: 1, Worsening: 1, 'ACTIVE & WORSENING': 1, 'Active & Worsening': 1 };
+var ESCALATING_SEVERITY = { ESCALATING: 1, Escalating: 1, WORSENING: 1, Worsening: 1 };
 
 var COLUMNS = [
   { key: 'product', label: 'Product', title: 'Product name', type: 'string' },
@@ -23,6 +28,10 @@ var COLUMNS = [
   { key: 'forecast_stockout_probability', label: '<abbr title="3-Day Probability">3-Day Prob</abbr>', title: '3-day stockout probability', type: 'bar', barField: 'forecast_stockout_probability' },
 ];
 
+// Pre-built O(1) lookup for sort column config
+var COLUMN_MAP = {};
+for (var ci = 0; ci < COLUMNS.length; ++ci) COLUMN_MAP[COLUMNS[ci].key] = COLUMNS[ci];
+
 export function renderEarlyWarning(rowsResult) {
   var el = document.getElementById('panel-early-warning');
   if (!el) return;
@@ -32,73 +41,97 @@ export function renderEarlyWarning(rowsResult) {
   catSelect = catSelect || document.getElementById('warning-cat-filter');
   supSelect = supSelect || document.getElementById('warning-sup-filter');
 
-  var rows = columnarToRows(rowsResult);
-  allRows = rows.filter(function (r) {
-    if (isActive(r.is_currently_active)) return false;
-    // Use Cube-defined risk_tier to exclude high-risk products (they belong in HIGHEST RISK)
-    var tier = String(r.risk_tier || '').toUpperCase();
-    if (tier === 'CRITICAL' || tier === 'HIGH') return false;
-    var trend = String(r.trend_signal || '').toUpperCase();
-    var severity = String(r.severity_trend || '').toUpperCase();
-    return trend === 'WORSENING' || severity === 'ESCALATING' || severity === 'WORSENING';
+  var data = getColumns(rowsResult);
+  columns = data.columns;
+  allIndices = filterIndices(columns, data.length, function (cols, i) {
+    if (isActive(cols.is_currently_active ? cols.is_currently_active[i] : null)) return false;
+    if (HIGH_RISK_TIER[(cols.risk_tier ? cols.risk_tier[i] : '') || ''] === 1) return false;
+    var trend = (cols.trend_signal ? cols.trend_signal[i] : '') || '';
+    var severity = (cols.severity_trend ? cols.severity_trend[i] : '') || '';
+    return WORSENING_SIGNAL[trend] === 1 || ESCALATING_SEVERITY[severity] === 1;
   });
 
-  sortRows();
-  populateSelects(allRows);
+  sortCurrentField();
+  populateSelects();
   renderFiltered();
 }
 
-function sortRows() {
-  allRows.sort(function (a, b) {
-    var av = sortValue(a, sortField);
-    var bv = sortValue(b, sortField);
-    if (av < bv) return -1 * sortDir;
-    if (av > bv) return 1 * sortDir;
-    return 0;
-  });
-}
-
-function sortValue(row, field) {
-  var col = COLUMNS.filter(function (c) { return c.key === field; })[0];
+function sortCurrentField() {
+  var col = COLUMN_MAP[sortField];
   if (col && col.type === 'delta') {
-    var r = Number(row[col.recent]) || 0;
-    var o = Number(row[col.older]) || 0;
-    return o > 0 ? r / o : (r > 0 ? 2 : 1);
+    var recentCol = columns[col.recent];
+    var olderCol = columns[col.older];
+    allIndices.sort(function (a, b) {
+      var ra = Number(recentCol ? recentCol[a] : 0) || 0;
+      var oa = Number(olderCol ? olderCol[a] : 0) || 0;
+      var av = oa > 0 ? ra / oa : (ra > 0 ? 2 : 1);
+      var rb = Number(recentCol ? recentCol[b] : 0) || 0;
+      var ob = Number(olderCol ? olderCol[b] : 0) || 0;
+      var bv = ob > 0 ? rb / ob : (rb > 0 ? 2 : 1);
+      return (av - bv) * sortDir;
+    });
+  } else {
+    sortIndices(allIndices, columns, sortField, sortDir);
   }
-  var v = row[field];
-  if (v == null) return '';
-  return typeof v === 'string' ? v.toLowerCase() : Number(v) || 0;
 }
 
 function onHeaderClick(field) {
   if (sortField === field) { sortDir *= -1; }
   else { sortField = field; sortDir = -1; }
-  sortRows();
+  sortCurrentField();
   renderFiltered();
 }
 
-function populateSelects(rows) {
-  if (!sevSelect || !catSelect || !supSelect) return;
+function populateSelects() {
+  if (!sevSelect || !catSelect || !supSelect || !columns) return;
   var prevSev = sevSelect.value, prevCat = catSelect.value, prevSup = supSelect.value;
-  sevSelect.innerHTML = '<option value="">All Severity (' + rows.length + ')</option>' + countedOptions(rows, 'severity_trend');
-  catSelect.innerHTML = '<option value="">All Categories (' + rows.length + ')</option>' + countedOptions(rows, 'product_category');
-  supSelect.innerHTML = '<option value="">All Suppliers (' + rows.length + ')</option>' + countedOptions(rows, 'supplier');
+  // Single pass counts all three filter fields simultaneously
+  var sevCol = columns.severity_trend;
+  var catCol = columns.product_category;
+  var supCol = columns.supplier;
+  var sevCounts = {}, catCounts = {}, supCounts = {};
+  for (var i = 0; i < allIndices.length; ++i) {
+    var idx = allIndices[i];
+    var sv = sevCol ? sevCol[idx] : null;
+    var cv = catCol ? catCol[idx] : null;
+    var uv = supCol ? supCol[idx] : null;
+    if (sv != null && sv !== '') sevCounts[sv] = (sevCounts[sv] || 0) + 1;
+    if (cv != null && cv !== '') catCounts[cv] = (catCounts[cv] || 0) + 1;
+    if (uv != null && uv !== '') supCounts[uv] = (supCounts[uv] || 0) + 1;
+  }
+  sevSelect.innerHTML = '<option value="">All Severity (' + allIndices.length + ')</option>' + countsToOptions(sevCounts);
+  catSelect.innerHTML = '<option value="">All Categories (' + allIndices.length + ')</option>' + countsToOptions(catCounts);
+  supSelect.innerHTML = '<option value="">All Suppliers (' + allIndices.length + ')</option>' + countsToOptions(supCounts);
   sevSelect.value = prevSev; catSelect.value = prevCat; supSelect.value = prevSup;
   sevSelect.onchange = renderFiltered; catSelect.onchange = renderFiltered; supSelect.onchange = renderFiltered;
 }
 
+var panelEl = null;
+var countEl = null;
+
 function renderFiltered() {
-  var el = document.getElementById('panel-early-warning');
-  var countEl = document.getElementById('warning-count');
-  if (!el) return;
+  panelEl = panelEl || document.getElementById('panel-early-warning');
+  countEl = countEl || document.getElementById('warning-count');
+  var el = panelEl;
+  if (!el || !columns) return;
 
   var sevVal = sevSelect ? sevSelect.value : '';
   var catVal = catSelect ? catSelect.value : '';
   var supVal = supSelect ? supSelect.value : '';
-  var filtered = allRows;
-  if (sevVal) filtered = filtered.filter(function (r) { return r.severity_trend === sevVal; });
-  if (catVal) filtered = filtered.filter(function (r) { return r.product_category === catVal; });
-  if (supVal) filtered = filtered.filter(function (r) { return r.supplier === supVal; });
+  var filtered = allIndices;
+  if (sevVal || catVal || supVal) {
+    var sevCol = columns.severity_trend;
+    var catCol = columns.product_category;
+    var supCol = columns.supplier;
+    filtered = [];
+    for (var f = 0; f < allIndices.length; ++f) {
+      var idx = allIndices[f];
+      if (sevVal && sevCol && sevCol[idx] !== sevVal) continue;
+      if (catVal && catCol && catCol[idx] !== catVal) continue;
+      if (supVal && supCol && supCol[idx] !== supVal) continue;
+      filtered.push(idx);
+    }
+  }
   if (countEl) countEl.textContent = filtered.length + ' deteriorating';
 
   if (!filtered.length) {
@@ -111,9 +144,9 @@ function renderFiltered() {
 
   var body = '';
   for (var i = 0; i < filtered.length; ++i) {
-    var r = filtered[i];
+    var idx = filtered[i];
     body += '<tr>';
-    for (var j = 0; j < COLUMNS.length; ++j) body += renderCell(r, COLUMNS[j]);
+    for (var j = 0; j < COLUMNS.length; ++j) body += renderCell(idx, COLUMNS[j]);
     body += '</tr>';
   }
 
@@ -122,12 +155,13 @@ function renderFiltered() {
   attachSortHandlers(el, onHeaderClick);
 }
 
-function renderCell(r, col) {
+function renderCell(idx, col) {
+  var v = columns[col.key] ? columns[col.key][idx] : null;
   switch (col.type) {
-    case 'string': return '<td class="val">' + esc(r[col.key]) + '</td>';
-    case 'field': return '<td>' + fieldBadge(col.field, r[col.key]) + '</td>';
-    case 'bar': return '<td>' + scoreBar(Number(r[col.key]) || 0, col.barField) + '</td>';
-    case 'delta': return '<td>' + deltaCell(r[col.recent], r[col.older]) + '</td>';
-    default: return '<td>' + esc(r[col.key]) + '</td>';
+    case 'string': return '<td class="val">' + esc(v) + '</td>';
+    case 'field': return '<td>' + fieldBadge(col.field, v) + '</td>';
+    case 'bar': return '<td>' + scoreBar(+v || 0, col.barField) + '</td>';
+    case 'delta': return '<td>' + deltaCell(columns[col.recent] ? columns[col.recent][idx] : null, columns[col.older] ? columns[col.older][idx] : null) + '</td>';
+    default: return '<td>' + esc(v) + '</td>';
   }
 }
