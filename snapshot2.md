@@ -1,0 +1,176 @@
+- generic [ref=e5]:
+  - banner [ref=e6]:
+    - generic [ref=e7]:
+      - heading "STORE OPERATIONS" [level=1] [ref=e8]
+      - heading "Essential Products Borgarnes" [level=2] [ref=e9]
+    - generic [ref=e10]:
+      - generic [ref=e2247]:
+        - 'button "Product: e.s brauð 2pk hvítlauks 350 gr ×" [ref=e2249] [cursor=pointer]':
+          - text: "Product: e.s brauð 2pk hvítlauks 350 gr"
+          - generic [ref=e2250]: ×
+        - button "Clear Filters" [ref=e2251] [cursor=pointer]
+      - combobox "Search stores..." [ref=e11]: Borgarnes
+  - generic [ref=e12]:
+    - generic [ref=e2252]:
+      - generic [ref=e2253]: Active Stockouts
+      - generic [ref=e2254]: "1"
+    - generic [ref=e2255]:
+      - generic [ref=e2256]: Ended Yesterday
+      - generic [ref=e2257]: "10"
+      - generic [ref=e2258]: ↑ 10 vs day before
+    - generic [ref=e2259]:
+      - generic [ref=e2260]: Started Yesterday
+      - generic [ref=e2261]: "5"
+      - generic [ref=e2262]: ↑ 3 vs day before
+    - generic [ref=e2263]:
+      - generic [ref=e2264]: Lost Sales Yesterday
+      - generic [ref=e2265]: 1.1K ISK
+      - generic [ref=e2266]: ↑ 1.1K vs day before
+  - generic [ref=e29]:
+    - generic [ref=e30]: STOCKOUT FREQUENCY — PEER COMPARISON
+    - generic [ref=e31]:
+      - generic [ref=e32]:
+        - button "Day" [ref=e33] [cursor=pointer]
+        - button "Week" [ref=e34] [cursor=pointer]
+        - button "Month" [ref=e35] [cursor=pointer]
+      - generic [ref=e36]: e.s brauð 2pk hvítlauks 350 gr
+  - generic [ref=e40]:
+    - generic [ref=e41]:
+      - generic [ref=e42]: CURRENTLY STOCKED OUT
+      - generic [ref=e43]:
+        - combobox [ref=e44] [cursor=pointer]:
+          - option "All Categories (1)" [selected]
+          - option "Frystivara (1)"
+        - combobox [ref=e45] [cursor=pointer]:
+          - option "All Suppliers (1)" [selected]
+          - option "Aðföng ehf (1)"
+        - generic [ref=e46]: 1 products
+    - table [ref=e2269]:
+      - rowgroup [ref=e2270]:
+        - row "Product Pattern Avg Dur Total Lost Status Freq/Mo" [ref=e2271]:
+          - columnheader "Product" [ref=e2272] [cursor=pointer]
+          - columnheader "Pattern" [ref=e2273] [cursor=pointer]
+          - columnheader "Avg Dur" [ref=e2274] [cursor=pointer]
+          - columnheader "Total Lost" [ref=e2275] [cursor=pointer]
+          - columnheader "Status" [ref=e2276] [cursor=pointer]
+          - columnheader "Freq/Mo" [ref=e2277] [cursor=pointer]
+      - rowgroup [ref=e2278]:
+        - row "e.s brauð 2pk hvítlauks 350 gr TYPICAL 1.2d 1.2K ACTIVE & WORSENING 4.5/mo" [ref=e2279] [cursor=pointer]:
+          - cell "e.s brauð 2pk hvítlauks 350 gr" [ref=e2280]
+          - cell "TYPICAL" [ref=e2281]:
+            - generic [ref=e2282]: TYPICAL
+          - cell "1.2d" [ref=e2283]
+          - cell "1.2K" [ref=e2284]
+          - cell "ACTIVE & WORSENING" [ref=e2285]:
+            - generic [ref=e2286]: ACTIVE & WORSENING
+          - cell "4.5/mo" [ref=e2287]
+  - generic [ref=e238]:
+    - generic [ref=e239]:
+      - generic [ref=e240]: AT RISK — NEXT 3 DAYS
+      - generic [ref=e241]:
+        - generic [ref=e242]:
+          - button "All" [ref=e2288] [cursor=pointer]
+          - button "Thu (0)" [ref=e2289] [cursor=pointer]
+          - button "Fri (0)" [ref=e2290] [cursor=pointer]
+          - button "Sat (0)" [ref=e2291] [cursor=pointer]
+        - combobox [ref=e247] [cursor=pointer]:
+          - option "All Categories (0)" [selected]
+        - combobox [ref=e248] [cursor=pointer]:
+          - option "All Suppliers (0)" [selected]
+        - generic [ref=e249]: 0 at risk
+    - generic [ref=e2292]: No at-risk products
+  - generic [ref=e1031]:
+    - generic [ref=e1032]:
+      - generic [ref=e1034]: HIGHEST RISK
+      - generic [ref=e2293]: No at-risk products
+    - generic [ref=e1227]:
+      - generic [ref=e1229]: DOW PATTERN
+      - generic [ref=e1233]:
+        - generic [ref=e2294]:
+          - text: "Pattern:"
+          - strong [ref=e2295]: WEEKDAY-PRONE
+        - generic [ref=e2296]:
+          - text: "Highest Risk Day:"
+          - strong [ref=e2297]: Mon
+        - generic [ref=e2298]:
+          - text: "Weekday Rate:"
+          - strong [ref=e2299]: 30.0%
+        - generic [ref=e2300]:
+          - text: "Weekend Rate:"
+          - strong [ref=e2301]: 19.8%
+  - generic [ref=e1242]:
+    - generic [ref=e1243]:
+      - generic [ref=e1244]:
+        - generic [ref=e1245]: ENDED YESTERDAY
+        - generic [ref=e1246]: 10 products
+      - table [ref=e2303]:
+        - rowgroup [ref=e2304]:
+          - row "Product Category Duration Lost Sales" [ref=e2305]:
+            - columnheader "Product" [ref=e2306]
+            - columnheader "Category" [ref=e2307]
+            - columnheader "Duration" [ref=e2308]
+            - columnheader "Lost Sales" [ref=e2309]
+        - rowgroup [ref=e2310]:
+          - row "jarðarber 500 gr holland Ávextir og grænmeti 97.0d 653" [ref=e2311]:
+            - cell "jarðarber 500 gr holland" [ref=e2312]
+            - cell "Ávextir og grænmeti" [ref=e2313]
+            - cell "97.0d" [ref=e2314]
+            - cell "653" [ref=e2315]
+          - row "my heimilisbrauð 770 gr Brauð og kökur 5.0d 311" [ref=e2316]:
+            - cell "my heimilisbrauð 770 gr" [ref=e2317]
+            - cell "Brauð og kökur" [ref=e2318]
+            - cell "5.0d" [ref=e2319]
+            - cell "311" [ref=e2320]
+          - row "sfg gulrætur 500 gr Ávextir og grænmeti 1.0d 54" [ref=e2321]:
+            - cell "sfg gulrætur 500 gr" [ref=e2322]
+            - cell "Ávextir og grænmeti" [ref=e2323]
+            - cell "1.0d" [ref=e2324]
+            - cell "54" [ref=e2325]
+          - row "bláber 500 gr fata holland Ávextir og grænmeti 0.0d 24" [ref=e2326]:
+            - cell "bláber 500 gr fata holland" [ref=e2327]
+            - cell "Ávextir og grænmeti" [ref=e2328]
+            - cell "0.0d" [ref=e2329]
+            - cell "24" [ref=e2330]
+          - row "bónus egg 10 stk large 675 gr Kælir 3.0d 23" [ref=e2331]:
+            - cell "bónus egg 10 stk large 675 gr" [ref=e2332]
+            - cell "Kælir" [ref=e2333]
+            - cell "3.0d" [ref=e2334]
+            - cell "23" [ref=e2335]
+          - row "sfg tómatar pakkaðir 6 stk Ávextir og grænmeti 0.0d 18" [ref=e2336]:
+            - cell "sfg tómatar pakkaðir 6 stk" [ref=e2337]
+            - cell "Ávextir og grænmeti" [ref=e2338]
+            - cell "0.0d" [ref=e2339]
+            - cell "18" [ref=e2340]
+          - row "klaki 2 litrar lime Drykkir 0.0d 18" [ref=e2341]:
+            - cell "klaki 2 litrar lime" [ref=e2342]
+            - cell "Drykkir" [ref=e2343]
+            - cell "0.0d" [ref=e2344]
+            - cell "18" [ref=e2345]
+          - row "e.s brauð 2pk hvítlauks 350 gr Frystivara 1.0d 14" [ref=e2346]:
+            - cell "e.s brauð 2pk hvítlauks 350 gr" [ref=e2347]
+            - cell "Frystivara" [ref=e2348]
+            - cell "1.0d" [ref=e2349]
+            - cell "14" [ref=e2350]
+          - row "avocado dole í lausu colombia Ávextir og grænmeti 0.0d 11" [ref=e2351]:
+            - cell "avocado dole í lausu colombia" [ref=e2352]
+            - cell "Ávextir og grænmeti" [ref=e2353]
+            - cell "0.0d" [ref=e2354]
+            - cell "11" [ref=e2355]
+          - row "ss hangiálegg 220 gr 2*8 sn. Kælir 0.0d 11" [ref=e2356]:
+            - cell "ss hangiálegg 220 gr 2*8 sn." [ref=e2357]
+            - cell "Kælir" [ref=e2358]
+            - cell "0.0d" [ref=e2359]
+            - cell "11" [ref=e2360]
+    - generic [ref=e1309]: ENDED BY CATEGORY
+  - generic [ref=e1313]:
+    - generic [ref=e1314]:
+      - generic [ref=e1315]: EARLY WARNING — DETERIORATING
+      - generic [ref=e1316]:
+        - combobox [ref=e1317] [cursor=pointer]:
+          - option "All Severity (0)" [selected]
+        - combobox [ref=e1318] [cursor=pointer]:
+          - option "All Categories (0)" [selected]
+        - combobox [ref=e1319] [cursor=pointer]:
+          - option "All Suppliers (0)" [selected]
+        - generic [ref=e1320]: 0 deteriorating
+    - generic [ref=e2361]: No deteriorating products
