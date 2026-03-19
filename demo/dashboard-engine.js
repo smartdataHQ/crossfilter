@@ -271,19 +271,24 @@ function buildDropdown(id, label, placeholder, items, multiSelect) {
   return html;
 }
 
+var _dropdownCloseWired = false;
+
 function wireDropdowns(container) {
   var dropdowns = container.querySelectorAll('.dropdown');
   for (var i = 0; i < dropdowns.length; ++i) {
     wireOneDropdown(dropdowns[i]);
   }
 
-  // Close dropdowns when clicking outside
-  document.addEventListener('click', function (e) {
-    if (!e.target.closest('.dropdown')) {
-      var allPanels = document.querySelectorAll('.dropdown-panel');
-      for (var j = 0; j < allPanels.length; ++j) allPanels[j].hidden = true;
-    }
-  });
+  // Close all dropdowns when clicking outside — wire once globally
+  if (!_dropdownCloseWired) {
+    _dropdownCloseWired = true;
+    document.addEventListener('mousedown', function (e) {
+      if (!e.target.closest('.dropdown')) {
+        var allPanels = document.querySelectorAll('.dropdown-panel');
+        for (var j = 0; j < allPanels.length; ++j) allPanels[j].hidden = true;
+      }
+    });
+  }
 }
 
 function wireOneDropdown(dropdown) {
@@ -294,18 +299,21 @@ function wireOneDropdown(dropdown) {
   var valueEl = dropdown.querySelector('.dropdown-value');
 
   // Toggle panel
-  trigger.addEventListener('click', function (e) {
+  trigger.addEventListener('mousedown', function (e) {
+    e.preventDefault();
     e.stopPropagation();
-    // Close other dropdowns
+    var wasOpen = !panel.hidden;
+    // Close all dropdowns first
     var allPanels = document.querySelectorAll('.dropdown-panel');
-    for (var i = 0; i < allPanels.length; ++i) {
-      if (allPanels[i] !== panel) allPanels[i].hidden = true;
-    }
-    panel.hidden = !panel.hidden;
-    if (!panel.hidden && search) {
-      search.value = '';
-      search.focus();
-      filterDropdownItems(panel, '');
+    for (var i = 0; i < allPanels.length; ++i) allPanels[i].hidden = true;
+    // Toggle this one
+    if (!wasOpen) {
+      panel.hidden = false;
+      if (search) {
+        search.value = '';
+        setTimeout(function () { search.focus(); }, 0);
+        filterDropdownItems(panel, '');
+      }
     }
   });
 
@@ -389,7 +397,7 @@ function buildModelBar(config, registry) {
   if (!hasSegments && !hasPresets && !hasFacets && !registry.description) return null;
 
   var bar = document.createElement('section');
-  bar.className = 'card model-bar anim d1';
+  bar.className = 'model-bar anim d1';
   var html = '';
 
   // Cube identity — user-facing, with (i) for full description (Principle 2)
@@ -742,7 +750,7 @@ function isFilterOnlySection(section) {
 function buildFilterBar(section, registry) {
   // Render toggle and range panels as compact inline controls in a single card
   var bar = document.createElement('section');
-  bar.className = 'card filter-bar anim d' + Math.min(6, 8);
+  bar.className = 'filter-bar anim d6';
   bar.dataset.sectionId = section.id;
 
   var html = '';

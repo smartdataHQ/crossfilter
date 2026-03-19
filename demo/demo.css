@@ -754,8 +754,17 @@ body {
 .tbl tbody tr:hover td { background: rgba(63, 101, 135, 0.04); color: var(--text-primary); }
 .tbl tbody tr:active td { background: rgba(61, 139, 253, 0.08); }
 
-/* Model Intelligence Bar */
-.model-bar { padding: 16px 20px; overflow: visible; }
+/* Model Intelligence Bar — NOT a .card, needs overflow visible for dropdowns */
+.model-bar {
+  padding: 12px 20px;
+  background: var(--bg-card);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border-white);
+  border-radius: var(--radius-lg);
+  margin-bottom: 16px;
+  overflow: visible;
+  position: relative; z-index: 10;
+}
 .model-bar-header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
 .model-bar-identity { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .model-bar-title {
@@ -879,7 +888,14 @@ body {
 }
 
 /* Filter bar — compact inline controls for toggles/ranges */
-.filter-bar { padding: 12px 20px; overflow: visible; }
+.filter-bar {
+  padding: 12px 20px; overflow: visible;
+  background: var(--bg-card);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border-white);
+  border-radius: var(--radius-lg);
+  margin-bottom: 16px;
+}
 .filter-bar-header { margin-bottom: 8px; }
 .filter-bar-title {
   font-size: 11px; font-weight: 600; color: var(--text-muted);
