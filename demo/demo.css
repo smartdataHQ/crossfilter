@@ -1076,9 +1076,11 @@ body {
 .chart-card { container: chartcard / inline-size; }
 .filter-bar { container: filterbar / inline-size; }
 .location-grid { container: locgrid / inline-size; }
-.model-bar-inline { container: inlinecontrol / inline-size; }
-.toggle-wrap      { container: inlinecontrol / inline-size; }
-.filter-bar-item  { container: inlinecontrol / inline-size; }
+/* Toggle containers — only on block-level elements that get width from parent.
+   Flex items (.model-bar-inline, .filter-bar-item) CANNOT be containers
+   because container-type: inline-size creates containment that collapses
+   flex items sized by content. Use the parent container instead. */
+.toggle-wrap { container: togglectx / inline-size; }
 
 /* ── Toggle component — responsive (expanded ↔ compact) ──────────── */
 /* A true responsive component: transforms from 3-button row into a   */
@@ -1162,10 +1164,22 @@ body {
 /* Compact needs relative positioning on parent for dropdown */
 .toggle-compact { position: relative; }
 
-/* Container query: switch to compact when container is narrow */
-@container inlinecontrol (max-width: 200px) {
+/* Container query: card toggles switch to compact when card is narrow */
+@container togglectx (max-width: 200px) {
   .toggle-expanded { display: none; }
   .toggle-compact  { display: inline-flex; }
+}
+
+/* Filter bar toggles: use the filterbar container (already defined) */
+@container filterbar (max-width: 500px) {
+  .filter-bar-item .toggle-expanded { display: none; }
+  .filter-bar-item .toggle-compact  { display: inline-flex; }
+}
+
+/* Model bar toggles: must use media query (containment clips Shoelace dropdowns) */
+@media (max-width: 767px) {
+  .model-bar-inline .toggle-expanded { display: none; }
+  .model-bar-inline .toggle-compact  { display: inline-flex; }
 }
 
 /* ── Page-level media queries (macro layout) ─────────────────────── */
