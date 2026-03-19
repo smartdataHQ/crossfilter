@@ -30,6 +30,8 @@ These are non-negotiable interaction patterns that every component must follow:
 
 10. **Responsive everything** — All dashboards are responsive. Components adapt their rendering based on available space — not just CSS reflow, but different visualization modes (e.g., bar chart → compact list on narrow screens).
 
+11. **Meaningful loading progress** — In a subtle but clear way, inform the user of progress when loading data. Show meaningful named steps (not percentages), and a summary of what was loaded when available. Never a blank screen or a spinner with no context.
+
 ## Design Principles — Architecture
 
 1. **Zero hardcoding** — The engine NEVER references specific field names, labels, segments, or domain-specific content. Everything comes from the config and the Cube metadata. The engine must work for ANY cube without code changes.
