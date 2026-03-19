@@ -320,7 +320,7 @@ function syncDropdownAfterRemove(dim, singleVal) {
 
 function infoIcon(text) {
   if (!text || !text.trim()) return '';
-  return ' <span class="info-icon" title="' + escapeHtml(text.trim()) + '">i</span>';
+  return ' <span class="info-tip"><span class="info-icon">i</span><span class="info-tip-content">' + escapeHtml(text.trim()) + '</span></span>';
 }
 
 // ── Header ────────────────────────────────────────────────────────────

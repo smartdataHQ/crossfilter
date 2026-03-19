@@ -779,18 +779,44 @@ body {
   overflow: visible;
 }
 
-/* Info icon (Principle 2: details on demand) */
+/* Info tooltip (Principle 2: details on demand) */
+.info-tip {
+  position: relative; display: inline-flex; vertical-align: middle; margin-left: 3px;
+}
 .info-icon {
   display: inline-flex; align-items: center; justify-content: center;
   width: 14px; height: 14px; border-radius: 50%;
-  border: 1px solid var(--text-muted);
+  border: 1px solid currentColor;
   font-size: 9px; font-weight: 700; font-style: italic;
   color: var(--text-muted); cursor: help;
-  opacity: 0.4; transition: opacity 0.15s, color 0.15s, border-color 0.15s;
-  vertical-align: middle; margin-left: 3px;
+  opacity: 0.35; transition: opacity 0.15s, color 0.15s;
   font-family: Georgia, serif; line-height: 1;
 }
-.info-icon:hover { opacity: 1; color: var(--accent-blue); border-color: var(--accent-blue); }
+.info-tip:hover .info-icon { opacity: 1; color: var(--accent-blue); }
+.info-tip-content {
+  display: none; position: absolute; bottom: calc(100% + 8px); left: 50%;
+  transform: translateX(-50%);
+  min-width: 200px; max-width: 320px; padding: 10px 14px;
+  background: var(--bg-card-solid, #fff);
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 8px);
+  box-shadow: 0 4px 24px rgba(0, 21, 88, 0.12);
+  font-size: 12px; font-style: normal; font-weight: 400;
+  color: var(--text-secondary); line-height: 1.55;
+  white-space: normal; text-transform: none; letter-spacing: 0;
+  z-index: 200; pointer-events: none;
+}
+.info-tip-content::after {
+  content: ''; position: absolute; top: 100%; left: 50%;
+  transform: translateX(-50%);
+  border: 6px solid transparent; border-top-color: var(--bg-card-solid, #fff);
+}
+.info-tip-content::before {
+  content: ''; position: absolute; top: 100%; left: 50%;
+  transform: translateX(-50%);
+  border: 7px solid transparent; border-top-color: var(--border);
+}
+.info-tip:hover .info-tip-content { display: block; }
 
 /* Custom dropdown (Principle 1: informative, searchable selectors) */
 .dropdown { position: relative; display: inline-block; }
