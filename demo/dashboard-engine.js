@@ -551,7 +551,7 @@ function buildModelBar(config, registry) {
     for (var s = 0; s < segments.length; ++s) {
       segItems.push({ value: segments[s].name, label: segments[s].title, description: segments[s].description });
     }
-    html += buildDropdown('_segment', 'Focus', 'All Data', segItems, true);
+    html += buildDropdown('_focus', 'Focus', 'All Data', segItems, true);
   }
 
   // Boolean presets — compact dropdown
@@ -560,7 +560,7 @@ function buildModelBar(config, registry) {
     for (var b = 0; b < extraBooleans.length; ++b) {
       boolItems.push({ value: extraBooleans[b].name, label: extraBooleans[b].label });
     }
-    html += buildDropdown('_boolean', 'Include', 'No filter', boolItems, true);
+    html += buildDropdown('_include', 'Include', 'No filter', boolItems, true);
   }
 
   // Facets — one dropdown per facet
