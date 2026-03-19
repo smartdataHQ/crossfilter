@@ -92,16 +92,30 @@ function scanPanels(panels, registry) {
 
 function buildCubeQuery(cubeName, dims, measures, registry) {
   var partition = registry._cubeMeta.partition;
+  var granularity = (registry._cubeMeta.granularity && registry._cubeMeta.granularity.default) || 'week';
   var filters = [];
   if (partition) {
     filters.push({ member: cubeName + '.partition', operator: 'equals', values: [partition] });
   }
 
+  var queryDims = [];
+  var timeDimensions = [];
+
+  Array.from(dims).forEach(function(d) {
+    var meta = registry.dimensions[d];
+    if (meta && meta.type === 'time') {
+      timeDimensions.push({ dimension: cubeName + '.' + d, granularity: granularity });
+    } else {
+      queryDims.push(cubeName + '.' + d);
+    }
+  });
+
   return {
     format: 'arrow',
     query: {
-      dimensions: Array.from(dims).map(function(d) { return cubeName + '.' + d; }),
+      dimensions: queryDims,
       measures: Array.from(measures).map(function(m) { return cubeName + '.' + m; }),
+      timeDimensions: timeDimensions,
       filters: filters,
       limit: 1000000,
     },
