@@ -1,0 +1,146 @@
+// demo/dashboard-meta.js
+// Fetches Cube.dev /api/meta and builds a field registry for a given cube.
+// Provides inference functions for chart type, label, filter mode.
+// All discovery is on-demand — no hardcoded lists.
+
+var META_API = '/api/meta';
+
+// ── Fetch ─────────────────────────────────────────────────────────────
+
+export function fetchCubeMeta() {
+  return fetch(META_API).then(function (res) {
+    if (!res.ok) throw new Error('Meta fetch failed: ' + res.status);
+    return res.json();
+  });
+}
+
+// ── Registry ──────────────────────────────────────────────────────────
+
+export function buildCubeRegistry(metaResponse, cubeName) {
+  var cubes = metaResponse && metaResponse.cubes || [];
+  var cube = null;
+  for (var i = 0; i < cubes.length; ++i) {
+    if (cubes[i].name === cubeName) { cube = cubes[i]; break; }
+  }
+  if (!cube) {
+    throw new Error('Cube "' + cubeName + '" not found. Available: ' +
+      cubes.map(function (c) { return c.name; }).join(', '));
+  }
+
+  var registry = {
+    name: cubeName,
+    title: cube.title || cubeName,
+    description: cube.description || '',
+    dimensions: {},
+    measures: {},
+    segments: [],
+  };
+
+  var dims = cube.dimensions || [];
+  for (var d = 0; d < dims.length; ++d) {
+    var dim = dims[d];
+    var shortName = dim.name.split('.').pop();
+    registry.dimensions[shortName] = {
+      fullName: dim.name,
+      type: dim.type || 'string',
+      meta: dim.meta || {},
+      description: dim.description || '',
+    };
+  }
+
+  var measures = cube.measures || [];
+  for (var m = 0; m < measures.length; ++m) {
+    var meas = measures[m];
+    var mShort = meas.name.split('.').pop();
+    registry.measures[mShort] = {
+      fullName: meas.name,
+      type: meas.type || 'number',
+      aggType: meas.aggType || '',
+      format: meas.format || '',
+      description: meas.description || '',
+    };
+  }
+
+  var segs = cube.segments || [];
+  for (var s = 0; s < segs.length; ++s) {
+    registry.segments.push(segs[s].name.split('.').pop());
+  }
+
+  return registry;
+}
+
+// ── Inference ─────────────────────────────────────────────────────────
+
+export function inferChartType(fieldName, registry) {
+  if (registry.measures[fieldName]) return 'kpi';
+
+  var dim = registry.dimensions[fieldName];
+  if (!dim) return 'bar';
+
+  var meta = dim.meta || {};
+  var fieldType = meta.field_type || dim.type || 'string';
+  var unique = typeof meta.unique_values === 'number' ? meta.unique_values : -1;
+
+  if (fieldType === 'boolean') return 'toggle';
+  if (fieldType === 'datetime' || dim.type === 'time') return 'line';
+  if (fieldType === 'number' || fieldType === 'float') return 'range';
+
+  // String types — by cardinality
+  if (unique >= 0 && unique <= 7) return 'pie';
+  if (unique > 500) return 'list';
+  return 'bar';
+}
+
+export function inferLabel(fieldName, registry) {
+  var dim = registry.dimensions[fieldName];
+  if (dim && dim.meta && dim.meta.description) return dim.meta.description;
+  var meas = registry.measures[fieldName];
+  if (meas && meas.description) return meas.description;
+  // snake_case → Title Case
+  return fieldName.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+}
+
+export function inferFilterMode(fieldName, registry) {
+  if (registry.measures[fieldName]) return 'none';
+  var dim = registry.dimensions[fieldName];
+  if (!dim) return 'in';
+  var meta = dim.meta || {};
+  var fieldType = meta.field_type || dim.type || 'string';
+  if (fieldType === 'boolean') return 'exact';
+  if (fieldType === 'datetime' || dim.type === 'time') return 'range';
+  if (fieldType === 'number' || fieldType === 'float') return 'range';
+  return 'in';
+}
+
+export function inferLimit(fieldName, registry) {
+  var dim = registry.dimensions[fieldName];
+  if (!dim) return 12;
+  var meta = dim.meta || {};
+  var unique = typeof meta.unique_values === 'number' ? meta.unique_values : -1;
+  if (unique > 0 && unique <= 20) return unique;
+  return 12;
+}
+
+export function inferSearchable(fieldName, registry) {
+  var dim = registry.dimensions[fieldName];
+  if (!dim) return false;
+  var meta = dim.meta || {};
+  var unique = typeof meta.unique_values === 'number' ? meta.unique_values : -1;
+  return unique > 50;
+}
+
+// ── ECharts Discovery ─────────────────────────────────────────────────
+
+export function discoverEChartsTypes(echartsInstance) {
+  // ECharts doesn't expose a public series type registry.
+  // We probe by checking if ComponentModel subclasses exist for known types.
+  var knownTypes = [
+    'line', 'bar', 'pie', 'scatter', 'radar', 'map', 'tree', 'treemap',
+    'graph', 'gauge', 'funnel', 'parallel', 'sankey', 'boxplot',
+    'candlestick', 'effectScatter', 'lines', 'heatmap', 'pictorialBar',
+    'themeRiver', 'sunburst', 'custom',
+  ];
+  // Non-chart controls handled by the engine directly
+  var controls = ['list', 'kpi', 'toggle', 'range', 'table'];
+  return { chartTypes: knownTypes, controlTypes: controls };
+}
