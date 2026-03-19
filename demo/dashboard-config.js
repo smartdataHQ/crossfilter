@@ -15,7 +15,8 @@ export var BLUECAR_STAYS_CONFIG = {
     { measure: 'poi_match_rate', label: 'POI Match Rate', chart: 'kpi', section: 'kpis' },
 
     // Time series
-    { dimension: 'stay_started_at', chart: 'line', granularity: 'day', section: 'timeline', width: 'full' },
+    // Granularity auto-inferred from probed time range
+    { dimension: 'stay_started_at', chart: 'line', section: 'timeline', width: 'full' },
 
     // Categorical charts
     { dimension: 'activity_type', section: 'overview' },

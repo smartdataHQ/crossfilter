@@ -221,6 +221,157 @@ export function discoverNotableMeasures(registry) {
   return notable;
 }
 
+// ── Time & Range Probing ──────────────────────────────────────────────
+
+// Discover time dimensions and extract any metadata bounds
+export function discoverTimeDimensions(registry) {
+  var timeDims = [];
+  var dimNames = Object.keys(registry.dimensions);
+  for (var i = 0; i < dimNames.length; ++i) {
+    var name = dimNames[i];
+    var dim = registry.dimensions[name];
+    if (dim.type === 'time') {
+      var meta = dim.meta || {};
+      timeDims.push({
+        name: name,
+        label: inferLabel(name, registry),
+        minValue: meta.min_value || null,
+        maxValue: meta.max_value || null,
+      });
+    }
+  }
+  return timeDims;
+}
+
+// Probe the Cube API for time bounds and number ranges when metadata is missing.
+// Returns { timeBounds: { dimName: { min, max } }, numberBounds: { dimName: { min, max } } }
+export function probeDataBounds(cubeName, partition, timeDimNames, numberDimNames) {
+  // Build a query that gets min/max for all requested fields in one call
+  var measures = [];
+  var measureMap = {};
+
+  for (var t = 0; t < timeDimNames.length; ++t) {
+    var tf = timeDimNames[t];
+    // Cube.dev doesn't support min/max on time dimensions directly,
+    // so we request it as a timeDimension with no granularity to get the range
+  }
+
+  // For number dimensions, we can use custom measures if available,
+  // but the simplest approach is to query with the dimension and get extremes
+  // Actually, the cleanest Cube approach: query with no dimensions, just measures
+  // But we can't create ad-hoc min/max measures for arbitrary dimensions.
+  //
+  // Practical approach: fetch a small sample sorted by the time dimension
+  // to get the first and last timestamps.
+
+  var fullTimeName = cubeName + '.' + timeDimNames[0];
+  var queries = [];
+
+  // Query 1: earliest record
+  queries.push(fetch('/api/cube', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: {
+        dimensions: timeDimNames.map(function (n) { return cubeName + '.' + n; }),
+        measures: [],
+        filters: [{ member: cubeName + '.partition', operator: 'equals', values: [partition] }],
+        order: [[ fullTimeName, 'asc' ]],
+        limit: 1,
+      },
+    }),
+  }).then(function (r) { return r.ok ? r.json() : null; }));
+
+  // Query 2: latest record
+  queries.push(fetch('/api/cube', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: {
+        dimensions: timeDimNames.map(function (n) { return cubeName + '.' + n; }),
+        measures: [],
+        filters: [{ member: cubeName + '.partition', operator: 'equals', values: [partition] }],
+        order: [[ fullTimeName, 'desc' ]],
+        limit: 1,
+      },
+    }),
+  }).then(function (r) { return r.ok ? r.json() : null; }));
+
+  return Promise.all(queries).then(function (results) {
+    var bounds = { timeBounds: {}, numberBounds: {} };
+    var earliest = results[0] && results[0].data && results[0].data[0];
+    var latest = results[1] && results[1].data && results[1].data[0];
+
+    for (var i = 0; i < timeDimNames.length; ++i) {
+      var key = cubeName + '.' + timeDimNames[i];
+      var minVal = earliest && earliest[key] ? earliest[key] : null;
+      var maxVal = latest && latest[key] ? latest[key] : null;
+      if (minVal || maxVal) {
+        bounds.timeBounds[timeDimNames[i]] = { min: minVal, max: maxVal };
+      }
+    }
+
+    return bounds;
+  });
+}
+
+// Infer which granularities make sense for a given time span
+export function inferGranularities(minDate, maxDate) {
+  if (!minDate || !maxDate) return ['day', 'week', 'month'];
+
+  var min = new Date(minDate);
+  var max = new Date(maxDate);
+  var spanMs = max.getTime() - min.getTime();
+  var spanDays = spanMs / 86400000;
+
+  var grans = [];
+  if (spanDays <= 3) grans.push('hour');
+  if (spanDays <= 90) grans.push('day');
+  if (spanDays >= 7) grans.push('week');
+  if (spanDays >= 28) grans.push('month');
+  if (spanDays >= 180) grans.push('quarter');
+  if (spanDays >= 365) grans.push('year');
+
+  return grans.length > 0 ? grans : ['day', 'week', 'month'];
+}
+
+// Pick the best default granularity for a given time span
+export function inferDefaultGranularity(minDate, maxDate) {
+  if (!minDate || !maxDate) return 'day';
+
+  var min = new Date(minDate);
+  var max = new Date(maxDate);
+  var spanDays = (max.getTime() - min.getTime()) / 86400000;
+
+  if (spanDays <= 3) return 'hour';
+  if (spanDays <= 60) return 'day';
+  if (spanDays <= 365) return 'week';
+  return 'month';
+}
+
+// Generate smart period presets based on the data range
+export function inferPeriodPresets(minDate, maxDate) {
+  if (!minDate || !maxDate) return [];
+
+  var max = new Date(maxDate);
+  var min = new Date(minDate);
+  var spanDays = (max.getTime() - min.getTime()) / 86400000;
+  var presets = [];
+
+  if (spanDays > 7) presets.push({ label: 'Last 7 days', days: 7 });
+  if (spanDays > 30) presets.push({ label: 'Last 30 days', days: 30 });
+  if (spanDays > 90) presets.push({ label: 'Last 90 days', days: 90 });
+  if (spanDays > 180) {
+    // Year to date
+    var ytdStart = new Date(Date.UTC(max.getUTCFullYear(), 0, 1));
+    presets.push({ label: 'Year to date', from: ytdStart.toISOString().slice(0, 10) });
+  }
+  if (spanDays > 365) presets.push({ label: 'Last 12 months', days: 365 });
+  presets.push({ label: 'All time', from: null, to: null });
+
+  return presets;
+}
+
 // ── ECharts Discovery ─────────────────────────────────────────────────
 
 export function discoverEChartsTypes(echartsInstance) {

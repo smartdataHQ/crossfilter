@@ -14,6 +14,11 @@ import {
   discoverBooleanDimensions,
   discoverFacetDimensions,
   discoverNotableMeasures,
+  discoverTimeDimensions,
+  probeDataBounds,
+  inferGranularities,
+  inferDefaultGranularity,
+  inferPeriodPresets,
 } from './dashboard-meta.js';
 import {
   registerDemoEChartsTheme,
@@ -755,16 +760,10 @@ function buildPanelCard(panel, accentIdx, registry) {
     '</div>';
 
   } else if (panel.chart === 'line') {
-    var granBtns = '';
-    var grans = ['minute', 'hour', 'day', 'week', 'month'];
-    for (var g = 0; g < grans.length; ++g) {
-      var isActive = panel.granularity === grans[g] ? ' active' : '';
-      granBtns += '<button class="gran-btn' + isActive + '" data-gran="' + grans[g] + '">' +
-        grans[g].charAt(0).toUpperCase() + grans[g].slice(1) + '</button>';
-    }
+    // Time bounds come from probed data (stored on panel at resolve time)
+    var timeBounds = panel._timeBounds || null;
     body = '<div class="card-head card-head--sub">' +
-      '<span class="group-size-badge" id="time-badge-' + panel.id + '"></span>' +
-      '<div class="gran-btns">' + granBtns + '</div>' +
+      buildPeriodSelector(panel.id, timeBounds, panel.granularity) +
     '</div>' +
     '<div id="chart-' + panel.id + '" class="chart-wrap chart-wrap-timeline">' +
       buildSkeletonLine() +
@@ -900,7 +899,151 @@ function wireRangeSelector(container, panelId, dimension) {
   updateFill();
 }
 
-// ── Principle 14: Skeleton placeholders ───────────────────────────────
+// ── Period Selector (time range + granularity) ────────────────────────
+
+function buildPeriodSelector(panelId, timeBounds, granularity) {
+  var min = timeBounds && timeBounds.min ? timeBounds.min.slice(0, 10) : '';
+  var max = timeBounds && timeBounds.max ? timeBounds.max.slice(0, 10) : '';
+  var grans = inferGranularities(min, max);
+  var defaultGran = granularity || inferDefaultGranularity(min, max);
+  var presets = inferPeriodPresets(min, max);
+
+  // Format dates for display
+  var displayMin = min ? formatDateShort(min) : '';
+  var displayMax = max ? formatDateShort(max) : '';
+  var rangeLabel = displayMin && displayMax ? displayMin + ' \u2013 ' + displayMax : 'All time';
+
+  var html = '<div class="period-sel" data-period-id="' + panelId + '">';
+
+  // Period dropdown trigger
+  html += '<div class="dropdown" data-dropdown-id="_period_' + panelId + '">';
+  html += '<button class="dropdown-trigger" type="button">';
+  html += '<span class="dropdown-label">Period</span>';
+  html += '<span class="dropdown-value dropdown-value--active" id="period-label-' + panelId + '">' + rangeLabel + '</span>';
+  html += '<span class="dropdown-arrow">&#9662;</span>';
+  html += '</button>';
+  html += '<div class="dropdown-panel period-panel">';
+
+  // Presets
+  if (presets.length > 0) {
+    html += '<div class="period-presets">';
+    for (var p = 0; p < presets.length; ++p) {
+      var preset = presets[p];
+      var pData = preset.days ? 'data-days="' + preset.days + '"' : '';
+      if (preset.from) pData += ' data-from="' + preset.from + '"';
+      html += '<button class="period-preset-btn" ' + pData + '>' + escapeHtml(preset.label) + '</button>';
+    }
+    html += '</div>';
+  }
+
+  // Custom date range
+  html += '<div class="period-custom">';
+  html += '<div class="period-field">';
+  html += '<label class="period-field-label">From</label>';
+  html += '<input type="date" class="period-date" id="period-from-' + panelId + '"' +
+    (min ? ' value="' + min + '" min="' + min + '"' : '') +
+    (max ? ' max="' + max + '"' : '') + '>';
+  html += '</div>';
+  html += '<div class="period-field">';
+  html += '<label class="period-field-label">To</label>';
+  html += '<input type="date" class="period-date" id="period-to-' + panelId + '"' +
+    (max ? ' value="' + max + '" max="' + max + '"' : '') +
+    (min ? ' min="' + min + '"' : '') + '>';
+  html += '</div>';
+  html += '</div>';
+
+  html += '</div></div>';
+
+  // Granularity buttons — only valid options for this time span
+  html += '<div class="gran-btns">';
+  for (var g = 0; g < grans.length; ++g) {
+    var isActive = grans[g] === defaultGran ? ' active' : '';
+    html += '<button class="gran-btn' + isActive + '" data-gran="' + grans[g] + '">' +
+      granularityLabel(grans[g]) + '</button>';
+  }
+  html += '</div>';
+
+  html += '</div>';
+  return html;
+}
+
+function granularityLabel(gran) {
+  // Short, user-friendly labels
+  var labels = { hour: 'Hourly', day: 'Daily', week: 'Weekly', month: 'Monthly', quarter: 'Quarterly', year: 'Yearly' };
+  return labels[gran] || gran.charAt(0).toUpperCase() + gran.slice(1);
+}
+
+function formatDateShort(dateStr) {
+  if (!dateStr) return '';
+  var d = new Date(dateStr);
+  var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return months[d.getUTCMonth()] + ' ' + d.getUTCDate() + ', ' + d.getUTCFullYear();
+}
+
+function wirePeriodSelector(container, panelId, dimension, timeBounds) {
+  var el = container.querySelector('[data-period-id="' + panelId + '"]');
+  if (!el) return;
+
+  var periodLabel = el.querySelector('#period-label-' + panelId);
+  var fromInput = el.querySelector('#period-from-' + panelId);
+  var toInput = el.querySelector('#period-to-' + panelId);
+  var max = timeBounds && timeBounds.max ? timeBounds.max.slice(0, 10) : '';
+  var min = timeBounds && timeBounds.min ? timeBounds.min.slice(0, 10) : '';
+
+  // Preset buttons
+  el.addEventListener('click', function (e) {
+    var preset = e.target.closest('.period-preset-btn');
+    if (preset) {
+      var days = parseInt(preset.dataset.days);
+      var fromDate = preset.dataset.from;
+      if (days && max) {
+        var to = new Date(max);
+        var from = new Date(to.getTime() - days * 86400000);
+        fromInput.value = from.toISOString().slice(0, 10);
+        toInput.value = max;
+      } else if (fromDate) {
+        fromInput.value = fromDate;
+        toInput.value = max;
+      } else {
+        // All time
+        fromInput.value = min;
+        toInput.value = max;
+      }
+      updatePeriod();
+      return;
+    }
+
+    // Granularity buttons
+    var granBtn = e.target.closest('.gran-btn');
+    if (granBtn) {
+      var siblings = el.querySelectorAll('.gran-btn');
+      for (var i = 0; i < siblings.length; ++i) siblings[i].classList.remove('active');
+      granBtn.classList.add('active');
+      setFilter('_granularity', granBtn.dataset.gran);
+    }
+  });
+
+  // Custom date inputs
+  fromInput.addEventListener('change', updatePeriod);
+  toInput.addEventListener('change', updatePeriod);
+
+  function updatePeriod() {
+    var from = fromInput.value;
+    var to = toInput.value;
+    if (from && to) {
+      periodLabel.textContent = formatDateShort(from) + ' \u2013 ' + formatDateShort(to);
+      setFilter(dimension, [from, to]);
+    }
+    // Close dropdown
+    var panel = el.querySelector('.dropdown-panel');
+    if (panel) panel.classList.remove('dropdown-panel--open');
+  }
+
+  // Wire the dropdown open/close
+  wireDropdowns(el);
+}
+
+// ── Skeleton placeholders ─────────────────────────────────────────────
 
 function buildPlaceholderListItems(count) {
   var html = '';
@@ -1005,6 +1148,11 @@ function wireCardInteractions(card, panel) {
       var val = btn.dataset.val;
       setFilter(panel.dimension, val === 'all' ? null : val);
     });
+  }
+
+  // Period selector for time series panels
+  if (panel.chart === 'line' && panel._timeBounds) {
+    wirePeriodSelector(card, panel.id, panel.dimension, panel._timeBounds);
   }
 }
 
@@ -1220,6 +1368,56 @@ async function main() {
 
     updateProgress(2, registry.title);
     var resolvedPanels = resolvePanels(config, registry);
+
+    // Probe time bounds for time-series panels
+    var timePanelDims = [];
+    for (var tp = 0; tp < resolvedPanels.length; ++tp) {
+      if (resolvedPanels[tp].chart === 'line' && resolvedPanels[tp].dimension) {
+        timePanelDims.push(resolvedPanels[tp].dimension);
+      }
+    }
+
+    if (timePanelDims.length > 0) {
+      // Check metadata first, probe only if needed
+      var timeDims = discoverTimeDimensions(registry);
+      var needsProbe = false;
+      for (var td = 0; td < timeDims.length; ++td) {
+        if (timePanelDims.indexOf(timeDims[td].name) >= 0 && !timeDims[td].minValue) {
+          needsProbe = true;
+          break;
+        }
+      }
+
+      var probedBounds = {};
+      if (needsProbe) {
+        try {
+          var probeResult = await probeDataBounds(config.cube, config.partition, timePanelDims, []);
+          probedBounds = probeResult.timeBounds;
+          console.log('[dashboard] Probed time bounds:', probedBounds);
+        } catch (probeErr) {
+          console.warn('[dashboard] Time probe failed, using defaults:', probeErr.message);
+        }
+      }
+
+      // Attach time bounds to resolved panels
+      for (var rp = 0; rp < resolvedPanels.length; ++rp) {
+        var rpanel = resolvedPanels[rp];
+        if (rpanel.chart === 'line' && rpanel.dimension) {
+          // Try metadata first
+          var metaTimeDim = timeDims.find(function (t) { return t.name === rpanel.dimension; });
+          if (metaTimeDim && metaTimeDim.minValue) {
+            rpanel._timeBounds = { min: metaTimeDim.minValue, max: metaTimeDim.maxValue };
+          } else if (probedBounds[rpanel.dimension]) {
+            rpanel._timeBounds = probedBounds[rpanel.dimension];
+          }
+          // Update granularity from inferred default if not set
+          if (rpanel._timeBounds && !rpanel.granularity) {
+            rpanel.granularity = inferDefaultGranularity(rpanel._timeBounds.min, rpanel._timeBounds.max);
+          }
+        }
+      }
+    }
+
     var sections = resolveSections(config, resolvedPanels);
 
     // Principle 3: restore state from URL
