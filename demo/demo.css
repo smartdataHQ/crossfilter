@@ -766,8 +766,8 @@ body {
   position: relative; z-index: 10;
 }
 .model-bar-header {
-  display: flex; align-items: center; gap: 12px; margin-bottom: 4px;
-  justify-content: space-between; flex-wrap: wrap;
+  display: flex; align-items: center; gap: 12px; margin-bottom: 8px;
+  justify-content: space-between;
 }
 .model-bar-identity { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .model-bar-title {
@@ -777,9 +777,10 @@ body {
 .model-bar-stats { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
 .model-bar-controls {
   display: flex; align-items: center; gap: 10px;
-  padding-top: 10px; margin-top: 2px;
+  padding-top: 8px; margin-top: 4px;
   border-top: 1px solid var(--border);
   overflow: visible; flex-wrap: wrap;
+  row-gap: 8px;
 }
 .model-bar-inline {
   display: flex; align-items: center; gap: 6px;
@@ -1033,7 +1034,7 @@ body {
 /* Period control — same visual language as dropdown selectors */
 .period-control {
   display: flex; align-items: center; gap: 6px;
-  flex-shrink: 1; min-width: 0;
+  flex-shrink: 0;
 }
 .period-trigger {
   appearance: none; border: 1px solid var(--border); border-radius: var(--radius, 8px);
@@ -1042,6 +1043,7 @@ body {
   cursor: pointer; font-family: var(--font-sans); font-size: 12px;
   transition: border-color 0.15s;
   white-space: nowrap; color: var(--text-secondary);
+  width: 180px; text-align: center;
 }
 .period-trigger:hover { border-color: var(--accent-blue); }
 .period-trigger:focus { outline: none; border-color: var(--accent-blue); }
@@ -1239,12 +1241,8 @@ body {
   .filter-bar-item--range { max-width: none; }
 }
 
-/* Dropdown adapts: wider panel on narrow triggers */
-.dropdown { container-type: inline-size; container-name: dropdown; }
-@container dropdown (max-width: 120px) {
-  .dropdown-trigger { padding: 4px 8px; font-size: 11px; }
-  .dropdown-label { display: none; }
-}
+/* Dropdowns cannot use container-type (inline-size containment        */
+/* collapses width to 0 inside flex parents). Use media queries.       */
 
 /* Responsive (Principle 10 — viewport fallbacks) */
 @media (max-width: 1024px) {

@@ -975,7 +975,7 @@ function buildPeriodControl(tpi) {
   for (var g = 0; g < grans.length; ++g) {
     granItems.push({ value: grans[g], label: granularityLabel(grans[g]) });
   }
-  html += buildDropdown('_granularity', granularityLabel(defaultGran), granularityLabel(defaultGran), granItems, false);
+  html += buildDropdown('_granularity', 'View by', granularityLabel(defaultGran), granItems, false);
   if (granNotes) html += infoIcon(granNotes);
 
   html += '</div>';
