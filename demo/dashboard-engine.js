@@ -15,10 +15,13 @@ import {
   discoverFacetDimensions,
   discoverNotableMeasures,
   discoverTimeDimensions,
-  probeDataBounds,
-  inferGranularities,
-  inferDefaultGranularity,
+  extractModelMeta,
+  resolveModelPeriod,
+  resolveTypicalRange,
   inferPeriodPresets,
+  getGranularityOptions,
+  getDefaultGranularity,
+  getGranularityNotes,
   granularityLabel,
 } from './dashboard-meta.js';
 import {
@@ -550,7 +553,7 @@ function buildModelBar(config, registry, inlinePanels, timePanelInfo) {
   html += '</div>';
   // Period control in the title line
   if (timePanelInfo) {
-    html += buildPeriodControl(timePanelInfo.timeBounds, timePanelInfo.granularity, timePanelInfo.dataResolutionDays);
+    html += buildPeriodControl(timePanelInfo);
   }
   html += '</div>';
 
@@ -924,38 +927,47 @@ function formatDateRange(from, to) {
   return months[a.getUTCMonth()] + ' ' + a.getUTCFullYear() + ' \u2013 ' + months[b.getUTCMonth()] + ' ' + b.getUTCFullYear();
 }
 
-function buildPeriodControl(timeBounds, granularity, dataResolutionDays) {
-  var min = timeBounds && timeBounds.min ? timeBounds.min.slice(0, 10) : '';
-  var max = timeBounds && timeBounds.max ? timeBounds.max.slice(0, 10) : '';
-  var grans = inferGranularities(min, max, dataResolutionDays);
-  var defaultGran = granularity || inferDefaultGranularity(min, max, dataResolutionDays);
-  var rangeLabel = formatDateRange(min, max);
+function buildPeriodControl(tpi) {
+  var timeBounds = tpi.timeBounds || {};
+  var min = timeBounds.min ? timeBounds.min.slice(0, 10) : '';
+  var max = timeBounds.max ? timeBounds.max.slice(0, 10) : '';
+  var grans = tpi.granOptions || ['day', 'week', 'month'];
+  var defaultGran = tpi.granularity || 'week';
+  var granNotes = tpi.granNotes || null;
+  // Show typical range if available, otherwise full range
+  var defaultRange = tpi.defaultRange || {};
+  var displayMin = defaultRange.from || min;
+  var displayMax = defaultRange.to || max;
+  var rangeLabel = formatDateRange(displayMin, displayMax);
 
   var html = '<div class="period-control" id="period-control">';
 
   // Date range trigger — flatpickr will attach here
   html += '<input type="text" class="period-trigger" id="period-trigger" value="' + escapeHtml(rangeLabel) + '" readonly>';
 
-  // Granularity — only valid options, auto-probed
+  // Granularity — from model meta or defaults
   html += '<div class="period-grans" id="period-grans">';
   for (var g = 0; g < grans.length; ++g) {
     var active = grans[g] === defaultGran ? ' active' : '';
     html += '<button class="gran-btn' + active + '" data-gran="' + grans[g] + '">' +
       granularityLabel(grans[g]) + '</button>';
   }
+  if (granNotes) html += infoIcon(granNotes);
   html += '</div>';
 
   html += '</div>';
   return html;
 }
 
-function wirePeriodControl(container, dimension, timeBounds, dataResolutionDays) {
+function wirePeriodControl(container, tpi) {
   var trigger = container.querySelector('#period-trigger');
   var gransEl = container.querySelector('#period-grans');
   if (!trigger) return;
 
-  var min = timeBounds && timeBounds.min ? timeBounds.min.slice(0, 10) : null;
-  var max = timeBounds && timeBounds.max ? timeBounds.max.slice(0, 10) : null;
+  var dimension = tpi.dimension;
+  var timeBounds = tpi.timeBounds || {};
+  var min = timeBounds.min ? timeBounds.min.slice(0, 10) : null;
+  var max = timeBounds.max ? timeBounds.max.slice(0, 10) : null;
   var presets = inferPeriodPresets(min, max);
   var flatpickr = globalThis.flatpickr;
 
@@ -974,10 +986,6 @@ function wirePeriodControl(container, dimension, timeBounds, dataResolutionDays)
           var to = dates[1].toISOString().slice(0, 10);
           trigger.value = formatDateRange(from, to);
           setFilter(dimension, [from, to]);
-
-          // Update granularity options for new range
-          var newGrans = inferGranularities(from, to, dataResolutionDays);
-          updateGranButtons(gransEl, newGrans);
         }
       },
       onReady: function (selectedDates, dateStr, instance) {
@@ -1022,27 +1030,6 @@ function wirePeriodControl(container, dimension, timeBounds, dataResolutionDays)
       btn.classList.add('active');
       setFilter('_granularity', btn.dataset.gran);
     });
-  }
-}
-
-function updateGranButtons(gransEl, newGrans) {
-  if (!gransEl) return;
-  // Preserve current selection if still valid
-  var current = gransEl.querySelector('.gran-btn.active');
-  var currentGran = current ? current.dataset.gran : null;
-
-  var html = '';
-  for (var g = 0; g < newGrans.length; ++g) {
-    var active = newGrans[g] === currentGran ? ' active' : '';
-    html += '<button class="gran-btn' + active + '" data-gran="' + newGrans[g] + '">' +
-      granularityLabel(newGrans[g]) + '</button>';
-  }
-  gransEl.innerHTML = html;
-
-  // If current selection is no longer valid, pick best default
-  if (currentGran && newGrans.indexOf(currentGran) < 0) {
-    var first = gransEl.querySelector('.gran-btn');
-    if (first) first.classList.add('active');
   }
 }
 
@@ -1251,7 +1238,14 @@ function buildDashboardDOM(container, config, sections, registry) {
     for (var tpj = 0; tpj < filteredSections[tpi].panels.length; ++tpj) {
       var tp = filteredSections[tpi].panels[tpj];
       if (tp.chart === 'line' && tp._timeBounds) {
-        timePanelInfo = { dimension: tp.dimension, timeBounds: tp._timeBounds, granularity: tp.granularity, dataResolutionDays: tp._dataResolutionDays };
+        timePanelInfo = {
+          dimension: tp.dimension,
+          timeBounds: tp._timeBounds,
+          defaultRange: tp._defaultRange,
+          granularity: tp.granularity,
+          granOptions: tp._granOptions,
+          granNotes: tp._granNotes,
+        };
         break;
       }
     }
@@ -1263,7 +1257,7 @@ function buildDashboardDOM(container, config, sections, registry) {
     container.appendChild(modelBar);
     // Wire the period control after DOM insertion
     if (timePanelInfo) {
-      wirePeriodControl(modelBar, timePanelInfo.dimension, timePanelInfo.timeBounds, timePanelInfo.dataResolutionDays);
+      wirePeriodControl(modelBar, timePanelInfo);
     }
   }
 
@@ -1385,58 +1379,35 @@ async function main() {
       Object.keys(registry.measures).length, 'measures');
 
     updateProgress(2, registry.title);
+
+    // Extract model-level metadata (grain, period, granularity, refresh)
+    var modelMeta = extractModelMeta(registry);
+    var modelPeriod = resolveModelPeriod(modelMeta);
+    var granOptions = getGranularityOptions(modelMeta);
+    var granDefault = getDefaultGranularity(modelMeta);
+    var granNotes = getGranularityNotes(modelMeta);
+
+    console.log('[dashboard] Model meta:', modelMeta.grain || 'unknown grain',
+      '| period:', modelPeriod ? modelPeriod.earliest + ' \u2013 ' + modelPeriod.latest : 'not declared',
+      '| granularity:', granOptions.join(', '), '(default:', granDefault + ')');
+
     var resolvedPanels = resolvePanels(config, registry);
 
-    // Probe time bounds for time-series panels
-    var timePanelDims = [];
-    for (var tp = 0; tp < resolvedPanels.length; ++tp) {
-      if (resolvedPanels[tp].chart === 'line' && resolvedPanels[tp].dimension) {
-        timePanelDims.push(resolvedPanels[tp].dimension);
-      }
-    }
-
-    if (timePanelDims.length > 0) {
-      // Check metadata first, probe only if needed
-      var timeDims = discoverTimeDimensions(registry);
-      var needsProbe = false;
-      for (var td = 0; td < timeDims.length; ++td) {
-        if (timePanelDims.indexOf(timeDims[td].name) >= 0 && !timeDims[td].minValue) {
-          needsProbe = true;
-          break;
+    // Attach model period and granularity to time-series panels
+    for (var rp = 0; rp < resolvedPanels.length; ++rp) {
+      var rpanel = resolvedPanels[rp];
+      if (rpanel.chart === 'line' && rpanel.dimension) {
+        if (modelPeriod) {
+          // Use typical_range for the default view, full range for date picker bounds
+          var typicalRange = resolveTypicalRange(
+            modelPeriod.typicalRange, modelPeriod.earliest, modelPeriod.latest
+          );
+          rpanel._timeBounds = { min: modelPeriod.earliest, max: modelPeriod.latest };
+          rpanel._defaultRange = typicalRange;
         }
-      }
-
-      var probedBounds = {};
-      var dataResolutionDays = null;
-      if (needsProbe) {
-        try {
-          var probeResult = await probeDataBounds(config.cube, config.partition, timePanelDims, []);
-          probedBounds = probeResult.timeBounds;
-          dataResolutionDays = probeResult.dataResolutionDays;
-          console.log('[dashboard] Probed time bounds:', probedBounds,
-            'resolution:', dataResolutionDays != null ? (dataResolutionDays * 24 * 60).toFixed(1) + ' min' : 'unknown');
-        } catch (probeErr) {
-          console.warn('[dashboard] Time probe failed, using defaults:', probeErr.message);
-        }
-      }
-
-      // Attach time bounds and resolution to resolved panels
-      for (var rp = 0; rp < resolvedPanels.length; ++rp) {
-        var rpanel = resolvedPanels[rp];
-        if (rpanel.chart === 'line' && rpanel.dimension) {
-          // Try metadata first
-          var metaTimeDim = timeDims.find(function (t) { return t.name === rpanel.dimension; });
-          if (metaTimeDim && metaTimeDim.minValue) {
-            rpanel._timeBounds = { min: metaTimeDim.minValue, max: metaTimeDim.maxValue };
-          } else if (probedBounds[rpanel.dimension]) {
-            rpanel._timeBounds = probedBounds[rpanel.dimension];
-          }
-          rpanel._dataResolutionDays = dataResolutionDays;
-          // Update granularity from inferred default if not set
-          if (rpanel._timeBounds && !rpanel.granularity) {
-            rpanel.granularity = inferDefaultGranularity(rpanel._timeBounds.min, rpanel._timeBounds.max, dataResolutionDays);
-          }
-        }
+        rpanel._granOptions = granOptions;
+        rpanel._granNotes = granNotes;
+        if (!rpanel.granularity) rpanel.granularity = granDefault;
       }
     }
 

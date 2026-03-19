@@ -34,6 +34,7 @@ export function buildCubeRegistry(metaResponse, cubeName) {
     dimensions: {},
     measures: {},
     segments: [],
+    _cubeMeta: cube.meta || {},
   };
 
   var dims = cube.dimensions || [];
@@ -244,155 +245,129 @@ export function discoverTimeDimensions(registry) {
 }
 
 // Probe the Cube API for time bounds and number ranges when metadata is missing.
-// Returns { timeBounds: { dimName: { min, max } }, numberBounds: { dimName: { min, max } } }
-// Probes the Cube API for time bounds and data resolution.
-// 2 queries total (run in parallel):
-//   1. 20 earliest records (sorted asc) → gives min timestamp + resolution sample
-//   2. 1 latest record (sorted desc) → gives max timestamp
-export function probeDataBounds(cubeName, partition, timeDimNames, numberDimNames) {
-  var dimFields = timeDimNames.map(function (n) { return cubeName + '.' + n; });
-  var primaryField = dimFields[0];
-  var partitionFilter = { member: cubeName + '.partition', operator: 'equals', values: [partition] };
-  var queries = [];
+// No probing needed — cube model meta declares period and granularity.
+// See extractModelMeta(), resolveModelPeriod(), getGranularityOptions().
 
-  // Query 1: 20 earliest records → min + resolution
-  queries.push(fetch('/api/cube', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      query: {
-        dimensions: dimFields,
-        measures: [],
-        filters: [partitionFilter],
-        order: [[ primaryField, 'asc' ]],
-        limit: 20,
-      },
-    }),
-  }).then(function (r) { return r.ok ? r.json() : null; }));
+// ── Cube Model Metadata Extraction ────────────────────────────────────
+//
+// The cube model can declare its data characteristics in `meta`:
+//
+//   meta:
+//     grain: stay_event
+//     grain_description: One row per car stay
+//     time_dimension: stay_ended_at
+//     time_zone: Atlantic/Reykjavik
+//     partition: bluecar.is
+//     period:
+//       earliest: "2025-01-01"
+//       latest: now                    # "now" resolves to today's date
+//       typical_range: last_12_months  # used as default date picker range
+//     refresh:
+//       cadence: hourly
+//       delay: ~30 minutes behind real-time
+//       incremental_window: 7 days
+//     granularity:
+//       available: [hour, day, week, month, quarter, year]
+//       default: week
+//       notes: "explanation for users"
+//
+// The engine reads these from the cube-level meta (not dimension meta)
+// to configure time pickers, granularity options, and refresh indicators.
 
-  // Query 2: latest record → max
-  queries.push(fetch('/api/cube', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      query: {
-        dimensions: dimFields,
-        measures: [],
-        filters: [partitionFilter],
-        order: [[ primaryField, 'desc' ]],
-        limit: 1,
-      },
-    }),
-  }).then(function (r) { return r.ok ? r.json() : null; }));
-
-  return Promise.all(queries).then(function (results) {
-    var bounds = { timeBounds: {}, numberBounds: {}, dataResolutionDays: null };
-
-    var ascRows = results[0] && results[0].data || [];
-    var descRows = results[1] && results[1].data || [];
-    var earliest = ascRows[0] || null;
-    var latest = descRows[0] || null;
-
-    for (var i = 0; i < timeDimNames.length; ++i) {
-      var key = cubeName + '.' + timeDimNames[i];
-      var minVal = earliest && earliest[key] ? earliest[key] : null;
-      var maxVal = latest && latest[key] ? latest[key] : null;
-      if (minVal || maxVal) {
-        bounds.timeBounds[timeDimNames[i]] = { min: minVal, max: maxVal };
-      }
-    }
-
-    // Compute median interval from the ascending sample
-    if (ascRows.length >= 2) {
-      var intervals = [];
-      for (var s = 1; s < ascRows.length; ++s) {
-        var t0 = new Date(ascRows[s - 1][primaryField]).getTime();
-        var t1 = new Date(ascRows[s][primaryField]).getTime();
-        if (t1 > t0) intervals.push((t1 - t0) / 86400000);
-      }
-      if (intervals.length > 0) {
-        intervals.sort(function (a, b) { return a - b; });
-        bounds.dataResolutionDays = intervals[Math.floor(intervals.length / 2)];
-      }
-    }
-
-    return bounds;
-  });
+// Extract cube-level model metadata (grain, period, granularity, refresh)
+export function extractModelMeta(registry) {
+  var cubeMeta = registry._cubeMeta || {};
+  return {
+    grain: cubeMeta.grain || null,
+    grainDescription: cubeMeta.grain_description || null,
+    timeDimension: cubeMeta.time_dimension || null,
+    timeZone: cubeMeta.time_zone || null,
+    partition: cubeMeta.partition || null,
+    eventType: cubeMeta.event_type || null,
+    period: cubeMeta.period || null,
+    refresh: cubeMeta.refresh || null,
+    granularity: cubeMeta.granularity || null,
+  };
 }
 
-// All Cube.dev supported granularities with their approximate bucket size in days.
-// Ordered finest to coarsest.
-var GRANULARITY_BUCKETS = [
-  { id: 'hour',    label: 'Hourly',    days: 1 / 24 },
-  { id: 'day',     label: 'Daily',     days: 1 },
-  { id: 'week',    label: 'Weekly',    days: 7 },
-  { id: 'month',   label: 'Monthly',   days: 30 },
-  { id: 'quarter', label: 'Quarterly', days: 91 },
-  { id: 'year',    label: 'Yearly',    days: 365 },
-];
+// Resolve the period range from model meta.
+// Handles "now" as latest, and typical_range for default selection.
+export function resolveModelPeriod(modelMeta) {
+  var period = modelMeta && modelMeta.period;
+  if (!period) return null;
 
-// Infer which granularities make sense for a given time span and data resolution.
-//
-// Two constraints determine the valid range:
-//   - Finest: limited by actual data resolution (median interval between records).
-//     A granularity is too fine if each bucket would have <1 record on average.
-//   - Coarsest: limited by the span. A granularity is too coarse if it would
-//     produce fewer than 3 buckets.
-//
-// dataResolutionDays: median interval between consecutive records (in days).
-//   If null/0, no lower bound is applied (all fine granularities available).
-//
-export function inferGranularities(minDate, maxDate, dataResolutionDays) {
-  if (!minDate || !maxDate) return ['day', 'week', 'month'];
-
-  var spanDays = (new Date(maxDate).getTime() - new Date(minDate).getTime()) / 86400000;
-  var resolution = typeof dataResolutionDays === 'number' && dataResolutionDays > 0 ? dataResolutionDays : 0;
-  var result = [];
-
-  for (var i = 0; i < GRANULARITY_BUCKETS.length; ++i) {
-    var g = GRANULARITY_BUCKETS[i];
-    var buckets = spanDays / g.days;
-
-    // Too coarse: fewer than 3 buckets
-    if (buckets < 3) continue;
-
-    // Too fine: bucket is smaller than the data resolution
-    // (each bucket would have <1 record — empty noise)
-    if (resolution > 0 && g.days < resolution) continue;
-
-    result.push(g.id);
+  var earliest = period.earliest || null;
+  var latest = period.latest;
+  if (latest === 'now' || !latest) {
+    latest = new Date().toISOString().slice(0, 10);
   }
 
-  return result.length > 0 ? result : ['day', 'week', 'month'];
+  return {
+    earliest: earliest,
+    latest: latest,
+    typicalRange: period.typical_range || null,
+  };
 }
 
-// Pick the best default granularity: the one closest to ~40 buckets
-// (good default density for a time series chart).
-export function inferDefaultGranularity(minDate, maxDate, dataResolutionDays) {
-  var grans = inferGranularities(minDate, maxDate, dataResolutionDays);
-  if (!minDate || !maxDate || grans.length === 0) return 'day';
-
-  var spanDays = (new Date(maxDate).getTime() - new Date(minDate).getTime()) / 86400000;
-  var targetBuckets = 40;
-  var best = grans[0];
-  var bestDist = Infinity;
-
-  for (var i = 0; i < GRANULARITY_BUCKETS.length; ++i) {
-    var g = GRANULARITY_BUCKETS[i];
-    if (grans.indexOf(g.id) < 0) continue;
-    var dist = Math.abs((spanDays / g.days) - targetBuckets);
-    if (dist < bestDist) { bestDist = dist; best = g.id; }
+// Resolve typical_range string to a from-date relative to latest.
+// Supports: last_7_days, last_30_days, last_90_days, last_6_months,
+//           last_12_months, year_to_date, all
+export function resolveTypicalRange(typicalRange, earliest, latest) {
+  if (!typicalRange || typicalRange === 'all') {
+    return { from: earliest, to: latest };
   }
-
-  return best;
+  var latestDate = new Date(latest);
+  var match = typicalRange.match(/^last_(\d+)_(days|months|years)$/);
+  if (match) {
+    var n = parseInt(match[1]);
+    var unit = match[2];
+    var from = new Date(latestDate);
+    if (unit === 'days') from.setUTCDate(from.getUTCDate() - n);
+    else if (unit === 'months') from.setUTCMonth(from.getUTCMonth() - n);
+    else if (unit === 'years') from.setUTCFullYear(from.getUTCFullYear() - n);
+    var fromStr = from.toISOString().slice(0, 10);
+    return { from: fromStr < earliest ? earliest : fromStr, to: latest };
+  }
+  if (typicalRange === 'year_to_date') {
+    var ytd = new Date(Date.UTC(latestDate.getUTCFullYear(), 0, 1));
+    return { from: ytd.toISOString().slice(0, 10), to: latest };
+  }
+  return { from: earliest, to: latest };
 }
 
-// Get the user-facing label for a granularity id
+// Get granularity options from model meta, or fall back to Cube defaults.
+export function getGranularityOptions(modelMeta) {
+  var gran = modelMeta && modelMeta.granularity;
+  if (gran && gran.available && gran.available.length > 0) {
+    return gran.available;
+  }
+  // Cube.dev standard granularities as fallback
+  return ['hour', 'day', 'week', 'month', 'quarter', 'year'];
+}
+
+// Get the default granularity from model meta, or pick a sensible one.
+export function getDefaultGranularity(modelMeta) {
+  var gran = modelMeta && modelMeta.granularity;
+  if (gran && gran.default) return gran.default;
+  return 'week';
+}
+
+// Get the granularity notes (explanation for the user)
+export function getGranularityNotes(modelMeta) {
+  var gran = modelMeta && modelMeta.granularity;
+  return gran && gran.notes ? gran.notes : null;
+}
+
+// User-facing label for a granularity id
+var GRAN_LABELS = {
+  second: 'Second', minute: 'Minute', hour: 'Hourly',
+  day: 'Daily', week: 'Weekly', month: 'Monthly',
+  quarter: 'Quarterly', year: 'Yearly',
+};
+
 export function granularityLabel(id) {
-  for (var i = 0; i < GRANULARITY_BUCKETS.length; ++i) {
-    if (GRANULARITY_BUCKETS[i].id === id) return GRANULARITY_BUCKETS[i].label;
-  }
-  return id.charAt(0).toUpperCase() + id.slice(1);
+  if (GRAN_LABELS[id]) return GRAN_LABELS[id];
+  return id.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
 }
 
 // Generate smart period presets based on the data range

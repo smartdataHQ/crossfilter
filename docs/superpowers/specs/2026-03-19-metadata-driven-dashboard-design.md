@@ -100,6 +100,52 @@ When `modelBar` is omitted, the engine auto-discovers everything from metadata. 
 - **Facet pills**: Applied as crossfilter `filterIn([...selectedValues])`.
 - All model bar filters coordinate with panel filters through the same filter state.
 
+## Cube Model Metadata Contract
+
+The cube model can optionally declare its data characteristics in the cube-level `meta` property. These are read from `/api/meta` and drive the period selector, granularity options, and refresh indicators — eliminating runtime probing.
+
+```yaml
+cubes:
+  - name: bluecar_stays
+    meta:
+      # What each row represents
+      grain: stay_event
+      grain_description: One row per car stay (Stop Ended event)
+
+      # Primary time dimension and timezone
+      time_dimension: stay_ended_at
+      time_zone: Atlantic/Reykjavik
+
+      # Data source identification
+      partition: bluecar.is
+      event_type: Stay Ended
+
+      # Period range — drives date picker bounds and defaults
+      period:
+        earliest: "2025-01-01"
+        latest: now                    # "now" resolves to today's date
+        typical_range: last_12_months  # default view on load
+
+      # Refresh cadence — optional, for freshness indicators
+      refresh:
+        cadence: hourly
+        delay: ~30 minutes behind real-time
+        incremental_window: 7 days
+
+      # Time granularity — what the UI offers
+      granularity:
+        available: [hour, day, week, month, quarter, year]
+        default: week
+        notes: "Stay events are instantaneous. Hour is the finest useful bucket."
+```
+
+All fields are optional. When absent, the engine falls back to sensible defaults:
+- `period` absent → date picker uses full data range from dimension metadata (`min_value`/`max_value`) if available
+- `granularity` absent → offers all Cube.dev standard granularities, defaults to `week`
+- `typical_range` absent → shows full range on load
+
+Supported `typical_range` values: `last_7_days`, `last_30_days`, `last_90_days`, `last_6_months`, `last_12_months`, `year_to_date`, `all`
+
 ## Architecture — Three Layers
 
 ### Layer 1: Schema (data wiring)
