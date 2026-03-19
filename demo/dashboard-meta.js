@@ -203,50 +203,6 @@ export function discoverFacetDimensions(registry, maxValues) {
   return facets;
 }
 
-// Discover formatted/described measures that are notable
-export function discoverNotableMeasures(registry) {
-  var notable = [];
-  var measNames = Object.keys(registry.measures);
-  for (var i = 0; i < measNames.length; ++i) {
-    var name = measNames[i];
-    var meas = registry.measures[name];
-    if (meas.format || meas.description) {
-      notable.push({
-        name: name,
-        label: inferLabel(name, registry),
-        format: meas.format || null,
-        description: meas.description || null,
-      });
-    }
-  }
-  return notable;
-}
-
-// ── Time & Range Probing ──────────────────────────────────────────────
-
-// Discover time dimensions and extract any metadata bounds
-export function discoverTimeDimensions(registry) {
-  var timeDims = [];
-  var dimNames = Object.keys(registry.dimensions);
-  for (var i = 0; i < dimNames.length; ++i) {
-    var name = dimNames[i];
-    var dim = registry.dimensions[name];
-    if (dim.type === 'time') {
-      var meta = dim.meta || {};
-      timeDims.push({
-        name: name,
-        label: inferLabel(name, registry),
-        minValue: meta.min_value || null,
-        maxValue: meta.max_value || null,
-      });
-    }
-  }
-  return timeDims;
-}
-
-// Probe the Cube API for time bounds and number ranges when metadata is missing.
-// No probing needed — cube model meta declares period and granularity.
-// See extractModelMeta(), resolveModelPeriod(), getGranularityOptions().
 
 // ── Cube Model Metadata Extraction ────────────────────────────────────
 //

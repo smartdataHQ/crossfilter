@@ -750,7 +750,6 @@ body {
   font-size: 13px; font-weight: 700; color: var(--text-primary);
   letter-spacing: 0.02em; text-transform: uppercase;
 }
-.model-bar-stats { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
 .model-bar-controls {
   display: flex; align-items: center; gap: 10px;
   padding-top: 8px; margin-top: 4px;
@@ -766,10 +765,6 @@ body {
 .model-bar-inline--range { min-width: 160px; }
 .model-bar-inline-label {
   font-size: 11px; color: var(--text-secondary); white-space: nowrap;
-}
-.model-bar-inline-val {
-  font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);
-  min-width: 28px; text-align: right;
 }
 
 /* Info icon — tooltips powered by tippy.js (Principle 2 + 14) */
@@ -825,11 +820,6 @@ body {
    The filter chips bar provides the global summary across all filters. */
 
 /* Filter chips are now Shoelace <sl-tag> — no custom CSS needed */
-.pill--negative {
-  background: var(--accent-red, #ef4565); border-color: var(--accent-red, #ef4565); color: white;
-}
-.dim-item--selected { background: rgba(61,139,253,0.06); }
-.dim-item--selected .dim-label { color: var(--accent-blue); font-weight: 600; }
 
 /* Card sub-header (for table controls, granularity) */
 .card-head--sub {
@@ -867,12 +857,6 @@ body {
 .filter-bar-count {
   font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);
 }
-.filter-bar-range-val {
-  font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);
-  min-width: 32px; text-align: right;
-}
-.pill-group--compact { gap: 2px; }
-.mode-btn--sm { padding: 2px 8px; font-size: 10px; }
 
 /* Range selector — noUiSlider (Principle 13 + 14) */
 .range-sel {

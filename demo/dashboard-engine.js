@@ -13,7 +13,6 @@ import {
   inferSearchable,
   discoverBooleanDimensions,
   discoverFacetDimensions,
-  discoverTimeDimensions,
   extractModelMeta,
   resolveModelPeriod,
   resolveTypicalRange,
@@ -30,6 +29,56 @@ import {
 
 var echarts = globalThis.echarts;
 var crossfilter = globalThis.crossfilter;
+
+// ── Shared Helpers ────────────────────────────────────────────────────
+
+function titleCase(str) {
+  return str.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+}
+
+function afterUpdate(el, fn) {
+  if (el.updateComplete) el.updateComplete.then(fn);
+  else setTimeout(fn, 100);
+}
+
+function buildToggleHtml(dimension) {
+  return '<sl-button-group>' +
+    '<sl-button size="small" data-toggle="' + escapeHtml(dimension) + '" data-val="true">Yes</sl-button>' +
+    '<sl-button size="small" data-toggle="' + escapeHtml(dimension) + '" data-val="false">No</sl-button>' +
+    '<sl-button size="small" variant="primary" data-toggle="' + escapeHtml(dimension) + '" data-val="all">All</sl-button>' +
+  '</sl-button-group>';
+}
+
+function wireToggleClicks(container) {
+  container.addEventListener('click', function (e) {
+    var btn = e.target.closest('sl-button[data-toggle]');
+    if (!btn) return;
+    var dim = btn.dataset.toggle;
+    var group = btn.closest('sl-button-group');
+    if (group) {
+      var siblings = group.querySelectorAll('sl-button[data-toggle="' + dim + '"]');
+      for (var i = 0; i < siblings.length; ++i) siblings[i].variant = 'default';
+    }
+    btn.variant = 'primary';
+    setFilter(dim, btn.dataset.val === 'all' ? null : btn.dataset.val);
+  });
+}
+
+function resetToggleGroup(dim) {
+  var firstBtn = document.querySelector('sl-button[data-toggle="' + dim + '"]');
+  if (!firstBtn) return;
+  var group = firstBtn.closest('sl-button-group');
+  if (!group) return;
+  var btns = group.querySelectorAll('sl-button[data-toggle="' + dim + '"]');
+  for (var i = 0; i < btns.length; ++i) {
+    btns[i].variant = btns[i].dataset.val === 'all' ? 'primary' : 'default';
+  }
+}
+
+function getDimDescription(registry, name) {
+  var dim = registry.dimensions[name];
+  return dim && dim.description ? dim.description : null;
+}
 
 // ── URL State (Principle 3: bookmarkable) ─────────────────────────────
 
@@ -91,10 +140,12 @@ function clearAllFilters() {
   for (var i = 0; i < selects.length; ++i) {
     selects[i].value = selects[i].multiple ? [] : '';
   }
-  // Reset Shoelace toggle buttons
-  var toggleBtns = document.querySelectorAll('sl-button[data-toggle], sl-button[data-val]');
-  for (var j = 0; j < toggleBtns.length; ++j) {
-    toggleBtns[j].variant = toggleBtns[j].dataset.val === 'all' ? 'primary' : 'default';
+  // Reset all toggle buttons
+  var allToggleBtns = document.querySelectorAll('sl-button[data-toggle]');
+  var resetDims = {};
+  for (var j = 0; j < allToggleBtns.length; ++j) {
+    var d = allToggleBtns[j].dataset.toggle;
+    if (!resetDims[d]) { resetToggleGroup(d); resetDims[d] = true; }
   }
 }
 
@@ -193,12 +244,7 @@ function escapeHtml(str) {
   return _escapeEl.innerHTML;
 }
 
-function formatCount(n) {
-  if (n == null) return '\u2014';
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
-  return String(n);
-}
+
 
 // ── Principle 8: Filter Chips (visible, removable) ────────────────────
 
@@ -210,7 +256,7 @@ function resolveFilterLabel(dim, rawValue) {
     if (option) return option.textContent.trim();
   }
   // Fallback: title-case the raw value
-  return rawValue.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+  return titleCase(rawValue);
 }
 
 function renderFilterChips() {
@@ -230,7 +276,7 @@ function renderFilterChips() {
     var dim = keys[i];
     var val = filterState[dim];
     var vals = Array.isArray(val) ? val : [val];
-    var displayDim = dim.replace(/^_/, '').replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+    var displayDim = titleCase(dim.replace(/^_/, ''));
 
     if (vals.length === 1) {
       var chipLabel = resolveFilterLabel(dim, vals[0]);
@@ -284,25 +330,13 @@ function syncDropdownAfterRemove(dim, singleVal) {
     } else {
       select.value = select.multiple ? [] : '';
     }
-    // Update the display text to reflect the change
-    if (select.updateComplete) {
-      select.updateComplete.then(function () { updateSelectDisplay(select); });
-    } else {
-      updateSelectDisplay(select);
-    }
+    afterUpdate(select, function () { updateSelectDisplay(select); });
     return;
   }
 
   // Toggle buttons — reset to "All"
-  var toggleBtn = document.querySelector('sl-button[data-toggle="' + dim + '"]');
-  if (toggleBtn) {
-    var group = toggleBtn.closest('sl-button-group');
-    if (group) {
-      var btns = group.querySelectorAll('sl-button');
-      for (var i = 0; i < btns.length; ++i) {
-        btns[i].variant = btns[i].dataset.val === 'all' ? 'primary' : 'default';
-      }
-    }
+  if (document.querySelector('sl-button[data-toggle="' + dim + '"]')) {
+    resetToggleGroup(dim);
     return;
   }
 }
@@ -395,10 +429,7 @@ function wireOneSelect(select) {
     }
   });
 
-  // Update display after Shoelace finishes rendering
-  select.updateComplete && select.updateComplete.then(function () {
-    updateSelectDisplay(select);
-  });
+  afterUpdate(select, function () { updateSelectDisplay(select); });
 }
 
 // Restore all input states from URL filter state
@@ -410,14 +441,8 @@ function restoreStateFromUrl() {
     var id = select.dataset.dropdownId;
     var vals = filterState[id];
     if (!vals) continue;
-    select.value = Array.isArray(vals) ? vals : vals;
-    (function (sel) {
-      if (sel.updateComplete) {
-        sel.updateComplete.then(function () { updateSelectDisplay(sel); });
-      } else {
-        setTimeout(function () { updateSelectDisplay(sel); }, 100);
-      }
-    })(select);
+    select.value = Array.isArray(vals) ? vals : [vals];
+    (function (sel) { afterUpdate(sel, function () { updateSelectDisplay(sel); }); })(select);
   }
 
   // Toggle buttons (Yes/No/All) — match by data-toggle or data-val
@@ -538,11 +563,7 @@ function buildModelBar(config, registry, inlinePanels, timePanelInfo) {
       if (p.chart === 'toggle') {
         html += '<div class="model-bar-inline" id="panel-' + p.id + '">';
         html += '<span class="model-bar-inline-label">' + escapeHtml(p.label) + (pDesc ? infoIcon(pDesc) : '') + '</span>';
-        html += '<sl-button-group>';
-        html += '<sl-button size="small" data-toggle="' + escapeHtml(p.dimension) + '" data-val="true">Yes</sl-button>';
-        html += '<sl-button size="small" data-toggle="' + escapeHtml(p.dimension) + '" data-val="false">No</sl-button>';
-        html += '<sl-button size="small" variant="primary" data-toggle="' + escapeHtml(p.dimension) + '" data-val="all">All</sl-button>';
-        html += '</sl-button-group>';
+        html += buildToggleHtml(p.dimension);
         html += '</div>';
       } else if (p.chart === 'range') {
         html += '<div class="model-bar-inline model-bar-inline--range" id="panel-' + p.id + '">';
@@ -558,17 +579,7 @@ function buildModelBar(config, registry, inlinePanels, timePanelInfo) {
   bar.innerHTML = html;
   wireDropdowns(bar);
 
-  // Wire inline toggle clicks (Shoelace sl-button)
-  bar.addEventListener('click', function (e) {
-    var btn = e.target.closest('sl-button[data-toggle]');
-    if (!btn) return;
-    var dim = btn.dataset.toggle;
-    var siblings = bar.querySelectorAll('sl-button[data-toggle="' + dim + '"]');
-    for (var j = 0; j < siblings.length; ++j) siblings[j].variant = 'default';
-    btn.variant = 'primary';
-    var val = btn.dataset.val;
-    setFilter(dim, val === 'all' ? null : val);
-  });
+  wireToggleClicks(bar);
 
   // Wire inline range selectors
   if (inlinePanels) {
@@ -684,11 +695,7 @@ function buildPanelCard(panel, accentIdx, registry) {
   } else if (panel.chart === 'toggle') {
     // Principle 7: clear active state
     body = '<div class="toggle-wrap" id="toggle-' + panel.id + '">' +
-      '<sl-button-group>' +
-        '<sl-button size="small" data-val="true">Yes</sl-button>' +
-        '<sl-button size="small" data-val="false">No</sl-button>' +
-        '<sl-button size="small" variant="primary" data-val="all">All</sl-button>' +
-      '</sl-button-group>' +
+      buildToggleHtml(panel.dimension) +
       '<span class="toggle-count" id="toggle-count-' + panel.id + '"></span>' +
     '</div>';
 
@@ -991,19 +998,9 @@ function wireCardInteractions(card, panel) {
     });
   }
 
-  // Toggle interactions — Shoelace sl-button
+  // Toggle interactions
   var toggleWrap = card.querySelector('.toggle-wrap');
-  if (toggleWrap) {
-    toggleWrap.addEventListener('click', function (e) {
-      var btn = e.target.closest('sl-button');
-      if (!btn || !btn.dataset.val) return;
-      var siblings = toggleWrap.querySelectorAll('sl-button[data-val]');
-      for (var i = 0; i < siblings.length; ++i) siblings[i].variant = 'default';
-      btn.variant = 'primary';
-      var val = btn.dataset.val;
-      setFilter(panel.dimension, val === 'all' ? null : val);
-    });
-  }
+  if (toggleWrap) wireToggleClicks(toggleWrap);
 
 }
 
@@ -1059,17 +1056,7 @@ function buildFilterBar(section, registry) {
   html += '</div>';
   bar.innerHTML = html;
 
-  // Wire toggle clicks (Shoelace sl-button)
-  bar.addEventListener('click', function (e) {
-    var btn = e.target.closest('sl-button[data-toggle]');
-    if (!btn) return;
-    var dim = btn.dataset.toggle;
-    var siblings = bar.querySelectorAll('sl-button[data-toggle="' + dim + '"]');
-    for (var j = 0; j < siblings.length; ++j) siblings[j].variant = 'default';
-    btn.variant = 'primary';
-    var val = btn.dataset.val;
-    setFilter(dim, val === 'all' ? null : val);
-  });
+  wireToggleClicks(bar);
 
   return bar;
 }
