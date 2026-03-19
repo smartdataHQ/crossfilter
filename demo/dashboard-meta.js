@@ -124,13 +124,33 @@ export function inferFilterMode(fieldName, registry) {
   return 'in';
 }
 
+// Smart Top-X: picks a sensible default based on cardinality.
+// If the full set is small enough, show all (no truncation needed).
+// Otherwise pick a round number that gives a useful summary.
 export function inferLimit(fieldName, registry) {
   var dim = registry.dimensions[fieldName];
-  if (!dim) return 12;
+  if (!dim) return 10;
   var meta = dim.meta || {};
   var unique = typeof meta.unique_values === 'number' ? meta.unique_values : -1;
-  if (unique > 0 && unique <= 20) return unique;
-  return 12;
+
+  // Unknown cardinality — safe default
+  if (unique <= 0) return 10;
+
+  // Small enough to show everything — no Top X needed
+  if (unique <= 15) return unique;
+
+  // Pick a round number that shows roughly 30-50% of items
+  // but never less than 5 or more than 25
+  var candidates = [5, 8, 10, 15, 20, 25];
+  for (var i = 0; i < candidates.length; ++i) {
+    if (candidates[i] >= unique * 0.3 && candidates[i] <= unique * 0.6) {
+      return candidates[i];
+    }
+  }
+
+  // For very large sets, cap at 10
+  if (unique > 50) return 10;
+  return Math.min(10, unique);
 }
 
 export function inferSearchable(fieldName, registry) {

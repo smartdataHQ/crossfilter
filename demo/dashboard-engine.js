@@ -635,9 +635,12 @@ function buildPanelCard(panel, accentIdx, registry) {
   var dimMeta = registry.dimensions[panel.dimension];
   var dimDesc = dimMeta && dimMeta.description ? dimMeta.description : null;
 
-  // Card head — Principle 4/5: single toggle between "Top X" and "All"
+  // Card head — Principle 4/5: adaptive Top X toggle
+  // Only show if there are more items than the limit (otherwise we're showing all already)
   var headRight = '';
-  if (panel.chart === 'bar' || panel.chart === 'pie') {
+  var dimUnique = dimMeta && dimMeta.meta && typeof dimMeta.meta.unique_values === 'number' ? dimMeta.meta.unique_values : -1;
+  var showingAll = dimUnique > 0 && panel.limit >= dimUnique;
+  if ((panel.chart === 'bar' || panel.chart === 'pie') && !showingAll) {
     headRight += '<button class="btn btn-ghost btn-tiny show-all-toggle" data-panel="' + panel.id + '" data-limit="' + panel.limit + '">Top ' + panel.limit + '</button>';
   }
   if (panel.chart === 'bar' && panel.searchable) {
