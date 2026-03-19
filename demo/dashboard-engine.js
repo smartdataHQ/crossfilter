@@ -808,17 +808,14 @@ function buildPanelCard(panel, accentIdx, registry) {
 
 function buildRangeSelector(id, label, compact) {
   var cls = compact ? 'range-sel range-sel--compact' : 'range-sel';
-  return '<div class="' + cls + '" id="range-' + id + '" data-range-id="' + id + '">' +
+  return '<div class="' + cls + '" data-range-id="' + id + '">' +
+    '<span class="range-sel-val range-sel-lo-val" id="range-lo-val-' + id + '">0</span>' +
     '<div class="range-sel-track">' +
       '<div class="range-sel-fill" id="range-fill-' + id + '"></div>' +
       '<input type="range" class="range-sel-input range-sel-lo" id="range-lo-' + id + '" min="0" max="100" value="0">' +
       '<input type="range" class="range-sel-input range-sel-hi" id="range-hi-' + id + '" min="0" max="100" value="100">' +
     '</div>' +
-    '<div class="range-sel-values">' +
-      '<span class="range-sel-val" id="range-lo-val-' + id + '">0</span>' +
-      '<span class="range-sel-sep">\u2013</span>' +
-      '<span class="range-sel-val" id="range-hi-val-' + id + '">100</span>' +
-    '</div>' +
+    '<span class="range-sel-val range-sel-hi-val" id="range-hi-val-' + id + '">100</span>' +
   '</div>';
 }
 
@@ -828,12 +825,16 @@ function wireRangeSelector(container, panelId, dimension) {
   var lo = el.querySelector('.range-sel-lo');
   var hi = el.querySelector('.range-sel-hi');
   var fill = el.querySelector('.range-sel-fill');
-  var loVal = el.querySelector('#range-lo-val-' + panelId);
-  var hiVal = el.querySelector('#range-hi-val-' + panelId);
+  var loVal = el.querySelector('.range-sel-lo-val');
+  var hiVal = el.querySelector('.range-sel-hi-val');
+  var track = el.querySelector('.range-sel-track');
 
   function updateFill() {
-    var loP = ((lo.value - lo.min) / (lo.max - lo.min)) * 100;
-    var hiP = ((hi.value - hi.min) / (hi.max - hi.min)) * 100;
+    var min = parseInt(lo.min);
+    var max = parseInt(lo.max);
+    var range = max - min || 1;
+    var loP = ((parseInt(lo.value) - min) / range) * 100;
+    var hiP = ((parseInt(hi.value) - min) / range) * 100;
     fill.style.left = loP + '%';
     fill.style.width = (hiP - loP) + '%';
     loVal.textContent = lo.value;
@@ -850,6 +851,50 @@ function wireRangeSelector(container, panelId, dimension) {
     if (parseInt(hi.value) < parseInt(lo.value)) hi.value = lo.value;
     updateFill();
     if (dimension) setFilter(dimension, [lo.value, hi.value]);
+  });
+
+  // Drag the fill to shift the entire range
+  var dragging = false;
+  var dragStartX = 0;
+  var dragLoStart = 0;
+  var dragHiStart = 0;
+
+  fill.style.cursor = 'grab';
+  fill.addEventListener('mousedown', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    dragging = true;
+    fill.style.cursor = 'grabbing';
+    dragStartX = e.clientX;
+    dragLoStart = parseInt(lo.value);
+    dragHiStart = parseInt(hi.value);
+  });
+
+  document.addEventListener('mousemove', function (e) {
+    if (!dragging) return;
+    var trackRect = track.getBoundingClientRect();
+    var pxPerUnit = trackRect.width / (parseInt(lo.max) - parseInt(lo.min));
+    var delta = Math.round((e.clientX - dragStartX) / pxPerUnit);
+    var min = parseInt(lo.min);
+    var max = parseInt(lo.max);
+    var span = dragHiStart - dragLoStart;
+
+    var newLo = dragLoStart + delta;
+    var newHi = dragHiStart + delta;
+    if (newLo < min) { newLo = min; newHi = min + span; }
+    if (newHi > max) { newHi = max; newLo = max - span; }
+
+    lo.value = newLo;
+    hi.value = newHi;
+    updateFill();
+    if (dimension) setFilter(dimension, [lo.value, hi.value]);
+  });
+
+  document.addEventListener('mouseup', function () {
+    if (dragging) {
+      dragging = false;
+      fill.style.cursor = 'grab';
+    }
   });
 
   updateFill();
