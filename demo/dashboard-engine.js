@@ -384,8 +384,9 @@ function wireOneSelect(select) {
   });
 }
 
-// Restore select values from URL filter state
-function restoreDropdownsFromState() {
+// Restore all input states from URL filter state
+function restoreStateFromUrl() {
+  // Shoelace selects
   var selects = document.querySelectorAll('sl-select[data-dropdown-id]');
   for (var i = 0; i < selects.length; ++i) {
     var select = selects[i];
@@ -393,7 +394,6 @@ function restoreDropdownsFromState() {
     var vals = filterState[id];
     if (!vals) continue;
     select.value = Array.isArray(vals) ? vals : vals;
-    // Update display after Shoelace processes the value change
     (function (sel) {
       if (sel.updateComplete) {
         sel.updateComplete.then(function () { updateSelectDisplay(sel); });
@@ -401,6 +401,38 @@ function restoreDropdownsFromState() {
         setTimeout(function () { updateSelectDisplay(sel); }, 100);
       }
     })(select);
+  }
+
+  // Toggle buttons (Yes/No/All) — match by data-toggle or data-val
+  var keys = Object.keys(filterState);
+  for (var k = 0; k < keys.length; ++k) {
+    var dim = keys[k];
+    var val = filterState[dim];
+    // Find toggle buttons for this dimension
+    var toggleBtns = document.querySelectorAll('sl-button[data-toggle="' + dim + '"], sl-button[data-val]');
+    if (toggleBtns.length === 0) continue;
+    // Check if these buttons belong to this dimension
+    var firstToggle = document.querySelector('sl-button[data-toggle="' + dim + '"]');
+    if (!firstToggle) continue;
+    var allBtns = firstToggle.closest('sl-button-group');
+    if (!allBtns) continue;
+    var btns = allBtns.querySelectorAll('sl-button');
+    for (var b = 0; b < btns.length; ++b) {
+      btns[b].variant = btns[b].dataset.val === String(val) ? 'primary' : 'default';
+    }
+  }
+
+  // Range sliders — set noUiSlider values
+  var sliders = document.querySelectorAll('[data-range-id]');
+  for (var s = 0; s < sliders.length; ++s) {
+    var rangeId = sliders[s].dataset.rangeId;
+    var rangeVal = filterState[rangeId];
+    if (!rangeVal) continue;
+    var rangeVals = Array.isArray(rangeVal) ? rangeVal : [rangeVal];
+    var sliderEl = sliders[s].querySelector('.noUi-target');
+    if (sliderEl && sliderEl.noUiSlider && rangeVals.length === 2) {
+      sliderEl.noUiSlider.set([parseFloat(rangeVals[0]), parseFloat(rangeVals[1])]);
+    }
   }
 }
 
@@ -1251,7 +1283,7 @@ async function main() {
 
     // Render dashboard immediately — visible under the overlay
     buildDashboardDOM(container, config, sections, registry);
-    restoreDropdownsFromState();
+    restoreStateFromUrl();
     renderFilterChips();
     console.log('[dashboard] Dashboard rendered, loading data...');
 
