@@ -820,12 +820,12 @@ function buildModelBar(config, registry, inlinePanels, timePanelInfo) {
       var pDesc = pDimMeta && pDimMeta.description ? pDimMeta.description : null;
 
       if (p.chart === 'toggle') {
-        html += '<div class="model-bar-inline" id="panel-' + p.id + '">';
+        html += '<div class="model-bar-inline control-container" id="panel-' + p.id + '">';
         html += '<span class="model-bar-inline-label">' + escapeHtml(p.label) + (pDesc ? infoIcon(pDesc) : '') + '</span>';
         html += buildToggleHtml(p.dimension);
         html += '</div>';
       } else if (p.chart === 'range') {
-        html += '<div class="model-bar-inline model-bar-inline--range" id="panel-' + p.id + '">';
+        html += '<div class="model-bar-inline model-bar-inline--range control-container" id="panel-' + p.id + '">';
         html += '<span class="model-bar-inline-label">' + escapeHtml(p.label) + (pDesc ? infoIcon(pDesc) : '') + '</span>';
         html += buildRangeSelector(p.id, p.label, true);
         html += '</div>';
@@ -953,7 +953,7 @@ function buildPanelCard(panel, accentIdx, registry) {
 
   } else if (panel.chart === 'toggle') {
     // Principle 7: clear active state
-    body = '<div class="toggle-wrap" id="toggle-' + panel.id + '">' +
+    body = '<div class="toggle-wrap control-container" id="toggle-' + panel.id + '">' +
       buildToggleHtml(panel.dimension) +
       '<span class="toggle-count" id="toggle-count-' + panel.id + '"></span>' +
     '</div>';
@@ -1293,15 +1293,9 @@ function buildFilterBar(section, registry) {
     var dimDesc = dimMeta && dimMeta.description ? dimMeta.description : null;
 
     if (panel.chart === 'toggle') {
-      html += '<div class="filter-bar-item" id="panel-' + panel.id + '">';
+      html += '<div class="filter-bar-item control-container" id="panel-' + panel.id + '">';
       html += '<span class="filter-bar-label">' + escapeHtml(panel.label) + (dimDesc ? infoIcon(dimDesc) : '') + '</span>';
-      html += '<div class="pill-group pill-group--compact">';
-      html += '<sl-button-group>';
-      html += '<sl-button size="small" data-toggle="' + escapeHtml(panel.dimension) + '" data-val="true">Yes</sl-button>';
-      html += '<sl-button size="small" data-toggle="' + escapeHtml(panel.dimension) + '" data-val="false">No</sl-button>';
-      html += '<sl-button size="small" variant="primary" data-toggle="' + escapeHtml(panel.dimension) + '" data-val="all">All</sl-button>';
-      html += '</sl-button-group>';
-      html += '</div>';
+      html += buildToggleHtml(panel.dimension);
       html += '<span class="filter-bar-count" id="toggle-count-' + panel.id + '"></span>';
       html += '</div>';
     } else if (panel.chart === 'range') {
