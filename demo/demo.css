@@ -1044,22 +1044,7 @@ body {
 }
 .period-trigger:hover { border-color: var(--accent-blue); }
 .period-trigger:focus { outline: none; border-color: var(--accent-blue); }
-.period-grans {
-  display: inline-flex; align-items: center;
-  border: 1px solid var(--border); border-radius: var(--radius, 8px);
-  overflow: hidden;
-}
-.period-grans .gran-btn {
-  border: none; border-radius: 0;
-  border-right: 1px solid var(--border);
-  font-size: 10px; padding: 6px 10px;
-  background: transparent; color: var(--text-muted);
-}
-.period-grans .gran-btn:last-child { border-right: none; }
-.period-grans .gran-btn:hover { background: rgba(61,139,253,0.04); color: var(--text-secondary); }
-.period-grans .gran-btn.active {
-  background: var(--accent-blue); color: white;
-}
+/* granularity is now a dropdown, no button strip needed */
 
 /* Flatpickr overrides to match design system */
 .flatpickr-calendar {
@@ -1223,7 +1208,49 @@ body {
   font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);
 }
 
-/* Responsive (Principle 10) */
+/* ── Container Queries — Responsive Components (Principle 10) ──────── */
+/* Components adapt their rendering based on their own available space, */
+/* not the viewport. Each component container is a query context.       */
+
+/* Model bar adapts: row → stacked when narrow */
+.model-bar { container-type: inline-size; container-name: modelbar; }
+@container modelbar (max-width: 500px) {
+  .model-bar-header { flex-direction: column; gap: 8px; }
+  .model-bar-controls { flex-direction: column; align-items: stretch; }
+  .model-bar-inline { padding-left: 0; border-left: none; }
+  .period-control { flex-direction: column; gap: 4px; align-items: stretch; }
+}
+
+/* Chart cards adapt: hide secondary controls when tight */
+.chart-card { container-type: inline-size; container-name: chartcard; }
+@container chartcard (max-width: 280px) {
+  .card-head { flex-wrap: wrap; }
+  .card-filters { width: 100%; justify-content: flex-end; }
+  .show-all-toggle, .dim-list-toggle { font-size: 9px !important; padding: 2px 6px; }
+}
+
+/* KPI cards adapt: smaller text when narrow */
+.kpi { container-type: inline-size; container-name: kpicard; }
+@container kpicard (max-width: 160px) {
+  .kpi-value { font-size: 24px; }
+  .kpi-label { font-size: 10px; }
+}
+
+/* Filter bar adapts: wrap controls */
+.filter-bar { container-type: inline-size; container-name: filterbar; }
+@container filterbar (max-width: 400px) {
+  .filter-bar-controls { flex-direction: column; gap: 8px; }
+  .filter-bar-item--range { max-width: none; }
+}
+
+/* Dropdown adapts: wider panel on narrow triggers */
+.dropdown { container-type: inline-size; container-name: dropdown; }
+@container dropdown (max-width: 120px) {
+  .dropdown-trigger { padding: 4px 8px; font-size: 11px; }
+  .dropdown-label { display: none; }
+}
+
+/* Responsive (Principle 10 — viewport fallbacks) */
 @media (max-width: 1024px) {
   .chart-grid { grid-template-columns: 1fr; }
   .kpi-row { grid-template-columns: repeat(3, 1fr); }

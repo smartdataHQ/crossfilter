@@ -353,9 +353,9 @@ function buildHeader(config) {
 // ── Custom Dropdown (Principle 1: informative, searchable selectors) ──
 
 function buildDropdown(id, label, placeholder, items, multiSelect) {
-  var selectedCount = 0; // will be updated from URL state
   var btnLabel = placeholder;
-  var html = '<div class="dropdown" data-dropdown-id="' + escapeHtml(id) + '">';
+  var html = '<div class="dropdown" data-dropdown-id="' + escapeHtml(id) + '"' +
+    (multiSelect ? '' : ' data-single-select="true"') + '>';
   html += '<button class="dropdown-trigger" type="button">';
   html += '<span class="dropdown-label">' + escapeHtml(label) + '</span>';
   html += '<span class="dropdown-value" id="dd-val-' + escapeHtml(id) + '">' + escapeHtml(btnLabel) + '</span>';
@@ -368,9 +368,11 @@ function buildDropdown(id, label, placeholder, items, multiSelect) {
   html += '<div class="dropdown-items">';
   for (var i = 0; i < items.length; ++i) {
     var item = items[i];
-    html += '<div class="dropdown-item" data-value="' + escapeHtml(item.value) + '">';
+    // Pre-select if the label matches the placeholder (for single-select defaults)
+    var preSelected = (!multiSelect && item.label === placeholder) ? ' dropdown-item--selected' : '';
+    html += '<div class="dropdown-item' + preSelected + '" data-value="' + escapeHtml(item.value) + '">';
     html += '<span class="dropdown-item-label">' + escapeHtml(item.label) + '</span>';
-    html += '<span class="dropdown-item-count"></span>'; // filled when data loads
+    html += '<span class="dropdown-item-count"></span>';
     if (item.description) {
       html += infoIcon(item.description);
     }
@@ -434,13 +436,24 @@ function wireOneDropdown(dropdown) {
     search.addEventListener('click', function (e) { e.stopPropagation(); });
   }
 
-  // Item selection
+  // Item selection — single-select (radio) or multi-select
+  var singleSelect = dropdown.dataset.singleSelect === 'true';
+
   panel.addEventListener('click', function (e) {
     var item = e.target.closest('.dropdown-item');
     if (!item) return;
     e.stopPropagation();
 
-    item.classList.toggle('dropdown-item--selected');
+    if (singleSelect) {
+      // Radio: deselect all, select this one
+      var allItems = panel.querySelectorAll('.dropdown-item--selected');
+      for (var j = 0; j < allItems.length; ++j) allItems[j].classList.remove('dropdown-item--selected');
+      item.classList.add('dropdown-item--selected');
+      // Close immediately
+      panel.classList.remove('dropdown-panel--open');
+    } else {
+      item.classList.toggle('dropdown-item--selected');
+    }
 
     // Collect selected values
     var selected = panel.querySelectorAll('.dropdown-item--selected');
@@ -451,18 +464,18 @@ function wireOneDropdown(dropdown) {
 
     // Update trigger label
     if (vals.length === 0) {
-      valueEl.textContent = trigger.querySelector('.dropdown-value').dataset.placeholder || 'All';
+      valueEl.textContent = valueEl.dataset.placeholder || 'All';
       valueEl.classList.remove('dropdown-value--active');
     } else if (vals.length === 1) {
-      var label = selected[0].querySelector('.dropdown-item-label');
-      valueEl.textContent = label ? label.textContent : vals[0];
+      var selLabel = selected[0].querySelector('.dropdown-item-label');
+      valueEl.textContent = selLabel ? selLabel.textContent : vals[0];
       valueEl.classList.add('dropdown-value--active');
     } else {
       valueEl.textContent = vals.length + ' selected';
       valueEl.classList.add('dropdown-value--active');
     }
 
-    setFilter(id, vals);
+    setFilter(id, singleSelect ? vals[0] : vals);
   });
 
   // Store placeholder on the value element
@@ -945,15 +958,13 @@ function buildPeriodControl(tpi) {
   // Date range trigger — flatpickr will attach here
   html += '<input type="text" class="period-trigger" id="period-trigger" value="' + escapeHtml(rangeLabel) + '" readonly>';
 
-  // Granularity — from model meta or defaults
-  html += '<div class="period-grans" id="period-grans">';
+  // Granularity — dropdown selector (single-select / radio behavior)
+  var granItems = [];
   for (var g = 0; g < grans.length; ++g) {
-    var active = grans[g] === defaultGran ? ' active' : '';
-    html += '<button class="gran-btn' + active + '" data-gran="' + grans[g] + '">' +
-      granularityLabel(grans[g]) + '</button>';
+    granItems.push({ value: grans[g], label: granularityLabel(grans[g]) });
   }
+  html += buildDropdown('_granularity', granularityLabel(defaultGran), granularityLabel(defaultGran), granItems, false);
   if (granNotes) html += infoIcon(granNotes);
-  html += '</div>';
 
   html += '</div>';
   return html;
