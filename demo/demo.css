@@ -1124,3 +1124,25 @@ body {
   .kpi:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0, 21, 88, 0.06); }
   .kpi-label { margin-bottom: 6px; }
 }
+
+/* ── Chart card variants ───────────────────────────────────────────── */
+
+/* Base (minimal): compact header, hide controls */
+.chart-card .card-filters { display: none; }
+.chart-card .show-all-toggle { display: none; }
+.chart-card .dim-list-toggle { display: none; }
+
+/* Compact (300px+): show chart at reduced height */
+@container chartcard (min-width: 300px) {
+  .chart-card .card-head { padding: 10px 14px; }
+  .chart-card .chart-wrap { height: 200px; }
+}
+
+/* Expanded (500px+): full chrome — controls, full height */
+@container chartcard (min-width: 500px) {
+  .chart-card .card-head { padding: 12px 16px; }
+  .chart-card .card-filters { display: flex; }
+  .chart-card .show-all-toggle { display: inline-flex; }
+  .chart-card .dim-list-toggle { display: inline-flex; }
+  .chart-card .chart-wrap { height: 280px; }
+}
