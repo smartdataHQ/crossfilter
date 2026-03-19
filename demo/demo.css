@@ -773,10 +773,23 @@ body {
 }
 .model-bar-stats { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
 .model-bar-controls {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: 10px;
   padding-top: 10px; margin-top: 2px;
   border-top: 1px solid var(--border);
-  overflow: visible;
+  overflow: visible; flex-wrap: wrap;
+}
+.model-bar-inline {
+  display: flex; align-items: center; gap: 6px;
+  padding-left: 10px; border-left: 1px solid var(--border);
+}
+.model-bar-inline:first-child { padding-left: 0; border-left: none; }
+.model-bar-inline--range { min-width: 160px; }
+.model-bar-inline-label {
+  font-size: 11px; color: var(--text-secondary); white-space: nowrap;
+}
+.model-bar-inline-val {
+  font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);
+  min-width: 28px; text-align: right;
 }
 
 /* Info tooltip (Principle 2: details on demand) */

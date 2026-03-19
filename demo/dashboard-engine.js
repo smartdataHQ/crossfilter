@@ -506,7 +506,7 @@ function restoreDropdownsFromState() {
 // ── Model Intelligence Bar ────────────────────────────────────────────
 // Principle 2: description tucked behind (i), clean surface
 
-function buildModelBar(config, registry) {
+function buildModelBar(config, registry, inlinePanels) {
   var modelBarConfig = config.modelBar;
   if (modelBarConfig === false) return null;
   modelBarConfig = modelBarConfig || {};
@@ -527,7 +527,8 @@ function buildModelBar(config, registry) {
   var hasPresets = modelBarConfig.presets !== false && extraBooleans.length > 0;
   var hasFacets = facets.length > 0;
 
-  if (!hasSegments && !hasPresets && !hasFacets && !registry.description) return null;
+  var hasInline = inlinePanels && inlinePanels.length > 0;
+  if (!hasSegments && !hasPresets && !hasFacets && !registry.description && !hasInline) return null;
 
   var bar = document.createElement('section');
   bar.className = 'model-bar anim d1';
@@ -576,10 +577,48 @@ function buildModelBar(config, registry) {
     }
   }
 
+  // Inline panels (toggles, ranges assigned to modelbar via config)
+  if (inlinePanels && inlinePanels.length > 0) {
+    for (var ip = 0; ip < inlinePanels.length; ++ip) {
+      var p = inlinePanels[ip];
+      var pDimMeta = registry.dimensions[p.dimension];
+      var pDesc = pDimMeta && pDimMeta.description ? pDimMeta.description : null;
+
+      if (p.chart === 'toggle') {
+        html += '<div class="model-bar-inline" id="panel-' + p.id + '">';
+        html += '<span class="model-bar-inline-label">' + escapeHtml(p.label) + (pDesc ? infoIcon(pDesc) : '') + '</span>';
+        html += '<div class="pill-group pill-group--compact">';
+        html += '<button class="mode-btn mode-btn--sm" data-toggle="' + escapeHtml(p.dimension) + '" data-val="true">Yes</button>';
+        html += '<button class="mode-btn mode-btn--sm" data-toggle="' + escapeHtml(p.dimension) + '" data-val="false">No</button>';
+        html += '<button class="mode-btn mode-btn--sm active" data-toggle="' + escapeHtml(p.dimension) + '" data-val="all">All</button>';
+        html += '</div>';
+        html += '</div>';
+      } else if (p.chart === 'range') {
+        html += '<div class="model-bar-inline model-bar-inline--range" id="panel-' + p.id + '">';
+        html += '<span class="model-bar-inline-label">' + escapeHtml(p.label) + (pDesc ? infoIcon(pDesc) : '') + '</span>';
+        html += '<input type="range" class="range-slider range-slider--compact" min="0" max="100" value="0" id="range-input-' + p.id + '">';
+        html += '<span class="model-bar-inline-val" id="range-val-' + p.id + '">\u2014</span>';
+        html += '</div>';
+      }
+    }
+  }
+
   html += '</div>';
 
   bar.innerHTML = html;
   wireDropdowns(bar);
+
+  // Wire inline toggle clicks
+  bar.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-toggle]');
+    if (!btn) return;
+    var dim = btn.dataset.toggle;
+    var siblings = bar.querySelectorAll('[data-toggle="' + dim + '"]');
+    for (var j = 0; j < siblings.length; ++j) siblings[j].classList.remove('active');
+    btn.classList.add('active');
+    var val = btn.dataset.val;
+    setFilter(dim, val === 'all' ? null : val);
+  });
 
   return bar;
 }
@@ -942,14 +981,35 @@ function buildDashboardDOM(container, config, sections, registry) {
   container.innerHTML = '';
   container.appendChild(buildHeader(config));
 
-  var modelBar = buildModelBar(config, registry);
+  // Collect panels assigned to modelbar via layout location
+  var modelbarPanels = [];
+  var layoutSections = config.layout && config.layout.sections || [];
+  var modelbarSectionIds = {};
+  for (var ls = 0; ls < layoutSections.length; ++ls) {
+    if (layoutSections[ls].location === 'modelbar') {
+      modelbarSectionIds[layoutSections[ls].id] = true;
+    }
+  }
+
+  var filteredSections = [];
+  for (var fs = 0; fs < sections.length; ++fs) {
+    if (modelbarSectionIds[sections[fs].id]) {
+      for (var mp = 0; mp < sections[fs].panels.length; ++mp) {
+        modelbarPanels.push(sections[fs].panels[mp]);
+      }
+    } else {
+      filteredSections.push(sections[fs]);
+    }
+  }
+
+  var modelBar = buildModelBar(config, registry, modelbarPanels);
   if (modelBar) container.appendChild(modelBar);
 
   var animDelay = 2;
   var kpiAccent = 0;
 
-  for (var s = 0; s < sections.length; ++s) {
-    var section = sections[s];
+  for (var s = 0; s < filteredSections.length; ++s) {
+    var section = filteredSections[s];
 
     // Filter-only sections render as a compact inline bar
     if (isFilterOnlySection(section)) {

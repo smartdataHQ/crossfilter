@@ -33,12 +33,10 @@ export var BLUECAR_STAYS_CONFIG = {
     { dimension: 'poi_name', chart: 'list', section: 'geography' },
     { dimension: 'poi_category', section: 'geography' },
 
-    // Boolean toggles
-    { dimension: 'has_poi_match', chart: 'toggle', section: 'filters' },
-    { dimension: 'is_first_stay', chart: 'toggle', section: 'filters' },
-
-    // Numeric range
-    { dimension: 'stay_duration_hours', chart: 'range', section: 'filters' },
+    // Inline filters — rendered inside the model bar
+    { dimension: 'has_poi_match', chart: 'toggle', section: 'modelbar' },
+    { dimension: 'is_first_stay', chart: 'toggle', section: 'modelbar' },
+    { dimension: 'stay_duration_hours', chart: 'range', section: 'modelbar' },
 
     // Data table
     { chart: 'table', section: 'details', width: 'full',
@@ -52,7 +50,7 @@ export var BLUECAR_STAYS_CONFIG = {
       { id: 'overview', label: 'Overview', columns: 3 },
       { id: 'vehicles', label: 'Vehicles', columns: 3 },
       { id: 'geography', label: 'Geography', columns: 2, collapsed: true },
-      { id: 'filters', label: 'Filters', columns: 4 },
+      { id: 'modelbar', location: 'modelbar' },
       { id: 'details', label: 'Details', columns: 1 },
     ],
   },
