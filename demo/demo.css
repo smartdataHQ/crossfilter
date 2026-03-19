@@ -156,12 +156,16 @@ body {
   padding: var(--ds-pad);
 }
 
+/* Consistent vertical spacing between all dashboard sections */
+.dashboard > * + * {
+  margin-top: var(--section-gap, 16px);
+}
+
 /* Header */
 .header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 20px;
   padding: 16px 0 16px;
   border-bottom: 1px solid var(--border);
   position: relative;
@@ -204,7 +208,6 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
   gap: var(--card-gap, 10px);
-  margin-bottom: var(--section-gap, 16px);
 }
 
 /* KPI cell — the container query context (grid cell, width from grid track) */
@@ -398,7 +401,6 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
   gap: var(--card-gap, 16px);
-  margin-bottom: var(--section-gap, 16px);
 }
 
 /* Chart cell — container query context (grid cell, width from grid track) */
@@ -754,7 +756,6 @@ body {
   background: var(--bg-card-solid);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  margin-bottom: 16px;
   overflow: visible;
   position: relative; z-index: 10;
   box-shadow: 0 1px 3px rgba(0, 21, 88, 0.04);
@@ -856,7 +857,6 @@ body {
   background: var(--bg-card-solid);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  margin-bottom: 16px;
   box-shadow: 0 1px 3px rgba(0, 21, 88, 0.04);
 }
 .filter-bar-header { margin-bottom: 8px; }
