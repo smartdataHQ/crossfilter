@@ -245,78 +245,53 @@ export function discoverTimeDimensions(registry) {
 
 // Probe the Cube API for time bounds and number ranges when metadata is missing.
 // Returns { timeBounds: { dimName: { min, max } }, numberBounds: { dimName: { min, max } } }
+// Probes the Cube API for time bounds and data resolution.
+// 2 queries total (run in parallel):
+//   1. 20 earliest records (sorted asc) → gives min timestamp + resolution sample
+//   2. 1 latest record (sorted desc) → gives max timestamp
 export function probeDataBounds(cubeName, partition, timeDimNames, numberDimNames) {
-  // Build a query that gets min/max for all requested fields in one call
-  var measures = [];
-  var measureMap = {};
-
-  for (var t = 0; t < timeDimNames.length; ++t) {
-    var tf = timeDimNames[t];
-    // Cube.dev doesn't support min/max on time dimensions directly,
-    // so we request it as a timeDimension with no granularity to get the range
-  }
-
-  // For number dimensions, we can use custom measures if available,
-  // but the simplest approach is to query with the dimension and get extremes
-  // Actually, the cleanest Cube approach: query with no dimensions, just measures
-  // But we can't create ad-hoc min/max measures for arbitrary dimensions.
-  //
-  // Practical approach: fetch a small sample sorted by the time dimension
-  // to get the first and last timestamps.
-
-  var fullTimeName = cubeName + '.' + timeDimNames[0];
+  var dimFields = timeDimNames.map(function (n) { return cubeName + '.' + n; });
+  var primaryField = dimFields[0];
+  var partitionFilter = { member: cubeName + '.partition', operator: 'equals', values: [partition] };
   var queries = [];
 
-  // Query 1: earliest record
+  // Query 1: 20 earliest records → min + resolution
   queries.push(fetch('/api/cube', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       query: {
-        dimensions: timeDimNames.map(function (n) { return cubeName + '.' + n; }),
+        dimensions: dimFields,
         measures: [],
-        filters: [{ member: cubeName + '.partition', operator: 'equals', values: [partition] }],
-        order: [[ fullTimeName, 'asc' ]],
-        limit: 1,
-      },
-    }),
-  }).then(function (r) { return r.ok ? r.json() : null; }));
-
-  // Query 2: latest record
-  queries.push(fetch('/api/cube', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      query: {
-        dimensions: timeDimNames.map(function (n) { return cubeName + '.' + n; }),
-        measures: [],
-        filters: [{ member: cubeName + '.partition', operator: 'equals', values: [partition] }],
-        order: [[ fullTimeName, 'desc' ]],
-        limit: 1,
-      },
-    }),
-  }).then(function (r) { return r.ok ? r.json() : null; }));
-
-  // Query 3: sample 20 consecutive records to measure data resolution
-  var sampleTimeName = cubeName + '.' + timeDimNames[0];
-  queries.push(fetch('/api/cube', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      query: {
-        dimensions: [sampleTimeName],
-        measures: [],
-        filters: [{ member: cubeName + '.partition', operator: 'equals', values: [partition] }],
-        order: [[ sampleTimeName, 'asc' ]],
+        filters: [partitionFilter],
+        order: [[ primaryField, 'asc' ]],
         limit: 20,
+      },
+    }),
+  }).then(function (r) { return r.ok ? r.json() : null; }));
+
+  // Query 2: latest record → max
+  queries.push(fetch('/api/cube', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: {
+        dimensions: dimFields,
+        measures: [],
+        filters: [partitionFilter],
+        order: [[ primaryField, 'desc' ]],
+        limit: 1,
       },
     }),
   }).then(function (r) { return r.ok ? r.json() : null; }));
 
   return Promise.all(queries).then(function (results) {
     var bounds = { timeBounds: {}, numberBounds: {}, dataResolutionDays: null };
-    var earliest = results[0] && results[0].data && results[0].data[0];
-    var latest = results[1] && results[1].data && results[1].data[0];
+
+    var ascRows = results[0] && results[0].data || [];
+    var descRows = results[1] && results[1].data || [];
+    var earliest = ascRows[0] || null;
+    var latest = descRows[0] || null;
 
     for (var i = 0; i < timeDimNames.length; ++i) {
       var key = cubeName + '.' + timeDimNames[i];
@@ -327,13 +302,12 @@ export function probeDataBounds(cubeName, partition, timeDimNames, numberDimName
       }
     }
 
-    // Compute median interval from sample
-    var sample = results[2] && results[2].data;
-    if (sample && sample.length >= 2) {
+    // Compute median interval from the ascending sample
+    if (ascRows.length >= 2) {
       var intervals = [];
-      for (var s = 1; s < sample.length; ++s) {
-        var t0 = new Date(sample[s - 1][sampleTimeName]).getTime();
-        var t1 = new Date(sample[s][sampleTimeName]).getTime();
+      for (var s = 1; s < ascRows.length; ++s) {
+        var t0 = new Date(ascRows[s - 1][primaryField]).getTime();
+        var t1 = new Date(ascRows[s][primaryField]).getTime();
         if (t1 > t0) intervals.push((t1 - t0) / 86400000);
       }
       if (intervals.length > 0) {
