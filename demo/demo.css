@@ -853,7 +853,7 @@ body {
 .dropdown-value--active { color: var(--accent-blue); font-weight: 600; }
 .dropdown-arrow { font-size: 8px; color: var(--text-muted); margin-left: 2px; }
 .dropdown-panel {
-  position: absolute; top: calc(100% + 4px); z-index: 100;
+  position: fixed; z-index: 200;
   min-width: 180px; max-height: 320px;
   background: var(--bg-card-solid, #fff);
   border: 1px solid var(--border);
@@ -862,14 +862,8 @@ body {
   flex-direction: column;
   overflow: hidden;
   display: none;
-  right: 0; left: auto;
 }
 .dropdown-panel--open { display: flex; }
-/* Left-align panels that have room (first few dropdowns in a row) */
-.model-bar-controls > .dropdown:first-child .dropdown-panel,
-.model-bar-controls > .dropdown:nth-child(2) .dropdown-panel {
-  left: 0; right: auto;
-}
 .dropdown-search {
   margin: 8px 8px 4px; padding: 6px 10px;
   border: 1px solid var(--border); border-radius: 4px;
@@ -1218,6 +1212,7 @@ body {
 /* Components adapt their rendering based on their own available space, */
 /* not the viewport. Each component container is a query context.       */
 
+/* Model bar adapts: row → stacked when narrow */
 /* Model bar adapts: row → stacked when narrow */
 .model-bar { container-type: inline-size; container-name: modelbar; }
 @container modelbar (max-width: 500px) {

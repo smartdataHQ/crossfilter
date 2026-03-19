@@ -409,7 +409,7 @@ function wireOneDropdown(dropdown) {
   var id = dropdown.dataset.dropdownId;
   var valueEl = dropdown.querySelector('.dropdown-value');
 
-  // Toggle panel
+  // Toggle panel — position with fixed coords to escape any containment
   trigger.addEventListener('mousedown', function (e) {
     e.preventDefault();
     e.stopPropagation();
@@ -419,6 +419,18 @@ function wireOneDropdown(dropdown) {
     for (var i = 0; i < allPanels.length; ++i) allPanels[i].classList.remove('dropdown-panel--open');
     // Toggle this one
     if (!wasOpen) {
+      // Position the panel below the trigger
+      var rect = trigger.getBoundingClientRect();
+      panel.style.top = (rect.bottom + 4) + 'px';
+      // Prefer right-aligned if near the right edge
+      var spaceRight = window.innerWidth - rect.right;
+      if (spaceRight < 200) {
+        panel.style.left = '';
+        panel.style.right = (window.innerWidth - rect.right) + 'px';
+      } else {
+        panel.style.left = rect.left + 'px';
+        panel.style.right = '';
+      }
       panel.classList.add('dropdown-panel--open');
       if (search) {
         search.value = '';
