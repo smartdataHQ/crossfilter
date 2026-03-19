@@ -18,10 +18,9 @@
 <script src="../node_modules/nouislider/dist/nouislider.min.js"></script>
 <!-- Shoelace autoloader: registers custom elements on demand -->
 <script type="module">
-  import '../node_modules/@shoelace-style/shoelace/dist/shoelace-autoloader.js';
-  // Set base path for Shoelace assets (icons etc.)
   import { setBasePath } from '../node_modules/@shoelace-style/shoelace/dist/utilities/base-path.js';
-  setBasePath('../node_modules/@shoelace-style/shoelace/dist');
+  setBasePath('/node_modules/@shoelace-style/shoelace/dist');
+  import '../node_modules/@shoelace-style/shoelace/dist/shoelace-autoloader.js';
 </script>
 <div id="error-banner" class="error-banner" hidden></div>
 <div id="dashboard" class="dashboard"></div>
