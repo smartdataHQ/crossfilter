@@ -284,6 +284,12 @@ function syncDropdownAfterRemove(dim, singleVal) {
     } else {
       select.value = select.multiple ? [] : '';
     }
+    // Update the display text to reflect the change
+    if (select.updateComplete) {
+      select.updateComplete.then(function () { updateSelectDisplay(select); });
+    } else {
+      updateSelectDisplay(select);
+    }
     return;
   }
 
