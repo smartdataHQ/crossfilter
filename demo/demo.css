@@ -1033,6 +1033,7 @@ body {
 /* Period control — same visual language as dropdown selectors */
 .period-control {
   display: flex; align-items: center; gap: 6px;
+  flex-shrink: 1; min-width: 0;
 }
 .period-trigger {
   appearance: none; border: 1px solid var(--border); border-radius: var(--radius, 8px);
@@ -1213,14 +1214,8 @@ body {
 /* not the viewport. Each component container is a query context.       */
 
 /* Model bar adapts: row → stacked when narrow */
-/* Model bar adapts: row → stacked when narrow */
-.model-bar { container-type: inline-size; container-name: modelbar; }
-@container modelbar (max-width: 500px) {
-  .model-bar-header { flex-direction: column; gap: 8px; }
-  .model-bar-controls { flex-direction: column; align-items: stretch; }
-  .model-bar-inline { padding-left: 0; border-left: none; }
-  .period-control { flex-direction: column; gap: 4px; align-items: stretch; }
-}
+/* Model bar — NO container-type (containment clips fixed dropdowns).  */
+/* Uses viewport media queries instead for responsive layout.          */
 
 /* Chart cards adapt: hide secondary controls when tight */
 .chart-card { container-type: inline-size; container-name: chartcard; }
@@ -1261,4 +1256,8 @@ body {
   .kpi-row { grid-template-columns: repeat(2, 1fr); }
   .header { flex-direction: column; align-items: flex-start; gap: 12px; }
   .dev-drawer-actions { grid-template-columns: 1fr; }
+  .model-bar-header { flex-direction: column; gap: 8px; }
+  .model-bar-controls { flex-direction: column; align-items: stretch; }
+  .model-bar-inline { padding-left: 0; border-left: none; }
+  .period-control { flex-direction: column; gap: 4px; align-items: stretch; }
 }
