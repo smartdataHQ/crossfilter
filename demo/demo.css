@@ -1076,11 +1076,15 @@ body {
 .chart-card { container: chartcard / inline-size; }
 .filter-bar { container: filterbar / inline-size; }
 .location-grid { container: locgrid / inline-size; }
-/* Toggle containers — only on block-level elements that get width from parent.
-   Flex items (.model-bar-inline, .filter-bar-item) CANNOT be containers
-   because container-type: inline-size creates containment that collapses
-   flex items sized by content. Use the parent container instead. */
-.toggle-wrap { container: togglectx / inline-size; }
+/* Inline control containers — flex items that are also container query contexts.
+   Key: flex: 1 1 200px gives each item a layout-driven width (from the flex
+   algorithm, not from content), preventing the containment collapse that happens
+   when flex items sized by content get container-type: inline-size. */
+.control-container {
+  container: controlctx / inline-size;
+  flex: 1 1 200px;
+  min-width: 0;
+}
 
 /* ── Toggle component — responsive (expanded ↔ compact) ──────────── */
 /* A true responsive component: transforms from 3-button row into a   */
@@ -1164,22 +1168,12 @@ body {
 /* Compact needs relative positioning on parent for dropdown */
 .toggle-compact { position: relative; }
 
-/* Container query: card toggles switch to compact when card is narrow */
-@container togglectx (max-width: 200px) {
+/* Container query: toggle switches to compact when its container is narrow.
+   Works everywhere — model bar, filter bar, cards — because .control-container
+   has flex: 1 1 200px (width from flex algorithm, not content). */
+@container controlctx (max-width: 250px) {
   .toggle-expanded { display: none; }
   .toggle-compact  { display: inline-flex; }
-}
-
-/* Filter bar toggles: use the filterbar container (already defined) */
-@container filterbar (max-width: 500px) {
-  .filter-bar-item .toggle-expanded { display: none; }
-  .filter-bar-item .toggle-compact  { display: inline-flex; }
-}
-
-/* Model bar toggles: must use media query (containment clips Shoelace dropdowns) */
-@media (max-width: 767px) {
-  .model-bar-inline .toggle-expanded { display: none; }
-  .model-bar-inline .toggle-compact  { display: inline-flex; }
 }
 
 /* ── Page-level media queries (macro layout) ─────────────────────── */
