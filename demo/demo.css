@@ -1076,6 +1076,97 @@ body {
 .chart-card { container: chartcard / inline-size; }
 .filter-bar { container: filterbar / inline-size; }
 .location-grid { container: locgrid / inline-size; }
+.model-bar-inline { container: inlinecontrol / inline-size; }
+.toggle-wrap      { container: inlinecontrol / inline-size; }
+.filter-bar-item  { container: inlinecontrol / inline-size; }
+
+/* ── Toggle component — responsive (expanded ↔ compact) ──────────── */
+/* A true responsive component: transforms from 3-button row into a   */
+/* single-button dropdown when its container is narrow.                */
+
+.toggle-component { display: inline-flex; }
+
+/* Default: show expanded (full 3-button group), hide compact */
+.toggle-expanded { display: inline-flex; }
+.toggle-compact  { display: none; }
+
+/* Compact trigger button */
+.toggle-compact-trigger {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 8px);
+  padding: 5px 10px;
+  background: var(--bg-card-solid);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  transition: border-color 0.15s;
+}
+.toggle-compact-trigger:hover { border-color: var(--accent-blue); }
+
+.toggle-compact-chevron {
+  font-size: 8px;
+  color: var(--text-muted);
+  transition: transform 0.2s;
+}
+
+/* Compact dropdown menu */
+.toggle-compact-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  min-width: 100%;
+  background: var(--bg-card-solid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 8px);
+  box-shadow: 0 8px 24px rgba(0, 21, 88, 0.12);
+  z-index: 20;
+  display: none;
+  flex-direction: column;
+  margin-top: 2px;
+  overflow: hidden;
+}
+.toggle-compact-menu--open {
+  display: flex;
+}
+
+.toggle-compact-option {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 8px 12px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  text-align: left;
+  min-height: 36px;
+  transition: background 0.1s;
+}
+.toggle-compact-option:hover { background: var(--bg-hover); }
+.toggle-compact-option--active {
+  color: var(--accent-blue);
+  font-weight: 600;
+  background: var(--accent-blue-dim);
+}
+.toggle-compact-option + .toggle-compact-option {
+  border-top: 1px solid rgba(63, 101, 135, 0.06);
+}
+
+/* Compact needs relative positioning on parent for dropdown */
+.toggle-compact { position: relative; }
+
+/* Container query: switch to compact when container is narrow */
+@container inlinecontrol (max-width: 200px) {
+  .toggle-expanded { display: none; }
+  .toggle-compact  { display: inline-flex; }
+}
 
 /* ── Page-level media queries (macro layout) ─────────────────────── */
 

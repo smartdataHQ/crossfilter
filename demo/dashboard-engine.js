@@ -42,25 +42,100 @@ function afterUpdate(el, fn) {
 }
 
 function buildToggleHtml(dimension) {
-  return '<sl-button-group>' +
-    '<sl-button size="small" data-toggle="' + escapeHtml(dimension) + '" data-val="true">Yes</sl-button>' +
-    '<sl-button size="small" data-toggle="' + escapeHtml(dimension) + '" data-val="false">No</sl-button>' +
-    '<sl-button size="small" variant="primary" data-toggle="' + escapeHtml(dimension) + '" data-val="all">All</sl-button>' +
-  '</sl-button-group>';
+  var dim = escapeHtml(dimension);
+  return '<div class="toggle-component" data-dim="' + dim + '">' +
+    // Expanded view: full 3-button group (shown when container is wide)
+    '<sl-button-group class="toggle-expanded">' +
+      '<sl-button size="small" data-toggle="' + dim + '" data-val="true">Yes</sl-button>' +
+      '<sl-button size="small" data-toggle="' + dim + '" data-val="false">No</sl-button>' +
+      '<sl-button size="small" variant="primary" data-toggle="' + dim + '" data-val="all">All</sl-button>' +
+    '</sl-button-group>' +
+    // Compact view: single button showing active value + chevron (shown when container is narrow)
+    '<div class="toggle-compact">' +
+      '<button class="toggle-compact-trigger" data-dim="' + dim + '">' +
+        '<span class="toggle-compact-value">All</span>' +
+        '<span class="toggle-compact-chevron">&#9662;</span>' +
+      '</button>' +
+      '<div class="toggle-compact-menu">' +
+        '<button class="toggle-compact-option" data-toggle="' + dim + '" data-val="true">Yes</button>' +
+        '<button class="toggle-compact-option" data-toggle="' + dim + '" data-val="false">No</button>' +
+        '<button class="toggle-compact-option toggle-compact-option--active" data-toggle="' + dim + '" data-val="all">All</button>' +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+function syncToggleCompact(component, activeVal) {
+  var trigger = component.querySelector('.toggle-compact-value');
+  if (trigger) {
+    var labels = { 'true': 'Yes', 'false': 'No', 'all': 'All' };
+    trigger.textContent = labels[activeVal] || activeVal;
+  }
+  var opts = component.querySelectorAll('.toggle-compact-option');
+  for (var i = 0; i < opts.length; ++i) {
+    if (opts[i].dataset.val === activeVal) {
+      opts[i].classList.add('toggle-compact-option--active');
+    } else {
+      opts[i].classList.remove('toggle-compact-option--active');
+    }
+  }
 }
 
 function wireToggleClicks(container) {
+  // Expanded view: sl-button clicks
   container.addEventListener('click', function (e) {
     var btn = e.target.closest('sl-button[data-toggle]');
-    if (!btn) return;
-    var dim = btn.dataset.toggle;
-    var group = btn.closest('sl-button-group');
-    if (group) {
-      var siblings = group.querySelectorAll('sl-button[data-toggle="' + dim + '"]');
-      for (var i = 0; i < siblings.length; ++i) siblings[i].variant = 'default';
+    if (btn) {
+      var dim = btn.dataset.toggle;
+      var group = btn.closest('sl-button-group');
+      if (group) {
+        var siblings = group.querySelectorAll('sl-button[data-toggle="' + dim + '"]');
+        for (var i = 0; i < siblings.length; ++i) siblings[i].variant = 'default';
+      }
+      btn.variant = 'primary';
+      var component = btn.closest('.toggle-component');
+      if (component) syncToggleCompact(component, btn.dataset.val);
+      setFilter(dim, btn.dataset.val === 'all' ? null : btn.dataset.val);
+      return;
     }
-    btn.variant = 'primary';
-    setFilter(dim, btn.dataset.val === 'all' ? null : btn.dataset.val);
+
+    // Compact view: trigger click opens/closes menu
+    var trigger = e.target.closest('.toggle-compact-trigger');
+    if (trigger) {
+      var menu = trigger.nextElementSibling;
+      if (menu) menu.classList.toggle('toggle-compact-menu--open');
+      return;
+    }
+
+    // Compact view: option click selects value
+    var opt = e.target.closest('.toggle-compact-option');
+    if (opt) {
+      var dim2 = opt.dataset.toggle;
+      var val = opt.dataset.val;
+      // Sync expanded view
+      var comp = opt.closest('.toggle-component');
+      if (comp) {
+        var expBtns = comp.querySelectorAll('sl-button[data-toggle="' + dim2 + '"]');
+        for (var j = 0; j < expBtns.length; ++j) {
+          expBtns[j].variant = expBtns[j].dataset.val === val ? 'primary' : 'default';
+        }
+        syncToggleCompact(comp, val);
+      }
+      // Close menu
+      var menu2 = opt.closest('.toggle-compact-menu');
+      if (menu2) menu2.classList.remove('toggle-compact-menu--open');
+      setFilter(dim2, val === 'all' ? null : val);
+    }
+  });
+
+  // Close compact menus on outside click
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest('.toggle-compact')) {
+      var openMenus = document.querySelectorAll('.toggle-compact-menu--open');
+      for (var k = 0; k < openMenus.length; ++k) {
+        openMenus[k].classList.remove('toggle-compact-menu--open');
+      }
+    }
   });
 }
 
@@ -73,6 +148,8 @@ function resetToggleGroup(dim) {
   for (var i = 0; i < btns.length; ++i) {
     btns[i].variant = btns[i].dataset.val === 'all' ? 'primary' : 'default';
   }
+  var component = firstBtn.closest('.toggle-component');
+  if (component) syncToggleCompact(component, 'all');
 }
 
 function getDimDescription(registry, name) {
