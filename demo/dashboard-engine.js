@@ -467,6 +467,61 @@ function wireFilterSheet() {
   }
 }
 
+function populateFilterSheet(registry, inlinePanels) {
+  var body = document.getElementById('filter-sheet-body');
+  if (!body) return;
+  body.innerHTML = '';
+
+  // Segments
+  if (registry.segments && registry.segments.length > 0) {
+    body.insertAdjacentHTML('beforeend',
+      '<sl-details summary="Segments" open>' +
+        '<div class="filter-sheet-section-body">' +
+        buildDropdown('sheet-segments', '', 'All Data', registry.segments, true) +
+        '</div>' +
+      '</sl-details>');
+  }
+
+  // Boolean dimensions
+  var boolDims = registry.booleanDimensions || [];
+  if (boolDims.length > 0) {
+    var boolOpts = boolDims.map(function(d) {
+      return { value: d.name, label: titleCase(d.name.replace(/_/g, ' ')) };
+    });
+    body.insertAdjacentHTML('beforeend',
+      '<sl-details summary="Include">' +
+        '<div class="filter-sheet-section-body">' +
+        buildDropdown('sheet-booleans', '', 'No filter', boolOpts, true) +
+        '</div>' +
+      '</sl-details>');
+  }
+
+  // Inline panels (toggles, ranges, facets from modelbar section)
+  if (inlinePanels && inlinePanels.length > 0) {
+    inlinePanels.forEach(function(panel) {
+      var label = panel.label || titleCase((panel.dimension || '').replace(/_/g, ' '));
+      var content = '';
+
+      if (panel.chart === 'toggle') {
+        content = '<div class="filter-sheet-section-body">' +
+          '<div class="pill-group" data-dim="' + panel.dimension + '">' +
+          buildToggleHtml(panel.dimension) + '</div></div>';
+      } else if (panel.chart === 'range') {
+        content = '<div class="filter-sheet-section-body">' +
+          buildRangeSelector('sheet-range-' + panel.dimension, label, false) +
+          '</div>';
+      } else {
+        content = '<div class="filter-sheet-section-body">' +
+          buildDropdown('sheet-' + (panel.dimension || panel.measure || 'unknown'), '', label, [], true) +
+          '</div>';
+      }
+
+      body.insertAdjacentHTML('beforeend',
+        '<sl-details summary="' + label + '">' + content + '</sl-details>');
+    });
+  }
+}
+
 function updateFilterCount() {
   var chips = document.querySelectorAll('#filter-chips sl-tag');
   var count = chips.length;
@@ -1232,6 +1287,7 @@ function buildDashboardDOM(container, config, sections, registry) {
   var filterSheetParts = buildFilterSheet();
   document.body.appendChild(filterSheetParts.backdrop);
   document.body.appendChild(filterSheetParts.sheet);
+  populateFilterSheet(registry, modelbarPanels);
 
   var animDelay = 2;
   var kpiAccent = 0;
