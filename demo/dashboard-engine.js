@@ -467,6 +467,24 @@ function wireFilterSheet() {
   }
 }
 
+function wireChartResize() {
+  var chartWraps = document.querySelectorAll('.chart-wrap');
+  if (!chartWraps.length || typeof ResizeObserver === 'undefined') return;
+
+  var ro = new ResizeObserver(function(entries) {
+    entries.forEach(function(entry) {
+      var instance = echarts.getInstanceByDom(entry.target);
+      if (instance) {
+        instance.resize();
+      }
+    });
+  });
+
+  chartWraps.forEach(function(wrap) {
+    ro.observe(wrap);
+  });
+}
+
 function populateFilterSheet(registry, inlinePanels) {
   var body = document.getElementById('filter-sheet-body');
   if (!body) return;
@@ -1455,6 +1473,7 @@ async function main() {
     // For now, simulate with a brief delay then dismiss.
     await new Promise(function (r) { setTimeout(r, 800); });
     dismissProgress();
+    wireChartResize();
 
   } catch (err) {
     container.innerHTML = '<div class="error-banner" style="display:block">' +
