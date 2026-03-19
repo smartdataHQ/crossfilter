@@ -241,6 +241,127 @@ function buildHeader(config) {
   return header;
 }
 
+// ── Custom Dropdown (Principle 1: informative, searchable selectors) ──
+
+function buildDropdown(id, label, placeholder, items, multiSelect) {
+  var selectedCount = 0; // will be updated from URL state
+  var btnLabel = placeholder;
+  var html = '<div class="dropdown" data-dropdown-id="' + escapeHtml(id) + '">';
+  html += '<button class="dropdown-trigger" type="button">';
+  html += '<span class="dropdown-label">' + escapeHtml(label) + '</span>';
+  html += '<span class="dropdown-value" id="dd-val-' + escapeHtml(id) + '">' + escapeHtml(btnLabel) + '</span>';
+  html += '<span class="dropdown-arrow">&#9662;</span>';
+  html += '</button>';
+  html += '<div class="dropdown-panel" hidden>';
+  if (items.length > 6) {
+    html += '<input type="text" class="dropdown-search" placeholder="Search\u2026">';
+  }
+  html += '<div class="dropdown-items">';
+  for (var i = 0; i < items.length; ++i) {
+    var item = items[i];
+    html += '<div class="dropdown-item" data-value="' + escapeHtml(item.value) + '">';
+    html += '<span class="dropdown-item-label">' + escapeHtml(item.label) + '</span>';
+    html += '<span class="dropdown-item-count"></span>'; // filled when data loads
+    if (item.description) {
+      html += infoIcon(item.description);
+    }
+    html += '</div>';
+  }
+  html += '</div></div></div>';
+  return html;
+}
+
+function wireDropdowns(container) {
+  var dropdowns = container.querySelectorAll('.dropdown');
+  for (var i = 0; i < dropdowns.length; ++i) {
+    wireOneDropdown(dropdowns[i]);
+  }
+
+  // Close dropdowns when clicking outside
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest('.dropdown')) {
+      var allPanels = document.querySelectorAll('.dropdown-panel');
+      for (var j = 0; j < allPanels.length; ++j) allPanels[j].hidden = true;
+    }
+  });
+}
+
+function wireOneDropdown(dropdown) {
+  var trigger = dropdown.querySelector('.dropdown-trigger');
+  var panel = dropdown.querySelector('.dropdown-panel');
+  var search = dropdown.querySelector('.dropdown-search');
+  var id = dropdown.dataset.dropdownId;
+  var valueEl = dropdown.querySelector('.dropdown-value');
+
+  // Toggle panel
+  trigger.addEventListener('click', function (e) {
+    e.stopPropagation();
+    // Close other dropdowns
+    var allPanels = document.querySelectorAll('.dropdown-panel');
+    for (var i = 0; i < allPanels.length; ++i) {
+      if (allPanels[i] !== panel) allPanels[i].hidden = true;
+    }
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden && search) {
+      search.value = '';
+      search.focus();
+      filterDropdownItems(panel, '');
+    }
+  });
+
+  // Search
+  if (search) {
+    search.addEventListener('input', function () {
+      filterDropdownItems(panel, search.value);
+    });
+    search.addEventListener('click', function (e) { e.stopPropagation(); });
+  }
+
+  // Item selection
+  panel.addEventListener('click', function (e) {
+    var item = e.target.closest('.dropdown-item');
+    if (!item) return;
+    e.stopPropagation();
+
+    item.classList.toggle('dropdown-item--selected');
+
+    // Collect selected values
+    var selected = panel.querySelectorAll('.dropdown-item--selected');
+    var vals = [];
+    for (var i = 0; i < selected.length; ++i) {
+      vals.push(selected[i].dataset.value);
+    }
+
+    // Update trigger label
+    if (vals.length === 0) {
+      valueEl.textContent = trigger.querySelector('.dropdown-value').dataset.placeholder || 'All';
+      valueEl.classList.remove('dropdown-value--active');
+    } else if (vals.length === 1) {
+      var label = selected[0].querySelector('.dropdown-item-label');
+      valueEl.textContent = label ? label.textContent : vals[0];
+      valueEl.classList.add('dropdown-value--active');
+    } else {
+      valueEl.textContent = vals.length + ' selected';
+      valueEl.classList.add('dropdown-value--active');
+    }
+
+    setFilter(id, vals);
+  });
+
+  // Store placeholder on the value element
+  valueEl.dataset.placeholder = valueEl.textContent;
+}
+
+function filterDropdownItems(panel, query) {
+  var items = panel.querySelectorAll('.dropdown-item');
+  var q = query.toLowerCase();
+  for (var i = 0; i < items.length; ++i) {
+    var label = items[i].querySelector('.dropdown-item-label');
+    var text = label ? label.textContent.toLowerCase() : '';
+    items[i].style.display = (!q || text.indexOf(q) >= 0) ? '' : 'none';
+  }
+}
+
 // ── Model Intelligence Bar ────────────────────────────────────────────
 // Principle 2: description tucked behind (i), clean surface
 
@@ -281,86 +402,43 @@ function buildModelBar(config, registry) {
   html += '</div>';
   html += '</div>';
 
-  // Segments — grouped by type for cleaner presentation
+  html += '<div class="model-bar-controls">';
+
+  // Segments — compact dropdown
   if (hasSegments) {
-    html += '<div class="model-bar-group">';
-    html += '<span class="model-bar-label">Focus</span>';
-    html += '<div class="pill-group">';
+    var segItems = [];
     for (var s = 0; s < segments.length; ++s) {
-      var seg = segments[s];
-      html += '<button class="pill" data-segment="' + escapeHtml(seg.name) + '"' +
-        (seg.description ? ' title="' + escapeHtml(seg.description) + '"' : '') + '>' +
-        escapeHtml(seg.title) + '</button>';
+      segItems.push({ value: segments[s].name, label: segments[s].title, description: segments[s].description });
     }
-    html += '</div></div>';
+    html += buildDropdown('_segment', 'Focus', 'All Data', segItems, true);
   }
 
-  // Boolean presets — only if there are any not already in panels
+  // Boolean presets — compact dropdown
   if (hasPresets) {
-    html += '<div class="model-bar-group">';
-    html += '<span class="model-bar-label">Include</span>';
-    html += '<div class="pill-group">';
+    var boolItems = [];
     for (var b = 0; b < extraBooleans.length; ++b) {
-      var bool = extraBooleans[b];
-      html += '<button class="pill" data-boolean="' + escapeHtml(bool.name) + '">' +
-        escapeHtml(bool.label) + '</button>';
+      boolItems.push({ value: extraBooleans[b].name, label: extraBooleans[b].label });
     }
-    html += '</div></div>';
+    html += buildDropdown('_boolean', 'Include', 'No filter', boolItems, true);
   }
 
-  // Facets — low-cardinality enums with known values
+  // Facets — one dropdown per facet
   if (hasFacets) {
     for (var f = 0; f < facets.length; ++f) {
       var facet = facets[f];
       if (Array.isArray(modelBarConfig.facets) && modelBarConfig.facets.indexOf(facet.name) < 0) continue;
-      html += '<div class="model-bar-group">';
-      html += '<span class="model-bar-label">' + escapeHtml(facet.label) + '</span>';
-      html += '<div class="pill-group">';
+      var facetItems = [];
       for (var v = 0; v < facet.values.length; ++v) {
-        html += '<button class="pill" data-facet="' + escapeHtml(facet.name) + '" data-value="' + escapeHtml(facet.values[v]) + '">' +
-          escapeHtml(facet.values[v]) + '</button>';
+        facetItems.push({ value: facet.values[v], label: facet.values[v] });
       }
-      html += '</div></div>';
+      html += buildDropdown(facet.name, facet.label, 'All', facetItems, true);
     }
   }
 
+  html += '</div>';
+
   bar.innerHTML = html;
-
-  // Wire interactions — Principle 7: clear selection state
-  bar.addEventListener('click', function (e) {
-    var btn = e.target.closest('.pill');
-    if (!btn) return;
-
-    // Segment toggle
-    if (btn.dataset.segment) {
-      btn.classList.toggle('pill--active');
-      var activeSegs = bar.querySelectorAll('[data-segment].pill--active');
-      var segVals = [];
-      for (var i = 0; i < activeSegs.length; ++i) segVals.push(activeSegs[i].dataset.segment);
-      setFilter('_segment', segVals);
-      return;
-    }
-
-    // Boolean toggle (3-state: active → negative → off)
-    if (btn.dataset.boolean) {
-      var current = btn.dataset.state || 'off';
-      var next = current === 'off' ? 'true' : current === 'true' ? 'false' : 'off';
-      btn.dataset.state = next;
-      btn.classList.toggle('pill--active', next === 'true');
-      btn.classList.toggle('pill--negative', next === 'false');
-      setFilter(btn.dataset.boolean, next === 'off' ? null : next);
-      return;
-    }
-
-    // Facet multi-select
-    if (btn.dataset.facet) {
-      btn.classList.toggle('pill--active');
-      var activeFacets = bar.querySelectorAll('[data-facet="' + btn.dataset.facet + '"].pill--active');
-      var vals = [];
-      for (var j = 0; j < activeFacets.length; ++j) vals.push(activeFacets[j].dataset.value);
-      setFilter(btn.dataset.facet, vals);
-    }
-  });
+  wireDropdowns(bar);
 
   return bar;
 }
