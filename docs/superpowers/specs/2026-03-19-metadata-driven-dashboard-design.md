@@ -6,7 +6,31 @@ A generic, config-driven dashboard engine that renders interactive crossfilter-p
 
 **End goal**: An LLM agent accepts a natural language dashboard request, selects the right Cube, and generates a config that this engine renders. The config schema is the structured output contract between the agent and the engine.
 
-## Design Principles
+## First Principles — UX & Interaction
+
+These are non-negotiable interaction patterns that every component must follow:
+
+1. **Informative selectors** — All pulldowns and selectors are custom-built, searchable, and show facet-like totals from crossfilter alongside each item. Every control communicates data, never just labels.
+
+2. **Clean surfaces, details on demand** — Long text is tucked away. Descriptions, metadata context, and explanations are available via `(i)` info affordances, not inline clutter. The UI stays extra clean.
+
+3. **Bookmarkable state** — All selected parameters, dimensions, filters, and settings are encoded in the URL query string (`?param=value&...`). Every dashboard state is a shareable, bookmarkable URL. Loading a URL restores the exact state.
+
+4. **Top-X with "Other"** — When showing Top X items (bar charts, lists), always include an X+1 item labeled "Other" that aggregates the remaining values. This gives context for what's hidden.
+
+5. **Top-X paired with "Show All"** — Every Top X view includes an option to expand to the full list. The user is never trapped in a truncated view.
+
+6. **Infinite scroll + search for long lists** — Lists with many items use infinite scroll with a search input. No pagination buttons — just scroll and search.
+
+7. **Clear selection state** — Selected dimensions and items have a subtle but unmistakable visual indicator. Never ambiguous whether something is active or not.
+
+8. **Filters visible and removable** — Active filters are always visible at the top of the dashboard as removable chips. Each can be removed individually; a "Clear All" removes them collectively.
+
+9. **Dimension group drill-down** — Selecting a dimension group allows the user to break relevant visualizations into the corresponding sub-groups (Top X style). This enables exploratory drill-down without config changes.
+
+10. **Responsive everything** — All dashboards are responsive. Components adapt their rendering based on available space — not just CSS reflow, but different visualization modes (e.g., bar chart → compact list on narrow screens).
+
+## Design Principles — Architecture
 
 1. **Zero hardcoding** — The engine NEVER references specific field names, labels, segments, or domain-specific content. Everything comes from the config and the Cube metadata. The engine must work for ANY cube without code changes.
 2. **Minimal config** — A valid config is just `{ cube, panels }`. Everything else has sensible defaults inferred from metadata.
