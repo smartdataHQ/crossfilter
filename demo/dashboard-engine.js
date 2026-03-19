@@ -635,11 +635,10 @@ function buildPanelCard(panel, accentIdx, registry) {
   var dimMeta = registry.dimensions[panel.dimension];
   var dimDesc = dimMeta && dimMeta.description ? dimMeta.description : null;
 
-  // Card head — Principle 4/5: Top X badge + Show All toggle
+  // Card head — Principle 4/5: single toggle between "Top X" and "All"
   var headRight = '';
   if (panel.chart === 'bar' || panel.chart === 'pie') {
-    headRight += '<span class="group-size-badge">Top ' + panel.limit + '</span>';
-    headRight += '<button class="btn btn-ghost btn-tiny show-all-toggle" data-panel="' + panel.id + '">Show All</button>';
+    headRight += '<button class="btn btn-ghost btn-tiny show-all-toggle" data-panel="' + panel.id + '" data-limit="' + panel.limit + '">Top ' + panel.limit + '</button>';
   }
   if (panel.chart === 'bar' && panel.searchable) {
     headRight += '<button class="btn btn-ghost btn-tiny dim-list-toggle" data-panel="' + panel.id + '">List</button>';
@@ -829,13 +828,13 @@ function buildSkeletonTable(columns) {
 }
 
 function wireCardInteractions(card, panel) {
-  // Principle 5: Show All toggle
+  // Principle 5: single button toggles between "Top X" ↔ "All"
   var showAllBtn = card.querySelector('.show-all-toggle');
   if (showAllBtn) {
     showAllBtn.addEventListener('click', function () {
       var expanded = showAllBtn.dataset.expanded === 'true';
       showAllBtn.dataset.expanded = expanded ? 'false' : 'true';
-      showAllBtn.textContent = expanded ? 'Show All' : 'Top ' + panel.limit;
+      showAllBtn.textContent = expanded ? 'Top ' + showAllBtn.dataset.limit : 'All';
       // TODO: re-render chart with all vs top-N
     });
   }
