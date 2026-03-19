@@ -316,8 +316,7 @@ export function probeDataBounds(cubeName, partition, timeDimNames, numberDimName
 }
 
 // All Cube.dev supported granularities with their approximate bucket size in days.
-// Ordered finest to coarsest. The engine filters this list based on the actual
-// data span to show only granularities that produce a useful number of buckets.
+// Ordered finest to coarsest.
 var GRANULARITY_BUCKETS = [
   { id: 'hour',    label: 'Hourly',    days: 1 / 24 },
   { id: 'day',     label: 'Daily',     days: 1 },
@@ -328,18 +327,26 @@ var GRANULARITY_BUCKETS = [
 ];
 
 // Infer which granularities make sense for a given time span.
-// Target: each granularity should produce between 4 and 300 buckets
-// to be useful for visualization.
+//
+// A granularity is included if it produces a reasonable number of buckets.
+// Min 3 buckets (otherwise too coarse to be useful).
+// Max depends on the granularity:
+//   - Hourly: cap at 168 (1 week of hours — beyond this, daily is better)
+//   - Daily: cap at 1500 (4+ years — time series charts handle this fine with zoom)
+//   - Everything else: no practical upper cap (weekly/monthly/quarterly never get too dense)
+//
 export function inferGranularities(minDate, maxDate) {
   if (!minDate || !maxDate) return ['day', 'week', 'month'];
 
   var spanDays = (new Date(maxDate).getTime() - new Date(minDate).getTime()) / 86400000;
+  var maxBuckets = { hour: 168, day: 1500, week: 520, month: 120, quarter: 40, year: 20 };
   var result = [];
 
   for (var i = 0; i < GRANULARITY_BUCKETS.length; ++i) {
     var g = GRANULARITY_BUCKETS[i];
     var buckets = spanDays / g.days;
-    if (buckets >= 4 && buckets <= 300) {
+    var cap = maxBuckets[g.id] || 500;
+    if (buckets >= 3 && buckets <= cap) {
       result.push(g.id);
     }
   }
@@ -347,13 +354,14 @@ export function inferGranularities(minDate, maxDate) {
   return result.length > 0 ? result : ['day', 'week', 'month'];
 }
 
-// Pick the best default granularity: the one closest to ~50 buckets.
+// Pick the best default granularity: the one closest to ~40 buckets
+// (good default density for a time series chart).
 export function inferDefaultGranularity(minDate, maxDate) {
   var grans = inferGranularities(minDate, maxDate);
   if (!minDate || !maxDate || grans.length === 0) return 'day';
 
   var spanDays = (new Date(maxDate).getTime() - new Date(minDate).getTime()) / 86400000;
-  var targetBuckets = 50;
+  var targetBuckets = 40;
   var best = grans[0];
   var bestDist = Infinity;
 
