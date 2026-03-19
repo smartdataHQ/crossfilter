@@ -1,18 +1,15 @@
 // demo/dashboard-engine.js
-// Core engine: reads config, fetches metadata, generates DOM, wires crossfilter.
-// All first principles applied to wireframe structure.
+// Core engine: reads config JSON, fetches cube metadata, generates DOM,
+// wires crossfilter. Dashboard name comes from the URL path:
+//   /demo/dashboards/bluecar-stays → fetches dashboards/bluecar-stays.json
 
-import { BLUECAR_STAYS_CONFIG } from './dashboard-config.js';
 import {
   fetchCubeMeta,
   buildCubeRegistry,
   inferChartType,
   inferLabel,
   inferFilterMode,
-  inferLimit,
-  inferSearchable,
   discoverBooleanDimensions,
-  discoverFacetDimensions,
   extractModelMeta,
   resolveModelPeriod,
   resolveTypicalRange,
@@ -26,6 +23,8 @@ import {
   registerDemoEChartsTheme,
   getDemoEChartsThemeName,
 } from './echarts-theme.js';
+import { createDashboardData } from './dashboard-data.js';
+import { getChartType } from './chart-types.js';
 
 var echarts = globalThis.echarts;
 var crossfilter = globalThis.crossfilter;
@@ -230,6 +229,79 @@ function notifyFilterChange() {
   for (var i = 0; i < filterListeners.length; ++i) filterListeners[i](filterState);
 }
 
+// ── Normalize config format ───────────────────────────────────────────
+// Accepts both the old flat format (panels[] + layout.sections[]) and
+// the new nested format (sections[].panels[]) from the schema generator.
+// Outputs the old flat format that the engine rendering pipeline expects.
+
+function normalizeConfig(config) {
+  // Already old format — has top-level panels[]
+  if (config.panels && Array.isArray(config.panels)) return config;
+
+  // New format — sections contain panels
+  if (!config.sections || !Array.isArray(config.sections)) return config;
+
+  // Check if sections have inline panels
+  var hasInlinePanels = false;
+  for (var i = 0; i < config.sections.length; ++i) {
+    if (config.sections[i].panels && config.sections[i].panels.length > 0) {
+      hasInlinePanels = true;
+      break;
+    }
+  }
+  if (!hasInlinePanels) return config;
+
+  // Convert: extract panels from sections, add section reference
+  var panels = [];
+  var layoutSections = [];
+
+  for (var s = 0; s < config.sections.length; ++s) {
+    var section = config.sections[s];
+    layoutSections.push({
+      id: section.id,
+      label: section.label || null,
+      columns: section.columns || 3,
+      collapsed: section.collapsed || false,
+      location: section.location || null,
+    });
+
+    var sectionPanels = section.panels || [];
+    for (var p = 0; p < sectionPanels.length; ++p) {
+      var panel = Object.assign({}, sectionPanels[p]);
+      panel.section = section.id;
+
+      // Map chart-type slot fields to the engine's dimension/measure fields.
+      // The new schema uses slot names (category, name, x, source, date,
+      // region, lng, etc.) but the engine expects dimension/measure as the
+      // primary field references. All slot fields are preserved on the panel
+      // for chart-type-specific rendering.
+      if (!panel.dimension) {
+        panel.dimension = panel.category || panel.name || panel.x ||
+          panel.source || panel.date || panel.region || panel.lng || null;
+      }
+      if (!panel.measure) {
+        panel.measure = panel.value || panel.y || panel.size || null;
+      }
+
+      panels.push(panel);
+    }
+  }
+
+  // Handle cube/cubes normalization
+  var cube = config.cube;
+  if (!cube && config.cubes && config.cubes.length > 0) {
+    cube = config.cubes[0];
+  }
+
+  return {
+    cube: cube || null,
+    title: config.title || null,
+    panels: panels,
+    layout: { sections: layoutSections },
+    modelBar: config.modelBar,
+  };
+}
+
 // ── Resolve panel defaults from metadata ──────────────────────────────
 
 function resolvePanels(config, registry) {
@@ -245,25 +317,32 @@ function resolvePanels(config, registry) {
       continue;
     }
 
-    resolved.push({
-      id: p.id || (fieldName ? fieldName : 'panel-' + i),
-      dimension: p.dimension || null,
-      measure: p.measure || null,
-      chart: chartType,
-      label: p.label || (fieldName ? inferLabel(fieldName, registry) : chartType),
-      limit: p.limit || (fieldName ? inferLimit(fieldName, registry) : 50),
-      sort: p.sort || 'value',
-      filter: p.filter || (fieldName ? inferFilterMode(fieldName, registry) : 'none'),
-      granularity: p.granularity || null,
-      op: p.op || 'count',
-      field: p.field || null,
-      columns: p.columns || null,
-      section: p.section || '_default',
-      width: p.width || null,
-      collapsed: p.collapsed != null ? p.collapsed : false,
-      searchable: p.searchable != null ? p.searchable : (fieldName ? inferSearchable(fieldName, registry) : false),
-      worker: p.worker || null,
-    });
+    // Copy all panel properties (preserves slot fields like source, target,
+    // size, color, lng, lat, levels, axes, etc.) then apply defaults.
+    var panel = {};
+    var keys = Object.keys(p);
+    for (var k = 0; k < keys.length; ++k) {
+      if (p[keys[k]] != null) panel[keys[k]] = p[keys[k]];
+    }
+
+    // Apply defaults for core fields
+    panel.id = p.id || (fieldName ? fieldName : 'panel-' + i);
+    panel.dimension = p.dimension || null;
+    panel.measure = p.measure || null;
+    panel.chart = chartType;
+    panel.label = p.label || (fieldName ? inferLabel(fieldName, registry) : chartType);
+    panel.limit = p.limit || 10;
+    panel.sort = p.sort || 'value';
+    panel.filter = p.filter || (fieldName ? inferFilterMode(fieldName, registry) : 'none');
+    panel.granularity = p.granularity || null;
+    panel.op = p.op || 'count';
+    panel.columns = p.columns || null;
+    panel.section = p.section || '_default';
+    panel.width = p.width || null;
+    panel.collapsed = p.collapsed != null ? p.collapsed : false;
+    panel.searchable = p.searchable || false;
+
+    resolved.push(panel);
   }
   return resolved;
 }
@@ -321,7 +400,180 @@ function escapeHtml(str) {
   return _escapeEl.innerHTML;
 }
 
+// ── Measure value formatting (metadata-driven) ───────────────────────
 
+function formatMeasureValue(value, meta) {
+  if (value == null || value !== value) return '\u2014';
+  if (!meta) return typeof value === 'number' ? value.toLocaleString() : String(value);
+  if (meta.format === 'percent' || (meta.aggType === 'number' && /rate|percent/i.test(meta.description || ''))) {
+    return (value * 100).toFixed(1) + '%';
+  }
+  if (/hours?/i.test(meta.description || '') || /duration.*hours/i.test(meta.fullName || '')) {
+    return value.toFixed(1) + 'h';
+  }
+  if (Number.isInteger(value)) return value.toLocaleString();
+  return value.toFixed(1);
+}
+
+// ── Chart Rendering (group data → ECharts) ───────────────────────────
+
+var THEME_NAME = getDemoEChartsThemeName();
+
+function renderBarChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+
+  var categories = [];
+  var values = [];
+  for (var i = 0; i < entries.length; ++i) {
+    categories.push(String(entries[i].key));
+    values.push(entries[i].value.value);
+  }
+
+  var chartDef = getChartType(panel.chart);
+  var isHorizontal = chartDef && chartDef.ecOptions && chartDef.ecOptions._horizontal;
+
+  var catAxis = {
+    type: 'category',
+    data: isHorizontal ? categories.slice().reverse() : categories,
+    axisLabel: { interval: 0, rotate: !isHorizontal && categories.length > 6 ? 30 : 0 },
+  };
+  var valAxis = { type: 'value' };
+
+  var option = {
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+    },
+    grid: { left: 10, right: 10, top: 10, bottom: 10, containLabel: true },
+    xAxis: isHorizontal ? valAxis : catAxis,
+    yAxis: isHorizontal ? catAxis : valAxis,
+    series: [{
+      type: 'bar',
+      data: isHorizontal ? values.slice().reverse() : values,
+      barMaxWidth: 40,
+    }],
+  };
+
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) {
+    instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  }
+  instance.setOption(option, true);
+  return instance;
+}
+
+function renderPieChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+
+  var pieData = [];
+  for (var i = 0; i < entries.length; ++i) {
+    pieData.push({ name: String(entries[i].key), value: entries[i].value.value });
+  }
+
+  var chartDef = getChartType(panel.chart);
+  var seriesOpts = {
+    type: 'pie',
+    data: pieData,
+    label: { fontSize: 11, formatter: '{b}\n{d}%' },
+    emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,21,88,0.15)' } },
+  };
+
+  if (chartDef && chartDef.ecOptions) {
+    var ec = chartDef.ecOptions;
+    if (ec.radius) seriesOpts.radius = ec.radius;
+    if (ec.roseType) seriesOpts.roseType = ec.roseType;
+    if (ec.startAngle != null) seriesOpts.startAngle = ec.startAngle;
+    if (ec.endAngle != null) seriesOpts.endAngle = ec.endAngle;
+  }
+
+  var option = {
+    tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+    series: [seriesOpts],
+  };
+
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) {
+    instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  }
+  instance.setOption(option, true);
+  return instance;
+}
+
+function renderKpi(panel, kpiValue, registry) {
+  var el = document.querySelector('#panel-' + panel.id + ' .kpi-value');
+  if (!el) return;
+  var raw = kpiValue;
+  if (raw == null || raw !== raw) { el.textContent = '\u2014'; return; }
+  var meta = registry.measures[panel._measField];
+  el.textContent = formatMeasureValue(raw, meta);
+}
+
+function wireChartClick(instance, panel) {
+  if (!instance || !panel._dimField) return;
+  instance.on('click', function(params) {
+    var dim = panel._dimField;
+    var clickedValue = params.name || (params.data && params.data.name);
+    if (!clickedValue) return;
+    var current = filterState[dim];
+    if (current === clickedValue || (Array.isArray(current) && current.length === 1 && current[0] === clickedValue)) {
+      setFilter(dim, null);
+    } else {
+      setFilter(dim, clickedValue);
+    }
+  });
+}
+
+var _chartInstances = {};
+
+function renderAllPanels(panels, response, registry) {
+  for (var i = 0; i < panels.length; ++i) {
+    var panel = panels[i];
+
+    if (panel._kpiId && response.kpis) {
+      var kpiVal = response.kpis[panel._kpiId];
+      renderKpi(panel, kpiVal, registry);
+      continue;
+    }
+
+    if (panel._groupId && response.groups) {
+      var groupData = response.groups[panel._groupId];
+      if (!groupData) continue;
+
+      var chartEl = document.getElementById('chart-' + panel.id);
+      if (!chartEl) continue;
+
+      var instance = null;
+      var chartDef = getChartType(panel.chart);
+      var ecType = chartDef ? chartDef.ecType : null;
+
+      if (ecType === 'bar' || ecType === 'pictorialBar') {
+        instance = renderBarChart(chartEl, panel, groupData);
+      } else if (ecType === 'pie' || ecType === 'funnel') {
+        instance = renderPieChart(chartEl, panel, groupData);
+      }
+
+      if (instance && !_chartInstances[panel.id]) {
+        wireChartClick(instance, panel);
+        _chartInstances[panel.id] = instance;
+      } else if (instance) {
+        _chartInstances[panel.id] = instance;
+      }
+
+      if (groupData.total != null) {
+        var countEl = document.getElementById('count-' + panel.id);
+        if (countEl) countEl.textContent = groupData.total + ' values';
+      }
+    }
+  }
+}
 
 // ── Principle 8: Filter Chips (visible, removable) ────────────────────
 
@@ -744,7 +996,6 @@ function buildModelBar(config, registry, inlinePanels, timePanelInfo) {
 
   var segments = registry.segments || [];
   var booleans = discoverBooleanDimensions(registry);
-  var facets = discoverFacetDimensions(registry);
 
   // Filter out booleans already in panels
   var panelDims = {};
@@ -756,10 +1007,9 @@ function buildModelBar(config, registry, inlinePanels, timePanelInfo) {
 
   var hasSegments = modelBarConfig.segments !== false && segments.length > 0;
   var hasPresets = modelBarConfig.presets !== false && extraBooleans.length > 0;
-  var hasFacets = facets.length > 0;
 
   var hasInline = inlinePanels && inlinePanels.length > 0;
-  if (!hasSegments && !hasPresets && !hasFacets && !registry.description && !hasInline) return null;
+  if (!hasSegments && !hasPresets && !registry.description && !hasInline) return null;
 
   var bar = document.createElement('section');
   bar.className = 'model-bar anim d1';
@@ -797,19 +1047,6 @@ function buildModelBar(config, registry, inlinePanels, timePanelInfo) {
       boolItems.push({ value: extraBooleans[b].name, label: extraBooleans[b].label });
     }
     html += buildDropdown('_include', '', 'No filter', boolItems, true);
-  }
-
-  // Facets — one dropdown per facet
-  if (hasFacets) {
-    for (var f = 0; f < facets.length; ++f) {
-      var facet = facets[f];
-      if (Array.isArray(modelBarConfig.facets) && modelBarConfig.facets.indexOf(facet.name) < 0) continue;
-      var facetItems = [];
-      for (var v = 0; v < facet.values.length; ++v) {
-        facetItems.push({ value: facet.values[v], label: facet.values[v] });
-      }
-      html += buildDropdown(facet.name, facet.label, 'All', facetItems, true);
-    }
   }
 
   // Inline panels (toggles, ranges assigned to modelbar via config)
@@ -916,15 +1153,13 @@ function buildPanelCard(panel, accentIdx, registry) {
   // Card head — Principle 4/5: adaptive Top X toggle
   // Only show if there are more items than the limit (otherwise we're showing all already)
   var headRight = '';
-  var dimUnique = dimMeta && dimMeta.meta && typeof dimMeta.meta.unique_values === 'number' ? dimMeta.meta.unique_values : -1;
-  var showingAll = dimUnique > 0 && panel.limit >= dimUnique;
-  if ((panel.chart === 'bar' || panel.chart === 'pie') && !showingAll) {
+  if (panel.chart === 'bar' || panel.chart === 'pie') {
     headRight += '<sl-button size="small" variant="text" class="show-all-toggle" data-panel="' + panel.id + '" data-limit="' + panel.limit + '">Top ' + panel.limit + '</sl-button>';
   }
   if (panel.chart === 'bar' && panel.searchable) {
     headRight += '<sl-button size="small" variant="text" class="dim-list-toggle" data-panel="' + panel.id + '">List</sl-button>';
   }
-  if (panel.chart === 'list') {
+  if (panel.chart === 'selector' || panel.chart === 'list') {
     headRight += '<span class="group-size-badge" id="count-' + panel.id + '"></span>';
   }
 
@@ -971,7 +1206,7 @@ function buildPanelCard(panel, accentIdx, registry) {
   } else if (panel.chart === 'range') {
     body = '<div class="range-wrap">' + buildRangeSelector(panel.id, panel.label, false) + '</div>';
 
-  } else if (panel.chart === 'list') {
+  } else if (panel.chart === 'selector' || panel.chart === 'list') {
     // Principle 1: informative (counts next to items)
     // Principle 6: infinite scroll + search
     body = '<div class="dim-list-panel dim-list-panel--open">' +
@@ -1454,9 +1689,24 @@ function buildDashboardDOM(container, config, sections, registry) {
 
 // ── Main Entry ────────────────────────────────────────────────────────
 
+function getDashboardName() {
+  // /demo/dashboards/bluecar-stays → bluecar-stays
+  var segments = window.location.pathname.replace(/\/+$/, '').split('/');
+  var name = segments[segments.length - 1];
+  return name && name !== 'dashboard.html' ? name : 'bluecar-stays';
+}
+
+async function fetchConfig(name) {
+  var url = 'dashboards/' + name + '.json';
+  var res = await fetch(url);
+  if (!res.ok) throw new Error('Config not found: ' + url + ' (' + res.status + ')');
+  return res.json();
+}
+
 async function main() {
   var container = document.getElementById('dashboard');
-  var config = BLUECAR_STAYS_CONFIG;
+  var dashboardName = getDashboardName();
+  var config = normalizeConfig(await fetchConfig(dashboardName));
 
   // Principle 11: progress overlay — dashboard renders underneath, updates live
   var overlay = document.createElement('div');
@@ -1548,11 +1798,42 @@ async function main() {
     renderFilterChips();
     console.log('[dashboard] Dashboard rendered, loading data...');
 
-    updateProgress(3, 'Streaming data into dashboard...');
-    // TODO: wire crossfilter worker here — as data streams in,
-    // charts update live under the overlay. Once complete, dismiss.
-    // For now, simulate with a brief delay then dismiss.
-    await new Promise(function (r) { setTimeout(r, 800); });
+    updateProgress(3, 'Connecting to data source...');
+
+    var data = await createDashboardData(config, registry, resolvedPanels);
+
+    data.on('progress', function(payload) {
+      if (payload.status === 'starting') {
+        updateProgress(3, 'Connecting...');
+      } else if (payload.status === 'downloading') {
+        var pct = payload.fetch.percent;
+        var label = pct != null ? Math.round(pct * 100) + '% downloaded' : 'Downloading...';
+        updateProgress(3, label);
+      } else if (payload.status === 'streaming') {
+        updateProgress(3, payload.load.rowsLoaded.toLocaleString() + ' rows loaded');
+      }
+    });
+
+    data.on('error', function(payload) {
+      var msg = payload && payload.message ? payload.message : 'Data loading failed';
+      progressCard.innerHTML = '<div class="progress-step progress-step--error">' +
+        '<span class="progress-dot"></span>' +
+        '<span>' + escapeHtml(msg) + '</span>' +
+      '</div>';
+    });
+
+    await data.ready;
+    console.log('[dashboard] Data loaded, rendering charts...');
+
+    filterListeners.push(function(newFilterState) {
+      data.query(newFilterState).then(function(response) {
+        renderAllPanels(resolvedPanels, response, registry);
+      });
+    });
+
+    var initialResponse = await data.query(filterState);
+    renderAllPanels(resolvedPanels, initialResponse, registry);
+
     dismissProgress();
     wireChartResize();
 
