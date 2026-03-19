@@ -247,30 +247,27 @@ function renderFilterChips() {
       });
       container.appendChild(tag);
     } else {
-      // Multiple values — one group tag + individual sub-tags
+      // Multiple values — consolidated group tag with tooltip listing all values
+      var allLabels = [];
       for (var v = 0; v < vals.length; ++v) {
-        var subLabel = resolveFilterLabel(dim, vals[v]);
-        var subTag = document.createElement('sl-tag');
-        subTag.setAttribute('size', 'small');
-        subTag.setAttribute('removable', '');
-        subTag.setAttribute('variant', 'primary');
-        subTag.textContent = displayDim + ': ' + subLabel;
-        subTag.dataset.dim = dim;
-        subTag.dataset.val = vals[v];
-        subTag.addEventListener('sl-remove', function (e) {
-          var d = e.target.dataset.dim;
-          var val = e.target.dataset.val;
-          var current = filterState[d];
-          if (Array.isArray(current)) {
-            var updated = current.filter(function (x) { return x !== val; });
-            setFilter(d, updated.length > 0 ? updated : null);
-          } else {
-            setFilter(d, null);
-          }
-          syncDropdownAfterRemove(d, val);
-        });
-        container.appendChild(subTag);
+        allLabels.push(resolveFilterLabel(dim, vals[v]));
       }
+      var groupTag = document.createElement('sl-tooltip');
+      groupTag.setAttribute('content', allLabels.join(', '));
+      groupTag.setAttribute('hoist', '');
+      var innerTag = document.createElement('sl-tag');
+      innerTag.setAttribute('size', 'small');
+      innerTag.setAttribute('removable', '');
+      innerTag.setAttribute('variant', 'primary');
+      innerTag.textContent = displayDim + ' (' + vals.length + ')';
+      innerTag.dataset.dim = dim;
+      innerTag.addEventListener('sl-remove', function (e) {
+        var d = e.target.dataset.dim;
+        setFilter(d, null);
+        syncDropdownAfterRemove(d);
+      });
+      groupTag.appendChild(innerTag);
+      container.appendChild(groupTag);
     }
   }
 }
