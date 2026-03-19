@@ -235,6 +235,7 @@ demo/
 
 ## What This Spec Does NOT Cover (Yet)
 
+- **Fully responsive design (320px–1440px+)** — see `docs/superpowers/specs/2026-03-19-responsive-dashboard-design.md`
 - LLM agent config generation flow
 - Array/map dimension support (semantic_events cube)
 - Geographic map visualizations
