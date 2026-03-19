@@ -776,12 +776,16 @@ body {
 
 /* Info icon (Principle 2: details on demand) */
 .info-icon {
-  display: inline-block; cursor: help;
-  font-size: 13px; color: var(--text-muted);
-  opacity: 0.5; transition: opacity 0.15s;
-  vertical-align: middle; margin-left: 2px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 1px solid var(--text-muted);
+  font-size: 9px; font-weight: 700; font-style: italic;
+  color: var(--text-muted); cursor: help;
+  opacity: 0.4; transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+  vertical-align: middle; margin-left: 3px;
+  font-family: Georgia, serif; line-height: 1;
 }
-.info-icon:hover { opacity: 1; color: var(--accent-blue); }
+.info-icon:hover { opacity: 1; color: var(--accent-blue); border-color: var(--accent-blue); }
 
 /* Filter chips (Principle 8: visible, removable) */
 .filter-chip {
@@ -804,7 +808,10 @@ body {
 .mode-btn.active {
   background: var(--accent-blue); border-color: var(--accent-blue); color: white;
 }
-.mode-btn.active-neg {
+.pill--active {
+  background: var(--accent-blue); border-color: var(--accent-blue); color: white;
+}
+.pill--negative {
   background: var(--accent-red, #ef4565); border-color: var(--accent-red, #ef4565); color: white;
 }
 .dim-item--selected { background: rgba(61,139,253,0.06); }
@@ -867,23 +874,33 @@ body {
 /* Show All toggle */
 .show-all-toggle { font-size: 10px !important; }
 
-/* Progress steps (Principle: meaningful loading) */
-.progress-steps { padding: 16px 20px; }
+/* Progress overlay (Principle 11: overlay on top of live dashboard) */
+.progress-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(245, 249, 255, 0.75);
+  backdrop-filter: blur(4px);
+  transition: opacity 0.5s ease;
+}
+.progress-overlay--done { opacity: 0; pointer-events: none; }
+.progress-overlay .progress-steps {
+  padding: 24px 32px; min-width: 320px; max-width: 400px;
+}
 .progress-step {
   display: flex; align-items: center; gap: 8px;
-  padding: 4px 0; font-size: 12px; color: var(--text-secondary);
+  padding: 5px 0; font-size: 13px; color: var(--text-secondary);
 }
 .progress-step--done { color: var(--accent-green); }
 .progress-step--active { color: var(--text-primary); font-weight: 600; }
 .progress-dot {
-  width: 6px; height: 6px; border-radius: 50%;
+  width: 7px; height: 7px; border-radius: 50%;
   background: var(--border); flex-shrink: 0;
 }
 .progress-step--done .progress-dot { background: var(--accent-green); }
 .progress-step--active .progress-dot { background: var(--accent-blue); animation: pulse 1s infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 .progress-summary {
-  margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
   font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);
 }
 

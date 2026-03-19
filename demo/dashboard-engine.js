@@ -220,7 +220,7 @@ function renderFilterChips() {
 
 function infoIcon(text) {
   if (!text) return '';
-  return ' <span class="info-icon" title="' + escapeHtml(text) + '">&#9432;</span>';
+  return ' <span class="info-icon" title="' + escapeHtml(text) + '">i</span>';
 }
 
 // ── Header ────────────────────────────────────────────────────────────
@@ -281,35 +281,34 @@ function buildModelBar(config, registry) {
   html += '</div>';
   html += '</div>';
 
-  // Segments
+  // Segments — grouped by type for cleaner presentation
   if (hasSegments) {
     html += '<div class="model-bar-group">';
-    html += '<span class="model-bar-label">Segments</span>';
+    html += '<span class="model-bar-label">Focus</span>';
     html += '<div class="pill-group">';
     for (var s = 0; s < segments.length; ++s) {
       var seg = segments[s];
-      html += '<button class="mode-btn" data-segment="' + escapeHtml(seg.name) + '">' +
-        escapeHtml(seg.title) +
-        (seg.description ? infoIcon(seg.description) : '') +
-      '</button>';
+      html += '<button class="pill" data-segment="' + escapeHtml(seg.name) + '"' +
+        (seg.description ? ' title="' + escapeHtml(seg.description) + '"' : '') + '>' +
+        escapeHtml(seg.title) + '</button>';
     }
     html += '</div></div>';
   }
 
-  // Boolean presets
+  // Boolean presets — only if there are any not already in panels
   if (hasPresets) {
     html += '<div class="model-bar-group">';
-    html += '<span class="model-bar-label">Quick Filters</span>';
+    html += '<span class="model-bar-label">Include</span>';
     html += '<div class="pill-group">';
     for (var b = 0; b < extraBooleans.length; ++b) {
       var bool = extraBooleans[b];
-      html += '<button class="mode-btn" data-boolean="' + escapeHtml(bool.name) + '">' +
+      html += '<button class="pill" data-boolean="' + escapeHtml(bool.name) + '">' +
         escapeHtml(bool.label) + '</button>';
     }
     html += '</div></div>';
   }
 
-  // Facets
+  // Facets — low-cardinality enums with known values
   if (hasFacets) {
     for (var f = 0; f < facets.length; ++f) {
       var facet = facets[f];
@@ -318,7 +317,7 @@ function buildModelBar(config, registry) {
       html += '<span class="model-bar-label">' + escapeHtml(facet.label) + '</span>';
       html += '<div class="pill-group">';
       for (var v = 0; v < facet.values.length; ++v) {
-        html += '<button class="mode-btn" data-facet="' + escapeHtml(facet.name) + '" data-value="' + escapeHtml(facet.values[v]) + '">' +
+        html += '<button class="pill" data-facet="' + escapeHtml(facet.name) + '" data-value="' + escapeHtml(facet.values[v]) + '">' +
           escapeHtml(facet.values[v]) + '</button>';
       }
       html += '</div></div>';
@@ -329,36 +328,34 @@ function buildModelBar(config, registry) {
 
   // Wire interactions — Principle 7: clear selection state
   bar.addEventListener('click', function (e) {
-    var btn = e.target.closest('.mode-btn');
+    var btn = e.target.closest('.pill');
     if (!btn) return;
 
     // Segment toggle
     if (btn.dataset.segment) {
-      btn.classList.toggle('active');
-      var activeSegs = bar.querySelectorAll('[data-segment].active');
+      btn.classList.toggle('pill--active');
+      var activeSegs = bar.querySelectorAll('[data-segment].pill--active');
       var segVals = [];
       for (var i = 0; i < activeSegs.length; ++i) segVals.push(activeSegs[i].dataset.segment);
       setFilter('_segment', segVals);
       return;
     }
 
-    // Boolean toggle (3-state: true → false → all)
+    // Boolean toggle (3-state: active → negative → off)
     if (btn.dataset.boolean) {
-      var siblings = btn.parentNode.querySelectorAll('[data-boolean="' + btn.dataset.boolean + '"]');
-      // This is a single button — cycle through states
-      var current = btn.dataset.state || 'all';
-      var next = current === 'all' ? 'true' : current === 'true' ? 'false' : 'all';
+      var current = btn.dataset.state || 'off';
+      var next = current === 'off' ? 'true' : current === 'true' ? 'false' : 'off';
       btn.dataset.state = next;
-      btn.classList.toggle('active', next !== 'all');
-      btn.classList.toggle('active-neg', next === 'false');
-      setFilter(btn.dataset.boolean, next === 'all' ? null : next);
+      btn.classList.toggle('pill--active', next === 'true');
+      btn.classList.toggle('pill--negative', next === 'false');
+      setFilter(btn.dataset.boolean, next === 'off' ? null : next);
       return;
     }
 
     // Facet multi-select
     if (btn.dataset.facet) {
-      btn.classList.toggle('active');
-      var activeFacets = bar.querySelectorAll('[data-facet="' + btn.dataset.facet + '"].active');
+      btn.classList.toggle('pill--active');
+      var activeFacets = bar.querySelectorAll('[data-facet="' + btn.dataset.facet + '"].pill--active');
       var vals = [];
       for (var j = 0; j < activeFacets.length; ++j) vals.push(activeFacets[j].dataset.value);
       setFilter(btn.dataset.facet, vals);
@@ -647,35 +644,39 @@ async function main() {
   var container = document.getElementById('dashboard');
   var config = BLUECAR_STAYS_CONFIG;
 
-  // Principle: meaningful progress steps
-  var progressEl = document.createElement('div');
-  progressEl.className = 'card progress-steps';
-  progressEl.style.maxWidth = '480px';
-  progressEl.style.margin = '60px auto';
-  container.innerHTML = '';
-  container.appendChild(progressEl);
+  // Principle 11: progress overlay — dashboard renders underneath, updates live
+  var overlay = document.createElement('div');
+  overlay.className = 'progress-overlay';
+  var progressCard = document.createElement('div');
+  progressCard.className = 'card progress-steps';
+  overlay.appendChild(progressCard);
+  document.body.appendChild(overlay);
 
   var steps = [
     { id: 'meta', label: 'Connecting to data source' },
     { id: 'registry', label: 'Reading model definition' },
     { id: 'layout', label: 'Preparing dashboard layout' },
-    { id: 'render', label: 'Rendering components' },
+    { id: 'data', label: 'Loading data' },
   ];
 
   function updateProgress(activeIdx, summary) {
     var html = '';
     for (var i = 0; i < steps.length; ++i) {
       var cls = i < activeIdx ? 'progress-step--done' : i === activeIdx ? 'progress-step--active' : '';
-      var icon = i < activeIdx ? '&#10003;' : '';
       html += '<div class="progress-step ' + cls + '">' +
         '<span class="progress-dot"></span>' +
-        '<span>' + steps[i].label + (icon ? ' ' + icon : '') + '</span>' +
+        '<span>' + steps[i].label + (i < activeIdx ? ' &#10003;' : '') + '</span>' +
       '</div>';
     }
     if (summary) {
       html += '<div class="progress-summary">' + escapeHtml(summary) + '</div>';
     }
-    progressEl.innerHTML = html;
+    progressCard.innerHTML = html;
+  }
+
+  function dismissProgress() {
+    overlay.classList.add('progress-overlay--done');
+    setTimeout(function () { overlay.remove(); }, 600);
   }
 
   try {
@@ -686,27 +687,28 @@ async function main() {
 
     updateProgress(1);
     var registry = buildCubeRegistry(metaResponse, config.cube);
-    var dimCount = Object.keys(registry.dimensions).length;
-    var measCount = Object.keys(registry.measures).length;
-    var segCount = registry.segments.length;
-    console.log('[dashboard] Cube registry:', registry.name, '\u2014', dimCount, 'dims,', measCount, 'measures');
+    console.log('[dashboard] Cube registry:', registry.name, '\u2014',
+      Object.keys(registry.dimensions).length, 'dims,',
+      Object.keys(registry.measures).length, 'measures');
 
-    updateProgress(2, registry.title + ' \u2014 ' +
-      segCount + ' analysis segments available');
+    updateProgress(2, registry.title);
     var resolvedPanels = resolvePanels(config, registry);
     var sections = resolveSections(config, resolvedPanels);
-    console.log('[dashboard] Resolved', resolvedPanels.length, 'panels in', sections.length, 'sections');
 
     // Principle 3: restore state from URL
     filterState = readUrlState();
 
-    updateProgress(3, resolvedPanels.length + ' panels in ' + sections.length + ' sections');
-    // Small delay so user sees the final step
-    await new Promise(function (r) { setTimeout(r, 300); });
-
+    // Render dashboard immediately — visible under the overlay
     buildDashboardDOM(container, config, sections, registry);
     renderFilterChips();
-    console.log('[dashboard] Wireframe rendered with first principles applied');
+    console.log('[dashboard] Dashboard rendered, loading data...');
+
+    updateProgress(3, 'Streaming data into dashboard...');
+    // TODO: wire crossfilter worker here — as data streams in,
+    // charts update live under the overlay. Once complete, dismiss.
+    // For now, simulate with a brief delay then dismiss.
+    await new Promise(function (r) { setTimeout(r, 800); });
+    dismissProgress();
 
   } catch (err) {
     container.innerHTML = '<div class="error-banner" style="display:block">' +

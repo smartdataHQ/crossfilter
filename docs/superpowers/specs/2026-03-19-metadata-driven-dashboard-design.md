@@ -30,7 +30,7 @@ These are non-negotiable interaction patterns that every component must follow:
 
 10. **Responsive everything** — All dashboards are responsive. Components adapt their rendering based on available space — not just CSS reflow, but different visualization modes (e.g., bar chart → compact list on narrow screens).
 
-11. **Meaningful loading progress** — In a subtle but clear way, inform the user of progress when loading data. Show meaningful named steps (not percentages), and a summary of what was loaded when available. Never a blank screen or a spinner with no context.
+11. **Meaningful loading progress** — Progress is shown as a subtle overlay on top of the dashboard, not instead of it. The dashboard layout renders immediately and updates live as data streams in — the user sees charts gradually populate underneath the overlay. The overlay shows meaningful named steps and a summary, then fades away when loading completes. Never a blank screen.
 
 ## Design Principles — Architecture
 
