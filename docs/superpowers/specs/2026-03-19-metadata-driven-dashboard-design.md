@@ -36,7 +36,9 @@ These are non-negotiable interaction patterns that every component must follow:
 
 13. **Visible selected values** — When using sliders or any control that obscures the exact value, always show the selected value(s) in a subtle readable form. Use range selectors (from–to) rather than single-ended sliders, so the user controls both bounds.
 
-14. **Skeleton placeholders** — Every component renders a simplified placeholder skeleton while data is loading. The skeleton matches the visual shape of the final component: shimmer bars for bar charts, shimmer lines for time series, shimmer circles for pie charts, shimmer rows for tables, shimmer pills for toggles. The user always sees what *will* be there before data arrives.
+14. **Use proven component libraries** — NEVER hand-build standard UI components (dropdowns, popovers, tooltips, date pickers, select boxes). Use battle-tested libraries: Floating UI for positioning, Tippy.js for tooltips, flatpickr for date pickers, etc. If a component involves positioning, z-index, or containment escaping — use a library. These are solved problems.
+
+15. **Skeleton placeholders** — Every component renders a simplified placeholder skeleton while data is loading. The skeleton matches the visual shape of the final component: shimmer bars for bar charts, shimmer lines for time series, shimmer circles for pie charts, shimmer rows for tables, shimmer pills for toggles. The user always sees what *will* be there before data arrives.
 
 ## Design Principles — Architecture
 
