@@ -1262,18 +1262,22 @@ body {
 
 /* ── Chart card variants ───────────────────────────────────────────── */
 
-/* Base (minimal): compact header, hide controls */
+/* Base (minimal): tight padding, hide controls, short chart */
+.chart-card .card-head { padding: 8px 10px; }
 .chart-card .card-filters { display: none; }
 .chart-card .show-all-toggle { display: none; }
 .chart-card .dim-list-toggle { display: none; }
+.chart-card .chart-wrap { height: 160px; }
+.chart-card .card-t { font-size: 12px; }
 
-/* Compact (300px+): show chart at reduced height */
+/* Compact (300px+): more padding, taller chart */
 @container chartcard (min-width: 300px) {
   .chart-card .card-head { padding: 10px 14px; }
   .chart-card .chart-wrap { height: 200px; }
+  .chart-card .card-t { font-size: 13px; }
 }
 
-/* Expanded (500px+): full chrome — controls, full height */
+/* Expanded (500px+): full chrome — generous padding, controls, full height */
 @container chartcard (min-width: 500px) {
   .chart-card .card-head { padding: 12px 16px; }
   .chart-card .card-filters { display: flex; }
