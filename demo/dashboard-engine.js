@@ -214,48 +214,113 @@ function renderFilterChips() {
     var vals = Array.isArray(val) ? val : [val];
     var displayDim = dim.replace(/^_/, '').replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
 
-    var chipText;
     if (vals.length === 1) {
-      chipText = displayDim + ': ' + vals[0];
+      // Single value — simple chip with × to remove
+      var chip = document.createElement('span');
+      chip.className = 'filter-chip';
+      chip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(displayDim) + ': ' + escapeHtml(vals[0]) + '</span>' +
+        '<button class="filter-chip-remove" data-dim="' + escapeHtml(dim) + '">&times;</button>';
+      container.appendChild(chip);
     } else {
-      chipText = displayDim + ' (' + vals.length + ')';
-    }
+      // Multiple values — expandable chip group
+      var group = document.createElement('span');
+      group.className = 'filter-chip-group';
 
-    var chip = document.createElement('span');
-    chip.className = 'filter-chip';
-    chip.title = vals.join(', ');
-    chip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(chipText) + '</span>' +
-      '<button class="filter-chip-remove" data-dim="' + escapeHtml(dim) + '">&times;</button>';
-    container.appendChild(chip);
+      var summary = document.createElement('button');
+      summary.className = 'filter-chip filter-chip--expandable';
+      summary.type = 'button';
+      summary.innerHTML = '<span class="filter-chip-label">' + escapeHtml(displayDim) + ' (' + vals.length + ')</span>' +
+        '<button class="filter-chip-remove" data-dim="' + escapeHtml(dim) + '">&times;</button>';
+      group.appendChild(summary);
+
+      var expandPanel = document.createElement('div');
+      expandPanel.className = 'filter-chip-expand';
+      for (var v = 0; v < vals.length; ++v) {
+        var subChip = document.createElement('span');
+        subChip.className = 'filter-chip filter-chip--sub';
+        subChip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(vals[v]) + '</span>' +
+          '<button class="filter-chip-remove-one" data-dim="' + escapeHtml(dim) + '" data-val="' + escapeHtml(vals[v]) + '">&times;</button>';
+        expandPanel.appendChild(subChip);
+      }
+      group.appendChild(expandPanel);
+      container.appendChild(group);
+    }
   }
 
   if (!_chipListenerWired) {
     _chipListenerWired = true;
     container.addEventListener('click', function (e) {
-      var removeBtn = e.target.closest('.filter-chip-remove');
-      if (!removeBtn) return;
-      var dim = removeBtn.dataset.dim;
-      setFilter(dim, null);
-      // Also deselect the corresponding dropdown items
-      var dd = document.querySelector('[data-dropdown-id="' + dim + '"]');
-      if (dd) {
-        var selected = dd.querySelectorAll('.dropdown-item--selected');
-        for (var i = 0; i < selected.length; ++i) selected[i].classList.remove('dropdown-item--selected');
-        var valueEl = dd.querySelector('.dropdown-value');
-        if (valueEl && valueEl.dataset.placeholder) {
-          valueEl.textContent = valueEl.dataset.placeholder;
-          valueEl.classList.remove('dropdown-value--active');
+      // Remove entire filter
+      var removeAll = e.target.closest('.filter-chip-remove');
+      if (removeAll && !e.target.closest('.filter-chip-remove-one')) {
+        var dim = removeAll.dataset.dim;
+        setFilter(dim, null);
+        syncDropdownAfterRemove(dim);
+        return;
+      }
+
+      // Remove single value from multi-select
+      var removeOne = e.target.closest('.filter-chip-remove-one');
+      if (removeOne) {
+        var dim2 = removeOne.dataset.dim;
+        var val = removeOne.dataset.val;
+        var current = filterState[dim2];
+        if (Array.isArray(current)) {
+          var updated = current.filter(function (v) { return v !== val; });
+          setFilter(dim2, updated);
         }
+        syncDropdownAfterRemove(dim2, val);
+        return;
+      }
+
+      // Toggle expand on group chip
+      var expandable = e.target.closest('.filter-chip--expandable');
+      if (expandable) {
+        var group = expandable.closest('.filter-chip-group');
+        if (group) group.classList.toggle('filter-chip-group--open');
       }
     });
+  }
+}
+
+function syncDropdownAfterRemove(dim, singleVal) {
+  var dd = document.querySelector('[data-dropdown-id="' + dim + '"]');
+  if (!dd) return;
+
+  if (singleVal) {
+    // Deselect just this one
+    var items = dd.querySelectorAll('.dropdown-item--selected');
+    for (var i = 0; i < items.length; ++i) {
+      if (items[i].dataset.value === singleVal) items[i].classList.remove('dropdown-item--selected');
+    }
+  } else {
+    // Deselect all
+    var selected = dd.querySelectorAll('.dropdown-item--selected');
+    for (var j = 0; j < selected.length; ++j) selected[j].classList.remove('dropdown-item--selected');
+  }
+
+  // Update trigger label
+  var remaining = dd.querySelectorAll('.dropdown-item--selected');
+  var valueEl = dd.querySelector('.dropdown-value');
+  if (!valueEl) return;
+  if (remaining.length === 0) {
+    valueEl.textContent = valueEl.dataset.placeholder || 'All';
+    valueEl.classList.remove('dropdown-value--active');
+  } else if (remaining.length === 1) {
+    var label = remaining[0].querySelector('.dropdown-item-label');
+    valueEl.textContent = label ? label.textContent : '';
+    valueEl.classList.add('dropdown-value--active');
+  } else {
+    valueEl.textContent = remaining.length + ' selected';
+    valueEl.classList.add('dropdown-value--active');
   }
 }
 
 // ── Principle 2: Info tooltip (i) ─────────────────────────────────────
 
 function infoIcon(text) {
-  if (!text) return '';
-  return ' <span class="info-icon" title="' + escapeHtml(text) + '">i</span>';
+  if (!text || !text.trim()) return '';
+  return ' <span class="info-icon" title="' + escapeHtml(text.trim()) + '">i</span>';
 }
 
 // ── Header ────────────────────────────────────────────────────────────
