@@ -1184,3 +1184,31 @@ body {
   .filter-bar .pill-group { gap: 2px; }
   .filter-bar .pill { flex: 1; text-align: center; min-height: 44px; }
 }
+
+/* ── Location grid — container query replaces old media query ──────── */
+.location-grid { grid-template-columns: 1fr; }
+
+@container locgrid (min-width: 500px) {
+  .location-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* ── List panels — touch-friendly on narrow containers ─────────────── */
+.dim-list-panel .dim-item { min-height: 44px; }
+.dim-list-panel .dim-search { min-height: 44px; }
+
+@container chartcard (min-width: 400px) {
+  .dim-list-panel .dim-item { min-height: auto; }
+  .dim-list-panel .dim-search { min-height: auto; }
+}
+
+/* ── Tables — frozen first column on narrow containers ─────────────── */
+@container chartcard (max-width: 499px) {
+  .table-scroll { overflow-x: auto; position: relative; }
+  .tbl th:first-child,
+  .tbl td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--bg-card-solid);
+  }
+}
