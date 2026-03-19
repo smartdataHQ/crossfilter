@@ -8,12 +8,65 @@ A generic, config-driven dashboard engine that renders interactive crossfilter-p
 
 ## Design Principles
 
-1. **Minimal config** — A valid config is just `{ cube, panels }`. Everything else has sensible defaults inferred from metadata.
-2. **Enum-based** — Constrained fields use enums so LLM structured output can't go off-rails.
-3. **Declarative** — Config describes *what* to show, not *how* to render. The engine decides rendering.
-4. **On-demand discovery** — Cube metadata fetched at runtime, ECharts types introspected at runtime. No hardcoded lists.
-5. **Override anything** — Every inferred default is overridable in the config.
-6. **Multi-worker** — Supports multiple crossfilter workers with automatic dimension budgeting and cross-worker filter propagation.
+1. **Zero hardcoding** — The engine NEVER references specific field names, labels, segments, or domain-specific content. Everything comes from the config and the Cube metadata. The engine must work for ANY cube without code changes.
+2. **Minimal config** — A valid config is just `{ cube, panels }`. Everything else has sensible defaults inferred from metadata.
+3. **Enum-based** — Constrained fields use enums so LLM structured output can't go off-rails.
+4. **Declarative** — Config describes *what* to show, not *how* to render. The engine decides rendering.
+5. **On-demand discovery** — Cube metadata fetched at runtime, ECharts types introspected at runtime. No hardcoded lists.
+6. **Override anything** — Every inferred default is overridable in the config.
+7. **Multi-worker** — Supports multiple crossfilter workers with automatic dimension budgeting and cross-worker filter propagation.
+8. **Custom-made feel** — Dynamically generated dashboards should look and feel as if they were hand-crafted for the specific dataset. The engine uses metadata intelligence (descriptions, segments, value distributions, measure formats) to make informed presentation choices.
+
+## Model Intelligence Bar
+
+The dashboard surfaces the cube's built-in analytical intelligence as a top-level UI element, rendered directly below the header. This is auto-generated from metadata — the config can customize it but never needs to.
+
+### What it surfaces
+
+The engine inspects the Cube metadata and discovers:
+
+1. **Segments** — Pre-defined data slices baked into the model (e.g., "POI Stops Only", "Weekday Only", "Long Stops"). These are server-side filters that the Cube model defines. Rendered as toggleable pills. Clicking one applies it as a Cube query filter, not a crossfilter dimension.
+
+2. **Preset filters** — Boolean dimensions discovered from metadata (`field_type: "boolean"`). Grouped intelligently by inspecting field names for common prefixes or by proximity in the dimension list. Rendered as toggle pills.
+
+3. **Dimension facets** — Low-cardinality string dimensions with `lc_values` in metadata (unique_values ≤ ~12). These are known enum values the model is aware of. Rendered as selectable pill groups.
+
+4. **Cube identity** — The cube's `title` and `description` from metadata, plus dimension/measure counts, giving the user context about what data they're exploring.
+
+### How it works
+
+The engine classifies metadata fields into three presentation tiers:
+
+| Metadata signal | Tier | Rendering |
+|---|---|---|
+| `segments` array | Segment pills | Toggle pills that apply server-side Cube segment filters |
+| `field_type: "boolean"` | Quick toggles | On/off pills grouped by metadata proximity |
+| `lc_values` present + `unique_values ≤ 12` | Facet pills | Multi-select pill groups with known values |
+| `description` on cube | Context | Subtitle/tooltip on dashboard header |
+
+### Config override
+
+The config can customize which metadata features appear in the model bar:
+
+```js
+{
+  modelBar: {
+    segments: true,           // show segment pills (default: true if segments exist)
+    presets: true,            // show boolean dimension toggles (default: true)
+    facets: ['stay_type', 'activity_type'],  // explicit facet dimensions (default: auto-discovered)
+    showDescription: true,    // show cube description (default: true)
+  }
+}
+```
+
+When `modelBar` is omitted, the engine auto-discovers everything from metadata. Setting `modelBar: false` hides it entirely.
+
+### Interaction with crossfilter
+
+- **Segments**: Applied as Cube query filters (server-side). Toggling a segment re-fetches data from the Cube API with the segment applied, then rebuilds crossfilter.
+- **Boolean toggles**: Applied as crossfilter `filterExact(true)` / `filterExact(false)` / `filterAll()`.
+- **Facet pills**: Applied as crossfilter `filterIn([...selectedValues])`.
+- All model bar filters coordinate with panel filters through the same filter state.
 
 ## Architecture — Three Layers
 
