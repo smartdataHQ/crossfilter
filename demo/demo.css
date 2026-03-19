@@ -864,14 +864,17 @@ body {
   font-size: 11px; font-weight: 600; color: var(--text-muted);
   text-transform: uppercase; letter-spacing: 0.04em;
 }
+/* Filter bar controls — auto-fit grid so each control is a container
+   query context with layout-driven width (same pattern as KPI/chart grids) */
 .filter-bar-controls {
-  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
+  gap: 10px;
+  align-items: center;
 }
 .filter-bar-item {
+  container: filteritem / inline-size;
   display: flex; align-items: center; gap: 8px;
-}
-.filter-bar-item--range {
-  flex: 1; min-width: 180px; max-width: 300px;
 }
 .filter-bar-label {
   font-size: 12px; color: var(--text-secondary); white-space: nowrap;
@@ -1192,10 +1195,11 @@ body {
 /* Compact needs relative positioning on parent for dropdown */
 .toggle-compact { position: relative; }
 
-/* Container query: toggle switches to compact when its container is narrow.
-   Works everywhere — model bar, filter bar, cards — because .control-container
-   has flex: 1 1 200px (width from flex algorithm, not content). */
-@container controlctx (max-width: 250px) {
+/* Toggle switches to compact when its nearest container is narrow.
+   Unnamed query matches the nearest ancestor with container-type —
+   works in any context: controlctx (model bar), filteritem (filter bar),
+   chartcard (chart cards). */
+@container (max-width: 250px) {
   .toggle-expanded { display: none; }
   .toggle-compact  { display: inline-flex; }
 }
@@ -1297,23 +1301,20 @@ body {
   .chart-cell .card { margin-bottom: 0; }
 }
 
-/* ── Filter bar variants ───────────────────────────────────────────── */
+/* ── Filter bar item variants (container queries on filteritem) ─────── */
+/* Each .filter-bar-item is a grid cell = container query context.      */
+/* auto-fit grid decides how many controls fit per row.                 */
 
-/* Base: stacked controls */
-.filter-bar .filter-bar-controls { flex-direction: column; gap: 8px; }
-.filter-bar .filter-bar-item--range { max-width: none; }
+/* Base: label hidden, compact layout */
+.filter-bar-item .filter-bar-label { display: none; }
 
-/* Wide (400px+): inline controls */
-@container filterbar (min-width: 400px) {
-  .filter-bar .filter-bar-controls { flex-direction: row; gap: 16px; }
-  .filter-bar .filter-bar-item--range { max-width: 300px; }
+/* Wide enough for label (250px+): show label inline */
+@container filteritem (min-width: 250px) {
+  .filter-bar-item .filter-bar-label { display: block; }
 }
 
-/* Toggle groups — full-width pills on narrow filter bars */
-@container filterbar (max-width: 399px) {
-  .filter-bar .pill-group { gap: 2px; }
-  .filter-bar .pill { flex: 1; text-align: center; min-height: 44px; }
-}
+/* Narrow item: toggle goes compact via controlctx (already wired) */
+/* Range items adapt naturally — noUiSlider is fluid */
 
 /* ── Location grid — container query replaces old media query ──────── */
 .location-grid { grid-template-columns: 1fr; }
