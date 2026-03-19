@@ -1484,7 +1484,8 @@ function wireCardInteractions(card, panel) {
       var expanded = showAllBtn.dataset.expanded === 'true';
       showAllBtn.dataset.expanded = expanded ? 'false' : 'true';
       showAllBtn.textContent = expanded ? 'Top ' + showAllBtn.dataset.limit : 'All';
-      // TODO: re-render chart with all vs top-N
+      panel._expanded = !expanded;
+      notifyFilterChange();
     });
   }
 
