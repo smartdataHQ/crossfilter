@@ -844,8 +844,9 @@ body {
 .ds-select::part(display-input) {
   font-family: var(--font-sans);
 }
-/* Hide selected tags in the trigger — filter chips bar handles this */
-.ds-select::part(tags) { display: none; }
+/* Hide selected tags in the trigger — filter chips bar handles this.
+   Keep the display-input visible so placeholder text ("2 selected") shows. */
+.ds-select[multiple]::part(tag) { display: none; }
 .ds-select::part(clear-button) { display: none; }
 
 /* Filter chips (Principle 8: visible, removable) */
