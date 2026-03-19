@@ -461,7 +461,7 @@ function wireFilterSheet() {
   var clearBtn = document.getElementById('filter-sheet-clear');
   if (clearBtn) {
     clearBtn.addEventListener('click', function() {
-      var clearAll = document.getElementById('clear-all');
+      var clearAll = document.getElementById('clear-all-btn');
       if (clearAll) clearAll.click();
     });
   }

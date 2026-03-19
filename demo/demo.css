@@ -1299,6 +1299,8 @@ body {
     flex-direction: row;
     align-items: center;
     gap: 10px;
+    flex-wrap: wrap;
+    row-gap: 8px;
   }
   .model-bar-inline {
     padding-left: 12px;
