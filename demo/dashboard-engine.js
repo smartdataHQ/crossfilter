@@ -1304,7 +1304,7 @@ function buildFilterBar(section, registry) {
     var dimDesc = dimMeta && dimMeta.description ? dimMeta.description : null;
 
     if (panel.chart === 'toggle') {
-      html += '<div class="filter-bar-item control-container" id="panel-' + panel.id + '">';
+      html += '<div class="filter-bar-item" id="panel-' + panel.id + '">';
       html += '<span class="filter-bar-label">' + escapeHtml(panel.label) + (dimDesc ? infoIcon(dimDesc) : '') + '</span>';
       html += buildToggleHtml(panel.dimension);
       html += '<span class="filter-bar-count" id="toggle-count-' + panel.id + '"></span>';
