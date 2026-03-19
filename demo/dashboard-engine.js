@@ -885,14 +885,18 @@ function buildPanelCard(panel, accentIdx, registry) {
 
   if (isKpi) {
     var color = ACCENT_COLORS[accentIdx % ACCENT_COLORS.length];
-    card.className = 'kpi kpi-' + color;
+    // Container wrapper — grid cell is the container, .kpi is the component.
+    // A container can only style descendants, not itself. The grid track
+    // gives the cell its width; @container kpicard queries adapt .kpi inside.
+    card.className = 'kpi-cell';
     card.id = 'panel-' + panel.id;
-    // Principle 2: (i) for measure description
     var measMeta = registry.measures[panel.measure];
     var measDesc = measMeta && measMeta.description ? measMeta.description : null;
     card.innerHTML =
-      '<div class="kpi-label">' + escapeHtml(panel.label) + (measDesc ? infoIcon(measDesc) : '') + '</div>' +
-      '<div class="kpi-value">\u2014</div>';
+      '<div class="kpi kpi-' + color + '">' +
+        '<div class="kpi-label">' + escapeHtml(panel.label) + (measDesc ? infoIcon(measDesc) : '') + '</div>' +
+        '<div class="kpi-value">\u2014</div>' +
+      '</div>';
     return card;
   }
 

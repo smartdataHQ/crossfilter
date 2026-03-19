@@ -197,20 +197,24 @@ body {
 .source-badge.source-live { background: var(--accent-green-dim); color: var(--accent-green); }
 .source-badge.source-file { background: var(--accent-amber-dim); color: var(--accent-amber); }
 
-/* KPI row — auto-fill grid. The grid decides how many columns fit;
-   each card's @container kpicard query decides its format.
-   min 110px ensures cards can go narrow enough to trigger compact mode. */
+/* KPI row — auto-fill grid. Grid cells are container query contexts.
+   min(140px, 100%) allows 4 KPIs at 640px+ and 2 at 320px.
+   Each .kpi-cell is the container; .kpi inside adapts via @container. */
 .kpi-row {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(140px, 100%), 1fr));
   gap: var(--card-gap, 10px);
   margin-bottom: var(--section-gap, 16px);
 }
 
-/* KPI card — mobile-first base: minimal variant (colored dot + value only)
-   Container queries on .kpi (kpicard) reformat the card at wider widths.
-   The .kpi-row grid (media queries) controls column count, which changes
-   each card's width, which triggers the container queries below. */
+/* KPI cell — the container query context (grid cell, width from grid track) */
+.kpi-cell {
+  container: kpicard / inline-size;
+}
+
+/* KPI card — mobile-first base: minimal variant (colored dot + value only).
+   .kpi-cell is the container (grid cell, width from grid track).
+   @container kpicard queries on .kpi-cell reformat .kpi at wider widths. */
 .kpi {
   background: var(--bg-card-solid);
   border: 1px solid var(--border);
@@ -1085,7 +1089,7 @@ body {
 
 /* Container contexts — every component wrapper is a query container */
 .kpi-row    { container: kpigrid / inline-size; }
-.kpi        { container: kpicard / inline-size; }
+/* .kpi-cell gets kpicard container — defined above with the grid */
 .chart-card { container: chartcard / inline-size; }
 .filter-bar { container: filterbar / inline-size; }
 .location-grid { container: locgrid / inline-size; }
