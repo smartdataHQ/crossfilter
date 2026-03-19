@@ -200,8 +200,8 @@ export async function createDashboardData(config, registry, resolvedPanels) {
   var workerDims = Array.from(scanResult.dims);
 
   var workerHandle = await crossfilter.createStreamingDashboardWorker({
-    crossfilterUrl: '../crossfilter.js',
-    arrowRuntimeUrl: '../node_modules/apache-arrow/Arrow.es2015.min.js',
+    crossfilterUrl: '/crossfilter.js',
+    arrowRuntimeUrl: '/node_modules/apache-arrow/Arrow.es2015.min.js',
     batchCoalesceRows: 65536,
     wasm: true,
     emitSnapshots: false,
