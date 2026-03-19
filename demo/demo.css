@@ -205,44 +205,46 @@ body {
   margin-bottom: var(--section-gap, 16px);
 }
 
+/* KPI card — mobile-first: minimal pill variant */
 .kpi {
   background: var(--bg-card-solid);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
   position: relative;
   overflow: hidden;
-  transition: transform 0.2s, box-shadow 0.2s;
   box-shadow: 0 1px 3px rgba(0, 21, 88, 0.04);
 }
 
-.kpi:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0, 21, 88, 0.06); }
+.kpi.kpi-green  { --kpi-accent: var(--accent-green); }
+.kpi.kpi-blue   { --kpi-accent: var(--accent-blue); }
+.kpi.kpi-amber  { --kpi-accent: var(--accent-amber); }
+.kpi.kpi-red    { --kpi-accent: var(--accent-red); }
+.kpi.kpi-purple { --kpi-accent: var(--accent-purple); }
 
 .kpi::before {
   content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 2px;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--kpi-accent, var(--accent-blue));
+  flex-shrink: 0;
 }
-
-.kpi.kpi-green::before  { background: var(--accent-green); }
-.kpi.kpi-blue::before   { background: var(--accent-blue); }
-.kpi.kpi-amber::before  { background: var(--accent-amber); }
-.kpi.kpi-red::before    { background: var(--accent-red); }
-.kpi.kpi-purple::before { background: var(--accent-purple); }
 
 .kpi-label {
   font-family: var(--font-sans);
-  font-size: 11px;
+  font-size: clamp(9px, 0.6rem + 0.3cqi, 11px);
   font-weight: 500;
   color: var(--text-muted);
-  margin-bottom: 6px;
   letter-spacing: 0.02em;
+  display: none;
 }
 
 .kpi-value {
   font-family: var(--font-sans);
-  font-size: 26px;
+  font-size: clamp(18px, 1rem + 2cqi, 26px);
   font-weight: 700;
   line-height: 1;
   color: var(--text-primary);
@@ -1092,4 +1094,33 @@ body {
 @media (min-width: 1200px) {
   .kpi-row { grid-template-columns: repeat(4, 1fr); }
   .chart-grid { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+}
+
+/* ── KPI card variants ─────────────────────────────────────────────── */
+
+/* Compact (160px+): horizontal — label visible, label left, value right */
+@container kpicard (min-width: 160px) {
+  .kpi {
+    justify-content: space-between;
+    padding: 10px 12px;
+  }
+  .kpi-label { display: block; }
+  .kpi::before {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    width: auto; height: 2px;
+    border-radius: 0;
+  }
+}
+
+/* Expanded (250px+): stacked — label top, big number below, hover lift */
+@container kpicard (min-width: 250px) {
+  .kpi {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 14px 16px;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .kpi:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0, 21, 88, 0.06); }
+  .kpi-label { margin-bottom: 6px; }
 }
