@@ -378,24 +378,37 @@ function wireDropdowns(container) {
   }
 }
 
+function updateSelectDisplay(select) {
+  if (!select.hasAttribute('multiple')) return;
+  var val = select.value;
+  var count = Array.isArray(val) ? val.length : 0;
+  var placeholder = select.getAttribute('placeholder') || 'All';
+  // Shoelace's display-input is inside shadow DOM
+  var displayInput = select.shadowRoot && select.shadowRoot.querySelector('.select__display-input');
+  if (displayInput) {
+    displayInput.placeholder = count > 0 ? count + ' selected' : placeholder;
+    displayInput.value = '';
+  }
+}
+
 function wireOneSelect(select) {
   var id = select.dataset.dropdownId;
   var isMulti = select.hasAttribute('multiple');
-  var placeholder = select.getAttribute('placeholder') || 'All';
 
   select.addEventListener('sl-change', function () {
     var val = select.value;
     if (isMulti) {
+      updateSelectDisplay(select);
       var count = Array.isArray(val) ? val.length : 0;
-      // Update the display input to show count since tags are hidden
-      var displayInput = select.shadowRoot && select.shadowRoot.querySelector('.select__display-input');
-      if (displayInput) {
-        displayInput.placeholder = count > 0 ? count + ' selected' : placeholder;
-      }
       setFilter(id, count > 0 ? val : null);
     } else {
       setFilter(id, val || null);
     }
+  });
+
+  // Update display after Shoelace finishes rendering
+  select.updateComplete && select.updateComplete.then(function () {
+    updateSelectDisplay(select);
   });
 }
 
@@ -403,11 +416,19 @@ function wireOneSelect(select) {
 function restoreDropdownsFromState() {
   var selects = document.querySelectorAll('sl-select[data-dropdown-id]');
   for (var i = 0; i < selects.length; ++i) {
-    var id = selects[i].dataset.dropdownId;
+    var select = selects[i];
+    var id = select.dataset.dropdownId;
     var vals = filterState[id];
     if (!vals) continue;
-    // Shoelace expects array for multiple, string for single
-    selects[i].value = Array.isArray(vals) ? vals : vals;
+    select.value = Array.isArray(vals) ? vals : vals;
+    // Update display after Shoelace processes the value change
+    (function (sel) {
+      if (sel.updateComplete) {
+        sel.updateComplete.then(function () { updateSelectDisplay(sel); });
+      } else {
+        setTimeout(function () { updateSelectDisplay(sel); }, 100);
+      }
+    })(select);
   }
 }
 

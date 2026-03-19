@@ -840,6 +840,7 @@ body {
 .ds-select::part(listbox) {
   font-family: var(--font-sans);
   font-size: 12px;
+  min-width: 240px;
 }
 .ds-select::part(display-input) {
   font-family: var(--font-sans);
