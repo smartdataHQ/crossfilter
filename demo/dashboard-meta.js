@@ -297,8 +297,24 @@ export function probeDataBounds(cubeName, partition, timeDimNames, numberDimName
     }),
   }).then(function (r) { return r.ok ? r.json() : null; }));
 
+  // Query 3: sample 20 consecutive records to measure data resolution
+  var sampleTimeName = cubeName + '.' + timeDimNames[0];
+  queries.push(fetch('/api/cube', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: {
+        dimensions: [sampleTimeName],
+        measures: [],
+        filters: [{ member: cubeName + '.partition', operator: 'equals', values: [partition] }],
+        order: [[ sampleTimeName, 'asc' ]],
+        limit: 20,
+      },
+    }),
+  }).then(function (r) { return r.ok ? r.json() : null; }));
+
   return Promise.all(queries).then(function (results) {
-    var bounds = { timeBounds: {}, numberBounds: {} };
+    var bounds = { timeBounds: {}, numberBounds: {}, dataResolutionDays: null };
     var earliest = results[0] && results[0].data && results[0].data[0];
     var latest = results[1] && results[1].data && results[1].data[0];
 
@@ -308,6 +324,21 @@ export function probeDataBounds(cubeName, partition, timeDimNames, numberDimName
       var maxVal = latest && latest[key] ? latest[key] : null;
       if (minVal || maxVal) {
         bounds.timeBounds[timeDimNames[i]] = { min: minVal, max: maxVal };
+      }
+    }
+
+    // Compute median interval from sample
+    var sample = results[2] && results[2].data;
+    if (sample && sample.length >= 2) {
+      var intervals = [];
+      for (var s = 1; s < sample.length; ++s) {
+        var t0 = new Date(sample[s - 1][sampleTimeName]).getTime();
+        var t1 = new Date(sample[s][sampleTimeName]).getTime();
+        if (t1 > t0) intervals.push((t1 - t0) / 86400000);
+      }
+      if (intervals.length > 0) {
+        intervals.sort(function (a, b) { return a - b; });
+        bounds.dataResolutionDays = intervals[Math.floor(intervals.length / 2)];
       }
     }
 
@@ -326,29 +357,36 @@ var GRANULARITY_BUCKETS = [
   { id: 'year',    label: 'Yearly',    days: 365 },
 ];
 
-// Infer which granularities make sense for a given time span.
+// Infer which granularities make sense for a given time span and data resolution.
 //
-// A granularity is included if it produces a reasonable number of buckets.
-// Min 3 buckets (otherwise too coarse to be useful).
-// Max depends on the granularity:
-//   - Hourly: cap at 168 (1 week of hours — beyond this, daily is better)
-//   - Daily: cap at 1500 (4+ years — time series charts handle this fine with zoom)
-//   - Everything else: no practical upper cap (weekly/monthly/quarterly never get too dense)
+// Two constraints determine the valid range:
+//   - Finest: limited by actual data resolution (median interval between records).
+//     A granularity is too fine if each bucket would have <1 record on average.
+//   - Coarsest: limited by the span. A granularity is too coarse if it would
+//     produce fewer than 3 buckets.
 //
-export function inferGranularities(minDate, maxDate) {
+// dataResolutionDays: median interval between consecutive records (in days).
+//   If null/0, no lower bound is applied (all fine granularities available).
+//
+export function inferGranularities(minDate, maxDate, dataResolutionDays) {
   if (!minDate || !maxDate) return ['day', 'week', 'month'];
 
   var spanDays = (new Date(maxDate).getTime() - new Date(minDate).getTime()) / 86400000;
-  var maxBuckets = { hour: 168, day: 1500, week: 520, month: 120, quarter: 40, year: 20 };
+  var resolution = typeof dataResolutionDays === 'number' && dataResolutionDays > 0 ? dataResolutionDays : 0;
   var result = [];
 
   for (var i = 0; i < GRANULARITY_BUCKETS.length; ++i) {
     var g = GRANULARITY_BUCKETS[i];
     var buckets = spanDays / g.days;
-    var cap = maxBuckets[g.id] || 500;
-    if (buckets >= 3 && buckets <= cap) {
-      result.push(g.id);
-    }
+
+    // Too coarse: fewer than 3 buckets
+    if (buckets < 3) continue;
+
+    // Too fine: bucket is smaller than the data resolution
+    // (each bucket would have <1 record — empty noise)
+    if (resolution > 0 && g.days < resolution) continue;
+
+    result.push(g.id);
   }
 
   return result.length > 0 ? result : ['day', 'week', 'month'];
@@ -356,8 +394,8 @@ export function inferGranularities(minDate, maxDate) {
 
 // Pick the best default granularity: the one closest to ~40 buckets
 // (good default density for a time series chart).
-export function inferDefaultGranularity(minDate, maxDate) {
-  var grans = inferGranularities(minDate, maxDate);
+export function inferDefaultGranularity(minDate, maxDate, dataResolutionDays) {
+  var grans = inferGranularities(minDate, maxDate, dataResolutionDays);
   if (!minDate || !maxDate || grans.length === 0) return 'day';
 
   var spanDays = (new Date(maxDate).getTime() - new Date(minDate).getTime()) / 86400000;
