@@ -16,11 +16,15 @@
 <body>
 <script src="../node_modules/flatpickr/dist/flatpickr.min.js"></script>
 <script src="../node_modules/nouislider/dist/nouislider.min.js"></script>
-<!-- Shoelace autoloader: registers custom elements on demand -->
+<!-- Shoelace: explicit component imports -->
 <script type="module">
   import { setBasePath } from '../node_modules/@shoelace-style/shoelace/dist/utilities/base-path.js';
   setBasePath('/node_modules/@shoelace-style/shoelace/dist');
-  import '../node_modules/@shoelace-style/shoelace/dist/shoelace-autoloader.js';
+  // Import only the components we use
+  import '../node_modules/@shoelace-style/shoelace/dist/components/select/select.js';
+  import '../node_modules/@shoelace-style/shoelace/dist/components/option/option.js';
+  import '../node_modules/@shoelace-style/shoelace/dist/components/tooltip/tooltip.js';
+  import '../node_modules/@shoelace-style/shoelace/dist/components/tag/tag.js';
 </script>
 <div id="error-banner" class="error-banner" hidden></div>
 <div id="dashboard" class="dashboard"></div>
