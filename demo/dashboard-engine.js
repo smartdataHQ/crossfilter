@@ -511,7 +511,7 @@ function restoreDropdownsFromState() {
 // ── Model Intelligence Bar ────────────────────────────────────────────
 // Principle 2: description tucked behind (i), clean surface
 
-function buildModelBar(config, registry, inlinePanels) {
+function buildModelBar(config, registry, inlinePanels, timePanelInfo) {
   var modelBarConfig = config.modelBar;
   if (modelBarConfig === false) return null;
   modelBarConfig = modelBarConfig || {};
@@ -539,7 +539,7 @@ function buildModelBar(config, registry, inlinePanels) {
   bar.className = 'model-bar anim d1';
   var html = '';
 
-  // Cube identity — user-facing, with (i) for full description (Principle 2)
+  // Title line with period control right-aligned
   html += '<div class="model-bar-header">';
   html += '<div class="model-bar-identity">';
   html += '<span class="model-bar-title">' + escapeHtml(registry.title) + '</span>';
@@ -547,6 +547,10 @@ function buildModelBar(config, registry, inlinePanels) {
     html += infoIcon(registry.description);
   }
   html += '</div>';
+  // Period control in the title line
+  if (timePanelInfo) {
+    html += buildPeriodControl(timePanelInfo.timeBounds, timePanelInfo.granularity);
+  }
   html += '</div>';
 
   html += '<div class="model-bar-controls">';
@@ -760,12 +764,8 @@ function buildPanelCard(panel, accentIdx, registry) {
     '</div>';
 
   } else if (panel.chart === 'line') {
-    // Time bounds come from probed data (stored on panel at resolve time)
-    var timeBounds = panel._timeBounds || null;
-    body = '<div class="card-head card-head--sub">' +
-      buildPeriodSelector(panel.id, timeBounds, panel.granularity) +
-    '</div>' +
-    '<div id="chart-' + panel.id + '" class="chart-wrap chart-wrap-timeline">' +
+    // Period/granularity controls are in the model bar title line
+    body = '<div id="chart-' + panel.id + '" class="chart-wrap chart-wrap-timeline">' +
       buildSkeletonLine() +
     '</div>';
 
@@ -899,67 +899,48 @@ function wireRangeSelector(container, panelId, dimension) {
   updateFill();
 }
 
-// ── Period Selector (time range + granularity) ────────────────────────
+// ── Period Selector (flatpickr range + smart granularity) ─────────────
 
-function buildPeriodSelector(panelId, timeBounds, granularity) {
+var GRAN_LABELS = { hour: 'Hourly', day: 'Daily', week: 'Weekly', month: 'Monthly', quarter: 'Quarterly', year: 'Yearly' };
+
+function formatDateRange(from, to) {
+  if (!from && !to) return 'All time';
+  var a = new Date(from);
+  var b = new Date(to);
+  var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var sameYear = a.getUTCFullYear() === b.getUTCFullYear();
+  var sameMonth = sameYear && a.getUTCMonth() === b.getUTCMonth();
+
+  if (sameMonth) {
+    // "Mar 1–19, 2026"
+    return months[a.getUTCMonth()] + ' ' + a.getUTCDate() + '\u2013' + b.getUTCDate() + ', ' + a.getUTCFullYear();
+  }
+  if (sameYear) {
+    // "Jan 15 – Mar 19, 2026"
+    return months[a.getUTCMonth()] + ' ' + a.getUTCDate() + ' \u2013 ' + months[b.getUTCMonth()] + ' ' + b.getUTCDate() + ', ' + a.getUTCFullYear();
+  }
+  // "Sep 2023 – Mar 2026"
+  return months[a.getUTCMonth()] + ' ' + a.getUTCFullYear() + ' \u2013 ' + months[b.getUTCMonth()] + ' ' + b.getUTCFullYear();
+}
+
+function buildPeriodControl(timeBounds, granularity) {
   var min = timeBounds && timeBounds.min ? timeBounds.min.slice(0, 10) : '';
   var max = timeBounds && timeBounds.max ? timeBounds.max.slice(0, 10) : '';
   var grans = inferGranularities(min, max);
   var defaultGran = granularity || inferDefaultGranularity(min, max);
-  var presets = inferPeriodPresets(min, max);
+  var rangeLabel = formatDateRange(min, max);
 
-  // Format dates for display
-  var displayMin = min ? formatDateShort(min) : '';
-  var displayMax = max ? formatDateShort(max) : '';
-  var rangeLabel = displayMin && displayMax ? displayMin + ' \u2013 ' + displayMax : 'All time';
+  var html = '<div class="period-control" id="period-control">';
 
-  var html = '<div class="period-sel" data-period-id="' + panelId + '">';
+  // Date range trigger — flatpickr will attach here
+  html += '<input type="text" class="period-trigger" id="period-trigger" value="' + escapeHtml(rangeLabel) + '" readonly>';
 
-  // Period dropdown trigger
-  html += '<div class="dropdown" data-dropdown-id="_period_' + panelId + '">';
-  html += '<button class="dropdown-trigger" type="button">';
-  html += '<span class="dropdown-label">Period</span>';
-  html += '<span class="dropdown-value dropdown-value--active" id="period-label-' + panelId + '">' + rangeLabel + '</span>';
-  html += '<span class="dropdown-arrow">&#9662;</span>';
-  html += '</button>';
-  html += '<div class="dropdown-panel period-panel">';
-
-  // Presets
-  if (presets.length > 0) {
-    html += '<div class="period-presets">';
-    for (var p = 0; p < presets.length; ++p) {
-      var preset = presets[p];
-      var pData = preset.days ? 'data-days="' + preset.days + '"' : '';
-      if (preset.from) pData += ' data-from="' + preset.from + '"';
-      html += '<button class="period-preset-btn" ' + pData + '>' + escapeHtml(preset.label) + '</button>';
-    }
-    html += '</div>';
-  }
-
-  // Custom date range
-  html += '<div class="period-custom">';
-  html += '<div class="period-field">';
-  html += '<label class="period-field-label">From</label>';
-  html += '<input type="date" class="period-date" id="period-from-' + panelId + '"' +
-    (min ? ' value="' + min + '" min="' + min + '"' : '') +
-    (max ? ' max="' + max + '"' : '') + '>';
-  html += '</div>';
-  html += '<div class="period-field">';
-  html += '<label class="period-field-label">To</label>';
-  html += '<input type="date" class="period-date" id="period-to-' + panelId + '"' +
-    (max ? ' value="' + max + '" max="' + max + '"' : '') +
-    (min ? ' min="' + min + '"' : '') + '>';
-  html += '</div>';
-  html += '</div>';
-
-  html += '</div></div>';
-
-  // Granularity buttons — only valid options for this time span
-  html += '<div class="gran-btns">';
+  // Granularity — only valid options, auto-probed
+  html += '<div class="period-grans" id="period-grans">';
   for (var g = 0; g < grans.length; ++g) {
-    var isActive = grans[g] === defaultGran ? ' active' : '';
-    html += '<button class="gran-btn' + isActive + '" data-gran="' + grans[g] + '">' +
-      granularityLabel(grans[g]) + '</button>';
+    var active = grans[g] === defaultGran ? ' active' : '';
+    html += '<button class="gran-btn' + active + '" data-gran="' + grans[g] + '">' +
+      (GRAN_LABELS[grans[g]] || grans[g]) + '</button>';
   }
   html += '</div>';
 
@@ -967,80 +948,101 @@ function buildPeriodSelector(panelId, timeBounds, granularity) {
   return html;
 }
 
-function granularityLabel(gran) {
-  // Short, user-friendly labels
-  var labels = { hour: 'Hourly', day: 'Daily', week: 'Weekly', month: 'Monthly', quarter: 'Quarterly', year: 'Yearly' };
-  return labels[gran] || gran.charAt(0).toUpperCase() + gran.slice(1);
-}
+function wirePeriodControl(container, dimension, timeBounds) {
+  var trigger = container.querySelector('#period-trigger');
+  var gransEl = container.querySelector('#period-grans');
+  if (!trigger) return;
 
-function formatDateShort(dateStr) {
-  if (!dateStr) return '';
-  var d = new Date(dateStr);
-  var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  return months[d.getUTCMonth()] + ' ' + d.getUTCDate() + ', ' + d.getUTCFullYear();
-}
+  var min = timeBounds && timeBounds.min ? timeBounds.min.slice(0, 10) : null;
+  var max = timeBounds && timeBounds.max ? timeBounds.max.slice(0, 10) : null;
+  var presets = inferPeriodPresets(min, max);
+  var flatpickr = globalThis.flatpickr;
 
-function wirePeriodSelector(container, panelId, dimension, timeBounds) {
-  var el = container.querySelector('[data-period-id="' + panelId + '"]');
-  if (!el) return;
+  if (flatpickr) {
+    var fp = flatpickr(trigger, {
+      mode: 'range',
+      dateFormat: 'Y-m-d',
+      minDate: min || undefined,
+      maxDate: max || undefined,
+      defaultDate: [min, max],
+      showMonths: 2,
+      animate: true,
+      onChange: function (dates) {
+        if (dates.length === 2) {
+          var from = dates[0].toISOString().slice(0, 10);
+          var to = dates[1].toISOString().slice(0, 10);
+          trigger.value = formatDateRange(from, to);
+          setFilter(dimension, [from, to]);
 
-  var periodLabel = el.querySelector('#period-label-' + panelId);
-  var fromInput = el.querySelector('#period-from-' + panelId);
-  var toInput = el.querySelector('#period-to-' + panelId);
-  var max = timeBounds && timeBounds.max ? timeBounds.max.slice(0, 10) : '';
-  var min = timeBounds && timeBounds.min ? timeBounds.min.slice(0, 10) : '';
-
-  // Preset buttons
-  el.addEventListener('click', function (e) {
-    var preset = e.target.closest('.period-preset-btn');
-    if (preset) {
-      var days = parseInt(preset.dataset.days);
-      var fromDate = preset.dataset.from;
-      if (days && max) {
-        var to = new Date(max);
-        var from = new Date(to.getTime() - days * 86400000);
-        fromInput.value = from.toISOString().slice(0, 10);
-        toInput.value = max;
-      } else if (fromDate) {
-        fromInput.value = fromDate;
-        toInput.value = max;
-      } else {
-        // All time
-        fromInput.value = min;
-        toInput.value = max;
-      }
-      updatePeriod();
-      return;
-    }
-
-    // Granularity buttons
-    var granBtn = e.target.closest('.gran-btn');
-    if (granBtn) {
-      var siblings = el.querySelectorAll('.gran-btn');
-      for (var i = 0; i < siblings.length; ++i) siblings[i].classList.remove('active');
-      granBtn.classList.add('active');
-      setFilter('_granularity', granBtn.dataset.gran);
-    }
-  });
-
-  // Custom date inputs
-  fromInput.addEventListener('change', updatePeriod);
-  toInput.addEventListener('change', updatePeriod);
-
-  function updatePeriod() {
-    var from = fromInput.value;
-    var to = toInput.value;
-    if (from && to) {
-      periodLabel.textContent = formatDateShort(from) + ' \u2013 ' + formatDateShort(to);
-      setFilter(dimension, [from, to]);
-    }
-    // Close dropdown
-    var panel = el.querySelector('.dropdown-panel');
-    if (panel) panel.classList.remove('dropdown-panel--open');
+          // Update granularity options for new range
+          var newGrans = inferGranularities(from, to);
+          updateGranButtons(gransEl, newGrans);
+        }
+      },
+      onReady: function (selectedDates, dateStr, instance) {
+        // Add preset buttons to the flatpickr calendar
+        if (presets.length > 0) {
+          var presetBar = document.createElement('div');
+          presetBar.className = 'flatpickr-presets';
+          for (var p = 0; p < presets.length; ++p) {
+            var btn = document.createElement('button');
+            btn.className = 'period-preset-btn';
+            btn.textContent = presets[p].label;
+            btn.type = 'button';
+            (function (preset) {
+              btn.addEventListener('click', function () {
+                var to = max ? new Date(max) : new Date();
+                var from;
+                if (preset.days) {
+                  from = new Date(to.getTime() - preset.days * 86400000);
+                } else if (preset.from) {
+                  from = new Date(preset.from);
+                } else {
+                  from = min ? new Date(min) : new Date(to.getTime() - 365 * 86400000);
+                }
+                instance.setDate([from, to], true);
+              });
+            })(presets[p]);
+            presetBar.appendChild(btn);
+          }
+          instance.calendarContainer.prepend(presetBar);
+        }
+      },
+    });
   }
 
-  // Wire the dropdown open/close
-  wireDropdowns(el);
+  // Granularity clicks
+  if (gransEl) {
+    gransEl.addEventListener('click', function (e) {
+      var btn = e.target.closest('.gran-btn');
+      if (!btn) return;
+      var siblings = gransEl.querySelectorAll('.gran-btn');
+      for (var i = 0; i < siblings.length; ++i) siblings[i].classList.remove('active');
+      btn.classList.add('active');
+      setFilter('_granularity', btn.dataset.gran);
+    });
+  }
+}
+
+function updateGranButtons(gransEl, newGrans) {
+  if (!gransEl) return;
+  // Preserve current selection if still valid
+  var current = gransEl.querySelector('.gran-btn.active');
+  var currentGran = current ? current.dataset.gran : null;
+
+  var html = '';
+  for (var g = 0; g < newGrans.length; ++g) {
+    var active = newGrans[g] === currentGran ? ' active' : '';
+    html += '<button class="gran-btn' + active + '" data-gran="' + newGrans[g] + '">' +
+      (GRAN_LABELS[newGrans[g]] || newGrans[g]) + '</button>';
+  }
+  gransEl.innerHTML = html;
+
+  // If current selection is no longer valid, pick best default
+  if (currentGran && newGrans.indexOf(currentGran) < 0) {
+    var first = gransEl.querySelector('.gran-btn');
+    if (first) first.classList.add('active');
+  }
 }
 
 // ── Skeleton placeholders ─────────────────────────────────────────────
@@ -1150,10 +1152,6 @@ function wireCardInteractions(card, panel) {
     });
   }
 
-  // Period selector for time series panels
-  if (panel.chart === 'line' && panel._timeBounds) {
-    wirePeriodSelector(card, panel.id, panel.dimension, panel._timeBounds);
-  }
 }
 
 // ── Dashboard DOM Assembly ────────────────────────────────────────────
@@ -1246,8 +1244,27 @@ function buildDashboardDOM(container, config, sections, registry) {
     }
   }
 
-  var modelBar = buildModelBar(config, registry, modelbarPanels);
-  if (modelBar) container.appendChild(modelBar);
+  // Find the first time-series panel for the period control
+  var timePanelInfo = null;
+  for (var tpi = 0; tpi < filteredSections.length; ++tpi) {
+    for (var tpj = 0; tpj < filteredSections[tpi].panels.length; ++tpj) {
+      var tp = filteredSections[tpi].panels[tpj];
+      if (tp.chart === 'line' && tp._timeBounds) {
+        timePanelInfo = { dimension: tp.dimension, timeBounds: tp._timeBounds, granularity: tp.granularity };
+        break;
+      }
+    }
+    if (timePanelInfo) break;
+  }
+
+  var modelBar = buildModelBar(config, registry, modelbarPanels, timePanelInfo);
+  if (modelBar) {
+    container.appendChild(modelBar);
+    // Wire the period control after DOM insertion
+    if (timePanelInfo) {
+      wirePeriodControl(modelBar, timePanelInfo.dimension, timePanelInfo.timeBounds);
+    }
+  }
 
   var animDelay = 2;
   var kpiAccent = 0;
