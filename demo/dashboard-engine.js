@@ -202,6 +202,17 @@ function formatCount(n) {
 
 // ── Principle 8: Filter Chips (visible, removable) ────────────────────
 
+// Resolve raw filter value to human label by looking up sl-option text
+function resolveFilterLabel(dim, rawValue) {
+  var select = document.querySelector('sl-select[data-dropdown-id="' + dim + '"]');
+  if (select) {
+    var option = select.querySelector('sl-option[value="' + rawValue + '"]');
+    if (option) return option.textContent.trim();
+  }
+  // Fallback: title-case the raw value
+  return rawValue.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+}
+
 var _chipListenerWired = false;
 
 function renderFilterChips() {
@@ -224,14 +235,13 @@ function renderFilterChips() {
     var displayDim = dim.replace(/^_/, '').replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
 
     if (vals.length === 1) {
-      // Single value — simple chip with × to remove
+      var chipLabel = resolveFilterLabel(dim, vals[0]);
       var chip = document.createElement('span');
       chip.className = 'filter-chip';
-      chip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(displayDim) + ': ' + escapeHtml(vals[0]) + '</span>' +
+      chip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(displayDim) + ': ' + escapeHtml(chipLabel) + '</span>' +
         '<button class="filter-chip-remove" data-dim="' + escapeHtml(dim) + '">&times;</button>';
       container.appendChild(chip);
     } else {
-      // Multiple values — expandable chip group
       var group = document.createElement('span');
       group.className = 'filter-chip-group';
 
@@ -245,9 +255,10 @@ function renderFilterChips() {
       var expandPanel = document.createElement('div');
       expandPanel.className = 'filter-chip-expand';
       for (var v = 0; v < vals.length; ++v) {
+        var subLabel = resolveFilterLabel(dim, vals[v]);
         var subChip = document.createElement('span');
         subChip.className = 'filter-chip filter-chip--sub';
-        subChip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(vals[v]) + '</span>' +
+        subChip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(subLabel) + '</span>' +
           '<button class="filter-chip-remove-one" data-dim="' + escapeHtml(dim) + '" data-val="' + escapeHtml(vals[v]) + '">&times;</button>';
         expandPanel.appendChild(subChip);
       }
@@ -376,8 +387,11 @@ function wireOneSelect(select) {
     var val = select.value;
     if (isMulti) {
       var count = Array.isArray(val) ? val.length : 0;
-      // Update the display text to show count (tags are hidden)
-      select.displayLabel = count > 0 ? count + ' selected' : '';
+      // Update the display input to show count since tags are hidden
+      var displayInput = select.shadowRoot && select.shadowRoot.querySelector('.select__display-input');
+      if (displayInput) {
+        displayInput.placeholder = count > 0 ? count + ' selected' : placeholder;
+      }
       setFilter(id, count > 0 ? val : null);
     } else {
       setFilter(id, val || null);

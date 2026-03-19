@@ -844,10 +844,9 @@ body {
 .ds-select::part(display-input) {
   font-family: var(--font-sans);
 }
-/* When items are selected, show count in the trigger instead of tags */
-.ds-select[multiple]::part(combobox)::after {
-  font-size: 11px; color: var(--accent-blue);
-}
+/* Hide selected tags in the trigger — filter chips bar handles this */
+.ds-select::part(tags) { display: none; }
+.ds-select::part(clear-button) { display: none; }
 
 /* Filter chips (Principle 8: visible, removable) */
 .filter-chip {
