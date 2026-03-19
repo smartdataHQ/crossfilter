@@ -409,7 +409,11 @@ function wireOneDropdown(dropdown) {
   var id = dropdown.dataset.dropdownId;
   var valueEl = dropdown.querySelector('.dropdown-value');
 
-  // Toggle panel — position with fixed coords to escape any containment
+  // Move panel to <body> so it escapes all containment contexts
+  // (backdrop-filter, transform, contain all break position:fixed)
+  document.body.appendChild(panel);
+
+  // Toggle panel
   trigger.addEventListener('mousedown', function (e) {
     e.preventDefault();
     e.stopPropagation();
@@ -419,10 +423,8 @@ function wireOneDropdown(dropdown) {
     for (var i = 0; i < allPanels.length; ++i) allPanels[i].classList.remove('dropdown-panel--open');
     // Toggle this one
     if (!wasOpen) {
-      // Position the panel below the trigger
       var rect = trigger.getBoundingClientRect();
       panel.style.top = (rect.bottom + 4) + 'px';
-      // Prefer right-aligned if near the right edge
       var spaceRight = window.innerWidth - rect.right;
       if (spaceRight < 200) {
         panel.style.left = '';

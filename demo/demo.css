@@ -853,13 +853,15 @@ body {
 .dropdown-value { color: var(--text-secondary); }
 .dropdown-value--active { color: var(--accent-blue); font-weight: 600; }
 .dropdown-arrow { font-size: 8px; color: var(--text-muted); margin-left: 2px; }
+/* Dropdown panels are moved to <body> by JS to escape all containment */
+/* (backdrop-filter, transform, contain all break position:fixed).     */
 .dropdown-panel {
   position: fixed; z-index: 200;
   min-width: 180px; max-height: 320px;
   background: var(--bg-card-solid, #fff);
   border: 1px solid var(--border);
   border-radius: var(--radius, 8px);
-  box-shadow: var(--shadow-hover, 0 4px 20px rgba(0,21,88,0.1));
+  box-shadow: 0 8px 32px rgba(0, 21, 88, 0.12);
   flex-direction: column;
   overflow: hidden;
   display: none;
