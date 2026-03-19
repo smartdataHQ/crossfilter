@@ -87,16 +87,16 @@ function clearAllFilters() {
   writeUrlState(filterState);
   renderFilterChips();
   notifyFilterChange();
-  // Reset all selection states
-  var actives = document.querySelectorAll('.mode-btn.active, .dim-item--selected, .dropdown-item--selected, .pill--active, .pill--negative, .dropdown-value--active');
-  for (var i = 0; i < actives.length; ++i) {
-    actives[i].classList.remove('active', 'dim-item--selected', 'dropdown-item--selected', 'pill--active', 'pill--negative', 'dropdown-value--active');
+  // Reset Shoelace selects
+  var selects = document.querySelectorAll('sl-select[data-dropdown-id]');
+  for (var i = 0; i < selects.length; ++i) {
+    selects[i].value = selects[i].multiple ? [] : '';
   }
-  // Reset dropdown trigger labels
-  var ddValues = document.querySelectorAll('.dropdown-value');
-  for (var j = 0; j < ddValues.length; ++j) {
-    if (ddValues[j].dataset.placeholder) ddValues[j].textContent = ddValues[j].dataset.placeholder;
-  }
+  // Reset toggle buttons
+  var actives = document.querySelectorAll('.mode-btn.active');
+  for (var j = 0; j < actives.length; ++j) actives[j].classList.remove('active');
+  var allBtns = document.querySelectorAll('[data-toggle][data-val="all"]');
+  for (var k = 0; k < allBtns.length; ++k) allBtns[k].classList.add('active');
 }
 
 function notifyFilterChange() {
@@ -293,35 +293,17 @@ function renderFilterChips() {
 }
 
 function syncDropdownAfterRemove(dim, singleVal) {
-  var dd = document.querySelector('[data-dropdown-id="' + dim + '"]');
-  if (!dd) return;
+  var select = document.querySelector('sl-select[data-dropdown-id="' + dim + '"]');
+  if (!select) return;
 
-  if (singleVal) {
-    // Deselect just this one
-    var items = dd.querySelectorAll('.dropdown-item--selected');
-    for (var i = 0; i < items.length; ++i) {
-      if (items[i].dataset.value === singleVal) items[i].classList.remove('dropdown-item--selected');
-    }
+  if (singleVal && select.multiple) {
+    // Remove one value from the array
+    var current = Array.isArray(select.value) ? select.value.slice() : [];
+    var idx = current.indexOf(singleVal);
+    if (idx >= 0) current.splice(idx, 1);
+    select.value = current;
   } else {
-    // Deselect all
-    var selected = dd.querySelectorAll('.dropdown-item--selected');
-    for (var j = 0; j < selected.length; ++j) selected[j].classList.remove('dropdown-item--selected');
-  }
-
-  // Update trigger label
-  var remaining = dd.querySelectorAll('.dropdown-item--selected');
-  var valueEl = dd.querySelector('.dropdown-value');
-  if (!valueEl) return;
-  if (remaining.length === 0) {
-    valueEl.textContent = valueEl.dataset.placeholder || 'All';
-    valueEl.classList.remove('dropdown-value--active');
-  } else if (remaining.length === 1) {
-    var label = remaining[0].querySelector('.dropdown-item-label');
-    valueEl.textContent = label ? label.textContent : '';
-    valueEl.classList.add('dropdown-value--active');
-  } else {
-    valueEl.textContent = remaining.length + ' selected';
-    valueEl.classList.add('dropdown-value--active');
+    select.value = select.multiple ? [] : '';
   }
 }
 
@@ -329,7 +311,7 @@ function syncDropdownAfterRemove(dim, singleVal) {
 
 function infoIcon(text) {
   if (!text || !text.trim()) return '';
-  return ' <span class="info-tip"><span class="info-icon">i</span><span class="info-tip-content">' + escapeHtml(text.trim()) + '</span></span>';
+  return ' <sl-tooltip content="' + escapeHtml(text.trim()) + '" hoist><span class="info-icon">i</span></sl-tooltip>';
 }
 
 // ── Header ────────────────────────────────────────────────────────────
@@ -350,192 +332,62 @@ function buildHeader(config) {
   return header;
 }
 
-// ── Custom Dropdown (Principle 1: informative, searchable selectors) ──
+// ── Dropdowns — Shoelace <sl-select> (Principle 1 + 14) ───────────────
 
 function buildDropdown(id, label, placeholder, items, multiSelect) {
-  var btnLabel = placeholder;
-  var html = '<div class="dropdown" data-dropdown-id="' + escapeHtml(id) + '"' +
-    (multiSelect ? '' : ' data-single-select="true"') + '>';
-  html += '<button class="dropdown-trigger" type="button">';
-  html += '<span class="dropdown-label">' + escapeHtml(label) + '</span>';
-  html += '<span class="dropdown-value" id="dd-val-' + escapeHtml(id) + '">' + escapeHtml(btnLabel) + '</span>';
-  html += '<span class="dropdown-arrow">&#9662;</span>';
-  html += '</button>';
-  html += '<div class="dropdown-panel">';
-  if (items.length > 6) {
-    html += '<input type="text" class="dropdown-search" placeholder="Search\u2026">';
-  }
-  html += '<div class="dropdown-items">';
+  var html = '<sl-select' +
+    ' data-dropdown-id="' + escapeHtml(id) + '"' +
+    ' placeholder="' + escapeHtml(placeholder) + '"' +
+    ' label="' + escapeHtml(label) + '"' +
+    ' size="small"' +
+    ' hoist' +
+    (multiSelect ? ' multiple' : '') +
+    (multiSelect ? ' clearable' : '') +
+    (items.length > 6 ? ' data-searchable="true"' : '') +
+    ' style="min-width:140px; max-width:220px"' +
+    '>';
   for (var i = 0; i < items.length; ++i) {
     var item = items[i];
-    // Pre-select if the label matches the placeholder (for single-select defaults)
-    var preSelected = (!multiSelect && item.label === placeholder) ? ' dropdown-item--selected' : '';
-    html += '<div class="dropdown-item' + preSelected + '" data-value="' + escapeHtml(item.value) + '">';
-    html += '<span class="dropdown-item-label">' + escapeHtml(item.label) + '</span>';
-    html += '<span class="dropdown-item-count"></span>';
-    if (item.description) {
-      html += infoIcon(item.description);
-    }
-    html += '</div>';
+    var selected = (!multiSelect && item.label === placeholder) ? ' checked' : '';
+    html += '<sl-option value="' + escapeHtml(item.value) + '"' + selected + '>' +
+      escapeHtml(item.label) +
+    '</sl-option>';
   }
-  html += '</div></div></div>';
+  html += '</sl-select>';
   return html;
 }
 
-var _dropdownCloseWired = false;
+// ── Wire Shoelace selects ─────────────────────────────────────────────
 
 function wireDropdowns(container) {
-  var dropdowns = container.querySelectorAll('.dropdown');
-  for (var i = 0; i < dropdowns.length; ++i) {
-    wireOneDropdown(dropdowns[i]);
-  }
-
-  // Close all dropdowns when clicking outside — wire once globally
-  if (!_dropdownCloseWired) {
-    _dropdownCloseWired = true;
-    document.addEventListener('mousedown', function (e) {
-      if (!e.target.closest('.dropdown')) {
-        var allPanels = document.querySelectorAll('.dropdown-panel--open');
-        for (var j = 0; j < allPanels.length; ++j) allPanels[j].classList.remove('dropdown-panel--open');
-      }
-    });
+  var selects = container.querySelectorAll('sl-select[data-dropdown-id]');
+  for (var i = 0; i < selects.length; ++i) {
+    wireOneSelect(selects[i]);
   }
 }
 
-function wireOneDropdown(dropdown) {
-  var trigger = dropdown.querySelector('.dropdown-trigger');
-  var panel = dropdown.querySelector('.dropdown-panel');
-  var search = dropdown.querySelector('.dropdown-search');
-  var id = dropdown.dataset.dropdownId;
-  var valueEl = dropdown.querySelector('.dropdown-value');
-
-  // Move panel to <body> so it escapes all containment contexts
-  // (backdrop-filter, transform, contain all break position:fixed)
-  document.body.appendChild(panel);
-
-  // Toggle panel
-  trigger.addEventListener('mousedown', function (e) {
-    e.preventDefault();
-    e.stopPropagation();
-    var wasOpen = panel.classList.contains('dropdown-panel--open');
-    // Close all dropdowns first
-    var allPanels = document.querySelectorAll('.dropdown-panel--open');
-    for (var i = 0; i < allPanels.length; ++i) allPanels[i].classList.remove('dropdown-panel--open');
-    // Toggle this one
-    if (!wasOpen) {
-      var rect = trigger.getBoundingClientRect();
-      panel.style.top = (rect.bottom + 4) + 'px';
-      var spaceRight = window.innerWidth - rect.right;
-      if (spaceRight < 200) {
-        panel.style.left = '';
-        panel.style.right = (window.innerWidth - rect.right) + 'px';
-      } else {
-        panel.style.left = rect.left + 'px';
-        panel.style.right = '';
-      }
-      panel.classList.add('dropdown-panel--open');
-      if (search) {
-        search.value = '';
-        setTimeout(function () { search.focus(); }, 0);
-        filterDropdownItems(panel, '');
-      }
+function wireOneSelect(select) {
+  var id = select.dataset.dropdownId;
+  select.addEventListener('sl-change', function () {
+    var val = select.value;
+    // sl-select returns string for single, array for multiple
+    if (Array.isArray(val)) {
+      setFilter(id, val.length > 0 ? val : null);
+    } else {
+      setFilter(id, val || null);
     }
   });
-
-  // Search
-  if (search) {
-    search.addEventListener('input', function () {
-      filterDropdownItems(panel, search.value);
-    });
-    search.addEventListener('click', function (e) { e.stopPropagation(); });
-  }
-
-  // Item selection — single-select (radio) or multi-select
-  var singleSelect = dropdown.dataset.singleSelect === 'true';
-
-  panel.addEventListener('click', function (e) {
-    var item = e.target.closest('.dropdown-item');
-    if (!item) return;
-    e.stopPropagation();
-
-    if (singleSelect) {
-      // Radio: deselect all, select this one
-      var allItems = panel.querySelectorAll('.dropdown-item--selected');
-      for (var j = 0; j < allItems.length; ++j) allItems[j].classList.remove('dropdown-item--selected');
-      item.classList.add('dropdown-item--selected');
-      // Close immediately
-      panel.classList.remove('dropdown-panel--open');
-    } else {
-      item.classList.toggle('dropdown-item--selected');
-    }
-
-    // Collect selected values
-    var selected = panel.querySelectorAll('.dropdown-item--selected');
-    var vals = [];
-    for (var i = 0; i < selected.length; ++i) {
-      vals.push(selected[i].dataset.value);
-    }
-
-    // Update trigger label
-    if (vals.length === 0) {
-      valueEl.textContent = valueEl.dataset.placeholder || 'All';
-      valueEl.classList.remove('dropdown-value--active');
-    } else if (vals.length === 1) {
-      var selLabel = selected[0].querySelector('.dropdown-item-label');
-      valueEl.textContent = selLabel ? selLabel.textContent : vals[0];
-      valueEl.classList.add('dropdown-value--active');
-    } else {
-      valueEl.textContent = vals.length + ' selected';
-      valueEl.classList.add('dropdown-value--active');
-    }
-
-    setFilter(id, singleSelect ? vals[0] : vals);
-  });
-
-  // Store placeholder on the value element
-  valueEl.dataset.placeholder = valueEl.textContent;
 }
 
-function filterDropdownItems(panel, query) {
-  var items = panel.querySelectorAll('.dropdown-item');
-  var q = query.toLowerCase();
-  for (var i = 0; i < items.length; ++i) {
-    var label = items[i].querySelector('.dropdown-item-label');
-    var text = label ? label.textContent.toLowerCase() : '';
-    items[i].style.display = (!q || text.indexOf(q) >= 0) ? '' : 'none';
-  }
-}
-
-// Restore dropdown selections from URL filter state
+// Restore select values from URL filter state
 function restoreDropdownsFromState() {
-  var dropdowns = document.querySelectorAll('.dropdown');
-  for (var i = 0; i < dropdowns.length; ++i) {
-    var dd = dropdowns[i];
-    var id = dd.dataset.dropdownId;
+  var selects = document.querySelectorAll('sl-select[data-dropdown-id]');
+  for (var i = 0; i < selects.length; ++i) {
+    var id = selects[i].dataset.dropdownId;
     var vals = filterState[id];
     if (!vals) continue;
-    if (!Array.isArray(vals)) vals = [vals];
-
-    var items = dd.querySelectorAll('.dropdown-item');
-    var selectedCount = 0;
-    for (var j = 0; j < items.length; ++j) {
-      if (vals.indexOf(items[j].dataset.value) >= 0) {
-        items[j].classList.add('dropdown-item--selected');
-        selectedCount++;
-      }
-    }
-
-    // Update trigger label
-    var valueEl = dd.querySelector('.dropdown-value');
-    if (valueEl && selectedCount > 0) {
-      if (selectedCount === 1) {
-        var sel = dd.querySelector('.dropdown-item--selected .dropdown-item-label');
-        valueEl.textContent = sel ? sel.textContent : vals[0];
-      } else {
-        valueEl.textContent = selectedCount + ' selected';
-      }
-      valueEl.classList.add('dropdown-value--active');
-    }
+    // Shoelace expects array for multiple, string for single
+    selects[i].value = Array.isArray(vals) ? vals : vals;
   }
 }
 
@@ -834,100 +686,41 @@ function buildPanelCard(panel, accentIdx, registry) {
   return card;
 }
 
-// ── Principle 13: Range selector with visible values ──────────────────
+// ── Range selector — noUiSlider (Principle 13 + 14) ──────────────────
 
 function buildRangeSelector(id, label, compact) {
   var cls = compact ? 'range-sel range-sel--compact' : 'range-sel';
   return '<div class="' + cls + '" data-range-id="' + id + '">' +
     '<span class="range-sel-val range-sel-lo-val" id="range-lo-val-' + id + '">0</span>' +
-    '<div class="range-sel-track">' +
-      '<div class="range-sel-fill" id="range-fill-' + id + '"></div>' +
-      '<input type="range" class="range-sel-input range-sel-lo" id="range-lo-' + id + '" min="0" max="100" value="0">' +
-      '<input type="range" class="range-sel-input range-sel-hi" id="range-hi-' + id + '" min="0" max="100" value="100">' +
-    '</div>' +
+    '<div class="range-sel-slider" id="range-slider-' + id + '"></div>' +
     '<span class="range-sel-val range-sel-hi-val" id="range-hi-val-' + id + '">100</span>' +
   '</div>';
 }
 
 function wireRangeSelector(container, panelId, dimension) {
-  var el = container.querySelector('[data-range-id="' + panelId + '"]');
-  if (!el) return;
-  var lo = el.querySelector('.range-sel-lo');
-  var hi = el.querySelector('.range-sel-hi');
-  var fill = el.querySelector('.range-sel-fill');
-  var loVal = el.querySelector('.range-sel-lo-val');
-  var hiVal = el.querySelector('.range-sel-hi-val');
-  var track = el.querySelector('.range-sel-track');
+  var sliderEl = container.querySelector('#range-slider-' + panelId);
+  if (!sliderEl) return;
+  var loVal = container.querySelector('#range-lo-val-' + panelId);
+  var hiVal = container.querySelector('#range-hi-val-' + panelId);
+  var noUiSlider = globalThis.noUiSlider;
+  if (!noUiSlider) return;
 
-  function updateFill() {
-    var min = parseInt(lo.min);
-    var max = parseInt(lo.max);
-    var range = max - min || 1;
-    var loP = ((parseInt(lo.value) - min) / range) * 100;
-    var hiP = ((parseInt(hi.value) - min) / range) * 100;
-    fill.style.left = loP + '%';
-    fill.style.width = (hiP - loP) + '%';
-    loVal.textContent = lo.value;
-    hiVal.textContent = hi.value;
-  }
-
-  lo.addEventListener('input', function () {
-    if (parseInt(lo.value) > parseInt(hi.value)) lo.value = hi.value;
-    updateFill();
-    if (dimension) setFilter(dimension, [lo.value, hi.value]);
+  noUiSlider.create(sliderEl, {
+    start: [0, 100],
+    connect: true,
+    range: { min: 0, max: 100 },
+    step: 1,
+    behaviour: 'drag',
   });
 
-  hi.addEventListener('input', function () {
-    if (parseInt(hi.value) < parseInt(lo.value)) hi.value = lo.value;
-    updateFill();
-    if (dimension) setFilter(dimension, [lo.value, hi.value]);
+  sliderEl.noUiSlider.on('update', function (values) {
+    loVal.textContent = Math.round(values[0]);
+    hiVal.textContent = Math.round(values[1]);
   });
 
-  // Drag the fill to shift the entire range
-  var dragging = false;
-  var dragStartX = 0;
-  var dragLoStart = 0;
-  var dragHiStart = 0;
-
-  fill.style.cursor = 'grab';
-  fill.addEventListener('mousedown', function (e) {
-    e.preventDefault();
-    e.stopPropagation();
-    dragging = true;
-    fill.style.cursor = 'grabbing';
-    dragStartX = e.clientX;
-    dragLoStart = parseInt(lo.value);
-    dragHiStart = parseInt(hi.value);
+  sliderEl.noUiSlider.on('change', function (values) {
+    if (dimension) setFilter(dimension, [Math.round(values[0]), Math.round(values[1])]);
   });
-
-  document.addEventListener('mousemove', function (e) {
-    if (!dragging) return;
-    var trackRect = track.getBoundingClientRect();
-    var pxPerUnit = trackRect.width / (parseInt(lo.max) - parseInt(lo.min));
-    var delta = Math.round((e.clientX - dragStartX) / pxPerUnit);
-    var min = parseInt(lo.min);
-    var max = parseInt(lo.max);
-    var span = dragHiStart - dragLoStart;
-
-    var newLo = dragLoStart + delta;
-    var newHi = dragHiStart + delta;
-    if (newLo < min) { newLo = min; newHi = min + span; }
-    if (newHi > max) { newHi = max; newLo = max - span; }
-
-    lo.value = newLo;
-    hi.value = newHi;
-    updateFill();
-    if (dimension) setFilter(dimension, [lo.value, hi.value]);
-  });
-
-  document.addEventListener('mouseup', function () {
-    if (dragging) {
-      dragging = false;
-      fill.style.cursor = 'grab';
-    }
-  });
-
-  updateFill();
 }
 
 // ── Period Selector (flatpickr range + smart granularity) ─────────────
