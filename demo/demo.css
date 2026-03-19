@@ -1312,3 +1312,14 @@ body {
     flex-shrink: 0;
   }
 }
+
+/* ── Section headers — sticky on mobile ────────────────────────────── */
+@media (max-width: 767px) {
+  .card-head--toggle {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--bg-card-solid);
+    backdrop-filter: blur(8px);
+  }
+}
