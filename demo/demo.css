@@ -1290,7 +1290,8 @@ body {
     scroll-snap-type: x mandatory;
     -webkit-overflow-scrolling: touch;
     gap: 12px;
-    padding-bottom: 8px;
+    padding: 0 var(--ds-pad, 12px) 8px;
+    margin: 0 calc(-1 * var(--ds-pad, 12px));
     scrollbar-width: none;
   }
   .chart-grid::-webkit-scrollbar { display: none; }
