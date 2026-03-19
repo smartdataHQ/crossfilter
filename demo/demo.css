@@ -1166,3 +1166,21 @@ body {
   }
   .chart-grid .card { margin-bottom: 0; }
 }
+
+/* ── Filter bar variants ───────────────────────────────────────────── */
+
+/* Base: stacked controls */
+.filter-bar .filter-bar-controls { flex-direction: column; gap: 8px; }
+.filter-bar .filter-bar-item--range { max-width: none; }
+
+/* Wide (400px+): inline controls */
+@container filterbar (min-width: 400px) {
+  .filter-bar .filter-bar-controls { flex-direction: row; gap: 16px; }
+  .filter-bar .filter-bar-item--range { max-width: 300px; }
+}
+
+/* Toggle groups — full-width pills on narrow filter bars */
+@container filterbar (max-width: 399px) {
+  .filter-bar .pill-group { gap: 2px; }
+  .filter-bar .pill { flex: 1; text-align: center; min-height: 44px; }
+}
