@@ -437,9 +437,10 @@ function buildPanelCard(panel, accentIdx, registry) {
   var body = '';
 
   if (panel.chart === 'table') {
-    // Principle 6: table with row count + sort
     var colHeaders = '';
+    var colCount = 4;
     if (panel.columns) {
+      colCount = panel.columns.length;
       for (var c = 0; c < panel.columns.length; ++c) {
         var colName = panel.columns[c];
         var colLabel = inferLabel(colName, registry);
@@ -451,12 +452,14 @@ function buildPanelCard(panel, accentIdx, registry) {
       }
     }
     body = '<div class="card-head card-head--sub">' +
-      '<span class="group-size-badge" id="table-count-' + panel.id + '">0 rows</span>' +
+      '<span class="group-size-badge" id="table-count-' + panel.id + '">Loading\u2026</span>' +
       '<button class="btn btn-ghost btn-tiny" id="table-sort-' + panel.id + '">Most Recent</button>' +
     '</div>' +
     '<div class="table-scroll" id="table-scroll-' + panel.id + '">' +
       '<table class="tbl"><thead><tr>' + colHeaders + '</tr></thead>' +
-      '<tbody id="table-body-' + panel.id + '"></tbody></table>' +
+      '<tbody id="table-body-' + panel.id + '">' +
+        '<tr><td colspan="' + colCount + '">' + buildSkeletonTable(colCount) + '</td></tr>' +
+      '</tbody></table>' +
     '</div>';
 
   } else if (panel.chart === 'toggle') {
@@ -491,7 +494,6 @@ function buildPanelCard(panel, accentIdx, registry) {
     '</div>';
 
   } else if (panel.chart === 'line') {
-    // Time series with granularity toggle
     var granBtns = '';
     var grans = ['minute', 'hour', 'day', 'week', 'month'];
     for (var g = 0; g < grans.length; ++g) {
@@ -503,11 +505,34 @@ function buildPanelCard(panel, accentIdx, registry) {
       '<span class="group-size-badge" id="time-badge-' + panel.id + '"></span>' +
       '<div class="gran-btns">' + granBtns + '</div>' +
     '</div>' +
-    '<div id="chart-' + panel.id + '" class="chart-wrap chart-wrap-timeline"></div>';
+    '<div id="chart-' + panel.id + '" class="chart-wrap chart-wrap-timeline">' +
+      buildSkeletonLine() +
+    '</div>';
+
+  } else if (panel.chart === 'pie') {
+    body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
+      buildSkeletonPie() +
+    '</div>';
+
+  } else if (panel.chart === 'bar') {
+    body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
+      buildSkeletonBars(Math.min(panel.limit, 8)) +
+    '</div>';
+    // Searchable list panel (hidden by default, toggled via List button)
+    if (panel.searchable) {
+      body += '<div class="dim-list-panel" id="list-panel-' + panel.id + '" style="display:none">' +
+        '<input type="text" class="dim-search" placeholder="Search ' + escapeHtml(panel.label.toLowerCase()) + '...">' +
+        '<div class="dim-list-scroll" id="list-' + panel.id + '">' +
+          buildPlaceholderListItems(5) +
+        '</div>' +
+      '</div>';
+    }
 
   } else {
-    // ECharts chart — Principle 4: placeholder showing Top X + Other pattern
-    body = '<div id="chart-' + panel.id + '" class="chart-wrap"></div>';
+    // Generic ECharts fallback
+    body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
+      buildSkeletonBars(6) +
+    '</div>';
   }
 
   card.innerHTML = head + body;
@@ -518,16 +543,69 @@ function buildPanelCard(panel, accentIdx, registry) {
   return card;
 }
 
+// ── Principle 12: Skeleton placeholders ───────────────────────────────
+
 function buildPlaceholderListItems(count) {
-  // Principle 1: list items show count bar alongside label
   var html = '';
   for (var i = 0; i < count; ++i) {
     html += '<div class="dim-item">' +
       '<span class="dim-label dim-label--placeholder"></span>' +
       '<span class="dim-count dim-count--placeholder"></span>' +
-      '<div class="dim-bar"><div class="dim-bar-fill" style="width:' + (80 - i * 15) + '%"></div></div>' +
+      '<div class="dim-bar"><div class="dim-bar-fill" style="width:' + (85 - i * 14) + '%"></div></div>' +
     '</div>';
   }
+  return html;
+}
+
+function buildSkeletonBars(count) {
+  var html = '<div class="skeleton-bars">';
+  for (var i = 0; i < count; ++i) {
+    var w = 90 - i * (60 / count);
+    html += '<div class="skeleton-bar">' +
+      '<span class="skeleton-label"></span>' +
+      '<div class="skeleton-bar-track"><div class="skeleton-bar-fill" style="width:' + w + '%"></div></div>' +
+      '<span class="skeleton-value"></span>' +
+    '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function buildSkeletonLine() {
+  return '<div class="skeleton-line-chart">' +
+    '<svg viewBox="0 0 400 120" preserveAspectRatio="none" class="skeleton-svg">' +
+      '<path d="M0,100 C40,90 80,60 120,65 C160,70 200,30 240,35 C280,40 320,50 360,20 L400,25" ' +
+        'fill="none" stroke="currentColor" stroke-width="2" class="skeleton-path"/>' +
+      '<path d="M0,100 C40,90 80,60 120,65 C160,70 200,30 240,35 C280,40 320,50 360,20 L400,25 L400,120 L0,120 Z" ' +
+        'fill="currentColor" opacity="0.05"/>' +
+    '</svg>' +
+  '</div>';
+}
+
+function buildSkeletonPie() {
+  return '<div class="skeleton-pie">' +
+    '<svg viewBox="0 0 120 120" class="skeleton-svg">' +
+      '<circle cx="60" cy="60" r="50" fill="none" stroke="currentColor" stroke-width="20" ' +
+        'stroke-dasharray="80 235" class="skeleton-arc"/>' +
+      '<circle cx="60" cy="60" r="50" fill="none" stroke="currentColor" stroke-width="20" ' +
+        'stroke-dasharray="50 265" stroke-dashoffset="-80" opacity="0.5" class="skeleton-arc"/>' +
+      '<circle cx="60" cy="60" r="50" fill="none" stroke="currentColor" stroke-width="20" ' +
+        'stroke-dasharray="105 210" stroke-dashoffset="-130" opacity="0.25" class="skeleton-arc"/>' +
+    '</svg>' +
+  '</div>';
+}
+
+function buildSkeletonTable(columns) {
+  var cols = columns || 4;
+  var html = '<div class="skeleton-table">';
+  for (var r = 0; r < 5; ++r) {
+    html += '<div class="skeleton-table-row">';
+    for (var c = 0; c < cols; ++c) {
+      html += '<span class="skeleton-cell"></span>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
   return html;
 }
 

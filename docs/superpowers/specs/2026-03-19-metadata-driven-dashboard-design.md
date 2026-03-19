@@ -32,6 +32,8 @@ These are non-negotiable interaction patterns that every component must follow:
 
 11. **Meaningful loading progress** — Progress is shown as a subtle overlay on top of the dashboard, not instead of it. The dashboard layout renders immediately and updates live as data streams in — the user sees charts gradually populate underneath the overlay. The overlay shows meaningful named steps and a summary, then fades away when loading completes. Never a blank screen.
 
+12. **Skeleton placeholders** — Every component renders a simplified placeholder skeleton while data is loading. The skeleton matches the visual shape of the final component: shimmer bars for bar charts, shimmer lines for time series, shimmer circles for pie charts, shimmer rows for tables, shimmer pills for toggles. The user always sees what *will* be there before data arrives.
+
 ## Design Principles — Architecture
 
 1. **Zero hardcoding** — The engine NEVER references specific field names, labels, segments, or domain-specific content. Everything comes from the config and the Cube metadata. The engine must work for ANY cube without code changes.
