@@ -63,7 +63,19 @@ export function buildCubeRegistry(metaResponse, cubeName) {
 
   var segs = cube.segments || [];
   for (var s = 0; s < segs.length; ++s) {
-    registry.segments.push(segs[s].name.split('.').pop());
+    var seg = segs[s];
+    var segShort = seg.name.split('.').pop();
+    // Clean up titles: remove cube title prefix if present
+    var segTitle = seg.title || segShort;
+    if (registry.title && segTitle.startsWith(registry.title + ' ')) {
+      segTitle = segTitle.slice(registry.title.length + 1);
+    }
+    registry.segments.push({
+      name: segShort,
+      fullName: seg.name,
+      title: segTitle,
+      description: seg.description || '',
+    });
   }
 
   return registry;
@@ -127,6 +139,66 @@ export function inferSearchable(fieldName, registry) {
   var meta = dim.meta || {};
   var unique = typeof meta.unique_values === 'number' ? meta.unique_values : -1;
   return unique > 50;
+}
+
+// ── Model Intelligence Discovery ──────────────────────────────────────
+
+// Discover boolean dimensions suitable for quick-toggle filters
+export function discoverBooleanDimensions(registry) {
+  var booleans = [];
+  var dimNames = Object.keys(registry.dimensions);
+  for (var i = 0; i < dimNames.length; ++i) {
+    var name = dimNames[i];
+    var dim = registry.dimensions[name];
+    var fieldType = dim.meta && dim.meta.field_type || dim.type || 'string';
+    if (dim.type === 'boolean' || fieldType === 'boolean') {
+      booleans.push({
+        name: name,
+        label: inferLabel(name, registry),
+      });
+    }
+  }
+  return booleans;
+}
+
+// Discover low-cardinality enum dimensions with known values
+export function discoverFacetDimensions(registry, maxValues) {
+  var limit = maxValues || 12;
+  var facets = [];
+  var dimNames = Object.keys(registry.dimensions);
+  for (var i = 0; i < dimNames.length; ++i) {
+    var name = dimNames[i];
+    var dim = registry.dimensions[name];
+    var meta = dim.meta || {};
+    var unique = typeof meta.unique_values === 'number' ? meta.unique_values : -1;
+    if (unique > 0 && unique <= limit && meta.lc_values && meta.lc_values.length > 0) {
+      facets.push({
+        name: name,
+        label: inferLabel(name, registry),
+        values: meta.lc_values,
+      });
+    }
+  }
+  return facets;
+}
+
+// Discover formatted/described measures that are notable
+export function discoverNotableMeasures(registry) {
+  var notable = [];
+  var measNames = Object.keys(registry.measures);
+  for (var i = 0; i < measNames.length; ++i) {
+    var name = measNames[i];
+    var meas = registry.measures[name];
+    if (meas.format || meas.description) {
+      notable.push({
+        name: name,
+        label: inferLabel(name, registry),
+        format: meas.format || null,
+        description: meas.description || null,
+      });
+    }
+  }
+  return notable;
 }
 
 // ── ECharts Discovery ─────────────────────────────────────────────────

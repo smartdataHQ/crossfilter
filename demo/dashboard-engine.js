@@ -11,6 +11,9 @@ import {
   inferFilterMode,
   inferLimit,
   inferSearchable,
+  discoverBooleanDimensions,
+  discoverFacetDimensions,
+  discoverNotableMeasures,
 } from './dashboard-meta.js';
 import {
   registerDemoEChartsTheme,
@@ -128,6 +131,98 @@ function buildHeader(config) {
   return header;
 }
 
+function buildModelBar(config, registry) {
+  var modelBarConfig = config.modelBar;
+  if (modelBarConfig === false) return null;
+  modelBarConfig = modelBarConfig || {};
+
+  var segments = registry.segments || [];
+  var booleans = discoverBooleanDimensions(registry);
+  var facets = discoverFacetDimensions(registry);
+
+  // Filter out booleans that are already in panels (to avoid duplication)
+  var panelDims = {};
+  var panels = config.panels || [];
+  for (var p = 0; p < panels.length; ++p) {
+    if (panels[p].dimension) panelDims[panels[p].dimension] = true;
+  }
+  var extraBooleans = booleans.filter(function (b) { return !panelDims[b.name]; });
+
+  // Nothing to show?
+  var hasSegments = modelBarConfig.segments !== false && segments.length > 0;
+  var hasPresets = modelBarConfig.presets !== false && extraBooleans.length > 0;
+  var hasFacets = facets.length > 0;
+  var showDescription = modelBarConfig.showDescription !== false && registry.description;
+
+  if (!hasSegments && !hasPresets && !hasFacets && !showDescription) return null;
+
+  var bar = document.createElement('section');
+  bar.className = 'card model-bar anim d1';
+  var html = '';
+
+  // Cube identity
+  html += '<div class="model-bar-header">';
+  html += '<div class="model-bar-identity">';
+  html += '<span class="model-bar-title">' + escapeHtml(registry.title) + '</span>';
+  html += '<span class="model-bar-stats">' +
+    Object.keys(registry.dimensions).length + ' dimensions &middot; ' +
+    Object.keys(registry.measures).length + ' measures' +
+    (segments.length > 0 ? ' &middot; ' + segments.length + ' segments' : '') +
+  '</span>';
+  html += '</div>';
+  html += '</div>';
+
+  if (showDescription) {
+    html += '<div class="model-bar-description">' + escapeHtml(registry.description) + '</div>';
+  }
+
+  // Segments
+  if (hasSegments) {
+    html += '<div class="model-bar-group">';
+    html += '<span class="model-bar-label">Segments</span>';
+    html += '<div class="pill-group">';
+    for (var s = 0; s < segments.length; ++s) {
+      var seg = segments[s];
+      html += '<button class="mode-btn" data-segment="' + escapeHtml(seg.name) + '" title="' + escapeHtml(seg.description || seg.title) + '">' +
+        escapeHtml(seg.title) + '</button>';
+    }
+    html += '</div></div>';
+  }
+
+  // Boolean presets (not already in panels)
+  if (hasPresets && extraBooleans.length > 0) {
+    html += '<div class="model-bar-group">';
+    html += '<span class="model-bar-label">Quick Filters</span>';
+    html += '<div class="pill-group">';
+    for (var b = 0; b < extraBooleans.length; ++b) {
+      var bool = extraBooleans[b];
+      html += '<button class="mode-btn" data-boolean="' + escapeHtml(bool.name) + '">' +
+        escapeHtml(bool.label) + '</button>';
+    }
+    html += '</div></div>';
+  }
+
+  // Facet dimensions (low-cardinality enums with known values)
+  if (hasFacets) {
+    var facetList = modelBarConfig.facets || facets.map(function (f) { return f.name; });
+    for (var f = 0; f < facets.length; ++f) {
+      var facet = facets[f];
+      if (Array.isArray(modelBarConfig.facets) && modelBarConfig.facets.indexOf(facet.name) < 0) continue;
+      html += '<div class="model-bar-group">';
+      html += '<span class="model-bar-label">' + escapeHtml(facet.label) + '</span>';
+      html += '<div class="pill-group">';
+      for (var v = 0; v < facet.values.length; ++v) {
+        html += '<button class="mode-btn" data-facet="' + escapeHtml(facet.name) + '" data-value="' + escapeHtml(facet.values[v]) + '">' +
+          escapeHtml(facet.values[v]) + '</button>';
+      }
+      html += '</div></div>';
+    }
+  }
+
+  bar.innerHTML = html;
+  return bar;
+}
+
 function buildSectionEl(section, animDelay) {
   var wrapper;
 
@@ -209,9 +304,13 @@ function buildPanelCard(panel, accentIdx) {
   return card;
 }
 
-function buildDashboardDOM(container, config, sections) {
+function buildDashboardDOM(container, config, sections, registry) {
   container.innerHTML = '';
   container.appendChild(buildHeader(config));
+
+  // Model intelligence bar
+  var modelBar = buildModelBar(config, registry);
+  if (modelBar) container.appendChild(modelBar);
 
   var animDelay = 2;
   var kpiAccent = 0;
@@ -293,7 +392,7 @@ async function main() {
     var sections = resolveSections(config, resolvedPanels);
     console.log('[dashboard] Resolved', resolvedPanels.length, 'panels in', sections.length, 'sections');
 
-    buildDashboardDOM(container, config, sections);
+    buildDashboardDOM(container, config, sections, registry);
     console.log('[dashboard] DOM wireframe rendered');
 
   } catch (err) {
