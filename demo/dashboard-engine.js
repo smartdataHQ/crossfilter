@@ -19,6 +19,7 @@ import {
   inferGranularities,
   inferDefaultGranularity,
   inferPeriodPresets,
+  granularityLabel,
 } from './dashboard-meta.js';
 import {
   registerDemoEChartsTheme,
@@ -901,7 +902,7 @@ function wireRangeSelector(container, panelId, dimension) {
 
 // ── Period Selector (flatpickr range + smart granularity) ─────────────
 
-var GRAN_LABELS = { hour: 'Hourly', day: 'Daily', week: 'Weekly', month: 'Monthly', quarter: 'Quarterly', year: 'Yearly' };
+// granularityLabel imported from dashboard-meta.js
 
 function formatDateRange(from, to) {
   if (!from && !to) return 'All time';
@@ -940,7 +941,7 @@ function buildPeriodControl(timeBounds, granularity) {
   for (var g = 0; g < grans.length; ++g) {
     var active = grans[g] === defaultGran ? ' active' : '';
     html += '<button class="gran-btn' + active + '" data-gran="' + grans[g] + '">' +
-      (GRAN_LABELS[grans[g]] || grans[g]) + '</button>';
+      granularityLabel(grans[g]) + '</button>';
   }
   html += '</div>';
 
@@ -1034,7 +1035,7 @@ function updateGranButtons(gransEl, newGrans) {
   for (var g = 0; g < newGrans.length; ++g) {
     var active = newGrans[g] === currentGran ? ' active' : '';
     html += '<button class="gran-btn' + active + '" data-gran="' + newGrans[g] + '">' +
-      (GRAN_LABELS[newGrans[g]] || newGrans[g]) + '</button>';
+      granularityLabel(newGrans[g]) + '</button>';
   }
   gransEl.innerHTML = html;
 

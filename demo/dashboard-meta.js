@@ -315,38 +315,64 @@ export function probeDataBounds(cubeName, partition, timeDimNames, numberDimName
   });
 }
 
-// Infer which granularities make sense for a given time span
+// All Cube.dev supported granularities with their approximate bucket size in days.
+// Ordered finest to coarsest. The engine filters this list based on the actual
+// data span to show only granularities that produce a useful number of buckets.
+var GRANULARITY_BUCKETS = [
+  { id: 'hour',    label: 'Hourly',    days: 1 / 24 },
+  { id: 'day',     label: 'Daily',     days: 1 },
+  { id: 'week',    label: 'Weekly',    days: 7 },
+  { id: 'month',   label: 'Monthly',   days: 30 },
+  { id: 'quarter', label: 'Quarterly', days: 91 },
+  { id: 'year',    label: 'Yearly',    days: 365 },
+];
+
+// Infer which granularities make sense for a given time span.
+// Target: each granularity should produce between 4 and 300 buckets
+// to be useful for visualization.
 export function inferGranularities(minDate, maxDate) {
   if (!minDate || !maxDate) return ['day', 'week', 'month'];
 
-  var min = new Date(minDate);
-  var max = new Date(maxDate);
-  var spanMs = max.getTime() - min.getTime();
-  var spanDays = spanMs / 86400000;
+  var spanDays = (new Date(maxDate).getTime() - new Date(minDate).getTime()) / 86400000;
+  var result = [];
 
-  var grans = [];
-  if (spanDays <= 3) grans.push('hour');
-  if (spanDays <= 90) grans.push('day');
-  if (spanDays >= 7) grans.push('week');
-  if (spanDays >= 28) grans.push('month');
-  if (spanDays >= 180) grans.push('quarter');
-  if (spanDays >= 365) grans.push('year');
+  for (var i = 0; i < GRANULARITY_BUCKETS.length; ++i) {
+    var g = GRANULARITY_BUCKETS[i];
+    var buckets = spanDays / g.days;
+    if (buckets >= 4 && buckets <= 300) {
+      result.push(g.id);
+    }
+  }
 
-  return grans.length > 0 ? grans : ['day', 'week', 'month'];
+  return result.length > 0 ? result : ['day', 'week', 'month'];
 }
 
-// Pick the best default granularity for a given time span
+// Pick the best default granularity: the one closest to ~50 buckets.
 export function inferDefaultGranularity(minDate, maxDate) {
-  if (!minDate || !maxDate) return 'day';
+  var grans = inferGranularities(minDate, maxDate);
+  if (!minDate || !maxDate || grans.length === 0) return 'day';
 
-  var min = new Date(minDate);
-  var max = new Date(maxDate);
-  var spanDays = (max.getTime() - min.getTime()) / 86400000;
+  var spanDays = (new Date(maxDate).getTime() - new Date(minDate).getTime()) / 86400000;
+  var targetBuckets = 50;
+  var best = grans[0];
+  var bestDist = Infinity;
 
-  if (spanDays <= 3) return 'hour';
-  if (spanDays <= 60) return 'day';
-  if (spanDays <= 365) return 'week';
-  return 'month';
+  for (var i = 0; i < GRANULARITY_BUCKETS.length; ++i) {
+    var g = GRANULARITY_BUCKETS[i];
+    if (grans.indexOf(g.id) < 0) continue;
+    var dist = Math.abs((spanDays / g.days) - targetBuckets);
+    if (dist < bestDist) { bestDist = dist; best = g.id; }
+  }
+
+  return best;
+}
+
+// Get the user-facing label for a granularity id
+export function granularityLabel(id) {
+  for (var i = 0; i < GRANULARITY_BUCKETS.length; ++i) {
+    if (GRANULARITY_BUCKETS[i].id === id) return GRANULARITY_BUCKETS[i].label;
+  }
+  return id.charAt(0).toUpperCase() + id.slice(1);
 }
 
 // Generate smart period presets based on the data range
