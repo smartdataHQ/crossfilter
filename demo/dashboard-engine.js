@@ -316,6 +316,7 @@ function renderFilterChips() {
       container.appendChild(groupTag);
     }
   }
+  updateFilterCount();
 }
 
 function syncDropdownAfterRemove(dim, singleVal) {
@@ -364,6 +365,115 @@ function buildHeader(config) {
   // Wire clear all (Principle 8)
   header.querySelector('#clear-all-btn').addEventListener('click', clearAllFilters);
   return header;
+}
+
+// ── Mobile Header + Bottom Sheet ──────────────────────────────────────
+
+function buildMobileHeader(config, registry, timePanelInfo) {
+  var el = document.createElement('div');
+  el.className = 'mobile-header';
+
+  var cubeInfo = registry.cube || {};
+  var title = (config.title || cubeInfo.title || cubeInfo.name || '').toUpperCase();
+
+  var periodHtml = '';
+  if (timePanelInfo) {
+    periodHtml = '<button class="period-trigger" id="mobile-period-trigger"></button>';
+  }
+
+  var granMeta = (cubeInfo.meta && cubeInfo.meta.granularity) || {};
+  var granList = granMeta.available || ['day','week','month','quarter','year'];
+  var granDefault = granMeta.default || 'week';
+  var granOpts = '';
+  granList.forEach(function(g) {
+    granOpts += '<sl-option value="' + g + '"' + (g === granDefault ? ' selected' : '') + '>' +
+      g.charAt(0).toUpperCase() + g.slice(1) + '</sl-option>';
+  });
+
+  el.innerHTML =
+    '<div class="mobile-header-title">' + title + '</div>' +
+    '<div class="mobile-header-controls">' +
+      periodHtml +
+      '<sl-select class="ds-select" size="small" value="' + granDefault + '" id="mobile-gran-select">' +
+        granOpts +
+      '</sl-select>' +
+      '<button class="filter-trigger" id="filter-trigger">' +
+        'Filters <sl-badge pill variant="primary" id="filter-count-badge">0</sl-badge>' +
+      '</button>' +
+    '</div>';
+
+  return el;
+}
+
+function buildFilterSheet() {
+  var backdrop = document.createElement('div');
+  backdrop.className = 'filter-sheet-backdrop';
+  backdrop.id = 'filter-sheet-backdrop';
+
+  var sheet = document.createElement('div');
+  sheet.className = 'filter-sheet';
+  sheet.id = 'filter-sheet';
+  sheet.setAttribute('aria-modal', 'true');
+  sheet.setAttribute('role', 'dialog');
+
+  sheet.innerHTML =
+    '<div class="filter-sheet-handle"></div>' +
+    '<div class="filter-sheet-header">' +
+      '<span class="filter-sheet-title">Filters</span>' +
+      '<span class="filter-sheet-count" id="filter-sheet-count"></span>' +
+      '<button class="filter-sheet-close" id="filter-sheet-close" aria-label="Close">&times;</button>' +
+    '</div>' +
+    '<div class="filter-sheet-body" id="filter-sheet-body"></div>' +
+    '<div class="filter-sheet-footer">' +
+      '<sl-button variant="primary" size="small" id="filter-sheet-close-btn">Close</sl-button>' +
+      '<sl-button variant="text" size="small" id="filter-sheet-clear">Clear All</sl-button>' +
+    '</div>';
+
+  return { backdrop: backdrop, sheet: sheet };
+}
+
+function wireFilterSheet() {
+  var backdrop = document.getElementById('filter-sheet-backdrop');
+  var sheet = document.getElementById('filter-sheet');
+  var trigger = document.getElementById('filter-trigger');
+  if (!backdrop || !sheet || !trigger) return;
+
+  function openSheet() {
+    backdrop.classList.add('open');
+    sheet.classList.add('open');
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closeSheet() {
+    backdrop.classList.remove('open');
+    sheet.classList.remove('open');
+    document.body.style.overflow = '';
+  }
+
+  trigger.addEventListener('click', openSheet);
+  backdrop.addEventListener('click', closeSheet);
+
+  var closeBtn = document.getElementById('filter-sheet-close');
+  var closeBtnFooter = document.getElementById('filter-sheet-close-btn');
+  if (closeBtn) closeBtn.addEventListener('click', closeSheet);
+  if (closeBtnFooter) closeBtnFooter.addEventListener('click', closeSheet);
+
+  var clearBtn = document.getElementById('filter-sheet-clear');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', function() {
+      var clearAll = document.getElementById('clear-all');
+      if (clearAll) clearAll.click();
+    });
+  }
+}
+
+function updateFilterCount() {
+  var chips = document.querySelectorAll('#filter-chips sl-tag');
+  var count = chips.length;
+  var badge = document.getElementById('filter-count-badge');
+  var sheetCount = document.getElementById('filter-sheet-count');
+  if (badge) badge.textContent = count;
+  if (sheetCount) sheetCount.textContent = count > 0 ? count + ' active' : '';
 }
 
 // ── Dropdowns — Shoelace <sl-select> (Principle 1 + 14) ───────────────
@@ -1115,6 +1225,14 @@ function buildDashboardDOM(container, config, sections, registry) {
     }
   }
 
+  // Mobile header + filter sheet
+  var mobileHeader = buildMobileHeader(config, registry, timePanelInfo);
+  container.insertBefore(mobileHeader, container.children[1]);
+
+  var filterSheetParts = buildFilterSheet();
+  document.body.appendChild(filterSheetParts.backdrop);
+  document.body.appendChild(filterSheetParts.sheet);
+
   var animDelay = 2;
   var kpiAccent = 0;
 
@@ -1270,6 +1388,7 @@ async function main() {
 
     // Render dashboard immediately — visible under the overlay
     buildDashboardDOM(container, config, sections, registry);
+    wireFilterSheet();
     restoreStateFromUrl();
     renderFilterChips();
     console.log('[dashboard] Dashboard rendered, loading data...');
