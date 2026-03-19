@@ -1212,3 +1212,31 @@ body {
     background: var(--bg-card-solid);
   }
 }
+
+/* ── Touch targets (mobile) ────────────────────────────────────────── */
+@media (max-width: 767px) {
+  .ds-select { --sl-input-height-small: 48px; }
+  .dim-list-item, .dim-item { min-height: 44px; display: flex; align-items: center; }
+  .pill { min-height: 36px; padding: 8px 14px; }
+  .btn { min-height: 44px; }
+  .gran-btn { min-height: 44px; padding: 8px 12px; }
+  .mode-btn { min-height: 44px; padding: 8px 12px; }
+}
+
+/* ── Loading popover — full-width on phone ─────────────────────────── */
+@media (max-width: 479px) {
+  .loading-popover {
+    right: 8px;
+    left: 8px;
+    width: auto;
+  }
+}
+
+/* ── Progress overlay — narrower card on phone ─────────────────────── */
+@media (max-width: 479px) {
+  .progress-overlay .progress-steps {
+    min-width: auto;
+    margin: 0 16px;
+    width: calc(100% - 32px);
+  }
+}
