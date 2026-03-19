@@ -373,15 +373,14 @@ function buildMobileHeader(config, registry, timePanelInfo) {
   var el = document.createElement('div');
   el.className = 'mobile-header';
 
-  var cubeInfo = registry.cube || {};
-  var title = (config.title || cubeInfo.title || cubeInfo.name || '').toUpperCase();
+  var title = (config.title || registry.title || registry.name || '').toUpperCase();
 
   var periodHtml = '';
   if (timePanelInfo) {
     periodHtml = '<button class="period-trigger" id="mobile-period-trigger"></button>';
   }
 
-  var granMeta = (cubeInfo.meta && cubeInfo.meta.granularity) || {};
+  var granMeta = (registry.meta && registry.meta.granularity) || {};
   var granList = granMeta.available || ['day','week','month','quarter','year'];
   var granDefault = granMeta.default || 'week';
   var granOpts = '';
@@ -501,7 +500,7 @@ function populateFilterSheet(registry, inlinePanels) {
   }
 
   // Boolean dimensions
-  var boolDims = registry.booleanDimensions || [];
+  var boolDims = discoverBooleanDimensions(registry);
   if (boolDims.length > 0) {
     var boolOpts = boolDims.map(function(d) {
       return { value: d.name, label: titleCase(d.name.replace(/_/g, ' ')) };
