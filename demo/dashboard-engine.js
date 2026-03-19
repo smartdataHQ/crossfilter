@@ -731,6 +731,70 @@ function wireCardInteractions(card, panel) {
 
 // ── Dashboard DOM Assembly ────────────────────────────────────────────
 
+function isFilterOnlySection(section) {
+  for (var i = 0; i < section.panels.length; ++i) {
+    var chart = section.panels[i].chart;
+    if (chart !== 'toggle' && chart !== 'range') return false;
+  }
+  return section.panels.length > 0;
+}
+
+function buildFilterBar(section, registry) {
+  // Render toggle and range panels as compact inline controls in a single card
+  var bar = document.createElement('section');
+  bar.className = 'card filter-bar anim d' + Math.min(6, 8);
+  bar.dataset.sectionId = section.id;
+
+  var html = '';
+  if (section.label) {
+    html += '<div class="filter-bar-header">' +
+      '<span class="filter-bar-title">' + escapeHtml(section.label) + '</span>' +
+    '</div>';
+  }
+  html += '<div class="filter-bar-controls">';
+
+  for (var i = 0; i < section.panels.length; ++i) {
+    var panel = section.panels[i];
+    var dimMeta = registry.dimensions[panel.dimension];
+    var dimDesc = dimMeta && dimMeta.description ? dimMeta.description : null;
+
+    if (panel.chart === 'toggle') {
+      html += '<div class="filter-bar-item" id="panel-' + panel.id + '">';
+      html += '<span class="filter-bar-label">' + escapeHtml(panel.label) + (dimDesc ? infoIcon(dimDesc) : '') + '</span>';
+      html += '<div class="pill-group pill-group--compact">';
+      html += '<button class="mode-btn mode-btn--sm" data-toggle="' + escapeHtml(panel.dimension) + '" data-val="true">Yes</button>';
+      html += '<button class="mode-btn mode-btn--sm" data-toggle="' + escapeHtml(panel.dimension) + '" data-val="false">No</button>';
+      html += '<button class="mode-btn mode-btn--sm active" data-toggle="' + escapeHtml(panel.dimension) + '" data-val="all">All</button>';
+      html += '</div>';
+      html += '<span class="filter-bar-count" id="toggle-count-' + panel.id + '"></span>';
+      html += '</div>';
+    } else if (panel.chart === 'range') {
+      html += '<div class="filter-bar-item filter-bar-item--range" id="panel-' + panel.id + '">';
+      html += '<span class="filter-bar-label">' + escapeHtml(panel.label) + (dimDesc ? infoIcon(dimDesc) : '') + '</span>';
+      html += '<input type="range" class="range-slider range-slider--compact" min="0" max="100" value="0" id="range-input-' + panel.id + '">';
+      html += '<span class="filter-bar-range-val" id="range-val-' + panel.id + '">\u2014</span>';
+      html += '</div>';
+    }
+  }
+
+  html += '</div>';
+  bar.innerHTML = html;
+
+  // Wire toggle clicks
+  bar.addEventListener('click', function (e) {
+    var btn = e.target.closest('.mode-btn');
+    if (!btn || !btn.dataset.toggle) return;
+    var dim = btn.dataset.toggle;
+    var siblings = bar.querySelectorAll('[data-toggle="' + dim + '"]');
+    for (var j = 0; j < siblings.length; ++j) siblings[j].classList.remove('active');
+    btn.classList.add('active');
+    var val = btn.dataset.val;
+    setFilter(dim, val === 'all' ? null : val);
+  });
+
+  return bar;
+}
+
 function buildDashboardDOM(container, config, sections, registry) {
   container.innerHTML = '';
   container.appendChild(buildHeader(config));
@@ -743,6 +807,14 @@ function buildDashboardDOM(container, config, sections, registry) {
 
   for (var s = 0; s < sections.length; ++s) {
     var section = sections[s];
+
+    // Filter-only sections render as a compact inline bar
+    if (isFilterOnlySection(section)) {
+      container.appendChild(buildFilterBar(section, registry));
+      animDelay++;
+      continue;
+    }
+
     var sectionEl = buildSectionEl(section, Math.min(animDelay, 8));
     var isKpiSection = section.panels.length > 0 && section.panels[0].chart === 'kpi';
 
