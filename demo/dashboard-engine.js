@@ -273,17 +273,31 @@ function renderFilterChips() {
 }
 
 function syncDropdownAfterRemove(dim, singleVal) {
+  // Shoelace selects
   var select = document.querySelector('sl-select[data-dropdown-id="' + dim + '"]');
-  if (!select) return;
+  if (select) {
+    if (singleVal && select.multiple) {
+      var current = Array.isArray(select.value) ? select.value.slice() : [];
+      var idx = current.indexOf(singleVal);
+      if (idx >= 0) current.splice(idx, 1);
+      select.value = current;
+    } else {
+      select.value = select.multiple ? [] : '';
+    }
+    return;
+  }
 
-  if (singleVal && select.multiple) {
-    // Remove one value from the array
-    var current = Array.isArray(select.value) ? select.value.slice() : [];
-    var idx = current.indexOf(singleVal);
-    if (idx >= 0) current.splice(idx, 1);
-    select.value = current;
-  } else {
-    select.value = select.multiple ? [] : '';
+  // Toggle buttons — reset to "All"
+  var toggleBtn = document.querySelector('sl-button[data-toggle="' + dim + '"]');
+  if (toggleBtn) {
+    var group = toggleBtn.closest('sl-button-group');
+    if (group) {
+      var btns = group.querySelectorAll('sl-button');
+      for (var i = 0; i < btns.length; ++i) {
+        btns[i].variant = btns[i].dataset.val === 'all' ? 'primary' : 'default';
+      }
+    }
+    return;
   }
 }
 
