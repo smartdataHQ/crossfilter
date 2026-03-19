@@ -755,7 +755,7 @@ body {
 .tbl tbody tr:active td { background: rgba(61, 139, 253, 0.08); }
 
 /* Model Intelligence Bar */
-.model-bar { padding: 16px 20px; }
+.model-bar { padding: 16px 20px; overflow: visible; }
 .model-bar-header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
 .model-bar-identity { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .model-bar-title {
@@ -764,9 +764,10 @@ body {
 }
 .model-bar-stats { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
 .model-bar-controls {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  display: flex; align-items: center; gap: 8px;
   padding-top: 10px; margin-top: 2px;
   border-top: 1px solid var(--border);
+  overflow: visible;
 }
 
 /* Info icon (Principle 2: details on demand) */
