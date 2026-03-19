@@ -393,18 +393,3 @@ export function inferPeriodPresets(minDate, maxDate) {
   return presets;
 }
 
-// ── ECharts Discovery ─────────────────────────────────────────────────
-
-export function discoverEChartsTypes(echartsInstance) {
-  // ECharts doesn't expose a public series type registry.
-  // We probe by checking if ComponentModel subclasses exist for known types.
-  var knownTypes = [
-    'line', 'bar', 'pie', 'scatter', 'radar', 'map', 'tree', 'treemap',
-    'graph', 'gauge', 'funnel', 'parallel', 'sankey', 'boxplot',
-    'candlestick', 'effectScatter', 'lines', 'heatmap', 'pictorialBar',
-    'themeRiver', 'sunburst', 'custom',
-  ];
-  // Non-chart controls handled by the engine directly
-  var controls = ['list', 'kpi', 'toggle', 'range', 'table'];
-  return { chartTypes: knownTypes, controlTypes: controls };
-}

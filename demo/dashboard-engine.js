@@ -13,7 +13,6 @@ import {
   inferSearchable,
   discoverBooleanDimensions,
   discoverFacetDimensions,
-  discoverNotableMeasures,
   discoverTimeDimensions,
   extractModelMeta,
   resolveModelPeriod,
@@ -187,10 +186,11 @@ function resolveSections(config, resolvedPanels) {
 
 var ACCENT_COLORS = ['green', 'blue', 'amber', 'red', 'purple'];
 
+var _escapeEl = null;
 function escapeHtml(str) {
-  var div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  if (!_escapeEl) _escapeEl = document.createElement('div');
+  _escapeEl.textContent = str;
+  return _escapeEl.innerHTML;
 }
 
 function formatCount(n) {
@@ -425,15 +425,12 @@ function restoreStateFromUrl() {
   for (var k = 0; k < keys.length; ++k) {
     var dim = keys[k];
     var val = filterState[dim];
-    // Find toggle buttons for this dimension
-    var toggleBtns = document.querySelectorAll('sl-button[data-toggle="' + dim + '"], sl-button[data-val]');
-    if (toggleBtns.length === 0) continue;
-    // Check if these buttons belong to this dimension
+    // Find toggle buttons for this specific dimension only
     var firstToggle = document.querySelector('sl-button[data-toggle="' + dim + '"]');
     if (!firstToggle) continue;
-    var allBtns = firstToggle.closest('sl-button-group');
-    if (!allBtns) continue;
-    var btns = allBtns.querySelectorAll('sl-button');
+    var group = firstToggle.closest('sl-button-group');
+    if (!group) continue;
+    var btns = group.querySelectorAll('sl-button[data-toggle="' + dim + '"]');
     for (var b = 0; b < btns.length; ++b) {
       btns[b].variant = btns[b].dataset.val === String(val) ? 'primary' : 'default';
     }
@@ -841,7 +838,6 @@ function buildPeriodControl(tpi) {
 
 function wirePeriodControl(container, tpi) {
   var trigger = container.querySelector('#period-trigger');
-  var gransEl = container.querySelector('#period-grans');
   if (!trigger) return;
 
   var dimension = tpi.dimension;
@@ -900,17 +896,6 @@ function wirePeriodControl(container, tpi) {
     });
   }
 
-  // Granularity clicks
-  if (gransEl) {
-    gransEl.addEventListener('click', function (e) {
-      var btn = e.target.closest('.gran-btn');
-      if (!btn) return;
-      var siblings = gransEl.querySelectorAll('.gran-btn');
-      for (var i = 0; i < siblings.length; ++i) siblings[i].classList.remove('active');
-      btn.classList.add('active');
-      setFilter('_granularity', btn.dataset.gran);
-    });
-  }
 }
 
 // ── Skeleton placeholders ─────────────────────────────────────────────
@@ -1250,6 +1235,7 @@ async function main() {
 
   try {
     registerDemoEChartsTheme(echarts);
+    filterState = readUrlState(); // Principle 3: read URL state early (no network needed)
 
     updateProgress(0);
     var metaResponse = await fetchCubeMeta();
@@ -1294,9 +1280,6 @@ async function main() {
     }
 
     var sections = resolveSections(config, resolvedPanels);
-
-    // Principle 3: restore state from URL
-    filterState = readUrlState();
 
     // Render dashboard immediately — visible under the overlay
     buildDashboardDOM(container, config, sections, registry);
