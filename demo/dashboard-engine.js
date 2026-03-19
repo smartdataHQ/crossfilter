@@ -335,16 +335,17 @@ function buildHeader(config) {
 // ── Dropdowns — Shoelace <sl-select> (Principle 1 + 14) ───────────────
 
 function buildDropdown(id, label, placeholder, items, multiSelect) {
+  // max-options-visible="0" hides selected tags from the trigger —
+  // selected state is shown in the filter chips bar instead (Principle 8)
   var html = '<sl-select' +
     ' data-dropdown-id="' + escapeHtml(id) + '"' +
     ' placeholder="' + escapeHtml(placeholder) + '"' +
     ' label="' + escapeHtml(label) + '"' +
     ' size="small"' +
     ' hoist' +
-    (multiSelect ? ' multiple' : '') +
+    ' class="ds-select"' +
+    (multiSelect ? ' multiple max-options-visible="0"' : '') +
     (multiSelect ? ' clearable' : '') +
-    (items.length > 6 ? ' data-searchable="true"' : '') +
-    ' style="min-width:140px; max-width:220px"' +
     '>';
   for (var i = 0; i < items.length; ++i) {
     var item = items[i];
@@ -368,11 +369,16 @@ function wireDropdowns(container) {
 
 function wireOneSelect(select) {
   var id = select.dataset.dropdownId;
+  var isMulti = select.hasAttribute('multiple');
+  var placeholder = select.getAttribute('placeholder') || 'All';
+
   select.addEventListener('sl-change', function () {
     var val = select.value;
-    // sl-select returns string for single, array for multiple
-    if (Array.isArray(val)) {
-      setFilter(id, val.length > 0 ? val : null);
+    if (isMulti) {
+      var count = Array.isArray(val) ? val.length : 0;
+      // Update the display text to show count (tags are hidden)
+      select.displayLabel = count > 0 ? count + ' selected' : '';
+      setFilter(id, count > 0 ? val : null);
     } else {
       setFilter(id, val || null);
     }

@@ -809,18 +809,44 @@ body {
 }
 .info-icon:hover { opacity: 1; color: var(--accent-blue); }
 
-/* Shoelace select overrides to match design system */
-sl-select::part(combobox) {
-  font-family: var(--font-sans);
-  font-size: 12px;
-  border-color: var(--border);
-  border-radius: var(--radius, 8px);
+/* Shoelace select — styled to match our design system */
+.ds-select {
+  --sl-input-font-family: var(--font-sans);
+  --sl-input-font-size-small: 12px;
+  --sl-input-height-small: 32px;
+  --sl-input-border-radius-small: var(--radius, 8px);
+  --sl-input-border-color: var(--border);
+  --sl-input-border-color-hover: var(--accent-blue);
+  --sl-input-border-color-focus: var(--accent-blue);
+  --sl-color-primary-600: var(--accent-blue);
+  --sl-input-placeholder-color: var(--text-muted);
+  --sl-input-color: var(--text-primary);
+  --sl-panel-border-color: var(--border);
+  --sl-panel-border-radius: var(--radius, 8px);
+  --sl-shadow-large: 0 8px 32px rgba(0, 21, 88, 0.12);
 }
-sl-select::part(form-control-label) {
+.ds-select::part(combobox) {
+  font-family: var(--font-sans);
+  min-height: var(--sl-input-height-small);
+  padding-top: 0; padding-bottom: 0;
+}
+.ds-select::part(form-control-label) {
   font-size: 10px; font-weight: 600;
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  margin-bottom: 2px;
+}
+.ds-select::part(listbox) {
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+.ds-select::part(display-input) {
+  font-family: var(--font-sans);
+}
+/* When items are selected, show count in the trigger instead of tags */
+.ds-select[multiple]::part(combobox)::after {
+  font-size: 11px; color: var(--accent-blue);
 }
 
 /* Filter chips (Principle 8: visible, removable) */
