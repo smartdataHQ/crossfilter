@@ -1146,3 +1146,23 @@ body {
   .chart-card .dim-list-toggle { display: inline-flex; }
   .chart-card .chart-wrap { height: 280px; }
 }
+
+/* ── Chart carousel (phone only) ───────────────────────────────────── */
+@media (max-width: 767px) {
+  .chart-grid {
+    display: flex;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    -webkit-overflow-scrolling: touch;
+    gap: 12px;
+    padding-bottom: 8px;
+    scrollbar-width: none;
+  }
+  .chart-grid::-webkit-scrollbar { display: none; }
+  .chart-grid > .chart-card {
+    flex: 0 0 85%;
+    scroll-snap-align: center;
+    margin-bottom: 0;
+  }
+  .chart-grid .card { margin-bottom: 0; }
+}
