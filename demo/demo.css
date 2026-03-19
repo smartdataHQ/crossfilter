@@ -392,14 +392,21 @@ body {
 }
 
 /* Chart grid */
+/* Chart grid — auto-fit decides columns. Chart cells are containers.
+   min 280px means 2 cols at 640px+, 1 col below. */
 .chart-grid {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
   gap: var(--card-gap, 16px);
   margin-bottom: var(--section-gap, 16px);
 }
 
-.chart-grid .card { margin-bottom: 0; }
+/* Chart cell — container query context (grid cell, width from grid track) */
+.chart-cell {
+  container: chartcard / inline-size;
+}
+
+.chart-cell .card { margin-bottom: 0; }
 
 .chart-wrap {
   position: relative;
@@ -1090,7 +1097,7 @@ body {
 /* Container contexts — every component wrapper is a query container */
 .kpi-row    { container: kpigrid / inline-size; }
 /* .kpi-cell gets kpicard container — defined above with the grid */
-.chart-card { container: chartcard / inline-size; }
+/* .chart-cell gets chartcard container — defined above with the grid */
 .filter-bar { container: filterbar / inline-size; }
 .location-grid { container: locgrid / inline-size; }
 /* Inline control containers — flex items that are also container query contexts.
@@ -1193,17 +1200,8 @@ body {
   .toggle-compact  { display: inline-flex; }
 }
 
-/* ── Page-level media queries (macro layout) ─────────────────────── */
-
-/* Tablet (768px): multi-column chart grid */
-@media (min-width: 768px) {
-  .chart-grid { grid-template-columns: repeat(2, 1fr); }
-}
-
-/* Desktop (1200px): full chart grid */
-@media (min-width: 1200px) {
-  .chart-grid { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
-}
+/* Chart grid and KPI grid use auto-fit — no media queries needed for columns.
+   Grid decides column count intrinsically; container queries decide card format. */
 
 /* ── KPI card variants (container queries on kpicard) ──────────────── */
 /* The card REFORMATS — not just reflows — at each threshold.          */
@@ -1292,12 +1290,11 @@ body {
     scrollbar-width: none;
   }
   .chart-grid::-webkit-scrollbar { display: none; }
-  .chart-grid > .chart-card {
+  .chart-grid > .chart-cell {
     flex: 0 0 85%;
     scroll-snap-align: center;
-    margin-bottom: 0;
   }
-  .chart-grid .card { margin-bottom: 0; }
+  .chart-cell .card { margin-bottom: 0; }
 }
 
 /* ── Filter bar variants ───────────────────────────────────────────── */

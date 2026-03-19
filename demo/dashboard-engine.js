@@ -900,6 +900,12 @@ function buildPanelCard(panel, accentIdx, registry) {
     return card;
   }
 
+  // Container wrapper — chart-cell is the container query context.
+  // Grid track gives chart-cell its width; @container chartcard
+  // queries on chart-cell style .chart-card (descendant) inside.
+  var cell = document.createElement('div');
+  cell.className = 'chart-cell';
+
   card.className = 'card chart-card';
   card.id = 'panel-' + panel.id;
 
@@ -1012,7 +1018,8 @@ function buildPanelCard(panel, accentIdx, registry) {
   // Wire panel-level interactions
   wireCardInteractions(card, panel);
 
-  return card;
+  cell.appendChild(card);
+  return cell;
 }
 
 // ── Range selector — noUiSlider (Principle 13 + 14) ──────────────────
