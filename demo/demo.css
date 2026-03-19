@@ -33,6 +33,11 @@
   --shadow-hover: 2px 2px 20px rgba(0, 21, 88, 0.08);
   --font-mono: 'JetBrains Mono', monospace;
   --font-sans: 'Lato', Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+
+  /* Fluid responsive tokens */
+  --ds-pad: clamp(12px, 3vw, 24px);
+  --section-gap: clamp(8px, 2vw, 16px);
+  --card-gap: clamp(8px, 1.5vw, 16px);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -148,7 +153,7 @@ body {
 .dashboard {
   max-width: 1440px;
   margin: 0 auto;
-  padding: 20px 24px;
+  padding: var(--ds-pad);
 }
 
 /* Header */
@@ -195,9 +200,9 @@ body {
 /* KPI row */
 .kpi-row {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 10px;
-  margin-bottom: 16px;
+  grid-template-columns: 1fr;
+  gap: var(--card-gap, 10px);
+  margin-bottom: var(--section-gap, 16px);
 }
 
 .kpi {
@@ -370,9 +375,9 @@ body {
 /* Chart grid */
 .chart-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-  gap: 16px;
-  margin-bottom: 16px;
+  grid-template-columns: 1fr;
+  gap: var(--card-gap, 16px);
+  margin-bottom: var(--section-gap, 16px);
 }
 
 .chart-grid .card { margin-bottom: 0; }
@@ -480,10 +485,6 @@ body {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   border-top: 1px solid rgba(63, 101, 135, 0.08);
-}
-
-@media (max-width: 640px) {
-  .location-grid { grid-template-columns: 1fr; }
 }
 
 .dim-col { border-right: 1px solid rgba(63, 101, 135, 0.06); }
@@ -1063,50 +1064,32 @@ body {
   font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);
 }
 
-/* ── Container Queries — Responsive Components (Principle 10) ──────── */
-/* Components adapt their rendering based on their own available space, */
-/* not the viewport. Each component container is a query context.       */
+/* ── Responsive Design — Mobile-First ──────────────────────────────── */
+/* Base styles = phone layout. Complexity added upward via min-width.  */
+/* Components adapt via @container queries, page via @media queries.   */
 
-/* Model bar adapts: row → stacked when narrow */
-/* Model bar — NO container-type (containment clips fixed dropdowns).  */
-/* Uses viewport media queries instead for responsive layout.          */
+/* Container contexts — every component wrapper is a query container */
+.kpi-row    { container: kpigrid / inline-size; }
+.kpi        { container: kpicard / inline-size; }
+.chart-card { container: chartcard / inline-size; }
+.filter-bar { container: filterbar / inline-size; }
+.location-grid { container: locgrid / inline-size; }
 
-/* Chart cards adapt: hide secondary controls when tight */
-.chart-card { container-type: inline-size; container-name: chartcard; }
-@container chartcard (max-width: 280px) {
-  .card-head { flex-wrap: wrap; }
-  .card-filters { width: 100%; justify-content: flex-end; }
-  .show-all-toggle, .dim-list-toggle { font-size: 9px !important; padding: 2px 6px; }
-}
+/* ── Page-level media queries (macro layout) ─────────────────────── */
 
-/* KPI cards adapt: smaller text when narrow */
-.kpi { container-type: inline-size; container-name: kpicard; }
-@container kpicard (max-width: 160px) {
-  .kpi-value { font-size: 24px; }
-  .kpi-label { font-size: 10px; }
-}
-
-/* Filter bar adapts: wrap controls */
-.filter-bar { container-type: inline-size; container-name: filterbar; }
-@container filterbar (max-width: 400px) {
-  .filter-bar-controls { flex-direction: column; gap: 8px; }
-  .filter-bar-item--range { max-width: none; }
-}
-
-/* Shoelace components handle their own responsive behavior */
-
-/* Responsive (Principle 10 — viewport fallbacks) */
-@media (max-width: 1024px) {
-  .chart-grid { grid-template-columns: 1fr; }
-  .kpi-row { grid-template-columns: repeat(3, 1fr); }
-}
-
-@media (max-width: 640px) {
+/* Phone landscape+ (480px): 2-col KPIs */
+@media (min-width: 480px) {
   .kpi-row { grid-template-columns: repeat(2, 1fr); }
-  .header { flex-direction: column; align-items: flex-start; gap: 12px; }
-  .dev-drawer-actions { grid-template-columns: 1fr; }
-  .model-bar-header { flex-direction: column; gap: 8px; }
-  .model-bar-controls { flex-direction: column; align-items: stretch; }
-  .model-bar-inline { padding-left: 0; border-left: none; }
-  .period-control { flex-direction: column; gap: 4px; align-items: stretch; }
+}
+
+/* Tablet (768px): multi-column grids, full model bar */
+@media (min-width: 768px) {
+  .kpi-row { grid-template-columns: repeat(3, 1fr); }
+  .chart-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* Desktop (1200px): full grid */
+@media (min-width: 1200px) {
+  .kpi-row { grid-template-columns: repeat(4, 1fr); }
+  .chart-grid { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
 }
