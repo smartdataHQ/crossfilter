@@ -211,12 +211,20 @@ function renderFilterChips() {
   for (var i = 0; i < keys.length; ++i) {
     var dim = keys[i];
     var val = filterState[dim];
-    var label = Array.isArray(val) ? val.join(', ') : String(val);
-    // Use a cleaner display name (strip _ prefix, title case)
+    var vals = Array.isArray(val) ? val : [val];
     var displayDim = dim.replace(/^_/, '').replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+
+    var chipText;
+    if (vals.length === 1) {
+      chipText = displayDim + ': ' + vals[0];
+    } else {
+      chipText = displayDim + ' (' + vals.length + ')';
+    }
+
     var chip = document.createElement('span');
     chip.className = 'filter-chip';
-    chip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(displayDim) + ': ' + escapeHtml(label) + '</span>' +
+    chip.title = vals.join(', ');
+    chip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(chipText) + '</span>' +
       '<button class="filter-chip-remove" data-dim="' + escapeHtml(dim) + '">&times;</button>';
     container.appendChild(chip);
   }
