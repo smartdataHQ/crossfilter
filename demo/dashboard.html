@@ -6,8 +6,8 @@
   <title>Dashboard Engine</title>
   <link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700;900&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="demo.css">
-  <!-- Shoelace: light theme + component autoloader -->
-  <link rel="stylesheet" href="../node_modules/@shoelace-style/shoelace/dist/themes/light.css">
+  <!-- Shoelace: light theme from CDN (bundled with Lit) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.20.1/cdn/themes/light.css">
   <!-- flatpickr: date range picker -->
   <link rel="stylesheet" href="../node_modules/flatpickr/dist/flatpickr.min.css">
   <!-- noUiSlider: dual-handle range slider -->
@@ -16,15 +16,14 @@
 <body>
 <script src="../node_modules/flatpickr/dist/flatpickr.min.js"></script>
 <script src="../node_modules/nouislider/dist/nouislider.min.js"></script>
-<!-- Shoelace: explicit component imports -->
+<!-- Shoelace: cherry-pick components from CDN (includes Lit) -->
 <script type="module">
-  import { setBasePath } from '../node_modules/@shoelace-style/shoelace/dist/utilities/base-path.js';
-  setBasePath('/node_modules/@shoelace-style/shoelace/dist');
-  // Import only the components we use
-  import '../node_modules/@shoelace-style/shoelace/dist/components/select/select.js';
-  import '../node_modules/@shoelace-style/shoelace/dist/components/option/option.js';
-  import '../node_modules/@shoelace-style/shoelace/dist/components/tooltip/tooltip.js';
-  import '../node_modules/@shoelace-style/shoelace/dist/components/tag/tag.js';
+  import { setBasePath } from 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.20.1/cdn/utilities/base-path.js';
+  setBasePath('https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.20.1/cdn');
+  import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.20.1/cdn/components/select/select.js';
+  import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.20.1/cdn/components/option/option.js';
+  import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.20.1/cdn/components/tooltip/tooltip.js';
+  import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.20.1/cdn/components/tag/tag.js';
 </script>
 <div id="error-banner" class="error-banner" hidden></div>
 <div id="dashboard" class="dashboard"></div>
