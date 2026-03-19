@@ -34,7 +34,9 @@ These are non-negotiable interaction patterns that every component must follow:
 
 12. **Business-user language** — This UI is for business users, not developers. Never use technical terms (boolean, dimension, integer, string, null, array) in any user-facing label, tooltip, or message. Always find the human-readable alternative: "Yes/No filter" not "Boolean toggle", "Category" not "Dimension", "Missing" not "null".
 
-13. **Skeleton placeholders** — Every component renders a simplified placeholder skeleton while data is loading. The skeleton matches the visual shape of the final component: shimmer bars for bar charts, shimmer lines for time series, shimmer circles for pie charts, shimmer rows for tables, shimmer pills for toggles. The user always sees what *will* be there before data arrives.
+13. **Visible selected values** — When using sliders or any control that obscures the exact value, always show the selected value(s) in a subtle readable form. Use range selectors (from–to) rather than single-ended sliders, so the user controls both bounds.
+
+14. **Skeleton placeholders** — Every component renders a simplified placeholder skeleton while data is loading. The skeleton matches the visual shape of the final component: shimmer bars for bar charts, shimmer lines for time series, shimmer circles for pie charts, shimmer rows for tables, shimmer pills for toggles. The user always sees what *will* be there before data arrives.
 
 ## Design Principles — Architecture
 

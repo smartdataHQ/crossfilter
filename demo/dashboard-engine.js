@@ -596,8 +596,7 @@ function buildModelBar(config, registry, inlinePanels) {
       } else if (p.chart === 'range') {
         html += '<div class="model-bar-inline model-bar-inline--range" id="panel-' + p.id + '">';
         html += '<span class="model-bar-inline-label">' + escapeHtml(p.label) + (pDesc ? infoIcon(pDesc) : '') + '</span>';
-        html += '<input type="range" class="range-slider range-slider--compact" min="0" max="100" value="0" id="range-input-' + p.id + '">';
-        html += '<span class="model-bar-inline-val" id="range-val-' + p.id + '">\u2014</span>';
+        html += buildRangeSelector(p.id, p.label, true);
         html += '</div>';
       }
     }
@@ -619,6 +618,15 @@ function buildModelBar(config, registry, inlinePanels) {
     var val = btn.dataset.val;
     setFilter(dim, val === 'all' ? null : val);
   });
+
+  // Wire inline range selectors
+  if (inlinePanels) {
+    for (var rp = 0; rp < inlinePanels.length; ++rp) {
+      if (inlinePanels[rp].chart === 'range') {
+        wireRangeSelector(bar, inlinePanels[rp].id, inlinePanels[rp].dimension);
+      }
+    }
+  }
 
   return bar;
 }
@@ -734,14 +742,7 @@ function buildPanelCard(panel, accentIdx, registry) {
     '</div>';
 
   } else if (panel.chart === 'range') {
-    body = '<div class="range-wrap" id="range-' + panel.id + '">' +
-      '<div class="range-header">' +
-        '<span class="range-min" id="range-min-' + panel.id + '">0</span>' +
-        '<span class="range-current" id="range-val-' + panel.id + '">\u2014</span>' +
-        '<span class="range-max" id="range-max-' + panel.id + '">100</span>' +
-      '</div>' +
-      '<input type="range" class="range-slider" min="0" max="100" value="0" id="range-input-' + panel.id + '">' +
-    '</div>';
+    body = '<div class="range-wrap">' + buildRangeSelector(panel.id, panel.label, false) + '</div>';
 
   } else if (panel.chart === 'list') {
     // Principle 1: informative (counts next to items)
@@ -803,7 +804,58 @@ function buildPanelCard(panel, accentIdx, registry) {
   return card;
 }
 
-// ── Principle 12: Skeleton placeholders ───────────────────────────────
+// ── Principle 13: Range selector with visible values ──────────────────
+
+function buildRangeSelector(id, label, compact) {
+  var cls = compact ? 'range-sel range-sel--compact' : 'range-sel';
+  return '<div class="' + cls + '" id="range-' + id + '" data-range-id="' + id + '">' +
+    '<div class="range-sel-track">' +
+      '<div class="range-sel-fill" id="range-fill-' + id + '"></div>' +
+      '<input type="range" class="range-sel-input range-sel-lo" id="range-lo-' + id + '" min="0" max="100" value="0">' +
+      '<input type="range" class="range-sel-input range-sel-hi" id="range-hi-' + id + '" min="0" max="100" value="100">' +
+    '</div>' +
+    '<div class="range-sel-values">' +
+      '<span class="range-sel-val" id="range-lo-val-' + id + '">0</span>' +
+      '<span class="range-sel-sep">\u2013</span>' +
+      '<span class="range-sel-val" id="range-hi-val-' + id + '">100</span>' +
+    '</div>' +
+  '</div>';
+}
+
+function wireRangeSelector(container, panelId, dimension) {
+  var el = container.querySelector('[data-range-id="' + panelId + '"]');
+  if (!el) return;
+  var lo = el.querySelector('.range-sel-lo');
+  var hi = el.querySelector('.range-sel-hi');
+  var fill = el.querySelector('.range-sel-fill');
+  var loVal = el.querySelector('#range-lo-val-' + panelId);
+  var hiVal = el.querySelector('#range-hi-val-' + panelId);
+
+  function updateFill() {
+    var loP = ((lo.value - lo.min) / (lo.max - lo.min)) * 100;
+    var hiP = ((hi.value - hi.min) / (hi.max - hi.min)) * 100;
+    fill.style.left = loP + '%';
+    fill.style.width = (hiP - loP) + '%';
+    loVal.textContent = lo.value;
+    hiVal.textContent = hi.value;
+  }
+
+  lo.addEventListener('input', function () {
+    if (parseInt(lo.value) > parseInt(hi.value)) lo.value = hi.value;
+    updateFill();
+    if (dimension) setFilter(dimension, [lo.value, hi.value]);
+  });
+
+  hi.addEventListener('input', function () {
+    if (parseInt(hi.value) < parseInt(lo.value)) hi.value = lo.value;
+    updateFill();
+    if (dimension) setFilter(dimension, [lo.value, hi.value]);
+  });
+
+  updateFill();
+}
+
+// ── Principle 14: Skeleton placeholders ───────────────────────────────
 
 function buildPlaceholderListItems(count) {
   var html = '';
@@ -953,8 +1005,7 @@ function buildFilterBar(section, registry) {
     } else if (panel.chart === 'range') {
       html += '<div class="filter-bar-item filter-bar-item--range" id="panel-' + panel.id + '">';
       html += '<span class="filter-bar-label">' + escapeHtml(panel.label) + (dimDesc ? infoIcon(dimDesc) : '') + '</span>';
-      html += '<input type="range" class="range-slider range-slider--compact" min="0" max="100" value="0" id="range-input-' + panel.id + '">';
-      html += '<span class="filter-bar-range-val" id="range-val-' + panel.id + '">\u2014</span>';
+      html += buildRangeSelector(panel.id, panel.label, true);
       html += '</div>';
     }
   }
