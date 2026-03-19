@@ -78,9 +78,16 @@ function clearAllFilters() {
   writeUrlState(filterState);
   renderFilterChips();
   notifyFilterChange();
-  // Deselect all active pills/buttons
-  var actives = document.querySelectorAll('.mode-btn.active, .dim-item--selected');
-  for (var i = 0; i < actives.length; ++i) actives[i].classList.remove('active', 'dim-item--selected');
+  // Reset all selection states
+  var actives = document.querySelectorAll('.mode-btn.active, .dim-item--selected, .dropdown-item--selected, .pill--active, .pill--negative, .dropdown-value--active');
+  for (var i = 0; i < actives.length; ++i) {
+    actives[i].classList.remove('active', 'dim-item--selected', 'dropdown-item--selected', 'pill--active', 'pill--negative', 'dropdown-value--active');
+  }
+  // Reset dropdown trigger labels
+  var ddValues = document.querySelectorAll('.dropdown-value');
+  for (var j = 0; j < ddValues.length; ++j) {
+    if (ddValues[j].dataset.placeholder) ddValues[j].textContent = ddValues[j].dataset.placeholder;
+  }
 }
 
 function notifyFilterChange() {
@@ -186,6 +193,8 @@ function formatCount(n) {
 
 // ── Principle 8: Filter Chips (visible, removable) ────────────────────
 
+var _chipListenerWired = false;
+
 function renderFilterChips() {
   var container = document.getElementById('filter-chips');
   if (!container) return;
@@ -203,17 +212,35 @@ function renderFilterChips() {
     var dim = keys[i];
     var val = filterState[dim];
     var label = Array.isArray(val) ? val.join(', ') : String(val);
+    // Use a cleaner display name (strip _ prefix, title case)
+    var displayDim = dim.replace(/^_/, '').replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
     var chip = document.createElement('span');
     chip.className = 'filter-chip';
-    chip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(dim) + ': ' + escapeHtml(label) + '</span>' +
+    chip.innerHTML = '<span class="filter-chip-label">' + escapeHtml(displayDim) + ': ' + escapeHtml(label) + '</span>' +
       '<button class="filter-chip-remove" data-dim="' + escapeHtml(dim) + '">&times;</button>';
     container.appendChild(chip);
   }
 
-  container.addEventListener('click', function (e) {
-    var removeBtn = e.target.closest('.filter-chip-remove');
-    if (removeBtn) setFilter(removeBtn.dataset.dim, null);
-  });
+  if (!_chipListenerWired) {
+    _chipListenerWired = true;
+    container.addEventListener('click', function (e) {
+      var removeBtn = e.target.closest('.filter-chip-remove');
+      if (!removeBtn) return;
+      var dim = removeBtn.dataset.dim;
+      setFilter(dim, null);
+      // Also deselect the corresponding dropdown items
+      var dd = document.querySelector('[data-dropdown-id="' + dim + '"]');
+      if (dd) {
+        var selected = dd.querySelectorAll('.dropdown-item--selected');
+        for (var i = 0; i < selected.length; ++i) selected[i].classList.remove('dropdown-item--selected');
+        var valueEl = dd.querySelector('.dropdown-value');
+        if (valueEl && valueEl.dataset.placeholder) {
+          valueEl.textContent = valueEl.dataset.placeholder;
+          valueEl.classList.remove('dropdown-value--active');
+        }
+      }
+    });
+  }
 }
 
 // ── Principle 2: Info tooltip (i) ─────────────────────────────────────
@@ -252,7 +279,7 @@ function buildDropdown(id, label, placeholder, items, multiSelect) {
   html += '<span class="dropdown-value" id="dd-val-' + escapeHtml(id) + '">' + escapeHtml(btnLabel) + '</span>';
   html += '<span class="dropdown-arrow">&#9662;</span>';
   html += '</button>';
-  html += '<div class="dropdown-panel" hidden>';
+  html += '<div class="dropdown-panel">';
   if (items.length > 6) {
     html += '<input type="text" class="dropdown-search" placeholder="Search\u2026">';
   }
@@ -284,8 +311,8 @@ function wireDropdowns(container) {
     _dropdownCloseWired = true;
     document.addEventListener('mousedown', function (e) {
       if (!e.target.closest('.dropdown')) {
-        var allPanels = document.querySelectorAll('.dropdown-panel');
-        for (var j = 0; j < allPanels.length; ++j) allPanels[j].hidden = true;
+        var allPanels = document.querySelectorAll('.dropdown-panel--open');
+        for (var j = 0; j < allPanels.length; ++j) allPanels[j].classList.remove('dropdown-panel--open');
       }
     });
   }
@@ -302,13 +329,13 @@ function wireOneDropdown(dropdown) {
   trigger.addEventListener('mousedown', function (e) {
     e.preventDefault();
     e.stopPropagation();
-    var wasOpen = !panel.hidden;
+    var wasOpen = panel.classList.contains('dropdown-panel--open');
     // Close all dropdowns first
-    var allPanels = document.querySelectorAll('.dropdown-panel');
-    for (var i = 0; i < allPanels.length; ++i) allPanels[i].hidden = true;
+    var allPanels = document.querySelectorAll('.dropdown-panel--open');
+    for (var i = 0; i < allPanels.length; ++i) allPanels[i].classList.remove('dropdown-panel--open');
     // Toggle this one
     if (!wasOpen) {
-      panel.hidden = false;
+      panel.classList.add('dropdown-panel--open');
       if (search) {
         search.value = '';
         setTimeout(function () { search.focus(); }, 0);
@@ -367,6 +394,39 @@ function filterDropdownItems(panel, query) {
     var label = items[i].querySelector('.dropdown-item-label');
     var text = label ? label.textContent.toLowerCase() : '';
     items[i].style.display = (!q || text.indexOf(q) >= 0) ? '' : 'none';
+  }
+}
+
+// Restore dropdown selections from URL filter state
+function restoreDropdownsFromState() {
+  var dropdowns = document.querySelectorAll('.dropdown');
+  for (var i = 0; i < dropdowns.length; ++i) {
+    var dd = dropdowns[i];
+    var id = dd.dataset.dropdownId;
+    var vals = filterState[id];
+    if (!vals) continue;
+    if (!Array.isArray(vals)) vals = [vals];
+
+    var items = dd.querySelectorAll('.dropdown-item');
+    var selectedCount = 0;
+    for (var j = 0; j < items.length; ++j) {
+      if (vals.indexOf(items[j].dataset.value) >= 0) {
+        items[j].classList.add('dropdown-item--selected');
+        selectedCount++;
+      }
+    }
+
+    // Update trigger label
+    var valueEl = dd.querySelector('.dropdown-value');
+    if (valueEl && selectedCount > 0) {
+      if (selectedCount === 1) {
+        var sel = dd.querySelector('.dropdown-item--selected .dropdown-item-label');
+        valueEl.textContent = sel ? sel.textContent : vals[0];
+      } else {
+        valueEl.textContent = selectedCount + ' selected';
+      }
+      valueEl.classList.add('dropdown-value--active');
+    }
   }
 }
 
@@ -936,6 +996,7 @@ async function main() {
 
     // Render dashboard immediately — visible under the overlay
     buildDashboardDOM(container, config, sections, registry);
+    restoreDropdownsFromState();
     renderFilterChips();
     console.log('[dashboard] Dashboard rendered, loading data...');
 
