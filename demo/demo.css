@@ -197,10 +197,12 @@ body {
 .source-badge.source-live { background: var(--accent-green-dim); color: var(--accent-green); }
 .source-badge.source-file { background: var(--accent-amber-dim); color: var(--accent-amber); }
 
-/* KPI row */
+/* KPI row — auto-fill grid. The grid decides how many columns fit;
+   each card's @container kpicard query decides its format.
+   min 110px ensures cards can go narrow enough to trigger compact mode. */
 .kpi-row {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
   gap: var(--card-gap, 10px);
   margin-bottom: var(--section-gap, 16px);
 }
@@ -1189,20 +1191,13 @@ body {
 
 /* ── Page-level media queries (macro layout) ─────────────────────── */
 
-/* Phone landscape+ (480px): 2-col KPIs */
-@media (min-width: 480px) {
-  .kpi-row { grid-template-columns: repeat(2, 1fr); }
-}
-
-/* Tablet (768px): multi-column grids, full model bar */
+/* Tablet (768px): multi-column chart grid */
 @media (min-width: 768px) {
-  .kpi-row { grid-template-columns: repeat(3, 1fr); }
   .chart-grid { grid-template-columns: repeat(2, 1fr); }
 }
 
-/* Desktop (1200px): full grid */
+/* Desktop (1200px): full chart grid */
 @media (min-width: 1200px) {
-  .kpi-row { grid-template-columns: repeat(4, 1fr); }
   .chart-grid { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
 }
 
