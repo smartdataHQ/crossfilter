@@ -24,7 +24,8 @@ Declares which Cube to query, how to partition, and optionally how to split dime
 ```js
 {
   cube: "bluecar_stays",           // required — Cube model name
-  partition: "bluecar.is",         // required — partition filter value
+  partition: "bluecar.is",         // required — tenant/dataset partition value
+                                   // applied as server-side filter: { member: "cube.partition", operator: "equals", values: [partition] }
   title: "Iceland Rental Stays",   // optional — dashboard title
 
   // Optional: explicit worker definitions. If omitted, engine auto-allocates.
@@ -66,7 +67,7 @@ The engine infers chart type, label, filter mode, sort, and limit from the Cube 
 
 ```js
 {
-  // Data binding — exactly one of these is required
+  // Data binding — one of dimension or measure (neither required for "table" panels)
   dimension: "car_class",          // Cube dimension short name
   // OR
   measure: "avg_stay_duration_hours",  // Cube measure short name
@@ -75,22 +76,29 @@ The engine infers chart type, label, filter mode, sort, and limit from the Cube 
   chart: "bar",                    // enum — see Chart Types below
   label: "Vehicle Class",          // display label (default: metadata description or field name)
   limit: 10,                       // top-N items to show (default: inferred from unique_values)
-  sort: "value",                   // enum: "value" | "key" | "natural"
+  sort: "value",                   // enum: "value" | "key" | "alphabetical"
 
   // Filtering
-  filter: "in",                    // enum: "exact" | "in" | "range" | "function" | "server"
+  filter: "in",                    // enum: "in" | "exact" | "range" | "none" | "server"
 
   // Time-specific (for datetime dimensions)
   granularity: "day",              // enum: "minute" | "hour" | "day" | "week" | "month"
 
-  // Aggregation (for measure panels or grouped dimensions)
+  // Aggregation — controls what value each group entry shows
   op: "count",                     // enum: "count" | "sum" | "avg" | "min" | "max"
-  field: "stay_duration_hours",    // measure field to aggregate (for dimension groups)
+                                   // default: "count" for dimension panels
+  field: "stay_duration_hours",    // which measure field to aggregate when op is sum/avg/min/max
+                                   // e.g. { dimension: "car_class", op: "avg", field: "stay_duration_hours" }
+                                   // → bar chart where each bar shows avg stay duration per car class
+
+  // Table-specific (only for chart: "table")
+  columns: ["car_class", "region", "stay_duration_hours", "poi_name"],  // which fields to show as columns
 
   // Layout hints
   section: "vehicles",             // group panels into named sections
   width: "full",                   // enum: "full" | "half" | "third" | "quarter"
-  collapsed: false,                // start collapsed (for searchable lists)
+  collapsed: false,                // start panel content collapsed (independent of section collapsed)
+  searchable: true,                // add search input (default: inferred from unique_values > 50)
 
   // Worker assignment
   worker: "cf-main"                // explicit worker (default: auto-allocated)
@@ -148,9 +156,9 @@ All enum fields — these constrain LLM structured output:
 | Field | Enum values |
 |---|---|
 | `chart` | Discovered from ECharts at runtime (`"line"`, `"bar"`, `"pie"`, `"scatter"`, `"radar"`, `"treemap"`, `"heatmap"`, `"gauge"`, `"funnel"`, `"sunburst"`, `"boxplot"`, `"sankey"`, ...) plus non-chart controls: `"list"`, `"kpi"`, `"toggle"`, `"range"`, `"table"` |
-| `filter` | `"exact"`, `"in"`, `"range"`, `"function"`, `"server"` |
-| `op` | `"count"`, `"sum"`, `"avg"`, `"min"`, `"max"` |
-| `sort` | `"value"`, `"key"`, `"natural"` |
+| `filter` | `"in"` (multi-select, default for bar/list/pie), `"exact"` (single-select), `"range"` (min/max), `"none"` (display only), `"server"` (Cube query filter, not crossfilter) |
+| `op` | `"count"` (default), `"sum"`, `"avg"`, `"min"`, `"max"` |
+| `sort` | `"value"` (by aggregate, descending — default), `"key"` (by dimension value), `"alphabetical"` (A-Z) |
 | `granularity` | `"minute"`, `"hour"`, `"day"`, `"week"`, `"month"` |
 | `width` | `"full"`, `"half"`, `"third"`, `"quarter"` |
 
@@ -179,6 +187,36 @@ This is the same pattern used in `demo-stockout/filter-router.js`.
 ### Server-side dimensions
 
 Dimensions listed in `serverDimensions` are filtered by modifying the Cube query (adding a `filters` clause) and re-fetching. This is for very high-cardinality dimensions (e.g., `booking` with unique IDs) that shouldn't consume a client-side crossfilter slot.
+
+## Measure Panel Data Flow
+
+Measure panels (`chart: "kpi"`) need reactive values that update when crossfilter filters change.
+
+**Approach**: The engine creates a crossfilter `groupAll()` with a custom reduce function for each measure panel. When any filter changes, the `groupAll` recomputes automatically via crossfilter's incremental reduce system.
+
+- `op: "count"` → `groupAll().reduceCount()`
+- `op: "sum"` → `groupAll().reduceSum(accessor)`
+- `op: "avg"` → custom reduce: tracks sum + count, `.value()` returns sum/count
+- `op: "min"` / `op: "max"` → custom reduce with running min/max
+
+Measures that come pre-aggregated from the Cube query (e.g., `avg_availability`) use the field value directly. The engine detects this by checking whether the field appears in the Cube query's `measures` array (server-computed) vs `dimensions` array (raw values).
+
+**Format inference**: The engine infers display formatting from the measure metadata:
+- `format: "percent"` → show as "94.2%"
+- Field name containing `_hours` → show as "2.4h"
+- Field name containing `_isk` or `_sales` → show as "4.9K ISK" (currency)
+- Otherwise → abbreviated number ("1.99M", "381K")
+
+## Validation Behavior
+
+When the config references a dimension or measure not found in the Cube metadata:
+- The panel is **skipped** (not rendered) and a warning is logged to the console
+- The engine does not throw — partial configs should degrade gracefully
+- This is important for LLM-generated configs where the agent may reference fields that were renamed or removed
+
+When the config specifies a `chart` type not registered in ECharts and not a built-in control:
+- The panel renders a placeholder card with the chart type name and a "unsupported" message
+- This allows future chart types to be visible as intent even before implementation
 
 ## Runtime Discovery
 
@@ -255,8 +293,9 @@ var BLUECAR_STAYS_CONFIG = {
     // Numeric range
     { dimension: "stay_duration_hours", chart: "range", section: "filters" },
 
-    // Data table
-    { chart: "table", section: "details", width: "full" }
+    // Data table — no dimension/measure required; shows all filtered rows
+    { chart: "table", section: "details", width: "full",
+      columns: ["car_class", "region", "activity_type", "poi_name", "stay_duration_hours", "stay_started_at"] }
   ],
 
   layout: {
