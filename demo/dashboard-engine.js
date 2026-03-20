@@ -713,17 +713,9 @@ function renderBarChart(panelEl, panel, groupData) {
     instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
   }
   option.animation = false;
-  option.animationDuration = 0;
-  option.animationDurationUpdate = 0;
-  // Also force on each series — ECharts 6 can ignore top-level animation settings
-  if (option.series) {
-    for (var si = 0; si < option.series.length; ++si) {
-      option.series[si].animation = false;
-      option.series[si].animationDuration = 0;
-      option.series[si].animationDurationUpdate = 0;
-    }
-  }
-  instance.setOption(option, true);
+  // Clear before setOption to prevent diff-based transition animations
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
   return instance;
 }
 
@@ -782,17 +774,9 @@ function renderPieChart(panelEl, panel, groupData) {
     instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
   }
   option.animation = false;
-  option.animationDuration = 0;
-  option.animationDurationUpdate = 0;
-  // Also force on each series — ECharts 6 can ignore top-level animation settings
-  if (option.series) {
-    for (var si = 0; si < option.series.length; ++si) {
-      option.series[si].animation = false;
-      option.series[si].animationDuration = 0;
-      option.series[si].animationDurationUpdate = 0;
-    }
-  }
-  instance.setOption(option, true);
+  // Clear before setOption to prevent diff-based transition animations
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
   return instance;
 }
 
@@ -838,17 +822,9 @@ function renderGaugeChart(panelEl, panel, kpiValue, registry) {
     instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
   }
   option.animation = false;
-  option.animationDuration = 0;
-  option.animationDurationUpdate = 0;
-  // Also force on each series — ECharts 6 can ignore top-level animation settings
-  if (option.series) {
-    for (var si = 0; si < option.series.length; ++si) {
-      option.series[si].animation = false;
-      option.series[si].animationDuration = 0;
-      option.series[si].animationDurationUpdate = 0;
-    }
-  }
-  instance.setOption(option, true);
+  // Clear before setOption to prevent diff-based transition animations
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
   return instance;
 }
 

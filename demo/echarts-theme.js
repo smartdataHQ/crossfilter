@@ -7,6 +7,10 @@ export function registerDemoEChartsTheme(echarts) {
   }
 
   echarts.registerTheme(DEMO_THEME_NAME, {
+    animation: false,
+    animationDuration: 0,
+    animationDurationUpdate: 0,
+    animationThreshold: 0,
     backgroundColor: 'transparent',
     textStyle: {
       fontFamily: "Lato, Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
