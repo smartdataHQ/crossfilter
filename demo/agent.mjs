@@ -553,6 +553,53 @@ function toolSaveDraft(args, ctx) {
   });
 }
 
+function toolDescribeDashboard(args, ctx) {
+  if (!ctx.currentConfig) {
+    return 'No dashboard has been generated yet. Call generate_dashboard first.';
+  }
+
+  var config = ctx.currentConfig;
+  var sections = config.sections || [];
+  var summary = {
+    title: config.title,
+    cubes: config.cubes,
+    total_sections: sections.length,
+    total_panels: sections.reduce(function (s, sec) { return s + (sec.panels || []).length; }, 0),
+    sections: sections.map(function (sec) {
+      var panels = (sec.panels || []).map(function (p) {
+        var dim = p.dimension || p.category || p.name || p.x || p.source || null;
+        var meas = p.measure || p.y || p.value || null;
+        var info = { chart: p.chart || 'bar' };
+        if (dim) info.dimension = dim;
+        if (meas) info.measure = meas;
+        if (p.stack) info.stack = p.stack;
+        if (p.levels) info.levels = p.levels;
+        if (p.columns) info.columns_count = p.columns.length;
+        if (p.primary) info.primary = true;
+        if (p.searchable) info.searchable = true;
+        if (p.label) info.label = p.label;
+        return info;
+      });
+      return {
+        id: sec.id,
+        label: sec.label || null,
+        location: sec.location || 'main',
+        columns: sec.columns || null,
+        collapsed: sec.collapsed || false,
+        lazy: sec.lazy || false,
+        panel_count: panels.length,
+        panels: panels,
+      };
+    }),
+  };
+
+  if (config.sharedFilters && config.sharedFilters.length > 0) {
+    summary.shared_filters = config.sharedFilters;
+  }
+
+  return JSON.stringify(summary);
+}
+
 // ── Tool dispatch ───────────────────────────────────────────────────
 
 function executeToolCall(name, argsStr, ctx) {
@@ -570,7 +617,8 @@ function executeToolCall(name, argsStr, ctx) {
     case 'query_cube': return toolQueryCube(args, ctx);
     case 'generate_dashboard': return toolGenerateDashboard(args, ctx);
     case 'save_draft': return Promise.resolve(toolSaveDraft(args, ctx));
-    default: return Promise.resolve('Unknown tool: "' + name + '". Available tools: list_cubes, describe_cube, get_chart_support, query_cube, generate_dashboard, save_draft.');
+    case 'describe_dashboard': return Promise.resolve(toolDescribeDashboard(args, ctx));
+    default: return Promise.resolve('Unknown tool: "' + name + '". Available tools: list_cubes, describe_cube, get_chart_support, query_cube, generate_dashboard, save_draft, describe_dashboard.');
   }
 }
 

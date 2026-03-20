@@ -153,5 +153,19 @@
         "additionalProperties": false
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "describe_dashboard",
+      "description": "Get a structured summary of the current dashboard config — sections, panels, chart types, dimensions, lazy status. Call this before updating a dashboard so you can write a precise purpose for generate_dashboard. Returns null if no dashboard has been generated yet.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    }
   }
 ]

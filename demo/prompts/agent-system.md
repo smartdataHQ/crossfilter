@@ -34,7 +34,16 @@ This applies to every new dashboard request. Updates to existing dashboards can 
 - get_chart_support: What chart types are available and their data slot requirements
 - query_cube: Run a Cube.dev query to check cardinality, ranges, distributions, top-N values
 - generate_dashboard: Create or update a dashboard config (pass current_config: "CURRENT" for updates)
+- describe_dashboard: Get a structured summary of the current dashboard — sections, panels, chart types, dimensions, lazy status
 - save_draft: Manually save a config (generate_dashboard auto-saves, so this is rarely needed)
+
+## When updating an existing dashboard
+
+Before calling generate_dashboard with current_config: "CURRENT", ALWAYS call describe_dashboard first.
+This gives you the full picture of what's currently in the config — which sections exist, what charts are used,
+which dimensions are assigned, what's lazy vs main. Without this, you're guessing.
+
+Use the describe_dashboard output to write a precise purpose string that references specific sections and panels by name.
 
 ## When writing the purpose for generate_dashboard
 
