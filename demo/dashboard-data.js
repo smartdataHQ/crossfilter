@@ -229,9 +229,11 @@ function buildCubeQuery(cubeName, scanResult, registry, serverState) {
 // ── Build Arrow field rename + type transform projection ──────────────
 // Only includes group-by dims + measures (server filter dims are not in the result)
 
-function buildProjection(cubeName, scanResult, registry) {
+function buildProjection(cubeName, scanResult, registry, serverState) {
   var rename = {};
   var transforms = {};
+  var granularity = (serverState && serverState.granularity) ||
+    (registry._cubeMeta.granularity && registry._cubeMeta.granularity.default) || 'week';
 
   function addField(field) {
     rename[cubeName + '.' + field] = field;
@@ -239,9 +241,13 @@ function buildProjection(cubeName, scanResult, registry) {
   }
 
   scanResult.groupByDims.forEach(function(d) { addField(d); });
-  // Time dims appear in Arrow result with granularity suffix — add both forms
+  // Time dims may appear in Arrow result with granularity suffix
+  // e.g. bluecar_stays.stay_started_at.week → stay_started_at
   for (var t = 0; t < scanResult.timeDims.length; ++t) {
-    addField(scanResult.timeDims[t]);
+    var td = scanResult.timeDims[t];
+    addField(td);
+    rename[cubeName + '.' + td + '.' + granularity] = td;
+    rename[cubeName + '__' + td + '__' + granularity] = td;
   }
   scanResult.measures.forEach(function(m) { addField(m); });
 
@@ -314,7 +320,7 @@ function mergeResponses(responses) {
 
 function createWorker(cubeName, scanResult, registry, serverState) {
   var cubeQuery = buildCubeQuery(cubeName, scanResult, registry, serverState);
-  var projection = buildProjection(cubeName, scanResult, registry);
+  var projection = buildProjection(cubeName, scanResult, registry, serverState);
   var workerDims = Array.from(scanResult.groupByDims);
 
   console.log('[dashboard-data] Cube query:', JSON.stringify(cubeQuery, null, 2));
