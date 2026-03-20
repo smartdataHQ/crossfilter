@@ -713,6 +713,7 @@ function renderBarChart(panelEl, panel, groupData) {
     instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
   }
   option.animation = false;
+  option.animationDuration = 0;
   instance.setOption(option, true);
   return instance;
 }
@@ -772,6 +773,7 @@ function renderPieChart(panelEl, panel, groupData) {
     instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
   }
   option.animation = false;
+  option.animationDuration = 0;
   instance.setOption(option, true);
   return instance;
 }
@@ -818,6 +820,7 @@ function renderGaugeChart(panelEl, panel, kpiValue, registry) {
     instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
   }
   option.animation = false;
+  option.animationDuration = 0;
   instance.setOption(option, true);
   return instance;
 }
