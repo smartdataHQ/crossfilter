@@ -2016,27 +2016,38 @@ function buildPanelCard(panel, accentIdx, registry) {
     headRight += '<sl-button size="small" variant="text" class="dim-list-toggle" data-panel="' + panel.id + '">List</sl-button>';
   }
   if (panel.chart === 'line' || panel._isTimeSeries) {
-    // All time-series visualization options
-    var timeVizOptions = [
-      { value: 'line', label: 'Line' },
-      { value: 'line.smooth', label: 'Smooth' },
-      { value: 'line.area', label: 'Area' },
-      { value: 'line.area.stacked', label: 'Stacked Area' },
-      { value: 'line.area.normalized', label: '100% Area' },
-      { value: 'line.step', label: 'Step' },
-      { value: 'bar', label: 'Bar' },
-      { value: 'bar.stacked', label: 'Stacked Bar' },
-      { value: 'bar.normalized', label: '100% Bar' },
-      { value: 'line.bump', label: 'Bump' },
-    ];
     var currentViz = filterState['_timeChart'] || panel.chart;
-    var vizOpts = '';
-    for (var ti = 0; ti < timeVizOptions.length; ++ti) {
-      var tvo = timeVizOptions[ti];
-      var ttSel = tvo.value === currentViz ? ' selected' : '';
-      vizOpts += '<sl-option value="' + tvo.value + '"' + ttSel + '>' + escapeHtml(tvo.label) + '</sl-option>';
+    // Inline SVG icons for each viz type (16×12 viewBox)
+    var vizIcons = [
+      { value: 'line', label: 'Line',
+        svg: '<path d="M1,10 L4,6 L7,8 L10,3 L13,5 L15,2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>' },
+      { value: 'line.smooth', label: 'Smooth',
+        svg: '<path d="M1,10 C3,6 5,4 8,6 C11,8 13,2 15,2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>' },
+      { value: 'line.area', label: 'Area',
+        svg: '<path d="M1,10 L4,6 L7,8 L10,3 L13,5 L15,2 L15,11 L1,11Z" fill="currentColor" opacity="0.25"/><path d="M1,10 L4,6 L7,8 L10,3 L13,5 L15,2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>' },
+      { value: 'line.area.stacked', label: 'Stacked Area',
+        svg: '<path d="M1,11 L1,8 L5,5 L9,7 L13,4 L15,3 L15,11Z" fill="currentColor" opacity="0.3"/><path d="M1,11 L1,10 L5,8 L9,9 L13,7 L15,6 L15,11Z" fill="currentColor" opacity="0.2"/>' },
+      { value: 'line.area.normalized', label: '100% Area',
+        svg: '<rect x="1" y="1" width="14" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="0.7" opacity="0.3"/><path d="M1,11 L1,4 L5,3 L9,5 L13,2 L15,1 L15,11Z" fill="currentColor" opacity="0.3"/><path d="M1,11 L1,7 L5,6 L9,8 L13,5 L15,4 L15,11Z" fill="currentColor" opacity="0.25"/>' },
+      { value: 'line.step', label: 'Step',
+        svg: '<path d="M1,10 L4,10 L4,6 L7,6 L7,8 L10,8 L10,3 L13,3 L13,5 L15,5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>' },
+      { value: 'bar', label: 'Bar',
+        svg: '<rect x="1" y="6" width="2.5" height="5" rx="0.5" fill="currentColor" opacity="0.7"/><rect x="4.5" y="3" width="2.5" height="8" rx="0.5" fill="currentColor" opacity="0.7"/><rect x="8" y="5" width="2.5" height="6" rx="0.5" fill="currentColor" opacity="0.7"/><rect x="11.5" y="2" width="2.5" height="9" rx="0.5" fill="currentColor" opacity="0.7"/>' },
+      { value: 'bar.stacked', label: 'Stacked Bar',
+        svg: '<rect x="1" y="4" width="2.5" height="3" rx="0.3" fill="currentColor" opacity="0.5"/><rect x="1" y="7.5" width="2.5" height="3" rx="0.3" fill="currentColor" opacity="0.3"/><rect x="5" y="2" width="2.5" height="4" rx="0.3" fill="currentColor" opacity="0.5"/><rect x="5" y="6.5" width="2.5" height="4" rx="0.3" fill="currentColor" opacity="0.3"/><rect x="9" y="3" width="2.5" height="3.5" rx="0.3" fill="currentColor" opacity="0.5"/><rect x="9" y="7" width="2.5" height="4" rx="0.3" fill="currentColor" opacity="0.3"/><rect x="12.5" y="1" width="2.5" height="5" rx="0.3" fill="currentColor" opacity="0.5"/><rect x="12.5" y="6.5" width="2.5" height="4.5" rx="0.3" fill="currentColor" opacity="0.3"/>' },
+      { value: 'bar.normalized', label: '100% Bar',
+        svg: '<rect x="1" y="1" width="2.5" height="4" rx="0.3" fill="currentColor" opacity="0.5"/><rect x="1" y="5.5" width="2.5" height="5.5" rx="0.3" fill="currentColor" opacity="0.25"/><rect x="5" y="1" width="2.5" height="6" rx="0.3" fill="currentColor" opacity="0.5"/><rect x="5" y="7.5" width="2.5" height="3.5" rx="0.3" fill="currentColor" opacity="0.25"/><rect x="9" y="1" width="2.5" height="5" rx="0.3" fill="currentColor" opacity="0.5"/><rect x="9" y="6.5" width="2.5" height="4.5" rx="0.3" fill="currentColor" opacity="0.25"/><rect x="12.5" y="1" width="2.5" height="3" rx="0.3" fill="currentColor" opacity="0.5"/><rect x="12.5" y="4.5" width="2.5" height="6.5" rx="0.3" fill="currentColor" opacity="0.25"/>' },
+      { value: 'line.bump', label: 'Bump',
+        svg: '<path d="M1,3 C4,3 5,8 8,8 C11,8 12,5 15,5" fill="none" stroke="currentColor" stroke-width="1.3" opacity="0.6"/><path d="M1,8 C4,8 5,3 8,3 C11,3 12,9 15,9" fill="none" stroke="currentColor" stroke-width="1.3" opacity="0.4"/>' },
+    ];
+    headRight += '<div class="viz-icon-bar">';
+    for (var ti = 0; ti < vizIcons.length; ++ti) {
+      var vi = vizIcons[ti];
+      var viActive = vi.value === currentViz ? ' viz-icon--active' : '';
+      headRight += '<button class="viz-icon' + viActive + '" data-viz="' + vi.value + '" title="' + escapeHtml(vi.label) + '">' +
+        '<svg viewBox="0 0 16 12" width="20" height="15">' + vi.svg + '</svg></button>';
     }
-    headRight += '<sl-select size="small" class="viz-type-select" value="' + escapeHtml(currentViz) + '" hoist>' + vizOpts + '</sl-select>';
+    headRight += '</div>';
   }
   if (panel.chart === 'selector' || panel.chart === 'list') {
     headRight += '<span class="group-size-badge" id="count-' + panel.id + '"></span>';
@@ -2637,7 +2648,12 @@ async function main() {
     var breakdownStyle = document.createElement('style');
     breakdownStyle.textContent =
       '.chart-card--breakdown { box-shadow: 0 0 0 1.5px rgba(63,101,135,0.35); }' +
-      '.chart-card--breakdown .card-t { color: #3f6587; }';
+      '.chart-card--breakdown .card-t { color: #3f6587; }' +
+      '.viz-icon-bar { display: flex; gap: 2px; align-items: center; }' +
+      '.viz-icon { border: none; background: none; padding: 3px 4px; border-radius: 4px; cursor: pointer; color: #8da4b8; transition: color 0.15s, background 0.15s; line-height: 0; }' +
+      '.viz-icon:hover { color: #3f6587; background: rgba(63,101,135,0.08); }' +
+      '.viz-icon--active { color: #3d8bfd; background: rgba(61,139,253,0.1); }' +
+      '.viz-icon--active:hover { color: #3d8bfd; background: rgba(61,139,253,0.15); }';
     document.head.appendChild(breakdownStyle);
 
     filterState = readUrlState(); // Principle 3: read URL state early (no network needed)
@@ -2692,12 +2708,19 @@ async function main() {
     restoreStateFromUrl();
     renderFilterChips();
 
-    // Wire viz type selectors on time charts
-    container.addEventListener('sl-change', function(e) {
-      var sel = e.target.closest('.viz-type-select');
-      if (!sel) return;
-      filterState['_timeChart'] = sel.value;
+    // Wire viz type icon buttons on time charts
+    container.addEventListener('click', function(e) {
+      var btn = e.target.closest('.viz-icon');
+      if (!btn) return;
+      var viz = btn.dataset.viz;
+      if (!viz) return;
+      filterState['_timeChart'] = viz;
       writeUrlState(filterState);
+      // Update active state on all viz icons
+      var allIcons = container.querySelectorAll('.viz-icon');
+      for (var vi = 0; vi < allIcons.length; ++vi) {
+        allIcons[vi].classList.toggle('viz-icon--active', allIcons[vi].dataset.viz === viz);
+      }
       notifyFilterChange();
     });
 
