@@ -211,7 +211,7 @@ function setFilter(dimension, values) {
   renderFilterChips();
 
   // Route to correct tier
-  if (_dashboardData && _dashboardData.isServerDim && _dashboardData.isServerDim(dimension)) {
+  if (isServerTrigger(dimension)) {
     triggerServerReload();
   } else {
     notifyFilterChange();
@@ -220,11 +220,9 @@ function setFilter(dimension, values) {
 
 function clearAllFilters() {
   var hadServerDims = false;
-  if (_dashboardData && _dashboardData.isServerDim) {
-    var keys = Object.keys(filterState);
-    for (var k = 0; k < keys.length; ++k) {
-      if (_dashboardData.isServerDim(keys[k])) { hadServerDims = true; break; }
-    }
+  var keys = Object.keys(filterState);
+  for (var k = 0; k < keys.length; ++k) {
+    if (isServerTrigger(keys[k])) { hadServerDims = true; break; }
   }
 
   filterState = {};
@@ -257,20 +255,80 @@ function notifyFilterChange() {
 // ── Tier 2: Server-side reload ────────────────────────────────────────
 // Collects active server-side filter values from filterState,
 // disposes the old worker, creates a new one with updated Cube query.
+//
+// Special filter keys (internal UI IDs, not cube dimensions):
+//   _focus       → segments (cube segment activation)
+//   _include     → boolean presets (filter boolean dims to true)
+//   _granularity → time bucketing granularity
+//   time dims    → period date range
+
+// All keys that are internal UI controls, not cube dimension names
+var SERVER_CONTROL_KEYS = { _focus: true, _include: true, _granularity: true };
+
+function isServerTrigger(dim) {
+  if (SERVER_CONTROL_KEYS[dim]) return true;
+  if (_dashboardData && _dashboardData.isServerDim(dim)) return true;
+  // Time dimensions (period picker) trigger reload
+  if (_dashboardData && _dashboardData.timeDims) {
+    for (var t = 0; t < _dashboardData.timeDims.length; ++t) {
+      if (_dashboardData.timeDims[t] === dim) return true;
+    }
+  }
+  return false;
+}
 
 function buildServerState() {
   var serverFilters = {};
+  var segments = [];
+  var granularity = null;
+  var dateRange = null;
+  var timeDims = _dashboardData ? _dashboardData.timeDims : [];
   var keys = Object.keys(filterState);
+
   for (var i = 0; i < keys.length; ++i) {
     var dim = keys[i];
-    if (!_dashboardData || !_dashboardData.isServerDim(dim)) continue;
     var val = filterState[dim];
+
+    // Segments: _focus contains selected segment names
+    if (dim === '_focus') {
+      var segVals = Array.isArray(val) ? val : [val];
+      for (var sv = 0; sv < segVals.length; ++sv) segments.push(segVals[sv]);
+      continue;
+    }
+
+    // Boolean presets: _include contains boolean dim names to filter as true
+    if (dim === '_include') {
+      var inclVals = Array.isArray(val) ? val : [val];
+      for (var iv = 0; iv < inclVals.length; ++iv) {
+        serverFilters[inclVals[iv]] = { operator: 'equals', values: ['true'] };
+      }
+      continue;
+    }
+
+    // Granularity: _granularity contains the selected granularity id
+    if (dim === '_granularity') {
+      granularity = val;
+      continue;
+    }
+
+    // Time dimension: period date range
+    var isTimeDim = false;
+    for (var td = 0; td < timeDims.length; ++td) {
+      if (timeDims[td] === dim) { isTimeDim = true; break; }
+    }
+    if (isTimeDim && Array.isArray(val) && val.length === 2) {
+      dateRange = val;
+      continue;
+    }
+
+    // Regular server-side dimension filter
+    if (!_dashboardData || !_dashboardData.isServerDim(dim)) continue;
+
     if (val === 'true' || val === true) {
       serverFilters[dim] = { operator: 'equals', values: ['true'] };
     } else if (val === 'false' || val === false) {
       serverFilters[dim] = { operator: 'equals', values: ['false'] };
     } else if (Array.isArray(val) && val.length === 2 && typeof val[0] === 'number') {
-      // Range: two Cube filters on the same member (gte + lte)
       serverFilters[dim] = [
         { operator: 'gte', values: [String(val[0])] },
         { operator: 'lte', values: [String(val[1])] },
@@ -280,35 +338,80 @@ function buildServerState() {
       serverFilters[dim] = { operator: 'equals', values: values.map(String) };
     }
   }
-  return { filters: serverFilters };
+
+  var state = { filters: serverFilters };
+  if (segments.length) state.segments = segments;
+  if (granularity) state.granularity = granularity;
+  if (dateRange) state.dateRange = dateRange;
+  return state;
 }
 
 var _reloadSeq = 0;
+var _reloadDebounce = 0;
+var _progressOverlay = null;  // set by main()
+var _progressCard = null;     // set by main()
+
+function showReloadProgress(status) {
+  if (!_progressOverlay) return;
+  _progressOverlay.classList.remove('progress-overlay--done');
+  if (!_progressOverlay.parentNode) document.body.appendChild(_progressOverlay);
+  _progressCard.innerHTML =
+    '<div class="progress-step progress-step--active">' +
+      '<span class="progress-dot"></span>' +
+      '<span>' + escapeHtml(status) + '</span>' +
+    '</div>';
+}
+
+function hideReloadProgress() {
+  if (!_progressOverlay) return;
+  _progressOverlay.classList.add('progress-overlay--done');
+  setTimeout(function () { if (_progressOverlay.parentNode) _progressOverlay.remove(); }, 600);
+}
 
 function triggerServerReload() {
   if (!_dashboardData) return;
+
+  // Debounce: range sliders and rapid changes get 300ms settle time
+  clearTimeout(_reloadDebounce);
+  _reloadDebounce = setTimeout(function () {
+    executeServerReload();
+  }, 300);
+}
+
+function executeServerReload() {
   var seq = ++_reloadSeq;
   var serverState = buildServerState();
   console.log('[dashboard] Server reload triggered:', JSON.stringify(serverState));
 
+  showReloadProgress('Reloading data...');
+
   _dashboardData.reload(serverState).then(function(newData) {
-    if (seq !== _reloadSeq) return; // stale
+    if (seq !== _reloadSeq) return;
     _dashboardData = newData;
 
-    // Re-register progress/error listeners
     newData.on('progress', function(payload) {
-      console.log('[dashboard] Reload progress:', payload.status,
-        payload.load ? payload.load.rowsLoaded + ' rows' : '');
+      if (seq !== _reloadSeq) return;
+      if (payload.status === 'downloading') {
+        var pct = payload.fetch.percent;
+        showReloadProgress(pct != null ? Math.round(pct * 100) + '% downloaded' : 'Downloading...');
+      } else if (payload.status === 'streaming') {
+        showReloadProgress(payload.load.rowsLoaded.toLocaleString() + ' rows loaded');
+      }
+    });
+
+    newData.on('error', function(payload) {
+      var msg = payload && payload.message ? payload.message : 'Reload failed';
+      showReloadProgress(msg);
     });
 
     return newData.ready.then(function() {
       if (seq !== _reloadSeq) return;
-      // Extract only client-side filters for the crossfilter query
       var clientFilters = {};
       var keys = Object.keys(filterState);
       for (var i = 0; i < keys.length; ++i) {
-        if (!newData.isServerDim(keys[i])) {
-          clientFilters[keys[i]] = filterState[keys[i]];
+        var dim = keys[i];
+        if (!SERVER_CONTROL_KEYS[dim] && !newData.isServerDim(dim)) {
+          clientFilters[dim] = filterState[dim];
         }
       }
       return newData.query(clientFilters);
@@ -316,8 +419,10 @@ function triggerServerReload() {
   }).then(function(response) {
     if (seq !== _reloadSeq || !response) return;
     renderAllPanels(_dashboardPanels, response, _dashboardRegistry);
+    hideReloadProgress();
   }).catch(function(err) {
     console.error('[dashboard] Server reload failed:', err);
+    showReloadProgress('Reload failed: ' + err.message);
   });
 }
 
@@ -1808,6 +1913,8 @@ async function main() {
   progressCard.className = 'card progress-steps';
   overlay.appendChild(progressCard);
   document.body.appendChild(overlay);
+  _progressOverlay = overlay;
+  _progressCard = progressCard;
 
   var steps = [
     { id: 'meta', label: 'Connecting to data source' },

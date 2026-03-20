@@ -157,14 +157,11 @@ function buildCubeQuery(cubeName, scanResult, registry, serverState) {
     }
   }
 
-  // Active segments
+  // Active segments — Cube.dev uses a dedicated segments array
   var activeSegments = serverState.segments || [];
+  var querySegments = [];
   for (var si = 0; si < activeSegments.length; ++si) {
-    filters.push({
-      member: cubeName + '.' + activeSegments[si],
-      operator: 'equals',
-      values: ['true'],
-    });
+    querySegments.push(cubeName + '.' + activeSegments[si]);
   }
 
   // Time dimensions with granularity and optional date range
@@ -189,6 +186,7 @@ function buildCubeQuery(cubeName, scanResult, registry, serverState) {
       dimensions: queryDims,
       measures: Array.from(scanResult.measures).map(function(m) { return cubeName + '.' + m; }),
       timeDimensions: timeDimensions,
+      segments: querySegments.length ? querySegments : undefined,
       filters: filters,
       limit: 1000000,
     },
