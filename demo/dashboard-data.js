@@ -436,11 +436,16 @@ function fetchKpis(cubeName, kpis, scanResult, registry, serverState) {
   var remoteKpis = kpis.filter(function(k) { return !k.local; });
   if (!remoteKpis.length) return Promise.resolve({});
 
+  // Multiple panels may use the same measure — collect all panel IDs per measure
   var kpiMeasures = [];
-  var kpiIdByMeasure = {};
+  var kpiIdsByMeasure = {};
   for (var i = 0; i < remoteKpis.length; ++i) {
-    kpiMeasures.push(remoteKpis[i].measure);
-    kpiIdByMeasure[remoteKpis[i].measure] = remoteKpis[i].id;
+    var meas = remoteKpis[i].measure;
+    if (!kpiIdsByMeasure[meas]) {
+      kpiIdsByMeasure[meas] = [];
+      kpiMeasures.push(meas);
+    }
+    kpiIdsByMeasure[meas].push(remoteKpis[i].id);
   }
 
   var cubeQuery = buildKpiCubeQuery(cubeName, kpiMeasures, scanResult, registry, serverState);
@@ -456,11 +461,13 @@ function fetchKpis(cubeName, kpis, scanResult, registry, serverState) {
   }).then(function(json) {
     var row = json.data && json.data[0] ? json.data[0] : {};
     var result = {};
-    for (var measure in kpiIdByMeasure) {
+    for (var measure in kpiIdsByMeasure) {
       var fullName = cubeName + '.' + measure;
       var val = row[fullName];
       if (val != null) val = Number(val);
-      result[kpiIdByMeasure[measure]] = val;
+      // Assign to all panel IDs that use this measure
+      var ids = kpiIdsByMeasure[measure];
+      for (var j = 0; j < ids.length; ++j) result[ids[j]] = val;
     }
     console.log('[dashboard-data] KPI values:', JSON.stringify(result));
     return result;
