@@ -1,6 +1,8 @@
 // demo/dashboard-data.js
 // Data layer for the config-driven dashboard engine.
-// Scans panels → builds Cube query → creates streaming worker → queries → returns results.
+// Two-tier filtering:
+//   Tier 1 (client, instant): crossfilter dims for bar/pie/selector click-to-filter
+//   Tier 2 (server, reload):  Cube query.filters for toggles/ranges/segments/period/granularity
 // Zero hardcoded field names — everything from config + cube registry.
 
 import { getChartType } from './chart-types.js';
@@ -19,10 +21,17 @@ function inferReduceOp(measureName, registry) {
   return 'sum';
 }
 
-// ── Scan resolved panels → collect fields needed by worker ────────────
+// ── Scan resolved panels → classify fields into tiers ─────────────────
+//
+// Group-by dims:      bar/pie/selector category fields → query.dimensions + worker dims
+// Server filter dims: toggle/range fields → query.filters when active (NOT in query.dimensions)
+// Time dims:          time-type fields → query.timeDimensions with granularity
+// Measures:           KPI/gauge value fields → query.measures + worker KPIs
 
 function scanPanels(panels, registry) {
-  var dims = new Set();
+  var groupByDims = new Set();
+  var serverFilterDims = [];
+  var timeDims = [];
   var measures = new Set();
   var groups = [];
   var kpis = [];
@@ -44,14 +53,12 @@ function scanPanels(panels, registry) {
       for (var f = 0; f < fields.length; ++f) {
         var fname = fields[f];
         if (slot.accepts === 'dimension') {
-          dims.add(fname);
           if (!panelDimField) panelDimField = fname;
         } else if (slot.accepts === 'measure') {
           measures.add(fname);
           if (!panelMeasField) panelMeasField = fname;
         } else if (slot.accepts === 'any') {
           if (registry.dimensions[fname]) {
-            dims.add(fname);
             if (!panelDimField) panelDimField = fname;
           } else {
             measures.add(fname);
@@ -65,17 +72,35 @@ function scanPanels(panels, registry) {
     panel._measField = panelMeasField || panel.measure || null;
 
     var family = chartDef.family;
-    if (panel._dimField && (family === 'category' || family === 'control')) {
-      var measField = panel._measField;
-      var op = measField ? inferReduceOp(measField, registry) : 'count';
-      groups.push({
-        id: panel.id,
-        field: panel._dimField,
-        metrics: [{ id: 'value', field: op === 'count' ? null : measField, op: op }],
-      });
-      panel._groupId = panel.id;
+    var chartType = panel.chart;
+
+    // Classify the dimension field by panel type
+    if (panel._dimField) {
+      var dimMeta = registry.dimensions[panel._dimField];
+      var isTime = dimMeta && dimMeta.type === 'time';
+
+      if (isTime) {
+        // Time dims → timeDimensions (not query.dimensions)
+        timeDims.push(panel._dimField);
+      } else if (chartType === 'toggle' || chartType === 'range') {
+        // Toggle/range → server-side filter (not query.dimensions)
+        serverFilterDims.push({ field: panel._dimField, chart: chartType });
+      } else if (family === 'category' || family === 'control') {
+        // Bar/pie/selector/dropdown → group-by dimension
+        groupByDims.add(panel._dimField);
+
+        var measField = panel._measField;
+        var op = measField ? inferReduceOp(measField, registry) : 'count';
+        groups.push({
+          id: panel.id,
+          field: panel._dimField,
+          metrics: [{ id: 'value', field: op === 'count' ? null : measField, op: op }],
+        });
+        panel._groupId = panel.id;
+      }
     }
 
+    // KPI/gauge → groupAll reducer
     if (family === 'single' && panel._measField) {
       var kpiOp = inferReduceOp(panel._measField, registry);
       kpis.push({ id: panel.id, field: kpiOp === 'count' ? null : panel._measField, op: kpiOp });
@@ -85,36 +110,73 @@ function scanPanels(panels, registry) {
 
   measures.add('count');
 
-  return { dims: dims, measures: measures, groups: groups, kpis: kpis };
+  return {
+    groupByDims: groupByDims,
+    serverFilterDims: serverFilterDims,
+    timeDims: timeDims,
+    measures: measures,
+    groups: groups,
+    kpis: kpis,
+  };
 }
 
 // ── Build Cube.dev POST query body ────────────────────────────────────
+// query.dimensions = group-by dims only (determines result grain)
+// query.filters = partition + active server-side filters
+// query.timeDimensions = time dims with granularity + optional dateRange
 
-function buildCubeQuery(cubeName, dims, measures, registry) {
+function buildCubeQuery(cubeName, scanResult, registry, serverState) {
+  serverState = serverState || {};
+
   var partition = registry._cubeMeta.partition;
-  var granularity = (registry._cubeMeta.granularity && registry._cubeMeta.granularity.default) || 'week';
   var filters = [];
   if (partition) {
     filters.push({ member: cubeName + '.partition', operator: 'equals', values: [partition] });
   }
 
-  var queryDims = [];
-  var timeDimensions = [];
+  // Server-side filters from active toggles/ranges
+  var activeFilters = serverState.filters || {};
+  for (var dim in activeFilters) {
+    var f = activeFilters[dim];
+    if (!f) continue;
+    filters.push({
+      member: cubeName + '.' + dim,
+      operator: f.operator || 'equals',
+      values: f.values,
+    });
+  }
 
-  Array.from(dims).forEach(function(d) {
-    var meta = registry.dimensions[d];
-    if (meta && meta.type === 'time') {
-      timeDimensions.push({ dimension: cubeName + '.' + d, granularity: granularity });
-    } else {
-      queryDims.push(cubeName + '.' + d);
+  // Active segments
+  var activeSegments = serverState.segments || [];
+  for (var si = 0; si < activeSegments.length; ++si) {
+    filters.push({
+      member: cubeName + '.' + activeSegments[si],
+      operator: 'equals',
+      values: ['true'],
+    });
+  }
+
+  // Time dimensions with granularity and optional date range
+  var granularity = serverState.granularity ||
+    (registry._cubeMeta.granularity && registry._cubeMeta.granularity.default) || 'week';
+  var timeDimensions = [];
+  for (var t = 0; t < scanResult.timeDims.length; ++t) {
+    var td = { dimension: cubeName + '.' + scanResult.timeDims[t], granularity: granularity };
+    if (serverState.dateRange) {
+      td.dateRange = serverState.dateRange;
     }
+    timeDimensions.push(td);
+  }
+
+  var queryDims = Array.from(scanResult.groupByDims).map(function(d) {
+    return cubeName + '.' + d;
   });
 
   return {
     format: 'arrow',
     query: {
       dimensions: queryDims,
-      measures: Array.from(measures).map(function(m) { return cubeName + '.' + m; }),
+      measures: Array.from(scanResult.measures).map(function(m) { return cubeName + '.' + m; }),
       timeDimensions: timeDimensions,
       filters: filters,
       limit: 1000000,
@@ -123,8 +185,9 @@ function buildCubeQuery(cubeName, dims, measures, registry) {
 }
 
 // ── Build Arrow field rename + type transform projection ──────────────
+// Only includes group-by dims + measures (server filter dims are not in the result)
 
-function buildProjection(cubeName, dims, measures, registry) {
+function buildProjection(cubeName, scanResult, registry) {
   var rename = {};
   var transforms = {};
 
@@ -133,16 +196,20 @@ function buildProjection(cubeName, dims, measures, registry) {
     rename[cubeName + '__' + field] = field;
   }
 
-  dims.forEach(function(d) { addField(d); });
-  measures.forEach(function(m) { addField(m); });
+  scanResult.groupByDims.forEach(function(d) { addField(d); });
+  // Time dims appear in Arrow result with granularity suffix — add both forms
+  for (var t = 0; t < scanResult.timeDims.length; ++t) {
+    addField(scanResult.timeDims[t]);
+  }
+  scanResult.measures.forEach(function(m) { addField(m); });
 
-  dims.forEach(function(d) {
+  scanResult.groupByDims.forEach(function(d) {
     var meta = registry.dimensions[d];
     if (meta && (meta.type === 'number' || meta.type === 'boolean')) {
       transforms[d] = 'number';
     }
   });
-  measures.forEach(function(m) {
+  scanResult.measures.forEach(function(m) {
     transforms[m] = 'number';
   });
 
@@ -150,8 +217,9 @@ function buildProjection(cubeName, dims, measures, registry) {
 }
 
 // ── Convert engine filterState to typed crossfilter filters ───────────
+// Only applies to group-by dims (client-side tier 1)
 
-function buildFilters(filterState, workerDimensions) {
+function buildClientFilters(filterState, workerDimensions) {
   var filters = {};
   for (var dim in filterState) {
     if (workerDimensions.indexOf(dim) < 0) continue;
@@ -198,22 +266,18 @@ function mergeResponses(responses) {
   return merged;
 }
 
-// ── Public API ────────────────────────────────────────────────────────
+// ── Create streaming worker ───────────────────────────────────────────
 
-export async function createDashboardData(config, registry, resolvedPanels) {
-  var cubeName = config.cube;
-  var scanResult = scanPanels(resolvedPanels, registry);
+function createWorker(cubeName, scanResult, registry, serverState) {
+  var cubeQuery = buildCubeQuery(cubeName, scanResult, registry, serverState);
+  var projection = buildProjection(cubeName, scanResult, registry);
+  var workerDims = Array.from(scanResult.groupByDims);
 
-  console.log('[dashboard-data] Scanned', resolvedPanels.length, 'panels →',
-    scanResult.dims.size, 'dims,', scanResult.measures.size, 'measures,',
-    scanResult.groups.length, 'groups,', scanResult.kpis.length, 'kpis');
+  console.log('[dashboard-data] Cube query:', JSON.stringify(cubeQuery, null, 2));
+  console.log('[dashboard-data] Worker dims:', workerDims.join(', '));
+  console.log('[dashboard-data] Groups:', scanResult.groups.length, '| KPIs:', scanResult.kpis.length);
 
-  var cubeQuery = buildCubeQuery(cubeName, scanResult.dims, scanResult.measures, registry);
-  var projection = buildProjection(cubeName, scanResult.dims, scanResult.measures, registry);
-
-  var workerDims = Array.from(scanResult.dims);
-
-  var workerHandle = await crossfilter.createStreamingDashboardWorker({
+  return crossfilter.createStreamingDashboardWorker({
     crossfilterUrl: '/crossfilter.js',
     arrowRuntimeUrl: '/node_modules/apache-arrow/Arrow.es2015.min.js',
     batchCoalesceRows: 65536,
@@ -235,6 +299,22 @@ export async function createDashboardData(config, registry, resolvedPanels) {
       projection: projection,
     }],
   });
+}
+
+// ── Public API ────────────────────────────────────────────────────────
+
+export async function createDashboardData(config, registry, resolvedPanels, serverState) {
+  var cubeName = config.cube;
+  var scanResult = scanPanels(resolvedPanels, registry);
+
+  console.log('[dashboard-data] Scanned', resolvedPanels.length, 'panels →',
+    scanResult.groupByDims.size, 'group-by dims,',
+    scanResult.serverFilterDims.length, 'server filter dims,',
+    scanResult.timeDims.length, 'time dims,',
+    scanResult.measures.size, 'measures');
+
+  var workerDims = Array.from(scanResult.groupByDims);
+  var workerHandle = await createWorker(cubeName, scanResult, registry, serverState);
 
   var listeners = { progress: [], ready: [], error: [] };
 
@@ -257,8 +337,9 @@ export async function createDashboardData(config, registry, resolvedPanels) {
       if (listeners[event]) listeners[event].push(fn);
     },
 
+    // Tier 1: client-side query (instant, no server round-trip)
     query: function(filterState) {
-      var filters = buildFilters(filterState || {}, workerDims);
+      var filters = buildClientFilters(filterState || {}, workerDims);
       var groupQueries = buildGroupQueries(resolvedPanels);
       return workerHandle.query({
         filters: filters,
@@ -267,6 +348,17 @@ export async function createDashboardData(config, registry, resolvedPanels) {
         return mergeResponses([response]);
       });
     },
+
+    // Tier 2: server-side reload (new Cube query, new worker)
+    // Returns a new data handle — caller should replace the old one.
+    reload: function(newServerState) {
+      workerHandle.dispose();
+      return createDashboardData(config, registry, resolvedPanels, newServerState);
+    },
+
+    // Expose scan result so engine can identify server filter dims
+    serverFilterDims: scanResult.serverFilterDims,
+    timeDims: scanResult.timeDims,
 
     dispose: function() {
       return workerHandle.dispose();
