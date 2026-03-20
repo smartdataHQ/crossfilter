@@ -118,6 +118,7 @@ function scanPanels(panels, registry) {
         kpis.push({ id: panel.id, measure: panel._measField, local: false });
       }
       panel._kpiId = panel.id;
+      panel._kpiLocal = isLocalReducible;
     }
   }
 

@@ -809,10 +809,10 @@ function executeKpiRefresh() {
   if (!_dashboardData || !_dashboardData.queryKpis) return;
   var seq = ++_kpiRefreshSeq;
 
-  // Show loading state on remote KPI cards
+  // Show loading state only on remote KPI cards (local ones update instantly)
   var panels = _dashboardPanels || [];
   for (var i = 0; i < panels.length; ++i) {
-    if (!panels[i]._kpiId) continue;
+    if (!panels[i]._kpiId || panels[i]._kpiLocal) continue;
     var el = document.querySelector('#panel-' + panels[i].id + ' .kpi-value');
     if (el && el.textContent !== '\u2014') {
       el.style.opacity = '0.4';
