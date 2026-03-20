@@ -195,6 +195,89 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
     }
   }
 
+  // Per-cube lazy loading classification
+  lines.push('## Lazy Loading Classification (per cube)');
+  lines.push('');
+  lines.push('The dashboard engine loads all non-lazy dimensions into ONE query. High-cardinality dimensions cause a Cartesian product explosion.');
+  lines.push('Any section containing a high-cardinality dimension MUST have lazy: true. This is MANDATORY — the dashboard will crash without it.');
+  lines.push('');
+
+  for (var lc = 0; lc < cubeNames.length; ++lc) {
+    var lcCube = null;
+    for (var li = 0; li < cubes.length; ++li) {
+      if (cubes[li].name === cubeNames[lc]) { lcCube = cubes[li]; break; }
+    }
+    if (!lcCube) continue;
+
+    // Classify dimensions by likely cardinality based on type and naming patterns
+    var safeDims = [];
+    var lazyDims = [];
+    var lcDims = lcCube.dimensions || [];
+
+    for (var ld = 0; ld < lcDims.length; ++ld) {
+      var ldim = lcDims[ld];
+      var lname = ldim.name.split('.').pop();
+      var ltype = ldim.type || 'string';
+      var lmeta = ldim.meta || {};
+
+      // Boolean and time dims are always safe (booleans are 2-3 values, time is handled specially)
+      if (ltype === 'boolean' || ltype === 'time') {
+        safeDims.push(lname);
+        continue;
+      }
+
+      // Dimensions with color_map have known enum values — check count
+      if (lmeta.color_map) {
+        var enumCount = Object.keys(lmeta.color_map).length;
+        if (enumCount <= 20) { safeDims.push(lname); } else { lazyDims.push(lname); }
+        continue;
+      }
+
+      // Dimensions with color_scale are numeric tiers — usually <10
+      if (lmeta.color_scale) {
+        safeDims.push(lname);
+        continue;
+      }
+
+      // Known high-cardinality patterns
+      var highCardPatterns = ['name', 'city', 'street', 'postal', 'booking', 'car', 'geohash',
+        'model', 'longitude', 'latitude', 'locality', 'municipality', 'zipcode', 'code'];
+      var isHighCard = false;
+      for (var hp = 0; hp < highCardPatterns.length; ++hp) {
+        if (lname.toLowerCase().indexOf(highCardPatterns[hp]) >= 0) { isHighCard = true; break; }
+      }
+
+      // Known low-cardinality patterns
+      var lowCardPatterns = ['type', 'class', 'tier', 'dow', 'region', 'country', 'division',
+        'partition', 'nr', 'category', 'subcategory', 'channel', 'status'];
+      var isLowCard = false;
+      for (var lp = 0; lp < lowCardPatterns.length; ++lp) {
+        if (lname.toLowerCase().indexOf(lowCardPatterns[lp]) >= 0) { isLowCard = true; break; }
+      }
+
+      // Number type dimensions are often continuous/high-cardinality
+      if (ltype === 'number' && !isLowCard) {
+        lazyDims.push(lname);
+        continue;
+      }
+
+      if (isHighCard) { lazyDims.push(lname); }
+      else if (isLowCard) { safeDims.push(lname); }
+      else { lazyDims.push(lname); } // default to lazy for unknown string dims
+    }
+
+    lines.push('### ' + cubeNames[lc]);
+    lines.push('');
+    lines.push('**Safe for main query** (low cardinality, <20 values):');
+    lines.push(safeDims.join(', '));
+    lines.push('');
+    lines.push('**MUST be in lazy: true sections** (high cardinality, 30+ values):');
+    lines.push(lazyDims.join(', '));
+    lines.push('');
+    lines.push('If a section contains ANY dimension from the lazy list above, the ENTIRE section must have lazy: true.');
+    lines.push('');
+  }
+
   // Chart type catalog
   lines.push('## Chart Types');
   lines.push('');
