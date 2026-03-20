@@ -191,9 +191,15 @@ function writeUrlState(state) {
 }
 
 // ── Filter State ──────────────────────────────────────────────────────
+// Two-tier filtering:
+//   Tier 1 (client): dimension is in the crossfilter worker → instant filter
+//   Tier 2 (server): dimension is NOT in the worker → reload with Cube query.filters
 
 var filterState = {};
 var filterListeners = [];
+var _dashboardData = null;        // set by main() after worker creation
+var _dashboardRegistry = null;    // set by main() for re-render after reload
+var _dashboardPanels = null;      // set by main() for re-render after reload
 
 function setFilter(dimension, values) {
   if (!values || (Array.isArray(values) && values.length === 0)) {
@@ -203,14 +209,27 @@ function setFilter(dimension, values) {
   }
   writeUrlState(filterState);
   renderFilterChips();
-  notifyFilterChange();
+
+  // Route to correct tier
+  if (_dashboardData && _dashboardData.isServerDim && _dashboardData.isServerDim(dimension)) {
+    triggerServerReload();
+  } else {
+    notifyFilterChange();
+  }
 }
 
 function clearAllFilters() {
+  var hadServerDims = false;
+  if (_dashboardData && _dashboardData.isServerDim) {
+    var keys = Object.keys(filterState);
+    for (var k = 0; k < keys.length; ++k) {
+      if (_dashboardData.isServerDim(keys[k])) { hadServerDims = true; break; }
+    }
+  }
+
   filterState = {};
   writeUrlState(filterState);
   renderFilterChips();
-  notifyFilterChange();
   // Reset Shoelace selects
   var selects = document.querySelectorAll('sl-select[data-dropdown-id]');
   for (var i = 0; i < selects.length; ++i) {
@@ -223,10 +242,83 @@ function clearAllFilters() {
     var d = allToggleBtns[j].dataset.toggle;
     if (!resetDims[d]) { resetToggleGroup(d); resetDims[d] = true; }
   }
+
+  if (hadServerDims) {
+    triggerServerReload();
+  } else {
+    notifyFilterChange();
+  }
 }
 
 function notifyFilterChange() {
   for (var i = 0; i < filterListeners.length; ++i) filterListeners[i](filterState);
+}
+
+// ── Tier 2: Server-side reload ────────────────────────────────────────
+// Collects active server-side filter values from filterState,
+// disposes the old worker, creates a new one with updated Cube query.
+
+function buildServerState() {
+  var serverFilters = {};
+  var keys = Object.keys(filterState);
+  for (var i = 0; i < keys.length; ++i) {
+    var dim = keys[i];
+    if (!_dashboardData || !_dashboardData.isServerDim(dim)) continue;
+    var val = filterState[dim];
+    if (val === 'true' || val === true) {
+      serverFilters[dim] = { operator: 'equals', values: ['true'] };
+    } else if (val === 'false' || val === false) {
+      serverFilters[dim] = { operator: 'equals', values: ['false'] };
+    } else if (Array.isArray(val) && val.length === 2 && typeof val[0] === 'number') {
+      // Range: two Cube filters on the same member (gte + lte)
+      serverFilters[dim] = [
+        { operator: 'gte', values: [String(val[0])] },
+        { operator: 'lte', values: [String(val[1])] },
+      ];
+    } else {
+      var values = Array.isArray(val) ? val : [val];
+      serverFilters[dim] = { operator: 'equals', values: values.map(String) };
+    }
+  }
+  return { filters: serverFilters };
+}
+
+var _reloadSeq = 0;
+
+function triggerServerReload() {
+  if (!_dashboardData) return;
+  var seq = ++_reloadSeq;
+  var serverState = buildServerState();
+  console.log('[dashboard] Server reload triggered:', JSON.stringify(serverState));
+
+  _dashboardData.reload(serverState).then(function(newData) {
+    if (seq !== _reloadSeq) return; // stale
+    _dashboardData = newData;
+
+    // Re-register progress/error listeners
+    newData.on('progress', function(payload) {
+      console.log('[dashboard] Reload progress:', payload.status,
+        payload.load ? payload.load.rowsLoaded + ' rows' : '');
+    });
+
+    return newData.ready.then(function() {
+      if (seq !== _reloadSeq) return;
+      // Extract only client-side filters for the crossfilter query
+      var clientFilters = {};
+      var keys = Object.keys(filterState);
+      for (var i = 0; i < keys.length; ++i) {
+        if (!newData.isServerDim(keys[i])) {
+          clientFilters[keys[i]] = filterState[keys[i]];
+        }
+      }
+      return newData.query(clientFilters);
+    });
+  }).then(function(response) {
+    if (seq !== _reloadSeq || !response) return;
+    renderAllPanels(_dashboardPanels, response, _dashboardRegistry);
+  }).catch(function(err) {
+    console.error('[dashboard] Server reload failed:', err);
+  });
 }
 
 // ── Normalize config format ───────────────────────────────────────────
@@ -1802,6 +1894,9 @@ async function main() {
     updateProgress(3, 'Connecting to data source...');
 
     var data = await createDashboardData(config, registry, resolvedPanels);
+    _dashboardData = data;
+    _dashboardRegistry = registry;
+    _dashboardPanels = resolvedPanels;
 
     data.on('progress', function(payload) {
       if (payload.status === 'starting') {

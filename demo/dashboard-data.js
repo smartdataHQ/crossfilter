@@ -139,11 +139,22 @@ function buildCubeQuery(cubeName, scanResult, registry, serverState) {
   for (var dim in activeFilters) {
     var f = activeFilters[dim];
     if (!f) continue;
-    filters.push({
-      member: cubeName + '.' + dim,
-      operator: f.operator || 'equals',
-      values: f.values,
-    });
+    if (Array.isArray(f)) {
+      // Multiple filters on same dimension (e.g., range: gte + lte)
+      for (var fi = 0; fi < f.length; ++fi) {
+        filters.push({
+          member: cubeName + '.' + dim,
+          operator: f[fi].operator,
+          values: f[fi].values,
+        });
+      }
+    } else {
+      filters.push({
+        member: cubeName + '.' + dim,
+        operator: f.operator || 'equals',
+        values: f.values,
+      });
+    }
   }
 
   // Active segments
@@ -356,7 +367,12 @@ export async function createDashboardData(config, registry, resolvedPanels, serv
       return createDashboardData(config, registry, resolvedPanels, newServerState);
     },
 
-    // Expose scan result so engine can identify server filter dims
+    // Check if a dimension is server-side (not in the worker)
+    isServerDim: function(dim) {
+      return workerDims.indexOf(dim) < 0;
+    },
+
+    // Expose scan result for introspection
     serverFilterDims: scanResult.serverFilterDims,
     timeDims: scanResult.timeDims,
 
