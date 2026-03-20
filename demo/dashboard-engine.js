@@ -32,6 +32,7 @@ var crossfilter = globalThis.crossfilter;
 // ── Shared Helpers ────────────────────────────────────────────────────
 
 function titleCase(str) {
+  str = String(str || '');
   return str.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
 }
 
@@ -978,6 +979,8 @@ function renderLineChart(panelEl, panel, groupData) {
   if (!instance) {
     instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
   }
+  // Suppress datazoom events from programmatic setOption to prevent feedback loop
+  if (panel._suppressZoom) panel._suppressZoom();
   instance.setOption(option, true);
 
   return instance;
@@ -988,9 +991,14 @@ function wireLineBrush(instance, panel) {
 
   var dim = panel._dimField;
   var debounceTimer = 0;
+  var suppressZoom = false;  // Suppress datazoom events from programmatic setOption
+
+  // Flag to suppress — set before setOption, cleared after
+  panel._suppressZoom = function() { suppressZoom = true; setTimeout(function() { suppressZoom = false; }, 50); };
 
   // Range brush via dataZoom
   instance.on('datazoom', function() {
+    if (suppressZoom) return;
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(function() {
       var option = instance.getOption();
@@ -2486,6 +2494,12 @@ async function main() {
 
   try {
     registerDemoEChartsTheme(echarts);
+
+    // Inject breakdown indicator style
+    var breakdownStyle = document.createElement('style');
+    breakdownStyle.textContent = '.chart-card--breakdown { box-shadow: 0 0 0 2px #3d8bfd; }';
+    document.head.appendChild(breakdownStyle);
+
     filterState = readUrlState(); // Principle 3: read URL state early (no network needed)
 
     updateProgress(0);
