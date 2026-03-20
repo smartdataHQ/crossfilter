@@ -413,10 +413,41 @@ function buildKpiCubeQuery(cubeName, kpiMeasures, scanResult, registry, serverSt
   }
 
   // Client-side filters also apply to KPIs (user clicked a bar → KPIs should reflect that)
+  var timeSet = new Set(scanResult.timeDims);
   var clientFilters = serverState._clientFilters || {};
   for (var cdim in clientFilters) {
     var cv = clientFilters[cdim];
     if (!cv) continue;
+
+    // Time dim filters → override timeDimensions dateRange (not a regular filter)
+    if (timeSet.has(cdim)) {
+      var tsVals = Array.isArray(cv) ? cv : [cv];
+      // Convert timestamps to ISO dates for Cube dateRange
+      var fromDate, toDate;
+      if (tsVals.length === 2) {
+        // Range: [startTs, endTs]
+        fromDate = new Date(Number(tsVals[0])).toISOString().slice(0, 10);
+        toDate = new Date(Number(tsVals[1])).toISOString().slice(0, 10);
+      } else {
+        // Single time-slice: from = bucket start, to = bucket start (Cube handles as inclusive)
+        fromDate = new Date(Number(tsVals[0])).toISOString().slice(0, 10);
+        toDate = fromDate;
+      }
+      // Apply to existing timeDimension or add new one
+      var found = false;
+      for (var tdi = 0; tdi < timeDimensions.length; ++tdi) {
+        if (timeDimensions[tdi].dimension === cubeName + '.' + cdim) {
+          timeDimensions[tdi].dateRange = [fromDate, toDate];
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        timeDimensions.push({ dimension: cubeName + '.' + cdim, dateRange: [fromDate, toDate] });
+      }
+      continue;
+    }
+
     var cvals = Array.isArray(cv) ? cv : [cv];
     filters.push({ member: cubeName + '.' + cdim, operator: 'equals', values: cvals.map(String) });
   }
