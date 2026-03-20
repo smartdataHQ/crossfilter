@@ -395,6 +395,7 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
   lines.push('- Do not collapse a section with only 1 panel — merge it into an adjacent section or leave it expanded');
   lines.push('- Do not use heatmap with two numeric dimensions — heatmap needs categorical axes. Use scatter for numeric×numeric');
   lines.push('- Do not omit the modelbar — every dashboard should have at least one boolean toggle or numeric range control');
+  lines.push('- **NEVER put municipality, locality, poi_name, location_name, vehicle_model, customer_city, car, booking, street, or postal_code in a non-lazy section** — these are high-cardinality and WILL crash the dashboard');
   lines.push('');
 
   // Config rules
@@ -409,6 +410,7 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
   lines.push('- Set primary: true on at most one panel to mark it as the dashboard\'s primary entity selector. Set primary: false on all other panels.');
   lines.push('- Every chart panel supports click-to-filter — this is automatic, not a config option.');
   lines.push('- For multi-cube dashboards, set "cube" on each panel and declare "sharedFilters" for cross-cube filter bridging.');
+  lines.push('- **Sections with lazy: true query Cube independently per panel.** Any section containing high-cardinality dimensions (30+ values) MUST have lazy: true. This is not optional — the dashboard will fail to load without it.');
   lines.push('');
 
   return lines.join('\n');
