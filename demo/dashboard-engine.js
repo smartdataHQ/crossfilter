@@ -523,7 +523,7 @@ function resolvePanels(config, registry) {
     }
 
     // Apply defaults for core fields
-    panel.id = p.id || (fieldName ? fieldName : 'panel-' + i);
+    panel.id = p.id || (fieldName ? fieldName + '-' + i : 'panel-' + i);
     panel.dimension = p.dimension || null;
     panel.measure = p.measure || null;
     panel.chart = chartType;
