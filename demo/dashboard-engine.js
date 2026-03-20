@@ -749,11 +749,14 @@ function renderAllPanels(panels, response, registry) {
   for (var i = 0; i < panels.length; ++i) {
     var panel = panels[i];
 
-    if (panel._kpiId && response.kpis) {
-      var kpiVal = response.kpis[panel._kpiId];
-      renderKpi(panel, kpiVal, registry);
+    // Local KPIs (count, sum) come from crossfilter snapshot
+    if (panel._kpiId && response.kpis && response.kpis[panel._kpiId] != null) {
+      renderKpi(panel, response.kpis[panel._kpiId], registry);
       continue;
     }
+
+    // Skip remote KPIs here — they're handled by refreshRemoteKpis
+    if (panel._kpiId) continue;
 
     if (panel._groupId && response.groups) {
       var groupData = response.groups[panel._groupId];
@@ -785,6 +788,68 @@ function renderAllPanels(panels, response, registry) {
       }
     }
   }
+
+  // Trigger debounced remote KPI refresh
+  scheduleKpiRefresh();
+}
+
+// ── Remote KPI refresh (debounced Cube query) ─────────────────────────
+// Slightly delayed so rapid filter clicks don't spam the server.
+// Shows a subtle loading state on KPI cards while querying.
+
+var _kpiRefreshTimer = 0;
+var _kpiRefreshSeq = 0;
+
+function scheduleKpiRefresh() {
+  clearTimeout(_kpiRefreshTimer);
+  _kpiRefreshTimer = setTimeout(function() { executeKpiRefresh(); }, 150);
+}
+
+function executeKpiRefresh() {
+  if (!_dashboardData || !_dashboardData.queryKpis) return;
+  var seq = ++_kpiRefreshSeq;
+
+  // Show loading state on remote KPI cards
+  var panels = _dashboardPanels || [];
+  for (var i = 0; i < panels.length; ++i) {
+    if (!panels[i]._kpiId) continue;
+    var el = document.querySelector('#panel-' + panels[i].id + ' .kpi-value');
+    if (el && el.textContent !== '\u2014') {
+      el.style.opacity = '0.4';
+    }
+  }
+
+  // Build client-side filter state (only dims in the worker)
+  var clientFilters = {};
+  var keys = Object.keys(filterState);
+  for (var k = 0; k < keys.length; ++k) {
+    if (!isServerTrigger(keys[k])) {
+      clientFilters[keys[k]] = filterState[keys[k]];
+    }
+  }
+
+  _dashboardData.queryKpis(clientFilters).then(function(kpiValues) {
+    if (seq !== _kpiRefreshSeq) return;
+    var registry = _dashboardRegistry;
+    for (var j = 0; j < panels.length; ++j) {
+      var panel = panels[j];
+      if (!panel._kpiId) continue;
+      var val = kpiValues[panel._kpiId];
+      if (val != null) {
+        renderKpi(panel, val, registry);
+      }
+      var kpiEl = document.querySelector('#panel-' + panel.id + ' .kpi-value');
+      if (kpiEl) kpiEl.style.opacity = '';
+    }
+  }).catch(function(err) {
+    console.error('[dashboard] KPI refresh failed:', err);
+    // Restore opacity
+    for (var j = 0; j < panels.length; ++j) {
+      if (!panels[j]._kpiId) continue;
+      var kpiEl = document.querySelector('#panel-' + panels[j].id + ' .kpi-value');
+      if (kpiEl) kpiEl.style.opacity = '';
+    }
+  });
 }
 
 // ── Principle 8: Filter Chips (visible, removable) ────────────────────

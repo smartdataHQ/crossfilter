@@ -100,10 +100,23 @@ function scanPanels(panels, registry) {
       }
     }
 
-    // KPI/gauge → groupAll reducer
+    // KPI/gauge → classify as local (crossfilter) or remote (Cube query)
+    // count and sum can be reduced locally; countDistinct and computed need Cube
     if (family === 'single' && panel._measField) {
-      var kpiOp = inferReduceOp(panel._measField, registry);
-      kpis.push({ id: panel.id, field: kpiOp === 'count' ? null : panel._measField, op: kpiOp });
+      var kpiMeta = registry.measures[panel._measField];
+      var kpiAgg = kpiMeta ? kpiMeta.aggType : '';
+      var isLocalReducible = (kpiAgg === 'count' || kpiAgg === 'sum' ||
+        panel._measField === 'count');
+
+      if (isLocalReducible) {
+        var localOp = inferReduceOp(panel._measField, registry);
+        kpis.push({
+          id: panel.id, measure: panel._measField, local: true,
+          op: localOp, field: localOp === 'count' ? null : panel._measField,
+        });
+      } else {
+        kpis.push({ id: panel.id, measure: panel._measField, local: false });
+      }
       panel._kpiId = panel.id;
     }
   }
@@ -284,7 +297,8 @@ function createWorker(cubeName, scanResult, registry, serverState) {
 
   console.log('[dashboard-data] Cube query:', JSON.stringify(cubeQuery, null, 2));
   console.log('[dashboard-data] Worker dims:', workerDims.join(', '));
-  console.log('[dashboard-data] Groups:', scanResult.groups.length, '| KPIs:', scanResult.kpis.length);
+  console.log('[dashboard-data] Groups:', scanResult.groups.length,
+    '| KPIs (Cube query):', scanResult.kpis.length);
 
   return crossfilter.createStreamingDashboardWorker({
     crossfilterUrl: '/crossfilter.js',
@@ -295,7 +309,10 @@ function createWorker(cubeName, scanResult, registry, serverState) {
     progressThrottleMs: 100,
     dimensions: workerDims,
     groups: scanResult.groups,
-    kpis: scanResult.kpis,
+    // Only local-reducible KPIs go into the worker (count, sum)
+    kpis: scanResult.kpis.filter(function(k) { return k.local; }).map(function(k) {
+      return { id: k.id, field: k.field, op: k.op };
+    }),
     sources: [{
       dataUrl: '/api/cube',
       id: cubeName,
@@ -307,6 +324,105 @@ function createWorker(cubeName, scanResult, registry, serverState) {
       },
       projection: projection,
     }],
+  });
+}
+
+// ── KPI direct Cube query (no crossfilter) ────────────────────────────
+// KPIs with countDistinct, computed ratios, etc. can't be reduced
+// client-side. Query Cube directly with no dimensions — returns one row.
+
+function buildKpiCubeQuery(cubeName, kpiMeasures, scanResult, registry, serverState) {
+  serverState = serverState || {};
+
+  var partition = registry._cubeMeta.partition;
+  var filters = [];
+  if (partition) {
+    filters.push({ member: cubeName + '.partition', operator: 'equals', values: [partition] });
+  }
+
+  // Server-side filters (same as main query)
+  var activeFilters = serverState.filters || {};
+  for (var dim in activeFilters) {
+    var f = activeFilters[dim];
+    if (!f) continue;
+    if (Array.isArray(f)) {
+      for (var fi = 0; fi < f.length; ++fi) {
+        filters.push({ member: cubeName + '.' + dim, operator: f[fi].operator, values: f[fi].values });
+      }
+    } else {
+      filters.push({ member: cubeName + '.' + dim, operator: f.operator || 'equals', values: f.values });
+    }
+  }
+
+  // Segments
+  var querySegments = [];
+  var activeSegments = serverState.segments || [];
+  for (var si = 0; si < activeSegments.length; ++si) {
+    querySegments.push(cubeName + '.' + activeSegments[si]);
+  }
+
+  // Time dimensions
+  var granularity = serverState.granularity ||
+    (registry._cubeMeta.granularity && registry._cubeMeta.granularity.default) || 'week';
+  var timeDimensions = [];
+  for (var t = 0; t < scanResult.timeDims.length; ++t) {
+    var td = { dimension: cubeName + '.' + scanResult.timeDims[t], granularity: granularity };
+    if (serverState.dateRange) td.dateRange = serverState.dateRange;
+    timeDimensions.push(td);
+  }
+
+  // Client-side filters also apply to KPIs (user clicked a bar → KPIs should reflect that)
+  var clientFilters = serverState._clientFilters || {};
+  for (var cdim in clientFilters) {
+    var cv = clientFilters[cdim];
+    if (!cv) continue;
+    var cvals = Array.isArray(cv) ? cv : [cv];
+    filters.push({ member: cubeName + '.' + cdim, operator: 'equals', values: cvals.map(String) });
+  }
+
+  return {
+    query: {
+      measures: kpiMeasures.map(function(m) { return cubeName + '.' + m; }),
+      timeDimensions: timeDimensions,
+      segments: querySegments.length ? querySegments : undefined,
+      filters: filters,
+    },
+  };
+}
+
+function fetchKpis(cubeName, kpis, scanResult, registry, serverState) {
+  // Only query remote (non-local) KPIs — local ones come from crossfilter
+  var remoteKpis = kpis.filter(function(k) { return !k.local; });
+  if (!remoteKpis.length) return Promise.resolve({});
+
+  var kpiMeasures = [];
+  var kpiIdByMeasure = {};
+  for (var i = 0; i < remoteKpis.length; ++i) {
+    kpiMeasures.push(remoteKpis[i].measure);
+    kpiIdByMeasure[remoteKpis[i].measure] = remoteKpis[i].id;
+  }
+
+  var cubeQuery = buildKpiCubeQuery(cubeName, kpiMeasures, scanResult, registry, serverState);
+  console.log('[dashboard-data] KPI query:', JSON.stringify(cubeQuery, null, 2));
+
+  return fetch('/api/cube', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cubeQuery),
+  }).then(function(res) {
+    if (!res.ok) throw new Error('KPI query failed: ' + res.status);
+    return res.json();
+  }).then(function(json) {
+    var row = json.data && json.data[0] ? json.data[0] : {};
+    var result = {};
+    for (var measure in kpiIdByMeasure) {
+      var fullName = cubeName + '.' + measure;
+      var val = row[fullName];
+      if (val != null) val = Number(val);
+      result[kpiIdByMeasure[measure]] = val;
+    }
+    console.log('[dashboard-data] KPI values:', JSON.stringify(result));
+    return result;
   });
 }
 
@@ -356,6 +472,14 @@ export async function createDashboardData(config, registry, resolvedPanels, serv
       }).then(function(response) {
         return mergeResponses([response]);
       });
+    },
+
+    // KPI query: direct Cube REST call (no crossfilter)
+    // clientFilters are included so KPIs reflect bar/pie click-to-filter state
+    queryKpis: function(clientFilterState) {
+      var ss = Object.assign({}, serverState || {});
+      ss._clientFilters = clientFilterState || {};
+      return fetchKpis(cubeName, scanResult.kpis, scanResult, registry, ss);
     },
 
     // Tier 2: server-side reload (new Cube query, new worker)
