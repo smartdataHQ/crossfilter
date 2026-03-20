@@ -134,59 +134,7 @@ function callOpenAI(messages, options) {
 }
 
 // ── Cube metadata ───────────────────────────────────────────────────
-
-var CUBE_META_API = 'https://dbx.fraios.dev/api/v1/meta';
-
-function loadCubeMeta(metaResponse) {
-  // If passed directly (from proxy-server cached version), use it
-  if (metaResponse) return Promise.resolve(metaResponse);
-
-  // Try cached file
-  var metaCachePath = path.join(ROOT, '.cache', 'cube-meta.json');
-  try {
-    if (fs.existsSync(metaCachePath)) {
-      return Promise.resolve(JSON.parse(fs.readFileSync(metaCachePath, 'utf8')));
-    }
-  } catch (_) {}
-
-  // Live fetch
-  var env = readEnvConfig();
-  var token = env.CUBE_TOKEN || process.env.CUBE_TOKEN || '';
-  if (token && !token.startsWith('Bearer ')) token = 'Bearer ' + token;
-  var datasourceId = env.CUBE_DATASOURCE || process.env.CUBE_DATASOURCE || '';
-  var branchId = env.CUBE_BRANCH || process.env.CUBE_BRANCH || '';
-
-  if (!token || !datasourceId || !branchId) {
-    return Promise.reject(new Error(
-      'Cube metadata not available. Either cache .cache/cube-meta.json or set CUBE_TOKEN, CUBE_DATASOURCE, CUBE_BRANCH in .env.'
-    ));
-  }
-
-  return new Promise(function (resolve, reject) {
-    var req = https.request({
-      hostname: new URL(CUBE_META_API).hostname,
-      port: 443, path: new URL(CUBE_META_API).pathname, method: 'GET',
-      headers: {
-        'Authorization': token,
-        'x-hasura-datasource-id': datasourceId,
-        'x-hasura-branch-id': branchId,
-      },
-    }, function (res) {
-      var chunks = [];
-      res.on('data', function (c) { chunks.push(c); });
-      res.on('end', function () {
-        if (res.statusCode !== 200) { reject(new Error('Meta fetch HTTP ' + res.statusCode)); return; }
-        var parsed = JSON.parse(Buffer.concat(chunks).toString());
-        fs.mkdirSync(path.dirname(metaCachePath), { recursive: true });
-        fs.writeFileSync(metaCachePath, JSON.stringify(parsed));
-        resolve(parsed);
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(30000, function () { req.destroy(new Error('Meta fetch timeout')); });
-    req.end();
-  });
-}
+// Metadata is loaded by proxy-server.mjs and passed to runAgentLoop.
 
 function findCube(metaResponse, cubeName) {
   var cubes = metaResponse && metaResponse.cubes || [];
