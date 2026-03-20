@@ -2040,14 +2040,24 @@ function buildPanelCard(panel, accentIdx, registry) {
       { value: 'line.bump', label: 'Bump',
         svg: '<path d="M1,3 C4,3 5,8 8,8 C11,8 12,5 15,5" fill="none" stroke="currentColor" stroke-width="1.3" opacity="0.6"/><path d="M1,8 C4,8 5,3 8,3 C11,3 12,9 15,9" fill="none" stroke="currentColor" stroke-width="1.3" opacity="0.4"/>' },
     ];
-    headRight += '<div class="viz-icon-bar">';
+    // Find the active icon SVG for the trigger button
+    var activeVizSvg = vizIcons[0].svg;
+    for (var avi = 0; avi < vizIcons.length; ++avi) {
+      if (vizIcons[avi].value === currentViz) { activeVizSvg = vizIcons[avi].svg; break; }
+    }
+    headRight += '<div class="viz-picker">' +
+      '<button class="viz-picker-trigger" title="Chart type">' +
+        '<svg viewBox="0 0 16 12" width="20" height="15">' + activeVizSvg + '</svg>' +
+        '<span class="viz-picker-caret">&#9662;</span>' +
+      '</button>' +
+      '<div class="viz-picker-menu">';
     for (var ti = 0; ti < vizIcons.length; ++ti) {
       var vi = vizIcons[ti];
       var viActive = vi.value === currentViz ? ' viz-icon--active' : '';
       headRight += '<button class="viz-icon' + viActive + '" data-viz="' + vi.value + '" title="' + escapeHtml(vi.label) + '">' +
-        '<svg viewBox="0 0 16 12" width="20" height="15">' + vi.svg + '</svg></button>';
+        '<svg viewBox="0 0 16 12" width="22" height="16">' + vi.svg + '</svg></button>';
     }
-    headRight += '</div>';
+    headRight += '</div></div>';
   }
   if (panel.chart === 'selector' || panel.chart === 'list') {
     headRight += '<span class="group-size-badge" id="count-' + panel.id + '"></span>';
@@ -2649,8 +2659,13 @@ async function main() {
     breakdownStyle.textContent =
       '.chart-card--breakdown { box-shadow: 0 0 0 1.5px rgba(63,101,135,0.35); }' +
       '.chart-card--breakdown .card-t { color: #3f6587; }' +
-      '.viz-icon-bar { display: flex; gap: 2px; align-items: center; }' +
-      '.viz-icon { border: none; background: none; padding: 3px 4px; border-radius: 4px; cursor: pointer; color: #8da4b8; line-height: 0; }' +
+      '.viz-picker { position: relative; }' +
+      '.viz-picker-trigger { display: flex; align-items: center; gap: 2px; border: none; background: none; padding: 3px 6px; border-radius: 5px; cursor: pointer; color: #3f6587; line-height: 0; }' +
+      '.viz-picker-trigger:hover { background: rgba(63,101,135,0.08); }' +
+      '.viz-picker-caret { font-size: 8px; color: #8da4b8; margin-top: 1px; }' +
+      '.viz-picker-menu { display: none; position: absolute; right: 0; top: 100%; z-index: 100; background: #fff; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,21,88,0.12); padding: 6px; margin-top: 4px; grid-template-columns: repeat(5, 1fr); gap: 2px; }' +
+      '.viz-picker--open .viz-picker-menu { display: grid; }' +
+      '.viz-icon { border: none; background: none; padding: 5px 6px; border-radius: 5px; cursor: pointer; color: #8da4b8; line-height: 0; }' +
       '.viz-icon:hover { color: #3f6587; background: rgba(63,101,135,0.08); }' +
       '.viz-icon--active { color: #3d8bfd; background: rgba(61,139,253,0.1); }' +
       '.viz-icon--active:hover { color: #3d8bfd; background: rgba(61,139,253,0.15); }';
@@ -2708,8 +2723,17 @@ async function main() {
     restoreStateFromUrl();
     renderFilterChips();
 
-    // Wire viz type icon buttons on time charts
+    // Wire viz type picker: trigger opens/closes menu, icon click selects type
     container.addEventListener('click', function(e) {
+      // Toggle menu open/close
+      var trigger = e.target.closest('.viz-picker-trigger');
+      if (trigger) {
+        var picker = trigger.closest('.viz-picker');
+        picker.classList.toggle('viz-picker--open');
+        e.stopPropagation();
+        return;
+      }
+      // Select a viz type
       var btn = e.target.closest('.viz-icon');
       if (!btn) return;
       var viz = btn.dataset.viz;
@@ -2721,7 +2745,23 @@ async function main() {
       for (var vi = 0; vi < allIcons.length; ++vi) {
         allIcons[vi].classList.toggle('viz-icon--active', allIcons[vi].dataset.viz === viz);
       }
+      // Update the trigger icon to show the active type
+      var picker = btn.closest('.viz-picker');
+      if (picker) {
+        var triggerSvg = picker.querySelector('.viz-picker-trigger svg');
+        if (triggerSvg) triggerSvg.innerHTML = btn.querySelector('svg').innerHTML;
+        picker.classList.remove('viz-picker--open');
+      }
       notifyFilterChange();
+    });
+    // Close picker on outside click
+    document.addEventListener('click', function(e) {
+      if (!e.target.closest('.viz-picker')) {
+        var openPickers = document.querySelectorAll('.viz-picker--open');
+        for (var op = 0; op < openPickers.length; ++op) {
+          openPickers[op].classList.remove('viz-picker--open');
+        }
+      }
     });
 
     // Wire breakdown: double-click on card header activates breakdown
