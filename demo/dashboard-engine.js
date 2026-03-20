@@ -1893,9 +1893,12 @@ function buildPanelCard(panel, accentIdx, registry) {
   if (panel.chart === 'selector' || panel.chart === 'list') {
     headRight += '<span class="group-size-badge" id="count-' + panel.id + '"></span>';
   }
-  if (panel._dimField && panel._groupId && !panel._isTimeSeries) {
+  // Breakdown toggle — uses panel.dimension (set by resolvePanels before DOM build)
+  var panelChartDef = getChartType(panel.chart);
+  var panelFamily = panelChartDef ? panelChartDef.family : null;
+  if (panel.dimension && (panelFamily === 'category' || panelFamily === 'control') && panel.chart !== 'toggle' && panel.chart !== 'range') {
     var isActiveBreakdown = filterState['_breakdown'] === panel.id;
-    headRight += '<sl-button size="small" variant="' + (isActiveBreakdown ? 'primary' : 'text') + '" class="breakdown-toggle" data-panel="' + panel.id + '" data-dim="' + escapeHtml(panel._dimField) + '" title="Break down time chart by ' + escapeHtml(panel.label) + '">\u2261</sl-button>';
+    headRight += '<sl-button size="small" variant="' + (isActiveBreakdown ? 'primary' : 'text') + '" class="breakdown-toggle" data-panel="' + panel.id + '" data-dim="' + escapeHtml(panel.dimension) + '" title="Break down time chart by ' + escapeHtml(panel.label) + '">\u2261</sl-button>';
   }
 
   var head = '<div class="card-head">' +
