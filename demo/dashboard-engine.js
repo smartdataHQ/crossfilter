@@ -2685,6 +2685,21 @@ async function main() {
     await data.ready;
     console.log('[dashboard] Data loaded, rendering charts...');
 
+    // Restore breakdown from URL state (must happen before initial query)
+    if (filterState['_breakdown']) {
+      var breakdownDim = null;
+      for (var bi = 0; bi < resolvedPanels.length; ++bi) {
+        if (resolvedPanels[bi].id === filterState['_breakdown']) {
+          breakdownDim = resolvedPanels[bi]._dimField;
+          break;
+        }
+      }
+      if (breakdownDim) {
+        await data.setBreakdown(breakdownDim);
+        console.log('[dashboard] Restored breakdown from URL:', breakdownDim);
+      }
+    }
+
     // Use module-scoped _dashboardData so this listener survives reloads
     filterListeners.push(function(newFilterState) {
       _dashboardData.query(newFilterState).then(function(response) {
