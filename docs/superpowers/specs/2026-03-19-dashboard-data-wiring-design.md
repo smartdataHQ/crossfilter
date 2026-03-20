@@ -587,16 +587,94 @@ renderAllPanels(resolvedPanels, response, registry):
 | `demo/dashboard-meta.js` | No changes. Already provides everything needed. |
 | `demo/dashboard.html` | Add `<script>` for Apache Arrow runtime (needed by streaming worker). |
 
+## Two-Tier Filtering Architecture
+
+Filtering is split between client-side (crossfilter) and server-side (Cube.dev query). The split follows Cube.dev best practices: `query.dimensions` determines the **grain** of the result set, not the set of filterable fields. Server-side filtering uses `query.filters` and does not require the filtered dimension to be in `query.dimensions`.
+
+### Tier 1 — Client-side (crossfilter, instant)
+
+Bar/pie/selector chart panels use crossfilter for instant click-to-filter. When a user clicks a bar segment, the crossfilter dimension is filtered and all panels re-render from the existing in-memory data. No server round-trip.
+
+**What goes into `query.dimensions`:** Only the fields that chart panels group by — the `category`, `name`, or `dimension` slot values from panels in the `category`, `control` (selector/dropdown), and similar families. These are the fields crossfilter needs as dimensions for `.group()` operations.
+
+For the `bluecar-stays` config, this produces:
+- `activity_type`, `car_class`, `region`, `vehicle_make` (bar panels)
+- `fuel_type`, `drive_type` (pie panels)
+- `municipality`, `locality`, `poi_name`, `poi_category` (selector/bar panels in geography section)
+
+**What goes into crossfilter worker `dimensions`:** Same fields as `query.dimensions`. These are the only dimensions the worker creates — one per group-by field.
+
+### Tier 2 — Server-side (Cube query, triggers reload)
+
+Named filters in the model bar (toggles, range sliders, dropdowns), segments, period changes, and granularity changes modify the Cube `query.filters` or `timeDimensions` and trigger a **full data reload**: dispose the old worker, rebuild the Cube query with updated filters, create a new streaming worker, await ready, re-render all panels.
+
+**What goes into `query.filters`:** The `partition` filter (always), plus any active model bar controls:
+- Toggle panels (`has_poi_match`, `is_first_stay`) → `{ member, operator: 'equals', values: ['true'/'false'] }`
+- Range panels (`stay_duration_hours`) → `{ member, operator: 'gte'/'lte', values: [...] }`
+- Segment dropdown → `{ member: 'cubeName.segmentName', operator: 'equals', values: ['true'] }` (Cube segments are boolean filters)
+
+**What goes into `timeDimensions`:** The time dimension from the cube model metadata (`_cubeMeta.time_dimension`), with the currently selected granularity (default from `_cubeMeta.granularity.default`, user-changeable via the granularity dropdown). Period (date range) is applied via `dateRange` on the `timeDimensions` entry.
+
+```
+timeDimensions: [{
+  dimension: 'bluecar_stays.stay_started_at',    // from _cubeMeta.time_dimension
+  granularity: 'week',                            // from _cubeMeta.granularity.default or user selection
+  dateRange: ['2025-01-01', '2026-03-20']         // from period picker, or _cubeMeta.period
+}]
+```
+
+### Classification rule
+
+`scanPanels` classifies each panel's fields:
+
+| Panel family | Slot | Classification | Goes into |
+|---|---|---|---|
+| `category` (bar, pie, funnel...) | `category` / `name` | **group-by dimension** | `query.dimensions` + worker dimensions + worker group |
+| `control` (selector, dropdown) | `dimension` | **group-by dimension** | `query.dimensions` + worker dimensions + worker group |
+| `control` (toggle, range) | `dimension` | **server-side filter** | `query.filters` when active (not in `query.dimensions`) |
+| `single` (kpi, gauge) | `value` | **measure** | `query.measures` + worker KPI |
+| `time` (line) | `x` (time-type) | **time dimension** | `query.timeDimensions` (not in `query.dimensions`) |
+| any | `value` / `y` / `size` | **measure** | `query.measures` |
+
+### Reload trigger flow
+
+```
+Model bar toggle/range/segment/period/granularity changes
+    ↓
+Engine collects current server-side filter state:
+  - Active toggles → Cube filters
+  - Active range → Cube filters
+  - Active segments → Cube filters
+  - Period → timeDimensions dateRange
+  - Granularity → timeDimensions granularity
+    ↓
+data.reload(serverFilters)
+    ↓
+  1. Dispose old worker
+  2. Rebuild Cube query with updated filters/timeDimensions
+  3. Create new streaming worker
+  4. Show progress overlay
+  5. Await ready
+  6. Initial query + render
+```
+
+### What does NOT go into `query.dimensions`
+
+- **Time-type dimensions** → use `timeDimensions` with granularity
+- **Toggle dimensions** (boolean) → server-side filter when active
+- **Range dimensions** (continuous numeric) → server-side filter when active
+- **Segment dimensions** → server-side filter when active
+- **Table `columns`** → Phase 2 (row queries, not group queries)
+
 ## What This Design Does NOT Cover (Future Phases)
 
-- Line/time-series charts (need time bucket groups + granularity switching)
+- Line/time-series chart rendering (timeDimensions query is built; chart rendering is Phase 2)
 - Scatter/bubble charts (need custom multi-measure groups)
 - Table panels (need row queries, not groups)
 - Selector/list panels (need group queries with search + pagination)
 - Hierarchy charts (treemap, sunburst — need multi-level grouping)
 - Relation charts (sankey, graph — need co-occurrence groups)
 - Geographic charts (need GeoJSON registration)
-- Segment filters (need Cube query filter integration)
 - Range slider data bounds (need `worker.bounds()` query)
 - Streaming snapshot updates (charts update while data loads — `emitSnapshots` set to false for Phase 1)
 - Multi-cube `sharedFilters` bridging (single-cube only for Phase 1; `sharedFilters: []` in config)
