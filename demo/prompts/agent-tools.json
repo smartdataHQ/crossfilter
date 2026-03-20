@@ -1,0 +1,157 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "list_cubes",
+      "description": "List all available data cubes with their name, title, description, and field counts. Call this first to discover what data is available.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "describe_cube",
+      "description": "Get the full field catalog for a cube: all dimensions (with types, descriptions, color maps), all measures (with aggregation type and format), all segments, and cube-level metadata (grain, period, granularity). Call this before generate_dashboard to understand what fields are available.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cube_name": {
+            "type": "string",
+            "description": "The exact cube name from list_cubes results."
+          }
+        },
+        "required": ["cube_name"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_chart_support",
+      "description": "List supported chart types with their data slot requirements. Returns which chart types have working renderers and what data fields each requires. Optionally filter by chart family.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "family": {
+            "anyOf": [{ "type": "string" }, { "type": "null" }],
+            "description": "Filter by chart family: category, time, numeric, single, hierarchy, relation, specialized, tabular, control, geo. Null for all families."
+          }
+        },
+        "required": ["family"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "query_cube",
+      "description": "Run a Cube.dev analytics query to answer data questions — check cardinality, date ranges, distributions, top-N values. Use dimension and measure short names (e.g. \"region\", \"count\"), not fully qualified names.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cube_name": { "type": "string", "description": "The cube to query." },
+          "dimensions": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Dimension short names to group by. Empty array for totals only."
+          },
+          "measures": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Measure short names to aggregate. At least one is required."
+          },
+          "filters": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "member": { "type": "string", "description": "Dimension or measure short name to filter on." },
+                    "operator": {
+                      "type": "string",
+                      "enum": ["equals", "notEquals", "contains", "notContains", "gt", "gte", "lt", "lte", "inDateRange", "beforeDate", "afterDate"],
+                      "description": "Filter operator."
+                    },
+                    "values": { "type": "array", "items": { "type": "string" }, "description": "Filter values as strings." }
+                  },
+                  "required": ["member", "operator", "values"],
+                  "additionalProperties": false
+                }
+              },
+              { "type": "null" }
+            ],
+            "description": "Filters to apply. Null for no filters."
+          },
+          "limit": {
+            "anyOf": [{ "type": "integer" }, { "type": "null" }],
+            "description": "Max rows returned. Default 100, max 1000. Null for default."
+          },
+          "order": {
+            "anyOf": [{ "type": "string" }, { "type": "null" }],
+            "description": "Sort field and direction as \"field_name:asc\" or \"field_name:desc\". Null for default order."
+          }
+        },
+        "required": ["cube_name", "dimensions", "measures", "filters", "limit", "order"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "generate_dashboard",
+      "description": "Create or update a dashboard config. Makes a specialized LLM call with the full schema and design guidelines. Returns a guaranteed-valid config and auto-saves it as a draft for preview. For updates, pass current_config: \"CURRENT\" to modify the last generated config.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cube_name": { "type": "string", "description": "The cube to build the dashboard for. Must match a name from list_cubes." },
+          "title": { "type": "string", "description": "Dashboard title, e.g. \"Fleet Overview\" or \"Tourism Patterns\"." },
+          "purpose": { "type": "string", "description": "What the dashboard should show, which dimensions/measures to focus on, and any specific chart preferences. Be detailed — this drives the entire generation." },
+          "current_config": {
+            "anyOf": [{ "type": "string" }, { "type": "null" }],
+            "description": "Pass \"CURRENT\" to update the last generated config. Pass null to create a new dashboard from scratch."
+          }
+        },
+        "required": ["cube_name", "title", "purpose", "current_config"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "save_draft",
+      "description": "Save a dashboard config to the draft file for preview. In most cases generate_dashboard auto-saves, so this is only needed for saving manually edited configs.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": ["CURRENT", "CUSTOM"],
+            "description": "CURRENT: save the last generated config. CUSTOM: save the config provided in custom_config."
+          },
+          "custom_config": {
+            "anyOf": [{ "type": "string" }, { "type": "null" }],
+            "description": "When source is CUSTOM: the full dashboard config as a JSON string. Null when source is CURRENT."
+          }
+        },
+        "required": ["source", "custom_config"],
+        "additionalProperties": false
+      }
+    }
+  }
+]
