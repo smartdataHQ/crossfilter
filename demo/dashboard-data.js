@@ -546,36 +546,40 @@ export async function createDashboardData(config, registry, resolvedPanels, serv
     serverFilterDims: scanResult.serverFilterDims,
     timeDims: scanResult.timeDims,
 
+    // Dynamic group management for breakdown — no worker re-creation needed
     setBreakdown: function(breakdownDimField) {
+      // Find the time-series panel and its current group
+      var timePanel = null;
+      var timeGroupSpec = null;
+      for (var p = 0; p < resolvedPanels.length; ++p) {
+        if (resolvedPanels[p]._isTimeSeries) { timePanel = resolvedPanels[p]; break; }
+      }
+      if (!timePanel) return Promise.resolve();
+
       for (var g = 0; g < scanResult.groups.length; ++g) {
-        var group = scanResult.groups[g];
-        for (var p = 0; p < resolvedPanels.length; ++p) {
-          if (resolvedPanels[p]._groupId === group.id && resolvedPanels[p]._isTimeSeries) {
-            if (breakdownDimField) {
-              group.splitField = breakdownDimField;
-            } else {
-              delete group.splitField;
-            }
-            break;
-          }
+        if (scanResult.groups[g].id === timePanel._groupId) {
+          timeGroupSpec = scanResult.groups[g];
+          break;
         }
       }
+      if (!timeGroupSpec) return Promise.resolve();
 
-      workerHandle.dispose();
-      return createWorker(cubeName, scanResult, registry, serverState).then(function(newHandle) {
-        workerHandle = newHandle;
+      // Dispose the old time-series group
+      var oldGroupId = timePanel._groupId;
+      return workerHandle.disposeGroup(oldGroupId).then(function() {
+        // Build new group spec with or without splitField
+        var newSpec = {
+          id: oldGroupId,
+          field: timeGroupSpec.field,
+          metrics: timeGroupSpec.metrics,
+        };
+        if (breakdownDimField) {
+          newSpec.splitField = breakdownDimField;
+        }
+        // Update the stored spec for future reference
+        timeGroupSpec.splitField = breakdownDimField || undefined;
 
-        newHandle.on('progress', function(payload) {
-          for (var i = 0; i < listeners.progress.length; ++i) listeners.progress[i](payload);
-        });
-        newHandle.on('ready', function(payload) {
-          for (var i = 0; i < listeners.ready.length; ++i) listeners.ready[i](payload);
-        });
-        newHandle.on('error', function(payload) {
-          for (var i = 0; i < listeners.error.length; ++i) listeners.error[i](payload);
-        });
-
-        return newHandle.ready;
+        return workerHandle.createGroup(newSpec);
       });
     },
 
