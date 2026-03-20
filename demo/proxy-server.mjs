@@ -511,42 +511,30 @@ const server = http.createServer((req, res) => {
           return;
         }
 
-        // Load cube metadata (cached or live)
-        const metaCachePath = path.join(ROOT, '.cache', 'cube-meta.json');
-        let metaResponse;
-        try {
-          if (fs.existsSync(metaCachePath)) {
-            metaResponse = JSON.parse(fs.readFileSync(metaCachePath, 'utf8'));
-          }
-        } catch (_) {}
-
-        if (!metaResponse) {
-          const authConfig = getProxyAuthConfig(req);
-          metaResponse = await new Promise((resolve, reject) => {
-            const mReq = https.request({
-              hostname: new URL(CUBE_META_API).hostname,
-              port: 443, path: new URL(CUBE_META_API).pathname, method: 'GET',
-              headers: {
-                'Authorization': authConfig.token,
-                'x-hasura-datasource-id': authConfig.datasourceId,
-                'x-hasura-branch-id': authConfig.branchId,
-              },
-            }, mRes => {
-              const chunks = [];
-              mRes.on('data', c => chunks.push(c));
-              mRes.on('end', () => {
-                if (mRes.statusCode !== 200) { reject(new Error('Meta ' + mRes.statusCode)); return; }
-                const parsed = JSON.parse(Buffer.concat(chunks).toString());
-                fs.mkdirSync(path.dirname(metaCachePath), { recursive: true });
-                fs.writeFileSync(metaCachePath, JSON.stringify(parsed));
-                resolve(parsed);
-              });
+        // Always fetch live cube metadata — never use cache.
+        // Cube models change frequently; stale metadata causes missing cubes/fields.
+        const authConfig = getProxyAuthConfig(req);
+        const metaResponse = await new Promise((resolve, reject) => {
+          const mReq = https.request({
+            hostname: new URL(CUBE_META_API).hostname,
+            port: 443, path: new URL(CUBE_META_API).pathname, method: 'GET',
+            headers: {
+              'Authorization': authConfig.token,
+              'x-hasura-datasource-id': authConfig.datasourceId,
+              'x-hasura-branch-id': authConfig.branchId,
+            },
+          }, mRes => {
+            const chunks = [];
+            mRes.on('data', c => chunks.push(c));
+            mRes.on('end', () => {
+              if (mRes.statusCode !== 200) { reject(new Error('Meta ' + mRes.statusCode)); return; }
+              resolve(JSON.parse(Buffer.concat(chunks).toString()));
             });
-            mReq.on('error', reject);
-            mReq.setTimeout(30000, () => mReq.destroy(new Error('Meta timeout')));
-            mReq.end();
           });
-        }
+          mReq.on('error', reject);
+          mReq.setTimeout(30000, () => mReq.destroy(new Error('Meta timeout')));
+          mReq.end();
+        });
 
         const { runAgentLoop } = await import('./agent.mjs');
         const result = await runAgentLoop(messages, metaResponse);
