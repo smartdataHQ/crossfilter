@@ -422,28 +422,16 @@ function renderBarChart(panelEl, panel, groupData, registry) {
 
 ### Click-to-filter wiring
 
-Every chart panel that has a dimension gets a click handler. The handler uses `panel._dimField` (resolved during scanning) to know which dimension to filter:
+Every chart panel that has a dimension gets a click handler. Two interaction modes:
 
-```javascript
-function wireChartClick(instance, panel) {
-  instance.on('click', function(params) {
-    var dim = panel._dimField;
-    if (!dim) return;
-    var clickedValue = params.name || (params.data && params.data.name);
-    if (!clickedValue) return;
+- **Normal click:** radio toggle — selects one value, clicking again deselects
+- **Cmd/Ctrl+click:** multi-select — adds/removes values from the selection array
 
-    // Toggle: if already filtered to this value, clear; otherwise set
-    var current = filterState[dim];
-    if (current === clickedValue || (Array.isArray(current) && current.length === 1 && current[0] === clickedValue)) {
-      setFilter(dim, null);
-    } else {
-      setFilter(dim, clickedValue);
-    }
-  });
-}
-```
+The handler uses `panel._dimField` (resolved during scanning) to know which dimension to filter.
 
-`setFilter` → `writeUrlState` → `notifyFilterChange` → data module `query(filterState)` → re-render all panels.
+`setFilter` routes by tier: if the dimension is in the crossfilter worker → instant client-side filter via `notifyFilterChange()`. If NOT in the worker → server-side reload via `triggerServerReload()` (300ms debounce).
+
+The routing rule is clean: **a dimension's presence in the crossfilter worker determines the tier.** If a dimension is used as a group-by field by any panel (bar category, pie name, selector), it's in the worker and filters client-side. If it's only used by a toggle, range, or segment control (no group needed), it's not in the worker and filters server-side. The same dimension could be either tier depending on the dashboard config.
 
 ### Progress overlay and error handling
 

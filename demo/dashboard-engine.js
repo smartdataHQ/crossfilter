@@ -1091,13 +1091,14 @@ function updateFilterCount() {
 
 // ── Dropdowns — Shoelace <sl-select> (Principle 1 + 14) ───────────────
 
-function buildDropdown(id, label, placeholder, items, multiSelect) {
+function buildDropdown(id, label, placeholder, items, multiSelect, defaultValue) {
   // max-options-visible="0" hides selected tags from the trigger —
   // selected state is shown in the filter chips bar instead (Principle 8)
   var html = '<sl-select' +
     ' data-dropdown-id="' + escapeHtml(id) + '"' +
     ' placeholder="' + escapeHtml(placeholder) + '"' +
     (label ? ' label="' + escapeHtml(label) + '"' : '') +
+    (defaultValue ? ' value="' + escapeHtml(defaultValue) + '"' : '') +
     ' size="small"' +
     ' hoist' +
     ' class="ds-select"' +
@@ -1553,7 +1554,7 @@ function buildPeriodControl(tpi) {
   for (var g = 0; g < grans.length; ++g) {
     granItems.push({ value: grans[g], label: granularityLabel(grans[g]) });
   }
-  html += buildDropdown('_granularity', '', granularityLabel(defaultGran), granItems, false);
+  html += buildDropdown('_granularity', '', granularityLabel(defaultGran), granItems, false, defaultGran);
   if (granNotes) html += infoIcon(granNotes);
 
   html += '</div>';
