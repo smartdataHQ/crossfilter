@@ -212,7 +212,11 @@ function setFilter(dimension, values) {
   renderFilterChips();
 
   // Route to correct tier
-  if (isServerTrigger(dimension)) {
+  if (dimension === '_breakdown') {
+    triggerBreakdownChange();
+  } else if (dimension === '_timeChart') {
+    notifyFilterChange();  // viz change is render-only, no data change
+  } else if (isServerTrigger(dimension)) {
     triggerServerReload();
   } else {
     notifyFilterChange();
@@ -221,6 +225,7 @@ function setFilter(dimension, values) {
 
 function clearAllFilters() {
   var hadServerDims = false;
+  var hadBreakdown = !!filterState['_breakdown'];
   var keys = Object.keys(filterState);
   for (var k = 0; k < keys.length; ++k) {
     if (isServerTrigger(keys[k])) { hadServerDims = true; break; }
@@ -242,6 +247,7 @@ function clearAllFilters() {
     if (!resetDims[d]) { resetToggleGroup(d); resetDims[d] = true; }
   }
 
+  if (hadBreakdown) triggerBreakdownChange();
   if (hadServerDims) {
     triggerServerReload();
   } else {
@@ -264,7 +270,7 @@ function notifyFilterChange() {
 //   time dims    → period date range
 
 // All keys that are internal UI controls, not cube dimension names
-var SERVER_CONTROL_KEYS = { _focus: true, _include: true, _granularity: true, _period: true, _breakdown: true, _timeChart: true };
+var SERVER_CONTROL_KEYS = { _focus: true, _include: true, _granularity: true, _period: true };
 
 function isServerTrigger(dim) {
   if (SERVER_CONTROL_KEYS[dim]) return true;
@@ -1383,15 +1389,23 @@ function renderFilterChips() {
   container.innerHTML = '';
   var clearBtn = document.getElementById('clear-all-btn');
 
+  // UI state keys that are not data filters — skip in chips
+  var UI_STATE_KEYS = { _breakdown: true, _timeChart: true, _granularity: true, _period: true };
+
   var keys = Object.keys(filterState);
-  if (keys.length === 0) {
+  var filterKeys = [];
+  for (var fi = 0; fi < keys.length; ++fi) {
+    if (!UI_STATE_KEYS[keys[fi]]) filterKeys.push(keys[fi]);
+  }
+
+  if (filterKeys.length === 0) {
     if (clearBtn) clearBtn.style.display = 'none';
     return;
   }
   if (clearBtn) clearBtn.style.display = '';
 
-  for (var i = 0; i < keys.length; ++i) {
-    var dim = keys[i];
+  for (var i = 0; i < filterKeys.length; ++i) {
+    var dim = filterKeys[i];
     var val = filterState[dim];
     var vals = Array.isArray(val) ? val : [val];
     var displayDim = titleCase(dim.replace(/^_/, ''));
