@@ -17,9 +17,13 @@ describe('chart-support', function () {
     expect(supported).toContain('bar');
     expect(supported).toContain('kpi');
     expect(supported).toContain('line');
-    // These are not yet implemented
-    expect(supported).not.toContain('sankey');
-    expect(supported).not.toContain('heatmap');
+    expect(supported).toContain('heatmap');
+    expect(supported).toContain('scatter');
+    // Relation charts now implemented
+    expect(supported).toContain('sankey');
+    expect(supported).toContain('graph');
+    // chord uses ecType: 'custom' — not implemented
+    expect(supported).not.toContain('chord');
   });
 
   it('listUnsupported returns types without renderers', function () {
@@ -40,14 +44,14 @@ describe('chart-support', function () {
         id: 's1', label: 'Test', location: 'main', columns: 2, collapsed: false,
         panels: [
           { chart: 'bar', dimension: 'region', cube: 'test_cube', label: 'Region', primary: false, limit: 10, searchable: false, width: null },
-          { chart: 'sankey', source: 'from', target: 'to', cube: 'test_cube', label: 'Flow', primary: false, limit: null, searchable: false, width: null },
+          { chart: 'chord', source: 'from', target: 'to', cube: 'test_cube', label: 'Flow', primary: false, limit: null, searchable: false, width: null },
         ],
       }],
     };
     var result = validateConfig(config);
     expect(result.valid).toBe(false);
     expect(result.errors.length).toBe(1);
-    expect(result.errors[0]).toContain('sankey');
+    expect(result.errors[0]).toContain('chord');
     expect(result.warnings).toEqual([]);
   });
 

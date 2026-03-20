@@ -36,6 +36,11 @@ var SUPPORTED = {
   dropdown: true,
   toggle: true,
   range: true,
+  // relation family
+  sankey: true,
+  'sankey.vertical': true,
+  graph: true,
+  'graph.circular': true,
 };
 
 export function isChartSupported(typeName) {
