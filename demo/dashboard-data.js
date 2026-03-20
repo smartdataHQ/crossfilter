@@ -241,13 +241,17 @@ function buildProjection(cubeName, scanResult, registry, serverState) {
   }
 
   scanResult.groupByDims.forEach(function(d) { addField(d); });
-  // Time dims may appear in Arrow result with granularity suffix
-  // e.g. bluecar_stays.stay_started_at.week → stay_started_at
+  // Time dims appear in Arrow result with granularity suffix.
+  // From the x-synmetrix-arrow-field-mapping header:
+  //   Arrow column: bluecar_stays__stay_started_at_week
+  //   Maps to:      bluecar_stays.stay_started_at.week
+  // So we need: cubeName__field_granularity → field (single underscore before granularity)
+  // and:        cubeName.field.granularity → field (dot before granularity)
   for (var t = 0; t < scanResult.timeDims.length; ++t) {
     var td = scanResult.timeDims[t];
     addField(td);
     rename[cubeName + '.' + td + '.' + granularity] = td;
-    rename[cubeName + '__' + td + '__' + granularity] = td;
+    rename[cubeName + '__' + td + '_' + granularity] = td;
   }
   scanResult.measures.forEach(function(m) { addField(m); });
 
