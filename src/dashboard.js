@@ -1272,6 +1272,19 @@ export function createDashboardRuntime(crossfilter, options) {
         dimensions[dimensionFields[dimensionIndex]].dispose();
       }
     },
+    createGroup: function(spec) {
+      var groupDimension = ensureDimension(dimensions, dimensionFields, cf, spec.field);
+      var groupIndex = Object.keys(groupRuntimes).length;
+      var groupRuntime = createGroupRuntime(groupDimension, spec, groupIndex);
+      groupRuntimes[groupRuntime.id] = groupRuntime;
+      return groupRuntime.id;
+    },
+    disposeGroup: function(id) {
+      if (groupRuntimes[id]) {
+        groupRuntimes[id].dispose();
+        delete groupRuntimes[id];
+      }
+    },
     query: function(request) {
       return queryRuntime(request);
     },

@@ -946,6 +946,14 @@ self.onmessage = async function(event) {
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.updateFilters(message.payload.filters));
         return;
+      case 'createGroup':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.createGroup(message.payload.spec));
+        return;
+      case 'disposeGroup':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.disposeGroup(message.payload.id));
+        return;
       case 'rows':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.rows(message.payload.query));
@@ -1194,6 +1202,12 @@ export function createStreamingDashboardWorker(options) {
       },
       updateFilters: function(filters) {
         return call("updateFilters", { filters: filters || null });
+      },
+      createGroup: function(spec) {
+        return call("createGroup", { spec: spec });
+      },
+      disposeGroup: function(groupId) {
+        return call("disposeGroup", { id: groupId });
       },
       workerRuntime: initPayload.runtime
     };
