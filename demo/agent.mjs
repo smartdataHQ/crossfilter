@@ -615,3 +615,289 @@ function toolQueryCube(args, ctx) {
     req.end();
   });
 }
+
+function toolGenerateDashboard(args, ctx) {
+  var cube = findCube(ctx.metaResponse, args.cube_name);
+  if (!cube) {
+    return Promise.resolve(suggestMatch(args.cube_name, allCubeNames(ctx.metaResponse), 'Cube'));
+  }
+
+  // Resolve "CURRENT" sentinel
+  var currentConfig = null;
+  if (args.current_config === 'CURRENT') {
+    if (!ctx.currentConfig) {
+      return Promise.resolve(
+        'No current config to update. Call generate_dashboard with current_config: null to create a new dashboard first.'
+      );
+    }
+    currentConfig = ctx.currentConfig;
+  } else if (args.current_config != null) {
+    try {
+      currentConfig = JSON.parse(args.current_config);
+    } catch (e) {
+      return Promise.resolve('current_config is not valid JSON: ' + e.message);
+    }
+  }
+
+  // Build inner call messages
+  var systemPrompt = ctx.generateSystemPrompt(ctx.metaResponse, [args.cube_name]);
+  var userContent;
+  if (currentConfig) {
+    userContent = 'Current dashboard config:\n' + JSON.stringify(currentConfig, null, 2) +
+      '\n\nUpdate this dashboard titled "' + args.title + '". Changes requested: ' + args.purpose;
+  } else {
+    userContent = 'Create a dashboard titled "' + args.title + '" for the "' + args.cube_name +
+      '" cube. Purpose: ' + args.purpose;
+  }
+
+  var schema = ctx.generateDashboardSchema(ctx.metaResponse, [args.cube_name], { supportedOnly: true });
+
+  return callOpenAI(
+    [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent },
+    ],
+    {
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'dashboard_config', strict: true, schema: schema },
+      },
+      timeout: 120000,
+    }
+  ).then(function (response) {
+    var choice = response.choices && response.choices[0];
+    if (!choice || !choice.message) {
+      return 'No response from config generator.';
+    }
+    if (choice.message.refusal) {
+      return 'Model refused to generate config. Reason: ' + choice.message.refusal + '. Try rephrasing the purpose.';
+    }
+
+    var config;
+    try {
+      config = JSON.parse(choice.message.content);
+    } catch (e) {
+      return 'Generated config failed to parse. Error: ' + e.message + '. Retrying may help.';
+    }
+
+    // Auto-save to _draft.json
+    fs.writeFileSync(DRAFT_PATH, JSON.stringify(config, null, 2));
+
+    // Update context
+    ctx.currentConfig = config;
+
+    // Track inner call usage
+    var usage = response.usage || {};
+    ctx.usage.prompt_tokens += usage.prompt_tokens || 0;
+    ctx.usage.completion_tokens += usage.completion_tokens || 0;
+
+    var sections = (config.sections || []).length;
+    var panels = (config.sections || []).reduce(function (s, sec) { return s + (sec.panels || []).length; }, 0);
+
+    return JSON.stringify({
+      config_summary: '"' + config.title + '" — ' + sections + ' sections, ' + panels + ' panels',
+      sections: sections,
+      panels: panels,
+      tokens: { prompt: usage.prompt_tokens || 0, completion: usage.completion_tokens || 0 },
+      saved: { url: '/demo/dashboards/_draft' },
+    });
+  }).catch(function (err) {
+    if (err.message.indexOf('timeout') >= 0) {
+      return 'Config generation timed out after 120s. Try a simpler purpose or fewer requirements.';
+    }
+    return 'Config generation failed: ' + err.message;
+  });
+}
+
+function toolSaveDraft(args, ctx) {
+  var config;
+
+  if (args.source === 'CURRENT') {
+    if (!ctx.currentConfig) {
+      return 'No current config to save. Call generate_dashboard first.';
+    }
+    config = ctx.currentConfig;
+  } else if (args.source === 'CUSTOM') {
+    if (!args.custom_config) {
+      return 'source is CUSTOM but custom_config is null. Provide the config JSON string.';
+    }
+    try {
+      config = JSON.parse(args.custom_config);
+    } catch (e) {
+      return 'Config is not valid JSON: ' + e.message + '. The config must be a JSON object.';
+    }
+    var required = ['title', 'cubes', 'sharedFilters', 'sections'];
+    for (var i = 0; i < required.length; ++i) {
+      if (config[required[i]] == null) {
+        return 'Config is missing required field "' + required[i] +
+          '". A valid config must have: title (string), cubes (array), sharedFilters (array), sections (array).';
+      }
+    }
+    ctx.currentConfig = config;
+  } else {
+    return 'source must be "CURRENT" or "CUSTOM". Got: "' + args.source + '".';
+  }
+
+  fs.writeFileSync(DRAFT_PATH, JSON.stringify(config, null, 2));
+
+  var sections = (config.sections || []).length;
+  var panels = (config.sections || []).reduce(function (s, sec) { return s + (sec.panels || []).length; }, 0);
+
+  return JSON.stringify({
+    saved: true,
+    url: '/demo/dashboards/_draft',
+    title: config.title || 'Untitled',
+    sections: sections,
+    panels: panels,
+  });
+}
+
+// ── Tool dispatch ───────────────────────────────────────────────────
+
+function executeToolCall(name, argsStr, ctx) {
+  var args;
+  try {
+    args = JSON.parse(argsStr);
+  } catch (e) {
+    return Promise.resolve('Invalid tool arguments: ' + e.message + '. Arguments must be valid JSON.');
+  }
+
+  switch (name) {
+    case 'list_cubes': return Promise.resolve(toolListCubes(args, ctx));
+    case 'describe_cube': return Promise.resolve(toolDescribeCube(args, ctx));
+    case 'get_chart_support': return Promise.resolve(toolGetChartSupport(args, ctx));
+    case 'query_cube': return toolQueryCube(args, ctx);
+    case 'generate_dashboard': return toolGenerateDashboard(args, ctx);
+    case 'save_draft': return Promise.resolve(toolSaveDraft(args, ctx));
+    default: return Promise.resolve('Unknown tool: "' + name + '". Available tools: list_cubes, describe_cube, get_chart_support, query_cube, generate_dashboard, save_draft.');
+  }
+}
+
+// ── Agent system prompt ─────────────────────────────────────────────
+
+var AGENT_SYSTEM_PROMPT = [
+  'You are a dashboard builder assistant. You help users create analytical',
+  'dashboards by discovering data models and generating configurations.',
+  '',
+  'Your workflow:',
+  '1. Use list_cubes to discover available data models',
+  '2. Use describe_cube to understand a model\'s fields, types, and metadata',
+  '3. Use get_chart_support to see what chart types are available and their data slots',
+  '4. Use query_cube to answer data questions (cardinality, ranges, distributions)',
+  '5. Use generate_dashboard to create or update dashboard configs',
+  '6. Use save_draft to save configs for live preview (usually not needed — generate_dashboard auto-saves)',
+  '',
+  'When creating a new dashboard, discover the cube first (list_cubes, describe_cube) so you',
+  'can write a detailed purpose for generate_dashboard. If the user names a specific cube,',
+  'you can skip list_cubes and go directly to describe_cube.',
+  'When updating, pass current_config: "CURRENT" to generate_dashboard.',
+  'generate_dashboard auto-saves the draft — the preview iframe will update automatically.',
+  '',
+  'Be concise in your responses. After generating a dashboard, summarize what was created',
+  'and invite the user to request changes.',
+].join('\n');
+
+// ── Agent loop ──────────────────────────────────────────────────────
+
+var MAX_ITERATIONS = 15;
+
+export async function runAgentLoop(userMessages, metaResponse) {
+  // Dynamic imports for chart modules (ESM)
+  var chartTypes = await import('./chart-types.js');
+  var chartSupport = await import('./chart-support.js');
+  var schemaGen = await import('./schema/generate-schema.js');
+
+  // Seed currentConfig from _draft.json if it exists
+  var currentConfig = null;
+  try {
+    if (fs.existsSync(DRAFT_PATH)) {
+      currentConfig = JSON.parse(fs.readFileSync(DRAFT_PATH, 'utf8'));
+    }
+  } catch (_) {}
+
+  // Context object shared across all tool calls
+  var ctx = {
+    metaResponse: metaResponse,
+    currentConfig: currentConfig,
+    chartTypes: chartTypes,
+    chartSupport: chartSupport,
+    generateSystemPrompt: schemaGen.generateSystemPrompt,
+    generateDashboardSchema: schemaGen.generateDashboardSchema,
+    usage: { prompt_tokens: 0, completion_tokens: 0 },
+  };
+
+  // Build messages: system + user conversation
+  var messages = [
+    { role: 'system', content: AGENT_SYSTEM_PROMPT },
+  ];
+  for (var i = 0; i < userMessages.length; ++i) {
+    messages.push(userMessages[i]);
+  }
+
+  var totalToolCalls = 0;
+
+  for (var iter = 0; iter < MAX_ITERATIONS; ++iter) {
+    var response = await callOpenAI(messages, { tools: TOOL_DEFINITIONS });
+
+    var outerUsage = response.usage || {};
+    ctx.usage.prompt_tokens += outerUsage.prompt_tokens || 0;
+    ctx.usage.completion_tokens += outerUsage.completion_tokens || 0;
+
+    var choice = response.choices && response.choices[0];
+    if (!choice || !choice.message) {
+      return {
+        reply: 'No response from the assistant. Please try again.',
+        config: ctx.currentConfig,
+        usage: buildUsage(ctx, totalToolCalls, iter + 1),
+      };
+    }
+
+    var msg = choice.message;
+    messages.push(msg);
+
+    // If no tool calls, we have the final response
+    if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      return {
+        reply: msg.content || '',
+        config: ctx.currentConfig,
+        usage: buildUsage(ctx, totalToolCalls, iter + 1),
+      };
+    }
+
+    // Execute each tool call
+    for (var tc = 0; tc < msg.tool_calls.length; ++tc) {
+      var toolCall = msg.tool_calls[tc];
+      totalToolCalls++;
+
+      var result;
+      try {
+        result = await executeToolCall(toolCall.function.name, toolCall.function.arguments, ctx);
+      } catch (err) {
+        result = 'Tool execution error (' + toolCall.function.name + '): ' + err.message;
+      }
+
+      messages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: typeof result === 'string' ? result : JSON.stringify(result),
+      });
+    }
+  }
+
+  // Max iterations reached
+  return {
+    reply: 'I made too many tool calls without producing a response. This usually means the request is too complex. Try breaking it into smaller steps.',
+    config: ctx.currentConfig,
+    usage: buildUsage(ctx, totalToolCalls, MAX_ITERATIONS),
+  };
+}
+
+function buildUsage(ctx, toolCalls, iterations) {
+  return {
+    total_tokens: ctx.usage.prompt_tokens + ctx.usage.completion_tokens,
+    prompt_tokens: ctx.usage.prompt_tokens,
+    completion_tokens: ctx.usage.completion_tokens,
+    tool_calls: toolCalls,
+    iterations: iterations,
+  };
+}
