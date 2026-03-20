@@ -693,20 +693,149 @@ function renderBarChart(panelEl, panel, groupData) {
   };
   var valAxis = { type: 'value' };
 
-  var option = {
-    tooltip: {
-      trigger: 'axis',
-      axisPointer: { type: 'shadow' },
-    },
-    grid: { left: 10, right: 10, top: 10, bottom: 10, containLabel: true },
-    xAxis: isHorizontal ? valAxis : catAxis,
-    yAxis: isHorizontal ? catAxis : valAxis,
-    series: [{
-      type: 'bar',
-      data: isHorizontal ? barData.slice().reverse() : barData,
-      barMaxWidth: 40,
-    }],
-  };
+  // Detect split group data (stacked bar with splitField active)
+  var firstBarEntry = entries[0];
+  var isSplitBar = firstBarEntry && firstBarEntry.value && typeof firstBarEntry.value.value === 'undefined';
+
+  var option;
+
+  if (isSplitBar) {
+    // Collect all split keys
+    var splitKeys = {};
+    for (var si = 0; si < entries.length; ++si) {
+      for (var sk in entries[si].value) splitKeys[sk] = true;
+    }
+    var keyNames = Object.keys(splitKeys);
+
+    // Top 8 by total
+    var keyTotals = {};
+    for (var ki = 0; ki < keyNames.length; ++ki) keyTotals[keyNames[ki]] = 0;
+    for (var ei = 0; ei < entries.length; ++ei) {
+      for (var ek in entries[ei].value) {
+        var ekv = entries[ei].value[ek];
+        if (ekv && ekv.value) keyTotals[ek] = (keyTotals[ek] || 0) + ekv.value;
+      }
+    }
+    keyNames.sort(function(a, b) { return (keyTotals[b] || 0) - (keyTotals[a] || 0); });
+    keyNames = keyNames.slice(0, 8);
+
+    // Build one series per split key, all stacked
+    var stackSeriesList = [];
+    for (var li = 0; li < keyNames.length; ++li) {
+      var stackKey = keyNames[li];
+      var stackData = [];
+      for (var le = 0; le < entries.length; ++le) {
+        var lv = entries[le].value[stackKey];
+        stackData.push([String(entries[le].key), lv ? lv.value : 0]);
+      }
+      stackSeriesList.push({
+        type: 'bar',
+        name: stackKey,
+        data: stackData,
+        stack: 'category',
+        barMaxWidth: 40,
+      });
+    }
+
+    // Normalize to 100% if bar.normalized
+    var isNorm = panel.chart === 'bar.normalized';
+    if (isNorm && stackSeriesList.length > 0) {
+      var bucketTotals = {};
+      for (var ns = 0; ns < stackSeriesList.length; ++ns) {
+        var nsData = stackSeriesList[ns].data;
+        for (var nd = 0; nd < nsData.length; ++nd) {
+          var nk = nsData[nd][0];
+          bucketTotals[nk] = (bucketTotals[nk] || 0) + nsData[nd][1];
+        }
+      }
+      for (var ns2 = 0; ns2 < stackSeriesList.length; ++ns2) {
+        var nsData2 = stackSeriesList[ns2].data;
+        for (var nd2 = 0; nd2 < nsData2.length; ++nd2) {
+          var nk2 = nsData2[nd2][0];
+          var total = bucketTotals[nk2] || 1;
+          nsData2[nd2] = [nk2, +(nsData2[nd2][1] / total * 100).toFixed(2)];
+        }
+      }
+    }
+
+    option = {
+      animation: false,
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      legend: { show: true, top: 0, textStyle: { fontSize: 10 } },
+      grid: { left: 10, right: 10, top: 30, bottom: 10, containLabel: true },
+      xAxis: catAxis,
+      yAxis: isNorm
+        ? { type: 'value', max: 100, axisLabel: { formatter: '{value}%' } }
+        : { type: 'value' },
+      series: stackSeriesList,
+    };
+
+  } else if (panel.chart === 'bar.waterfall') {
+    // Waterfall chart: invisible placeholder + colored bar series
+    // Sort entries by value descending
+    var wfEntries = entries.slice().sort(function(a, b) {
+      return (b.value.value || 0) - (a.value.value || 0);
+    });
+
+    var wfCats = [];
+    var wfPlaceholder = [];
+    var wfBars = [];
+    var runningTotal = 0;
+    for (var wi = 0; wi < wfEntries.length; ++wi) {
+      var wfKey = String(wfEntries[wi].key);
+      var wfVal = wfEntries[wi].value.value || 0;
+      wfCats.push(wfKey);
+      wfPlaceholder.push({ value: runningTotal, itemStyle: { opacity: 0 } });
+      wfBars.push({ value: wfVal });
+      runningTotal += wfVal;
+    }
+
+    option = {
+      animation: false,
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      grid: { left: 10, right: 10, top: 10, bottom: 10, containLabel: true },
+      xAxis: {
+        type: 'category',
+        data: wfCats,
+        axisLabel: { interval: 0, rotate: wfCats.length > 6 ? 30 : 0 },
+      },
+      yAxis: { type: 'value' },
+      series: [
+        {
+          type: 'bar',
+          name: 'placeholder',
+          stack: 'waterfall',
+          itemStyle: { borderColor: 'transparent', color: 'transparent' },
+          emphasis: { itemStyle: { borderColor: 'transparent', color: 'transparent' } },
+          data: wfPlaceholder,
+          barMaxWidth: 40,
+        },
+        {
+          type: 'bar',
+          name: 'value',
+          stack: 'waterfall',
+          data: wfBars,
+          barMaxWidth: 40,
+        },
+      ],
+    };
+
+  } else {
+    option = {
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'shadow' },
+      },
+      grid: { left: 10, right: 10, top: 10, bottom: 10, containLabel: true },
+      xAxis: isHorizontal ? valAxis : catAxis,
+      yAxis: isHorizontal ? catAxis : valAxis,
+      series: [{
+        type: 'bar',
+        data: isHorizontal ? barData.slice().reverse() : barData,
+        barMaxWidth: 40,
+      }],
+    };
+  }
 
   var instance = echarts.getInstanceByDom(panelEl);
   if (!instance) {
@@ -2141,7 +2270,9 @@ function buildPanelCard(panel, accentIdx, registry) {
       buildSkeletonPie() +
     '</div>';
 
-  } else if (panel.chart === 'bar') {
+  } else if (panel.chart === 'bar' || panel.chart === 'bar.horizontal' ||
+             panel.chart === 'bar.stacked' || panel.chart === 'bar.normalized' ||
+             panel.chart === 'bar.waterfall') {
     body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
       buildSkeletonBars(Math.min(panel.limit, 8)) +
     '</div>';

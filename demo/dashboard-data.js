@@ -100,6 +100,20 @@ function scanPanels(panels, registry) {
       } else if (chartType === 'toggle' || chartType === 'range') {
         // Toggle/range → server-side filter (not query.dimensions)
         serverFilterDims.push({ field: panel._dimField, chart: chartType });
+      } else if (family === 'category' && (chartType === 'bar.stacked' || chartType === 'bar.normalized' || chartType === 'bar.waterfall')) {
+        // Stacked bars need both the category dim AND the stack dim
+        groupByDims.add(panel._dimField);
+        if (panel.stack) groupByDims.add(panel.stack);
+
+        var stackMeasField = panel._measField;
+        var stackOp = stackMeasField ? inferReduceOp(stackMeasField, registry) : 'count';
+        groups.push({
+          id: panel.id,
+          field: panel._dimField,
+          metrics: [{ id: 'value', field: stackOp === 'count' ? null : stackMeasField, op: stackOp }],
+          splitField: panel.stack || null,
+        });
+        panel._groupId = panel.id;
       } else if (family === 'category' || family === 'control') {
         // Bar/pie/selector/dropdown → group-by dimension
         groupByDims.add(panel._dimField);

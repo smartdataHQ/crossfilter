@@ -10,6 +10,9 @@ var SUPPORTED = {
   // category family
   bar: true,
   'bar.horizontal': true,
+  'bar.stacked': true,
+  'bar.normalized': true,
+  'bar.waterfall': true,
   pictorialBar: true,
   pie: true,
   'pie.donut': true,
