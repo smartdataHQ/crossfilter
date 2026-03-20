@@ -2650,7 +2650,7 @@ async function main() {
       '.chart-card--breakdown { box-shadow: 0 0 0 1.5px rgba(63,101,135,0.35); }' +
       '.chart-card--breakdown .card-t { color: #3f6587; }' +
       '.viz-icon-bar { display: flex; gap: 2px; align-items: center; }' +
-      '.viz-icon { border: none; background: none; padding: 3px 4px; border-radius: 4px; cursor: pointer; color: #8da4b8; transition: color 0.15s, background 0.15s; line-height: 0; }' +
+      '.viz-icon { border: none; background: none; padding: 3px 4px; border-radius: 4px; cursor: pointer; color: #8da4b8; line-height: 0; }' +
       '.viz-icon:hover { color: #3f6587; background: rgba(63,101,135,0.08); }' +
       '.viz-icon--active { color: #3d8bfd; background: rgba(61,139,253,0.1); }' +
       '.viz-icon--active:hover { color: #3d8bfd; background: rgba(61,139,253,0.15); }';
