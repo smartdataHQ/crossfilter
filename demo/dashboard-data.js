@@ -80,8 +80,23 @@ function scanPanels(panels, registry) {
       var isTime = dimMeta && dimMeta.type === 'time';
 
       if (isTime) {
-        // Time dims → timeDimensions (not query.dimensions)
-        timeDims.push(panel._dimField);
+        // Time dims → timeDimensions in Cube query + crossfilter group for line/brush
+        if (timeDims.indexOf(panel._dimField) < 0) timeDims.push(panel._dimField);
+        // Also add as a worker dimension so crossfilter can filter on it (brush)
+        groupByDims.add(panel._dimField);
+
+        // Create a group for time-series panels (line, area, etc.)
+        if (family === 'time') {
+          var timeMeasField = panel._measField;
+          var timeOp = timeMeasField ? inferReduceOp(timeMeasField, registry) : 'count';
+          groups.push({
+            id: panel.id,
+            field: panel._dimField,
+            metrics: [{ id: 'value', field: timeOp === 'count' ? null : timeMeasField, op: timeOp }],
+          });
+          panel._groupId = panel.id;
+          panel._isTimeSeries = true;
+        }
       } else if (chartType === 'toggle' || chartType === 'range') {
         // Toggle/range → server-side filter (not query.dimensions)
         serverFilterDims.push({ field: panel._dimField, chart: chartType });
@@ -190,7 +205,11 @@ function buildCubeQuery(cubeName, scanResult, registry, serverState) {
     timeDimensions.push(td);
   }
 
-  var queryDims = Array.from(scanResult.groupByDims).map(function(d) {
+  // Exclude time dims from query.dimensions — they're in timeDimensions
+  var timeSet = new Set(scanResult.timeDims);
+  var queryDims = Array.from(scanResult.groupByDims).filter(function(d) {
+    return !timeSet.has(d);
+  }).map(function(d) {
     return cubeName + '.' + d;
   });
 
@@ -228,7 +247,9 @@ function buildProjection(cubeName, scanResult, registry) {
 
   scanResult.groupByDims.forEach(function(d) {
     var meta = registry.dimensions[d];
-    if (meta && (meta.type === 'number' || meta.type === 'boolean')) {
+    if (meta && meta.type === 'time') {
+      transforms[d] = 'timestampMs';
+    } else if (meta && (meta.type === 'number' || meta.type === 'boolean')) {
       transforms[d] = 'number';
     }
   });

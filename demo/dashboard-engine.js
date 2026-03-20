@@ -263,17 +263,13 @@ function notifyFilterChange() {
 //   time dims    → period date range
 
 // All keys that are internal UI controls, not cube dimension names
-var SERVER_CONTROL_KEYS = { _focus: true, _include: true, _granularity: true };
+var SERVER_CONTROL_KEYS = { _focus: true, _include: true, _granularity: true, _period: true };
 
 function isServerTrigger(dim) {
   if (SERVER_CONTROL_KEYS[dim]) return true;
   if (_dashboardData && _dashboardData.isServerDim(dim)) return true;
-  // Time dimensions (period picker) trigger reload
-  if (_dashboardData && _dashboardData.timeDims) {
-    for (var t = 0; t < _dashboardData.timeDims.length; ++t) {
-      if (_dashboardData.timeDims[t] === dim) return true;
-    }
-  }
+  // Time dimensions are in the worker now (for brush filtering).
+  // Period picker uses _period key to trigger reload, not the dim name.
   return false;
 }
 
@@ -311,12 +307,8 @@ function buildServerState() {
       continue;
     }
 
-    // Time dimension: period date range
-    var isTimeDim = false;
-    for (var td = 0; td < timeDims.length; ++td) {
-      if (timeDims[td] === dim) { isTimeDim = true; break; }
-    }
-    if (isTimeDim && Array.isArray(val) && val.length === 2) {
+    // Period: _period contains date range [from, to] for timeDimensions
+    if (dim === '_period' && Array.isArray(val) && val.length === 2) {
       dateRange = val;
       continue;
     }
@@ -751,6 +743,147 @@ function renderGaugeChart(panelEl, panel, kpiValue, registry) {
   return instance;
 }
 
+function renderLineChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+
+  // Sort by time key (ascending)
+  entries.sort(function(a, b) { return a.key - b.key; });
+
+  var xData = [];
+  var yData = [];
+  for (var i = 0; i < entries.length; ++i) {
+    xData.push(entries[i].key);
+    yData.push(entries[i].value.value);
+  }
+
+  var chartDef = getChartType(panel.chart);
+  var seriesOpts = {
+    type: 'line',
+    data: yData,
+    showSymbol: false,
+    areaStyle: { opacity: 0.15 },
+  };
+
+  // Apply chart-type-specific options (smooth, step, area, etc.)
+  if (chartDef && chartDef.ecOptions) {
+    var ec = chartDef.ecOptions;
+    if (ec.smooth) seriesOpts.smooth = ec.smooth;
+    if (ec.step) seriesOpts.step = ec.step;
+    if (ec.areaStyle) seriesOpts.areaStyle = ec.areaStyle;
+  }
+
+  // Read current brush range from filterState to set initial dataZoom
+  var dim = panel._dimField;
+  var currentRange = dim ? filterState[dim] : null;
+  var startValue = null;
+  var endValue = null;
+  if (currentRange && Array.isArray(currentRange) && currentRange.length === 2) {
+    startValue = Number(currentRange[0]);
+    endValue = Number(currentRange[1]);
+  }
+
+  var option = {
+    tooltip: {
+      trigger: 'axis',
+      formatter: function(params) {
+        var p = params[0];
+        var d = new Date(p.axisValue);
+        var dateStr = d.toISOString().slice(0, 10);
+        return dateStr + '<br>' + p.seriesName + ': ' + (p.value != null ? p.value.toLocaleString() : '\u2014');
+      },
+    },
+    grid: { left: 50, right: 20, top: 20, bottom: 80, containLabel: false },
+    xAxis: {
+      type: 'time',
+      data: xData,
+      axisLabel: {
+        formatter: function(val) {
+          var d = new Date(val);
+          var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+          return months[d.getUTCMonth()] + ' ' + d.getUTCDate();
+        },
+      },
+    },
+    yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(63,101,135,0.06)' } } },
+    series: [seriesOpts],
+    dataZoom: [
+      {
+        type: 'slider',
+        xAxisIndex: 0,
+        filterMode: 'none',
+        height: 30,
+        bottom: 10,
+        startValue: startValue,
+        endValue: endValue,
+        start: startValue == null ? 0 : undefined,
+        end: endValue == null ? 100 : undefined,
+        labelFormatter: function(val) {
+          var d = new Date(val);
+          return d.toISOString().slice(0, 10);
+        },
+      },
+      {
+        type: 'inside',
+        xAxisIndex: 0,
+        filterMode: 'none',
+      },
+    ],
+  };
+
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) {
+    instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  }
+  instance.setOption(option, true);
+
+  return instance;
+}
+
+function wireLineBrush(instance, panel) {
+  if (!instance || !panel._dimField) return;
+
+  var dim = panel._dimField;
+  var debounceTimer = 0;
+
+  instance.on('datazoom', function(params) {
+    // Get the current visible range from the xAxis
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(function() {
+      var option = instance.getOption();
+      var zoom = option.dataZoom && option.dataZoom[0];
+      if (!zoom) return;
+
+      var xAxis = option.xAxis && option.xAxis[0];
+      var xData = xAxis ? xAxis.data : [];
+      if (!xData.length) return;
+
+      // Calculate the start/end values from percentage or absolute
+      var startVal, endVal;
+      if (zoom.startValue != null && zoom.endValue != null) {
+        startVal = zoom.startValue;
+        endVal = zoom.endValue;
+      } else {
+        var startIdx = Math.round((zoom.start / 100) * (xData.length - 1));
+        var endIdx = Math.round((zoom.end / 100) * (xData.length - 1));
+        startVal = xData[Math.max(0, startIdx)];
+        endVal = xData[Math.min(xData.length - 1, endIdx)];
+      }
+
+      // If full range, clear filter; otherwise set range
+      var isFullRange = startVal <= xData[0] && endVal >= xData[xData.length - 1];
+      if (isFullRange) {
+        setFilter(dim, null);
+      } else {
+        setFilter(dim, [startVal, endVal]);
+      }
+    }, 200);
+  });
+}
+
 function renderSelectorList(panel, groupData) {
   var listEl = document.getElementById('list-' + panel.id);
   if (!listEl) return;
@@ -907,7 +1040,13 @@ function renderAllPanels(panels, response, registry) {
 
       var instance = null;
 
-      if (ecType === 'bar' || ecType === 'pictorialBar') {
+      if (ecType === 'line') {
+        instance = renderLineChart(chartEl, panel, groupData);
+        // Wire brush (only once)
+        if (instance && !_chartInstances[panel.id]) {
+          wireLineBrush(instance, panel);
+        }
+      } else if (ecType === 'bar' || ecType === 'pictorialBar') {
         instance = renderBarChart(chartEl, panel, groupData);
       } else if (ecType === 'pie' || ecType === 'funnel') {
         instance = renderPieChart(chartEl, panel, groupData);
@@ -1794,7 +1933,7 @@ function wirePeriodControl(container, tpi) {
           var from = dates[0].toISOString().slice(0, 10);
           var to = dates[1].toISOString().slice(0, 10);
           trigger.value = formatDateRange(from, to);
-          setFilter(dimension, [from, to]);
+          setFilter('_period', [from, to]);
         }
       },
       onReady: function (selectedDates, dateStr, instance) {
