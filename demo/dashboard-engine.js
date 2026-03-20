@@ -2156,10 +2156,18 @@ function buildPanelCard(panel, accentIdx, registry) {
     }
 
   } else {
-    // Generic ECharts fallback
-    body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
-      buildSkeletonBars(6) +
-    '</div>';
+    // Check if chart type is known but unimplemented
+    var _chartDef = getChartType(panel.chart);
+    if (_chartDef) {
+      body = '<div class="panel-unsupported">' +
+        '<span class="unsupported-icon">&#9888;</span>' +
+        '<span class="unsupported-label">Chart type "' + escapeHtml(panel.chart) + '" is not yet supported</span>' +
+      '</div>';
+    } else {
+      body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
+        buildSkeletonBars(6) +
+      '</div>';
+    }
   }
 
   card.innerHTML = head + body;
@@ -2677,7 +2685,10 @@ async function main() {
       '.viz-icon { border: none; background: none; padding: 5px 6px; border-radius: 5px; cursor: pointer; color: #8da4b8; line-height: 0; }' +
       '.viz-icon:hover { color: #3f6587; background: rgba(63,101,135,0.08); }' +
       '.viz-icon--active { color: #3d8bfd; background: rgba(61,139,253,0.1); }' +
-      '.viz-icon--active:hover { color: #3d8bfd; background: rgba(61,139,253,0.15); }';
+      '.viz-icon--active:hover { color: #3d8bfd; background: rgba(61,139,253,0.15); }' +
+      '.panel-unsupported { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; color: #8da4b8; gap: 8px; min-height: 120px; }' +
+      '.unsupported-icon { font-size: 28px; opacity: 0.5; }' +
+      '.unsupported-label { font-size: 12px; text-align: center; }';
     document.head.appendChild(breakdownStyle);
 
     filterState = readUrlState(); // Principle 3: read URL state early (no network needed)
