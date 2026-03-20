@@ -44,11 +44,16 @@
     .typing span:nth-child(2) { animation-delay: 0.2s; }
     .typing span:nth-child(3) { animation-delay: 0.4s; }
     @keyframes bounce { 0%, 80%, 100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
+
+    .cube-select { font-family: inherit; font-size: 12px; padding: 4px 8px; border: 1px solid rgba(63,101,135,0.15); border-radius: 6px; background: #fff; color: #3f6587; }
   </style>
 </head>
 <body>
   <div class="builder-header">
     <span class="builder-title">Dashboard Builder</span>
+    <select id="cube-select" class="cube-select">
+      <option value="">Loading cubes...</option>
+    </select>
     <span class="builder-status" id="status"></span>
   </div>
   <div class="builder-body">
@@ -65,6 +70,7 @@
       <div class="preview-toolbar">
         <span class="preview-label" id="preview-label">No dashboard yet</span>
         <button id="btn-download">Download JSON</button>
+        <button id="btn-save">Save As</button>
         <button id="btn-reload">Reload</button>
       </div>
       <iframe class="preview-frame" id="preview" src="about:blank"></iframe>
@@ -80,7 +86,9 @@
   var previewEl = document.getElementById('preview');
   var previewLabel = document.getElementById('preview-label');
   var btnDownload = document.getElementById('btn-download');
+  var btnSave = document.getElementById('btn-save');
   var btnReload = document.getElementById('btn-reload');
+  var cubeSelect = document.getElementById('cube-select');
 
   // Conversation state
   var conversation = []; // { role, content } — sent to OpenAI
@@ -137,30 +145,17 @@
   }
 
   async function generate(userMessage) {
-    // Add user message to conversation
     conversation.push({ role: 'user', content: userMessage });
     addMessage('user', userMessage);
-
-    // If we have a current config, inject it as assistant context
-    // so the LLM knows what to modify
-    var messagesToSend = conversation.slice();
-
-    // On subsequent turns, prepend the current config as context
-    if (currentConfig && conversation.length > 1) {
-      // Find the last assistant message and ensure config is there
-      var configContext = 'Current dashboard config:\n' + JSON.stringify(currentConfig, null, 2) +
-        '\n\nThe user wants to modify this dashboard. Update the config based on their feedback. Return the complete updated config.';
-      messagesToSend.push({ role: 'user', content: configContext });
-    }
 
     setGenerating(true);
     showTyping();
 
     try {
-      var res = await fetch('/api/dashboard/generate', {
+      var res = await fetch('/api/dashboard/agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: messagesToSend }),
+        body: JSON.stringify({ messages: conversation }),
       });
 
       hideTyping();
@@ -171,46 +166,28 @@
       }
 
       var data = await res.json();
-      currentConfig = data.config;
 
-      // Validate against supported chart types
-      var supportRes = await fetch('/api/chart-support');
-      var support = await supportRes.json();
-      var unsupportedSet = {};
-      for (var u = 0; u < support.unsupported.length; ++u) {
-        unsupportedSet[support.unsupported[u]] = true;
+      // Add assistant reply to conversation
+      if (data.reply) {
+        conversation.push({ role: 'assistant', content: data.reply });
+        addMessage('assistant', data.reply);
       }
 
-      var issues = [];
-      var configSections = currentConfig.sections || [];
-      for (var si = 0; si < configSections.length; ++si) {
-        var sectionPanels = configSections[si].panels || [];
-        for (var pi = 0; pi < sectionPanels.length; ++pi) {
-          if (sectionPanels[pi].chart && unsupportedSet[sectionPanels[pi].chart]) {
-            issues.push(sectionPanels[pi].chart + ' ("' + (sectionPanels[pi].label || 'unnamed') + '")');
-          }
-        }
-      }
-      if (issues.length > 0) {
-        addMessage('error', 'Warning: ' + issues.length + ' panel(s) use unsupported chart types: ' +
-          issues.join(', ') + '. These will show placeholder panels.');
+      // If a config was generated/updated, show it
+      if (data.config) {
+        currentConfig = data.config;
+        addConfigPreview(currentConfig);
+        previewLabel.textContent = currentConfig.title || 'Dashboard';
+        previewEl.src = '/demo/dashboards/_draft';
       }
 
-      // Add assistant response to conversation (the config)
-      var assistantContent = JSON.stringify(currentConfig);
-      conversation.push({ role: 'assistant', content: assistantContent });
-
-      // Show summary
-      var sections = (currentConfig.sections || []).length;
-      var panels = (currentConfig.sections || []).reduce(function (s, sec) { return s + (sec.panels || []).length; }, 0);
+      // Show usage info
       var usage = data.usage || {};
-      var tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
-      addMessage('system', 'Generated: ' + sections + ' sections, ' + panels + ' panels (' + tokens + ' tokens)');
-      addConfigPreview(currentConfig);
-
-      // Update preview
-      previewLabel.textContent = currentConfig.title || 'Dashboard';
-      previewEl.src = '/demo/dashboards/_draft';
+      if (usage.tool_calls) {
+        addMessage('system', (usage.tool_calls || 0) + ' tool calls, ' +
+          (usage.iterations || 0) + ' iterations, ' +
+          ((usage.total_tokens || 0)) + ' tokens');
+      }
 
     } catch (err) {
       hideTyping();
@@ -242,6 +219,24 @@
     inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
   });
 
+  // Save As
+  btnSave.addEventListener('click', function () {
+    if (!currentConfig) return;
+    var name = prompt('Dashboard name:', (currentConfig.title || 'dashboard').toLowerCase().replace(/[^a-z0-9]+/g, '-'));
+    if (!name) return;
+    fetch('/api/dashboard/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, config: currentConfig }),
+    }).then(function(r) { return r.json(); }).then(function(data) {
+      if (data.saved) {
+        addMessage('system', 'Saved as "' + data.saved + '". View at /demo/dashboards/' + data.saved);
+      }
+    }).catch(function(err) {
+      addMessage('error', 'Save failed: ' + err.message);
+    });
+  });
+
   // Download
   btnDownload.addEventListener('click', function () {
     if (!currentConfig) return;
@@ -258,6 +253,24 @@
       previewEl.src = previewEl.src;
     }
   });
+
+  // Load cube list on page init
+  fetch('/api/cubes').then(function(r) { return r.json(); }).then(function(data) {
+    cubeSelect.innerHTML = '';
+    var cubes = data.cubes || [];
+    for (var i = 0; i < cubes.length; ++i) {
+      var opt = document.createElement('option');
+      opt.value = cubes[i].name;
+      opt.textContent = cubes[i].title;
+      cubeSelect.appendChild(opt);
+    }
+  }).catch(function() {});
+
+  // Show chart support count in status bar on page init
+  fetch('/api/chart-support').then(function(r) { return r.json(); }).then(function(data) {
+    var total = data.supported.length + data.unsupported.length;
+    statusEl.textContent = data.supported.length + '/' + total + ' chart types';
+  }).catch(function() {});
 
   inputEl.focus();
 })();

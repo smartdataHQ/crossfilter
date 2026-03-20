@@ -429,6 +429,138 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && urlPath === '/api/cubes') {
+    (async () => {
+      try {
+        var metaCachePath = path.join(ROOT, '.cache', 'cube-meta.json');
+        var metaResponse;
+        try {
+          if (fs.existsSync(metaCachePath)) {
+            metaResponse = JSON.parse(fs.readFileSync(metaCachePath, 'utf8'));
+          }
+        } catch (_) {}
+
+        if (!metaResponse) {
+          const authConfig = getProxyAuthConfig(req);
+          metaResponse = await new Promise((resolve, reject) => {
+            const mReq = https.request({
+              hostname: new URL(CUBE_META_API).hostname,
+              port: 443,
+              path: new URL(CUBE_META_API).pathname,
+              method: 'GET',
+              headers: {
+                'Authorization': authConfig.token,
+                'x-hasura-datasource-id': authConfig.datasourceId,
+                'x-hasura-branch-id': authConfig.branchId,
+              },
+            }, mRes => {
+              const chunks = [];
+              mRes.on('data', c => chunks.push(c));
+              mRes.on('end', () => {
+                if (mRes.statusCode !== 200) { reject(new Error('Meta ' + mRes.statusCode)); return; }
+                const parsed = JSON.parse(Buffer.concat(chunks).toString());
+                fs.mkdirSync(path.dirname(metaCachePath), { recursive: true });
+                fs.writeFileSync(metaCachePath, JSON.stringify(parsed));
+                resolve(parsed);
+              });
+            });
+            mReq.on('error', reject);
+            mReq.setTimeout(30000, () => mReq.destroy(new Error('Meta timeout')));
+            mReq.end();
+          });
+        }
+
+        var cubeList = (metaResponse.cubes || []).map(function (c) {
+          return { name: c.name, title: c.title || c.name };
+        });
+        sendJson(res, 200, { cubes: cubeList });
+      } catch (err) {
+        sendJson(res, 500, { error: err.message });
+      }
+    })();
+    return;
+  }
+
+  if (req.method === 'POST' && urlPath === '/api/dashboard/save') {
+    let saveBody = '';
+    req.on('data', chunk => { saveBody += chunk; });
+    req.on('end', () => {
+      try {
+        var payload = JSON.parse(saveBody);
+        var safeName = (payload.name || 'dashboard').replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
+        var savePath = path.resolve(ROOT, 'demo', 'dashboards', safeName + '.json');
+        fs.writeFileSync(savePath, JSON.stringify(payload.config, null, 2) + '\n');
+        sendJson(res, 200, { saved: safeName, path: '/demo/dashboards/' + safeName });
+      } catch (err) {
+        sendJson(res, 500, { error: err.message });
+      }
+    });
+    return;
+  }
+
+  if (req.url === '/api/dashboard/agent' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const payload = JSON.parse(body);
+        const { messages } = payload;
+
+        if (!messages || !Array.isArray(messages)) {
+          sendJson(res, 400, { error: 'messages[] required' });
+          return;
+        }
+
+        // Load cube metadata (cached or live)
+        const metaCachePath = path.join(ROOT, '.cache', 'cube-meta.json');
+        let metaResponse;
+        try {
+          if (fs.existsSync(metaCachePath)) {
+            metaResponse = JSON.parse(fs.readFileSync(metaCachePath, 'utf8'));
+          }
+        } catch (_) {}
+
+        if (!metaResponse) {
+          const authConfig = getProxyAuthConfig(req);
+          metaResponse = await new Promise((resolve, reject) => {
+            const mReq = https.request({
+              hostname: new URL(CUBE_META_API).hostname,
+              port: 443, path: new URL(CUBE_META_API).pathname, method: 'GET',
+              headers: {
+                'Authorization': authConfig.token,
+                'x-hasura-datasource-id': authConfig.datasourceId,
+                'x-hasura-branch-id': authConfig.branchId,
+              },
+            }, mRes => {
+              const chunks = [];
+              mRes.on('data', c => chunks.push(c));
+              mRes.on('end', () => {
+                if (mRes.statusCode !== 200) { reject(new Error('Meta ' + mRes.statusCode)); return; }
+                const parsed = JSON.parse(Buffer.concat(chunks).toString());
+                fs.mkdirSync(path.dirname(metaCachePath), { recursive: true });
+                fs.writeFileSync(metaCachePath, JSON.stringify(parsed));
+                resolve(parsed);
+              });
+            });
+            mReq.on('error', reject);
+            mReq.setTimeout(30000, () => mReq.destroy(new Error('Meta timeout')));
+            mReq.end();
+          });
+        }
+
+        const { runAgentLoop } = await import('./agent.mjs');
+        const result = await runAgentLoop(messages, metaResponse);
+
+        sendJson(res, 200, result);
+
+      } catch (err) {
+        console.error('[agent]', err.message);
+        sendJson(res, 500, { error: err.message });
+      }
+    });
+    return;
+  }
+
   if (req.url === '/api/dashboard/generate' && req.method === 'POST') {
     handleDashboardGenerate(req, res);
   } else if (req.url === '/api/meta' && req.method === 'GET') {
