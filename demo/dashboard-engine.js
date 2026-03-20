@@ -2486,20 +2486,18 @@ function buildPanelCard(panel, accentIdx, registry) {
       '</div>' +
     '</div>';
 
-  } else if (panel.chart === 'line' || panel._isTimeSeries) {
+  } else if (panel._isTimeSeries || (panelChartDef && panelChartDef.ecType === 'line')) {
     // Period/granularity controls are in the model bar title line
     body = '<div id="chart-' + panel.id + '" class="chart-wrap chart-wrap-timeline">' +
       buildSkeletonLine() +
     '</div>';
 
-  } else if (panel.chart === 'pie') {
+  } else if (panelChartDef && (panelChartDef.ecType === 'pie' || panelChartDef.ecType === 'funnel')) {
     body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
       buildSkeletonPie() +
     '</div>';
 
-  } else if (panel.chart === 'bar' || panel.chart === 'bar.horizontal' ||
-             panel.chart === 'bar.stacked' || panel.chart === 'bar.normalized' ||
-             panel.chart === 'bar.waterfall') {
+  } else if (panelChartDef && (panelChartDef.ecType === 'bar' || panelChartDef.ecType === 'pictorialBar')) {
     body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
       buildSkeletonBars(Math.min(panel.limit, 8)) +
     '</div>';
