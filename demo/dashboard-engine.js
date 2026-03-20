@@ -839,13 +839,20 @@ function renderLineChart(panelEl, panel, groupData) {
     xData.push(ts);
   }
 
-  var chartDef = getChartType(panel.chart);
+  var activeViz = filterState['_timeChart'] || panel.chart;
+  var chartDef = getChartType(activeViz) || getChartType(panel.chart);
+  var isBarViz = activeViz === 'bar' || activeViz === 'bar.stacked';
+
   var seriesOpts = {
-    type: 'line',
+    type: isBarViz ? 'bar' : 'line',
     data: seriesData,
     showSymbol: false,
-    areaStyle: { opacity: 0.15 },
   };
+
+  // Default area fill for single-line (non-bar) views
+  if (!isBarViz) {
+    seriesOpts.areaStyle = { opacity: 0.15 };
+  }
 
   // Apply chart-type-specific options (smooth, step, area, etc.)
   if (chartDef && chartDef.ecOptions) {
@@ -853,6 +860,10 @@ function renderLineChart(panelEl, panel, groupData) {
     if (ec.smooth) seriesOpts.smooth = ec.smooth;
     if (ec.step) seriesOpts.step = ec.step;
     if (ec.areaStyle) seriesOpts.areaStyle = ec.areaStyle;
+  }
+  // Stacked bar/area
+  if (activeViz === 'bar.stacked' || activeViz === 'line.area.stacked') {
+    seriesOpts.stack = 'timeline';
   }
 
   var dim = panel._dimField;
@@ -996,6 +1007,7 @@ function renderLineChart(panelEl, panel, groupData) {
     // Build one series per split key
     var activeChartType = filterState['_timeChart'] || panel.chart;
     var vizDef = getChartType(activeChartType);
+    var isBarSplit = activeChartType === 'bar' || activeChartType === 'bar.stacked';
     var seriesList = [];
     for (var li = 0; li < keyNames.length; ++li) {
       var lineKey = keyNames[li];
@@ -1005,19 +1017,19 @@ function renderLineChart(panelEl, panel, groupData) {
         lineData.push([entries[le].key, lv ? lv.value : 0]);
       }
       var lineSeries = {
-        type: 'line',
+        type: isBarSplit ? 'bar' : 'line',
         name: lineKey,
         data: lineData,
         showSymbol: false,
-        triggerLineEvent: true,
+        triggerLineEvent: !isBarSplit,
       };
-      if (vizDef && vizDef.ecOptions) {
+      if (!isBarSplit && vizDef && vizDef.ecOptions) {
         if (vizDef.ecOptions.smooth) lineSeries.smooth = true;
         if (vizDef.ecOptions.step) lineSeries.step = vizDef.ecOptions.step;
         if (vizDef.ecOptions.areaStyle) lineSeries.areaStyle = vizDef.ecOptions.areaStyle;
       }
-      // Stacked if the chart type calls for it
-      if (activeChartType === 'line.area.stacked' || activeChartType === 'line.bump') {
+      // Stacked
+      if (activeChartType === 'bar.stacked' || activeChartType === 'line.area.stacked' || activeChartType === 'line.bump') {
         lineSeries.stack = 'breakdown';
         if (!lineSeries.areaStyle) lineSeries.areaStyle = {};
       }
@@ -1964,14 +1976,23 @@ function buildPanelCard(panel, accentIdx, registry) {
     headRight += '<sl-button size="small" variant="text" class="dim-list-toggle" data-panel="' + panel.id + '">List</sl-button>';
   }
   if (panel.chart === 'line' || panel._isTimeSeries) {
-    var timeTypes = typesByFamily('time');
+    // All time-series visualization options
+    var timeVizOptions = [
+      { value: 'line', label: 'Line' },
+      { value: 'line.smooth', label: 'Smooth' },
+      { value: 'line.area', label: 'Area' },
+      { value: 'line.area.stacked', label: 'Stacked Area' },
+      { value: 'line.step', label: 'Step' },
+      { value: 'bar', label: 'Bar' },
+      { value: 'bar.stacked', label: 'Stacked Bar' },
+      { value: 'line.bump', label: 'Bump' },
+    ];
     var currentViz = filterState['_timeChart'] || panel.chart;
     var vizOpts = '';
-    for (var ti = 0; ti < timeTypes.length; ++ti) {
-      var tt = timeTypes[ti];
-      var ttLabel = tt.type.replace(/\./g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
-      var ttSel = tt.type === currentViz ? ' selected' : '';
-      vizOpts += '<sl-option value="' + tt.type + '"' + ttSel + '>' + escapeHtml(ttLabel) + '</sl-option>';
+    for (var ti = 0; ti < timeVizOptions.length; ++ti) {
+      var tvo = timeVizOptions[ti];
+      var ttSel = tvo.value === currentViz ? ' selected' : '';
+      vizOpts += '<sl-option value="' + tvo.value + '"' + ttSel + '>' + escapeHtml(tvo.label) + '</sl-option>';
     }
     headRight += '<sl-select size="small" class="viz-type-select" value="' + escapeHtml(currentViz) + '" hoist>' + vizOpts + '</sl-select>';
   }
