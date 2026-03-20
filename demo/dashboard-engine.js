@@ -314,6 +314,9 @@ function buildServerState() {
       continue;
     }
 
+    // UI-only state keys — not Cube filters
+    if (dim === '_timeChart' || dim === '_breakdown') continue;
+
     // Regular server-side dimension filter
     if (!_dashboardData || !_dashboardData.isServerDim(dim)) continue;
 
@@ -652,11 +655,26 @@ function renderBarChart(panelEl, panel, groupData) {
     return null;
   }
 
+  // Check if this dimension has an active filter
+  var dim = panel._dimField;
+  var activeFilter = dim ? filterState[dim] : null;
+  var selectedSet = null;
+  if (activeFilter) {
+    var selectedArr = Array.isArray(activeFilter) ? activeFilter : [activeFilter];
+    selectedSet = {};
+    for (var sa = 0; sa < selectedArr.length; ++sa) selectedSet[String(selectedArr[sa])] = true;
+  }
+
   var categories = [];
-  var values = [];
+  var barData = [];
   for (var i = 0; i < entries.length; ++i) {
-    categories.push(String(entries[i].key));
-    values.push(entries[i].value.value);
+    var key = String(entries[i].key);
+    categories.push(key);
+    var item = { value: entries[i].value.value };
+    if (selectedSet && !selectedSet[key]) {
+      item.itemStyle = { opacity: 0.25 };
+    }
+    barData.push(item);
   }
 
   var chartDef = getChartType(panel.chart);
@@ -679,7 +697,7 @@ function renderBarChart(panelEl, panel, groupData) {
     yAxis: isHorizontal ? catAxis : valAxis,
     series: [{
       type: 'bar',
-      data: isHorizontal ? values.slice().reverse() : values,
+      data: isHorizontal ? barData.slice().reverse() : barData,
       barMaxWidth: 40,
     }],
   };
@@ -699,9 +717,24 @@ function renderPieChart(panelEl, panel, groupData) {
     return null;
   }
 
+  // Check if this dimension has an active filter
+  var dim = panel._dimField;
+  var activeFilter = dim ? filterState[dim] : null;
+  var selectedSet = null;
+  if (activeFilter) {
+    var selectedArr = Array.isArray(activeFilter) ? activeFilter : [activeFilter];
+    selectedSet = {};
+    for (var sa = 0; sa < selectedArr.length; ++sa) selectedSet[String(selectedArr[sa])] = true;
+  }
+
   var pieData = [];
   for (var i = 0; i < entries.length; ++i) {
-    pieData.push({ name: String(entries[i].key), value: entries[i].value.value });
+    var key = String(entries[i].key);
+    var item = { name: key, value: entries[i].value.value };
+    if (selectedSet && !selectedSet[key]) {
+      item.itemStyle = { opacity: 0.25 };
+    }
+    pieData.push(item);
   }
 
   var chartDef = getChartType(panel.chart);
@@ -844,15 +877,21 @@ function renderLineChart(panelEl, panel, groupData) {
   if (selectedTimestamp != null) {
     seriesOpts.markLine = {
       silent: true,
-      symbol: 'none',
-      lineStyle: { type: 'solid', color: '#3d8bfd', width: 2, opacity: 0.6 },
+      symbol: ['none', 'none'],
+      lineStyle: { type: 'dashed', color: '#3d8bfd', width: 2 },
       label: {
         formatter: function() {
-          return new Date(selectedTimestamp).toISOString().slice(0, 10);
+          var d = new Date(selectedTimestamp);
+          var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+          return months[d.getUTCMonth()] + ' ' + d.getUTCDate() + ', ' + d.getUTCFullYear();
         },
-        position: 'start',
-        fontSize: 10,
+        position: 'insideEndTop',
+        fontSize: 11,
+        fontWeight: 600,
         color: '#3d8bfd',
+        backgroundColor: 'rgba(255,255,255,0.85)',
+        padding: [2, 6],
+        borderRadius: 3,
       },
       data: [{ xAxis: selectedTimestamp }],
     };
@@ -1328,6 +1367,11 @@ function resolveFilterLabel(dim, rawValue) {
   if (select) {
     var option = select.querySelector('sl-option[value="' + rawValue + '"]');
     if (option) return option.textContent.trim();
+  }
+  // Timestamps: format as date
+  var num = Number(rawValue);
+  if (num > 1e12) {
+    return new Date(num).toISOString().slice(0, 10);
   }
   // Fallback: title-case the raw value
   return titleCase(rawValue);
@@ -2514,7 +2558,9 @@ async function main() {
 
     // Inject breakdown indicator style
     var breakdownStyle = document.createElement('style');
-    breakdownStyle.textContent = '.chart-card--breakdown { box-shadow: 0 0 0 2px #3d8bfd; }';
+    breakdownStyle.textContent =
+      '.chart-card--breakdown { box-shadow: 0 0 0 1.5px rgba(63,101,135,0.35); }' +
+      '.chart-card--breakdown .card-t { color: #3f6587; }';
     document.head.appendChild(breakdownStyle);
 
     filterState = readUrlState(); // Principle 3: read URL state early (no network needed)
