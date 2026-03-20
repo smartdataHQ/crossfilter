@@ -676,8 +676,9 @@ function renderPieChart(panelEl, panel, groupData) {
   }
 
   var chartDef = getChartType(panel.chart);
+  var ecSeriesType = chartDef ? chartDef.ecType : 'pie';
   var seriesOpts = {
-    type: 'pie',
+    type: ecSeriesType,
     data: pieData,
     label: { fontSize: 11, formatter: '{b}\n{d}%' },
     emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,21,88,0.15)' } },
@@ -689,6 +690,7 @@ function renderPieChart(panelEl, panel, groupData) {
     if (ec.roseType) seriesOpts.roseType = ec.roseType;
     if (ec.startAngle != null) seriesOpts.startAngle = ec.startAngle;
     if (ec.endAngle != null) seriesOpts.endAngle = ec.endAngle;
+    if (ec.sort) seriesOpts.sort = ec.sort;
   }
 
   var option = {
@@ -702,6 +704,123 @@ function renderPieChart(panelEl, panel, groupData) {
   }
   instance.setOption(option, true);
   return instance;
+}
+
+function renderGaugeChart(panelEl, panel, kpiValue, registry) {
+  if (kpiValue == null || kpiValue !== kpiValue) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+
+  var chartDef = getChartType(panel.chart);
+  var meta = registry.measures[panel._measField];
+  var isPercent = meta && (meta.format === 'percent' ||
+    (meta.aggType === 'number' && /rate|percent/i.test(meta.description || '')));
+
+  var displayValue = isPercent ? +(kpiValue * 100).toFixed(1) : kpiValue;
+  var maxValue = isPercent ? 100 : undefined;
+  var formatter = isPercent ? '{value}%' : undefined;
+
+  var seriesOpts = {
+    type: 'gauge',
+    data: [{ value: displayValue, name: panel.label }],
+    detail: { formatter: formatter, fontSize: 14 },
+    title: { fontSize: 12 },
+  };
+
+  if (maxValue != null) seriesOpts.max = maxValue;
+
+  // Apply chart-type-specific options (progress, ring, etc.)
+  if (chartDef && chartDef.ecOptions) {
+    var ec = chartDef.ecOptions;
+    var ecKeys = Object.keys(ec);
+    for (var k = 0; k < ecKeys.length; ++k) {
+      seriesOpts[ecKeys[k]] = ec[ecKeys[k]];
+    }
+  }
+
+  var option = {
+    series: [seriesOpts],
+  };
+
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) {
+    instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  }
+  instance.setOption(option, true);
+  return instance;
+}
+
+function renderSelectorList(panel, groupData) {
+  var listEl = document.getElementById('list-' + panel.id);
+  if (!listEl) return;
+
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    listEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < entries.length; ++i) {
+    var entry = entries[i];
+    var key = String(entry.key);
+    var count = entry.value.value;
+    var maxCount = entries[0].value.value || 1;
+    var pct = Math.round((count / maxCount) * 100);
+
+    html += '<div class="dim-item" data-value="' + escapeHtml(key) + '">' +
+      '<span class="dim-label">' + escapeHtml(key) + '</span>' +
+      '<span class="dim-count">' + count.toLocaleString() + '</span>' +
+      '<div class="dim-bar"><div class="dim-bar-fill" style="width:' + pct + '%"></div></div>' +
+    '</div>';
+  }
+  listEl.innerHTML = html;
+
+  // Update count badge
+  if (groupData.total != null) {
+    var countEl = document.getElementById('count-' + panel.id);
+    if (countEl) countEl.textContent = groupData.total + ' values';
+  }
+
+  // Wire click-to-filter on list items
+  listEl.onclick = function(e) {
+    var item = e.target.closest('.dim-item');
+    if (!item) return;
+    var dim = panel._dimField;
+    var val = item.dataset.value;
+    if (!dim || !val) return;
+
+    var isMulti = e.metaKey || e.ctrlKey;
+    var current = filterState[dim];
+
+    if (isMulti) {
+      var arr = current ? (Array.isArray(current) ? current.slice() : [current]) : [];
+      var idx = arr.indexOf(val);
+      if (idx >= 0) arr.splice(idx, 1);
+      else arr.push(val);
+      setFilter(dim, arr.length ? arr : null);
+    } else {
+      var isSame = current === val ||
+        (Array.isArray(current) && current.length === 1 && current[0] === val);
+      setFilter(dim, isSame ? null : val);
+    }
+  };
+
+  // Wire search input
+  var searchEl = document.getElementById('search-' + panel.id);
+  if (searchEl && !searchEl._wired) {
+    searchEl._wired = true;
+    searchEl.addEventListener('input', function() {
+      var query = searchEl.value.toLowerCase();
+      var items = listEl.querySelectorAll('.dim-item');
+      for (var j = 0; j < items.length; ++j) {
+        var label = items[j].querySelector('.dim-label');
+        var text = label ? label.textContent.toLowerCase() : '';
+        items[j].style.display = !query || text.indexOf(query) >= 0 ? '' : 'none';
+      }
+    });
+  }
 }
 
 function renderKpi(panel, kpiValue, registry) {
@@ -750,13 +869,25 @@ function renderAllPanels(panels, response, registry) {
     var panel = panels[i];
 
     // Local KPIs (count, sum) come from crossfilter snapshot
-    if (panel._kpiId && response.kpis && response.kpis[panel._kpiId] != null) {
+    if (panel._kpiId && panel.chart === 'kpi' && response.kpis && response.kpis[panel._kpiId] != null) {
       renderKpi(panel, response.kpis[panel._kpiId], registry);
       continue;
     }
 
-    // Skip remote KPIs here — they're handled by refreshRemoteKpis
-    if (panel._kpiId) continue;
+    // Skip remote text KPIs here — they're handled by refreshRemoteKpis
+    if (panel._kpiId && panel.chart === 'kpi') continue;
+
+    // Gauge panels: KPI value rendered as ECharts gauge
+    if (panel._kpiId && (panel.chart === 'gauge' || panel.chart === 'gauge.progress' || panel.chart === 'gauge.ring')) {
+      // Gauge gets its value from remote KPIs (handled by refreshRemoteKpis)
+      // but we also try local KPIs here
+      var gaugeKpiVal = response.kpis ? response.kpis[panel._kpiId] : null;
+      if (gaugeKpiVal != null) {
+        var gaugeEl = document.getElementById('chart-' + panel.id);
+        if (gaugeEl) renderGaugeChart(gaugeEl, panel, gaugeKpiVal, registry);
+      }
+      continue;
+    }
 
     if (panel._groupId && response.groups) {
       var groupData = response.groups[panel._groupId];
@@ -773,6 +904,11 @@ function renderAllPanels(panels, response, registry) {
         instance = renderBarChart(chartEl, panel, groupData);
       } else if (ecType === 'pie' || ecType === 'funnel') {
         instance = renderPieChart(chartEl, panel, groupData);
+      }
+
+      // Selector/list panels — DOM-based, no ECharts
+      if (!ecType && (panel.chart === 'selector' || panel.chart === 'dropdown')) {
+        renderSelectorList(panel, groupData);
       }
 
       if (instance && !_chartInstances[panel.id]) {
@@ -836,7 +972,12 @@ function executeKpiRefresh() {
       if (!panel._kpiId) continue;
       var val = kpiValues[panel._kpiId];
       if (val != null) {
-        renderKpi(panel, val, registry);
+        if (panel.chart === 'kpi') {
+          renderKpi(panel, val, registry);
+        } else if (panel.chart === 'gauge' || panel.chart === 'gauge.progress' || panel.chart === 'gauge.ring') {
+          var gaugeEl = document.getElementById('chart-' + panel.id);
+          if (gaugeEl) renderGaugeChart(gaugeEl, panel, val, registry);
+        }
       }
       var kpiEl = document.querySelector('#panel-' + panel.id + ' .kpi-value');
       if (kpiEl) kpiEl.style.opacity = '';

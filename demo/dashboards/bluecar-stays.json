@@ -1,0 +1,114 @@
+{
+  "title": "Iceland Rental Car Stays",
+  "cubes": ["bluecar_stays"],
+  "sharedFilters": [],
+  "sections": [
+    {
+      "id": "kpis",
+      "label": null,
+      "location": "main",
+      "columns": 4,
+      "collapsed": false,
+      "panels": [
+        { "chart": "kpi", "label": "Total Stays", "value": "count" },
+        { "chart": "kpi", "label": "Bookings", "value": "unique_bookings" },
+        { "chart": "kpi", "label": "Vehicles", "value": "unique_cars" },
+        { "chart": "kpi", "label": "POI Match Rate", "value": "poi_match_rate" }
+      ]
+    },
+    {
+      "id": "timeline",
+      "label": null,
+      "location": "main",
+      "columns": 1,
+      "collapsed": false,
+      "panels": [
+        { "chart": "line", "label": "Stays Over Time", "width": "full", "x": "stay_started_at", "y": "count" }
+      ]
+    },
+    {
+      "id": "overview",
+      "label": "Overview",
+      "location": "main",
+      "columns": 3,
+      "collapsed": false,
+      "panels": [
+        { "chart": "bar", "label": "Activity Type", "category": "activity_type" },
+        { "chart": "bar.horizontal", "label": "Car Class", "limit": 12, "category": "car_class" },
+        { "chart": "pie.donut", "label": "Region", "name": "region" }
+      ]
+    },
+    {
+      "id": "chart-variants",
+      "label": "Chart Variants",
+      "location": "main",
+      "columns": 3,
+      "collapsed": false,
+      "panels": [
+        { "chart": "pie.rose", "label": "Activity (Rose)", "name": "activity_type" },
+        { "chart": "funnel", "label": "Activity (Funnel)", "name": "activity_type" },
+        { "chart": "bar", "label": "Vehicle Make", "category": "vehicle_make" }
+      ]
+    },
+    {
+      "id": "vehicles",
+      "label": "Vehicles",
+      "location": "main",
+      "columns": 3,
+      "collapsed": false,
+      "panels": [
+        { "chart": "pie", "label": "Fuel Type", "name": "fuel_type" },
+        { "chart": "pie.half", "label": "Drive Type (Half)", "name": "drive_type" },
+        { "chart": "gauge", "label": "POI Match", "value": "poi_match_rate" }
+      ]
+    },
+    {
+      "id": "selectors",
+      "label": "Browse Dimensions",
+      "location": "main",
+      "columns": 3,
+      "collapsed": false,
+      "panels": [
+        { "chart": "selector", "label": "Municipality", "searchable": true, "dimension": "municipality" },
+        { "chart": "selector", "label": "Locality", "searchable": true, "dimension": "locality" },
+        { "chart": "selector", "label": "POI Name", "searchable": true, "dimension": "poi_name" }
+      ]
+    },
+    {
+      "id": "more-charts",
+      "label": "More Chart Types",
+      "location": "main",
+      "columns": 2,
+      "collapsed": false,
+      "panels": [
+        { "chart": "bar", "label": "POI Category", "category": "poi_category" },
+        { "chart": "pie.donut", "label": "Fuel (Donut)", "name": "fuel_type" }
+      ]
+    },
+    {
+      "id": "modelbar",
+      "label": null,
+      "location": "modelbar",
+      "columns": null,
+      "collapsed": false,
+      "panels": [
+        { "chart": "toggle", "label": "POI Match", "dimension": "has_poi_match" },
+        { "chart": "toggle", "label": "First Stay", "dimension": "is_first_stay" },
+        { "chart": "range", "label": "Stay Duration (hrs)", "dimension": "stay_duration_hours" }
+      ]
+    },
+    {
+      "id": "details",
+      "label": "Details",
+      "location": "main",
+      "columns": 1,
+      "collapsed": false,
+      "panels": [
+        {
+          "chart": "table", "label": "Stay Records", "width": "full",
+          "columns": ["car_class", "region", "activity_type", "poi_name", "stay_duration_hours", "stay_started_at"]
+        }
+      ]
+    }
+  ]
+}
