@@ -24,7 +24,7 @@ import {
   getDemoEChartsThemeName,
 } from './echarts-theme.js';
 import { createDashboardData } from './dashboard-data.js';
-import { getChartType } from './chart-types.js';
+import { getChartType, typesByFamily } from './chart-types.js';
 
 var echarts = globalThis.echarts;
 var crossfilter = globalThis.crossfilter;
@@ -1106,6 +1106,13 @@ function renderAllPanels(panels, response, registry) {
     }
   }
 
+  // Update breakdown visual indicators
+  var breakdownId = filterState['_breakdown'];
+  var allCards = document.querySelectorAll('.chart-card');
+  for (var ci = 0; ci < allCards.length; ++ci) {
+    allCards[ci].classList.toggle('chart-card--breakdown', allCards[ci].id === 'panel-' + breakdownId);
+  }
+
   // Trigger debounced remote KPI refresh
   scheduleKpiRefresh();
 }
@@ -1759,8 +1766,24 @@ function buildPanelCard(panel, accentIdx, registry) {
   if (panel.chart === 'bar' && panel.searchable) {
     headRight += '<sl-button size="small" variant="text" class="dim-list-toggle" data-panel="' + panel.id + '">List</sl-button>';
   }
+  if (panel.chart === 'line' || panel._isTimeSeries) {
+    var timeTypes = typesByFamily('time');
+    var currentViz = filterState['_timeChart'] || panel.chart;
+    var vizOpts = '';
+    for (var ti = 0; ti < timeTypes.length; ++ti) {
+      var tt = timeTypes[ti];
+      var ttLabel = tt.type.replace(/\./g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+      var ttSel = tt.type === currentViz ? ' selected' : '';
+      vizOpts += '<sl-option value="' + tt.type + '"' + ttSel + '>' + escapeHtml(ttLabel) + '</sl-option>';
+    }
+    headRight += '<sl-select size="small" class="viz-type-select" value="' + escapeHtml(currentViz) + '" hoist>' + vizOpts + '</sl-select>';
+  }
   if (panel.chart === 'selector' || panel.chart === 'list') {
     headRight += '<span class="group-size-badge" id="count-' + panel.id + '"></span>';
+  }
+  if (panel._dimField && panel._groupId && !panel._isTimeSeries) {
+    var isActiveBreakdown = filterState['_breakdown'] === panel.id;
+    headRight += '<sl-button size="small" variant="' + (isActiveBreakdown ? 'primary' : 'text') + '" class="breakdown-toggle" data-panel="' + panel.id + '" data-dim="' + escapeHtml(panel._dimField) + '" title="Break down time chart by ' + escapeHtml(panel.label) + '">\u2261</sl-button>';
   }
 
   var head = '<div class="card-head">' +
@@ -1816,7 +1839,7 @@ function buildPanelCard(panel, accentIdx, registry) {
       '</div>' +
     '</div>';
 
-  } else if (panel.chart === 'line') {
+  } else if (panel.chart === 'line' || panel._isTimeSeries) {
     // Period/granularity controls are in the model bar title line
     body = '<div id="chart-' + panel.id + '" class="chart-wrap chart-wrap-timeline">' +
       buildSkeletonLine() +
@@ -2399,6 +2422,38 @@ async function main() {
     wireFilterSheet();
     restoreStateFromUrl();
     renderFilterChips();
+
+    // Wire viz type selectors on time charts
+    container.addEventListener('sl-change', function(e) {
+      var sel = e.target.closest('.viz-type-select');
+      if (!sel) return;
+      filterState['_timeChart'] = sel.value;
+      writeUrlState(filterState);
+      notifyFilterChange();
+    });
+
+    // Wire breakdown toggles on category panels
+    container.addEventListener('click', function(e) {
+      var btn = e.target.closest('.breakdown-toggle');
+      if (!btn) return;
+      var panelId = btn.dataset.panel;
+      var current = filterState['_breakdown'];
+      if (current === panelId) {
+        delete filterState['_breakdown'];
+      } else {
+        filterState['_breakdown'] = panelId;
+      }
+      writeUrlState(filterState);
+      // Update all breakdown button states
+      var allBtns = container.querySelectorAll('.breakdown-toggle');
+      for (var b = 0; b < allBtns.length; ++b) {
+        allBtns[b].variant = allBtns[b].dataset.panel === filterState['_breakdown'] ? 'primary' : 'text';
+      }
+      // TODO: triggerBreakdownChange() will be added in Task 5
+      // For now just re-render to update visual state
+      notifyFilterChange();
+    });
+
     console.log('[dashboard] Dashboard rendered, loading data...');
 
     updateProgress(3, 'Connecting to data source...');
