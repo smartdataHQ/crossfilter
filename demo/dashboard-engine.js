@@ -263,7 +263,7 @@ function notifyFilterChange() {
 //   time dims    → period date range
 
 // All keys that are internal UI controls, not cube dimension names
-var SERVER_CONTROL_KEYS = { _focus: true, _include: true, _granularity: true, _period: true };
+var SERVER_CONTROL_KEYS = { _focus: true, _include: true, _granularity: true, _period: true, _breakdown: true, _timeChart: true };
 
 function isServerTrigger(dim) {
   if (SERVER_CONTROL_KEYS[dim]) return true;
@@ -415,6 +415,42 @@ function executeServerReload() {
   }).catch(function(err) {
     console.error('[dashboard] Server reload failed:', err);
     showReloadProgress('Reload failed: ' + err.message);
+  });
+}
+
+// ── Breakdown: re-create worker with splitField ──────────────────────
+
+function triggerBreakdownChange() {
+  if (!_dashboardData) return;
+  var breakdownId = filterState['_breakdown'];
+  var breakdownDim = null;
+
+  if (breakdownId) {
+    for (var i = 0; i < _dashboardPanels.length; ++i) {
+      if (_dashboardPanels[i].id === breakdownId) {
+        breakdownDim = _dashboardPanels[i]._dimField;
+        break;
+      }
+    }
+  }
+
+  console.log('[dashboard] Breakdown change:', breakdownDim || '(none)');
+
+  _dashboardData.setBreakdown(breakdownDim).then(function() {
+    // Build client filters (exclude server control keys)
+    var clientFilters = {};
+    var keys = Object.keys(filterState);
+    for (var k = 0; k < keys.length; ++k) {
+      var dim = keys[k];
+      if (!SERVER_CONTROL_KEYS[dim] && !_dashboardData.isServerDim(dim)) {
+        clientFilters[dim] = filterState[dim];
+      }
+    }
+    return _dashboardData.query(clientFilters);
+  }).then(function(response) {
+    renderAllPanels(_dashboardPanels, response, _dashboardRegistry);
+  }).catch(function(err) {
+    console.error('[dashboard] Breakdown change failed:', err);
   });
 }
 
@@ -861,6 +897,82 @@ function renderLineChart(panelEl, panel, groupData) {
       },
     ],
   };
+
+  // Detect split group data (breakdown active)
+  var firstEntry = entries[0];
+  var isSplit = firstEntry && firstEntry.value && typeof firstEntry.value.value === 'undefined';
+
+  if (isSplit) {
+    // Collect all split keys
+    var splitKeys = {};
+    for (var si = 0; si < entries.length; ++si) {
+      for (var sk in entries[si].value) splitKeys[sk] = true;
+    }
+    var keyNames = Object.keys(splitKeys);
+
+    // If breakdown dimension has active filter, only show filtered values
+    var breakdownId = filterState['_breakdown'];
+    var breakdownDim = null;
+    if (breakdownId && _dashboardPanels) {
+      for (var bp = 0; bp < _dashboardPanels.length; ++bp) {
+        if (_dashboardPanels[bp].id === breakdownId) {
+          breakdownDim = _dashboardPanels[bp]._dimField;
+          break;
+        }
+      }
+    }
+    var dimFilter = breakdownDim ? filterState[breakdownDim] : null;
+    if (dimFilter) {
+      var filterVals = Array.isArray(dimFilter) ? dimFilter : [dimFilter];
+      keyNames = keyNames.filter(function(k) { return filterVals.indexOf(k) >= 0; });
+    } else {
+      // No filter: top 8 by total
+      var keyTotals = {};
+      for (var ki = 0; ki < keyNames.length; ++ki) keyTotals[keyNames[ki]] = 0;
+      for (var ei = 0; ei < entries.length; ++ei) {
+        for (var ek in entries[ei].value) {
+          var ekv = entries[ei].value[ek];
+          if (ekv && ekv.value) keyTotals[ek] = (keyTotals[ek] || 0) + ekv.value;
+        }
+      }
+      keyNames.sort(function(a, b) { return (keyTotals[b] || 0) - (keyTotals[a] || 0); });
+      keyNames = keyNames.slice(0, 8);
+    }
+
+    // Build one series per split key
+    var activeChartType = filterState['_timeChart'] || panel.chart;
+    var vizDef = getChartType(activeChartType);
+    var seriesList = [];
+    for (var li = 0; li < keyNames.length; ++li) {
+      var lineKey = keyNames[li];
+      var lineData = [];
+      for (var le = 0; le < entries.length; ++le) {
+        var lv = entries[le].value[lineKey];
+        lineData.push([entries[le].key, lv ? lv.value : 0]);
+      }
+      var lineSeries = {
+        type: 'line',
+        name: lineKey,
+        data: lineData,
+        showSymbol: false,
+      };
+      if (vizDef && vizDef.ecOptions) {
+        if (vizDef.ecOptions.smooth) lineSeries.smooth = true;
+        if (vizDef.ecOptions.step) lineSeries.step = vizDef.ecOptions.step;
+        if (vizDef.ecOptions.areaStyle) lineSeries.areaStyle = vizDef.ecOptions.areaStyle;
+      }
+      // Stacked if the chart type calls for it
+      if (activeChartType === 'line.area.stacked' || activeChartType === 'line.bump') {
+        lineSeries.stack = 'breakdown';
+        if (!lineSeries.areaStyle) lineSeries.areaStyle = {};
+      }
+      seriesList.push(lineSeries);
+    }
+
+    option.series = seriesList;
+    option.legend = { show: true, top: 0, textStyle: { fontSize: 10 } };
+    option.grid.top = 30;  // Make room for legend
+  }
 
   var instance = echarts.getInstanceByDom(panelEl);
   if (!instance) {
@@ -2449,9 +2561,7 @@ async function main() {
       for (var b = 0; b < allBtns.length; ++b) {
         allBtns[b].variant = allBtns[b].dataset.panel === filterState['_breakdown'] ? 'primary' : 'text';
       }
-      // TODO: triggerBreakdownChange() will be added in Task 5
-      // For now just re-render to update visual state
-      notifyFilterChange();
+      triggerBreakdownChange();
     });
 
     console.log('[dashboard] Dashboard rendered, loading data...');

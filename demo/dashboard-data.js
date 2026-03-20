@@ -546,6 +546,39 @@ export async function createDashboardData(config, registry, resolvedPanels, serv
     serverFilterDims: scanResult.serverFilterDims,
     timeDims: scanResult.timeDims,
 
+    setBreakdown: function(breakdownDimField) {
+      for (var g = 0; g < scanResult.groups.length; ++g) {
+        var group = scanResult.groups[g];
+        for (var p = 0; p < resolvedPanels.length; ++p) {
+          if (resolvedPanels[p]._groupId === group.id && resolvedPanels[p]._isTimeSeries) {
+            if (breakdownDimField) {
+              group.splitField = breakdownDimField;
+            } else {
+              delete group.splitField;
+            }
+            break;
+          }
+        }
+      }
+
+      workerHandle.dispose();
+      return createWorker(cubeName, scanResult, registry, serverState).then(function(newHandle) {
+        workerHandle = newHandle;
+
+        newHandle.on('progress', function(payload) {
+          for (var i = 0; i < listeners.progress.length; ++i) listeners.progress[i](payload);
+        });
+        newHandle.on('ready', function(payload) {
+          for (var i = 0; i < listeners.ready.length; ++i) listeners.ready[i](payload);
+        });
+        newHandle.on('error', function(payload) {
+          for (var i = 0; i < listeners.error.length; ++i) listeners.error[i](payload);
+        });
+
+        return newHandle.ready;
+      });
+    },
+
     dispose: function() {
       return workerHandle.dispose();
     },
