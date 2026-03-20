@@ -201,6 +201,8 @@ var filterListeners = [];
 var _dashboardData = null;        // set by main() after worker creation
 var _dashboardRegistry = null;    // set by main() for re-render after reload
 var _dashboardPanels = null;      // set by main() for re-render after reload
+var _lazyPanels = null;           // panels served by lazy Cube query
+var _lazyRefreshSeq = 0;          // sequence for stale-check
 
 function setFilter(dimension, values) {
   if (!values || (Array.isArray(values) && values.length === 0)) {
@@ -351,13 +353,23 @@ function buildServerState() {
 var _reloadSeq = 0;
 var _reloadDebounce = 0;
 var _progressOverlay = null;  // set by main()
-var _progressCard = null;     // set by main()
+
+var _reloadOverlay = null;
 
 function showReloadProgress(status) {
-  if (!_progressOverlay) return;
-  _progressOverlay.classList.remove('progress-overlay--done');
-  if (!_progressOverlay.parentNode) document.body.appendChild(_progressOverlay);
-  _progressCard.innerHTML =
+  if (!_reloadOverlay) {
+    _reloadOverlay = document.createElement('div');
+    _reloadOverlay.className = 'progress-overlay';
+    var card = document.createElement('div');
+    card.className = 'progress-card';
+    card.style.minWidth = '260px';
+    _reloadOverlay.appendChild(card);
+    _reloadOverlay._card = card;
+  }
+  _reloadOverlay.classList.remove('progress-overlay--done');
+  _reloadOverlay.classList.remove('fade-out');
+  if (!_reloadOverlay.parentNode) document.body.appendChild(_reloadOverlay);
+  _reloadOverlay._card.innerHTML =
     '<div class="progress-step progress-step--active">' +
       '<span class="progress-dot"></span>' +
       '<span>' + escapeHtml(status) + '</span>' +
@@ -365,9 +377,9 @@ function showReloadProgress(status) {
 }
 
 function hideReloadProgress() {
-  if (!_progressOverlay) return;
-  _progressOverlay.classList.add('progress-overlay--done');
-  setTimeout(function () { if (_progressOverlay.parentNode) _progressOverlay.remove(); }, 600);
+  if (!_reloadOverlay) return;
+  _reloadOverlay.classList.add('fade-out');
+  setTimeout(function () { if (_reloadOverlay.parentNode) _reloadOverlay.remove(); }, 600);
 }
 
 function triggerServerReload() {
@@ -422,6 +434,9 @@ function executeServerReload() {
     if (seq !== _reloadSeq || !response) return;
     renderAllPanels(_dashboardPanels, response, _dashboardRegistry);
     hideReloadProgress();
+
+    // Refresh lazy panels with new server state
+    refreshLazyPanels();
   }).catch(function(err) {
     console.error('[dashboard] Server reload failed:', err);
     showReloadProgress('Reload failed: ' + err.message);
@@ -498,12 +513,14 @@ function normalizeConfig(config) {
       columns: section.columns || 3,
       collapsed: section.collapsed || false,
       location: section.location || null,
+      lazy: section.lazy || false,
     });
 
     var sectionPanels = section.panels || [];
     for (var p = 0; p < sectionPanels.length; ++p) {
       var panel = Object.assign({}, sectionPanels[p]);
       panel.section = section.id;
+      if (section.lazy || panel.lazy) panel._lazy = true;
 
       // Map chart-type slot fields to the engine's dimension/measure fields.
       // The new schema uses slot names (category, name, x, source, date,
@@ -1795,6 +1812,16 @@ function renderSelectorList(panel, groupData) {
     return;
   }
 
+  // Determine active filter for this dimension
+  var dim = panel._dimField;
+  var activeFilter = dim ? filterState[dim] : null;
+  var activeSet = {};
+  if (activeFilter) {
+    var activeVals = Array.isArray(activeFilter) ? activeFilter : [activeFilter];
+    for (var av = 0; av < activeVals.length; ++av) activeSet[String(activeVals[av])] = true;
+  }
+  var hasActive = Object.keys(activeSet).length > 0;
+
   var html = '';
   for (var i = 0; i < entries.length; ++i) {
     var entry = entries[i];
@@ -1802,8 +1829,11 @@ function renderSelectorList(panel, groupData) {
     var count = entry.value.value;
     var maxCount = entries[0].value.value || 1;
     var pct = Math.round((count / maxCount) * 100);
+    var isSelected = activeSet[key];
+    var dimmedClass = hasActive && !isSelected ? ' dim-item--dimmed' : '';
+    var selectedClass = isSelected ? ' dim-item--selected' : '';
 
-    html += '<div class="dim-item" data-value="' + escapeHtml(key) + '">' +
+    html += '<div class="dim-item' + selectedClass + dimmedClass + '" data-value="' + escapeHtml(key) + '">' +
       '<span class="dim-label">' + escapeHtml(key) + '</span>' +
       '<span class="dim-count">' + count.toLocaleString() + '</span>' +
       '<div class="dim-bar"><div class="dim-bar-fill" style="width:' + pct + '%"></div></div>' +
@@ -1841,8 +1871,24 @@ function renderSelectorList(panel, groupData) {
     }
   };
 
-  // Wire search input
+  // Wire search toggle button
+  var searchToggle = document.getElementById('search-toggle-' + panel.id);
   var searchEl = document.getElementById('search-' + panel.id);
+  if (searchToggle && searchEl && !searchToggle._wired) {
+    searchToggle._wired = true;
+    searchToggle.addEventListener('click', function() {
+      var isHidden = searchEl.classList.toggle('dim-search--hidden');
+      searchToggle.classList.toggle('dim-search-btn--active', !isHidden);
+      if (!isHidden) {
+        searchEl.focus();
+      } else {
+        searchEl.value = '';
+        searchEl.dispatchEvent(new Event('input'));
+      }
+    });
+  }
+
+  // Wire search input — when typing, show all items (bypass Top X limit)
   if (searchEl && !searchEl._wired) {
     searchEl._wired = true;
     searchEl.addEventListener('input', function() {
@@ -1853,6 +1899,18 @@ function renderSelectorList(panel, groupData) {
         var text = label ? label.textContent.toLowerCase() : '';
         items[j].style.display = !query || text.indexOf(query) >= 0 ? '' : 'none';
       }
+    });
+  }
+
+  // Wire limit selector
+  var limitEl = document.getElementById('limit-' + panel.id);
+  if (limitEl && !limitEl._wired) {
+    limitEl._wired = true;
+    limitEl.addEventListener('change', function() {
+      var newLimit = parseInt(limitEl.value);
+      panel.limit = newLimit || 0;
+      panel._expanded = newLimit === 0;
+      notifyFilterChange();
     });
   }
 }
@@ -2083,6 +2141,166 @@ function executeKpiRefresh() {
       if (kpiEl) kpiEl.style.opacity = '';
     }
   });
+}
+
+// ── Lazy panels: direct Cube API query (no crossfilter worker) ────────
+// Lazy panels query Cube with only their own dimension + count, and all
+// active dashboard filters as server-side query.filters. This avoids the
+// cross-product explosion of adding high-cardinality dims to the worker.
+
+var _lazyConfig = null;  // { cube, registry } — set by main()
+
+function refreshLazyPanels() {
+  if (!_lazyPanels || !_lazyPanels.length || !_lazyConfig) return;
+  var seq = ++_lazyRefreshSeq;
+  var cubeName = _lazyConfig.cube;
+  var registry = _lazyConfig.registry;
+
+  for (var lp = 0; lp < _lazyPanels.length; ++lp) {
+    (function(panel) {
+      var dimField = panel._dimField || panel.dimension;
+      if (!dimField) return;
+      var limit = panel.limit || 50;
+
+      // Show loading indicator
+      var panelEl = document.getElementById('panel-' + panel.id);
+      if (panelEl) panelEl.classList.add('panel-lazy-loading');
+
+      // Build Cube query: only this dimension + count measure
+      // Use the same filter-building logic as the main worker to ensure
+      // correct handling of ranges, booleans, timestamps, and segments.
+      var filters = [];
+
+      // Partition filter
+      var partition = registry._cubeMeta && registry._cubeMeta.partition;
+      if (partition) {
+        filters.push({ member: cubeName + '.partition', operator: 'equals', values: [partition] });
+      }
+
+      // Collect server state (handles _period, _granularity, _focus, _include,
+      // toggles, ranges, and lazy dim filters — all correctly typed)
+      var serverState = buildServerState();
+
+      // Server-side filters (toggle/range/lazy dims) — skip own dimension
+      var activeFilters = serverState.filters || {};
+      for (var dim in activeFilters) {
+        if (dim === dimField) continue;
+        var f = activeFilters[dim];
+        if (!f) continue;
+        if (Array.isArray(f)) {
+          for (var fi = 0; fi < f.length; ++fi) {
+            filters.push({ member: cubeName + '.' + dim, operator: f[fi].operator, values: f[fi].values });
+          }
+        } else {
+          filters.push({ member: cubeName + '.' + dim, operator: f.operator || 'equals', values: f.values });
+        }
+      }
+
+      // Client-side filters (dims in the main crossfilter worker).
+      // buildServerState skips these (isServerDim=false), so we handle them here.
+      // Skip: internal keys, own dimension, time dims, server dims (already above).
+      var timeDimSet = {};
+      var mainTimeDims = _dashboardData ? _dashboardData.timeDims : [];
+      for (var td = 0; td < mainTimeDims.length; ++td) timeDimSet[mainTimeDims[td]] = true;
+
+      for (var ck in filterState) {
+        if (ck.charAt(0) === '_') continue;
+        if (ck === dimField) continue;
+        if (timeDimSet[ck]) continue;
+        if (activeFilters[ck]) continue;  // already handled above
+        var cv = filterState[ck];
+        if (!cv) continue;
+
+        // Range filter: [number, number]
+        if (Array.isArray(cv) && cv.length === 2 && typeof cv[0] === 'number') {
+          filters.push({ member: cubeName + '.' + ck, operator: 'gte', values: [String(cv[0])] });
+          filters.push({ member: cubeName + '.' + ck, operator: 'lte', values: [String(cv[1])] });
+        } else {
+          var cvals = Array.isArray(cv) ? cv : [cv];
+          filters.push({ member: cubeName + '.' + ck, operator: 'equals', values: cvals.map(String) });
+        }
+      }
+
+      // Time dimension date range — from _period picker or brush selection
+      var timeDimensions = [];
+      var modelTimeDim = registry._cubeMeta && registry._cubeMeta.time_dimension;
+      if (modelTimeDim) {
+        // Start with period picker range if set
+        var lazyDateRange = serverState.dateRange || null;
+
+        // Override with brush selection if active (more specific)
+        for (var td = 0; td < mainTimeDims.length; ++td) {
+          var brushVal = filterState[mainTimeDims[td]];
+          if (brushVal && Array.isArray(brushVal) && brushVal.length === 2 && typeof brushVal[0] === 'number') {
+            lazyDateRange = [
+              new Date(brushVal[0]).toISOString().slice(0, 10),
+              new Date(brushVal[1]).toISOString().slice(0, 10),
+            ];
+            break;
+          }
+        }
+
+        if (lazyDateRange) {
+          timeDimensions.push({
+            dimension: cubeName + '.' + modelTimeDim,
+            dateRange: lazyDateRange,
+          });
+        }
+      }
+
+      // Segments
+      var querySegments = [];
+      var activeSegments = serverState.segments || [];
+      for (var si = 0; si < activeSegments.length; ++si) {
+        querySegments.push(cubeName + '.' + activeSegments[si]);
+      }
+
+      var cubeQuery = {
+        query: {
+          dimensions: [cubeName + '.' + dimField],
+          measures: [cubeName + '.count'],
+          filters: filters,
+          timeDimensions: timeDimensions.length ? timeDimensions : undefined,
+          segments: querySegments.length ? querySegments : undefined,
+          order: [[ cubeName + '.count', 'desc' ]],
+          limit: limit,
+        },
+      };
+
+      fetch('/api/cube', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cubeQuery),
+      }).then(function(res) {
+        if (!res.ok) throw new Error('Lazy query failed: ' + res.status);
+        return res.json();
+      }).then(function(json) {
+        if (seq !== _lazyRefreshSeq) return;  // stale
+        // Remove loading indicator
+        var doneEl = document.getElementById('panel-' + panel.id);
+        if (doneEl) doneEl.classList.remove('panel-lazy-loading');
+        var rows = json.data || [];
+        var entries = [];
+        for (var r = 0; r < rows.length; ++r) {
+          var key = rows[r][cubeName + '.' + dimField];
+          var val = Number(rows[r][cubeName + '.count']) || 0;
+          if (key != null) entries.push({ key: key, value: { value: val } });
+        }
+        var total = 0;
+        for (var t = 0; t < entries.length; ++t) total += entries[t].value.value;
+
+        // Build a response that renderAllPanels understands
+        var groupData = { entries: entries, total: total };
+        var response = { kpis: {}, groups: {} };
+        response.groups[panel._groupId || panel.id] = groupData;
+        renderAllPanels([panel], response, registry);
+      }).catch(function(err) {
+        var errEl = document.getElementById('panel-' + panel.id);
+        if (errEl) errEl.classList.remove('panel-lazy-loading');
+        console.error('[dashboard] Lazy panel refresh failed:', panel.id, err);
+      });
+    })(_lazyPanels[lp]);
+  }
 }
 
 // ── Principle 8: Filter Chips (visible, removable) ────────────────────
@@ -2780,10 +2998,24 @@ function buildPanelCard(panel, accentIdx, registry) {
     body = '<div class="range-wrap">' + buildRangeSelector(panel.id, panel.label, false) + '</div>';
 
   } else if (panel.chart === 'selector' || panel.chart === 'list') {
-    // Principle 1: informative (counts next to items)
-    // Principle 6: infinite scroll + search
+    // Toolbar: search toggle + Top X selector
+    var limitOptions = [10, 25, 50, 100];
+    var panelLimit = panel.limit || 10;
+    var limitHtml = '<select class="dim-limit-select" id="limit-' + panel.id + '" data-panel="' + panel.id + '">';
+    for (var lo = 0; lo < limitOptions.length; ++lo) {
+      var lv = limitOptions[lo];
+      limitHtml += '<option value="' + lv + '"' + (lv === panelLimit ? ' selected' : '') + '>Top ' + lv + '</option>';
+    }
+    limitHtml += '<option value="0"' + (panelLimit === 0 ? ' selected' : '') + '>All</option>';
+    limitHtml += '</select>';
+
     body = '<div class="dim-list-panel dim-list-panel--open">' +
-      '<input type="text" class="dim-search" id="search-' + panel.id + '" placeholder="Search ' + escapeHtml(panel.label.toLowerCase()) + '...">' +
+      '<div class="dim-toolbar">' +
+        limitHtml +
+        '<div class="dim-toolbar-spacer"></div>' +
+        '<button class="dim-search-btn" id="search-toggle-' + panel.id + '" title="Search">&#x1F50D;</button>' +
+      '</div>' +
+      '<input type="text" class="dim-search dim-search--hidden" id="search-' + panel.id + '" placeholder="Search ' + escapeHtml(panel.label.toLowerCase()) + '...">' +
       '<div class="dim-list-scroll" id="list-' + panel.id + '">' +
         buildPlaceholderListItems(5) +
       '</div>' +
@@ -3319,38 +3551,220 @@ async function main() {
   // Principle 11: progress overlay — dashboard renders underneath, updates live
   var overlay = document.createElement('div');
   overlay.className = 'progress-overlay';
-  var progressCard = document.createElement('div');
-  progressCard.className = 'card progress-steps';
-  overlay.appendChild(progressCard);
+
+  var progressCardEl = document.createElement('div');
+  progressCardEl.className = 'progress-card';
+  overlay.appendChild(progressCardEl);
+
+  // Header: title + elapsed timer
+  var headerEl = document.createElement('div');
+  headerEl.className = 'progress-header';
+  var titleEl = document.createElement('div');
+  titleEl.className = 'progress-title';
+  titleEl.textContent = 'Loading Dashboard';
+  var elapsedEl = document.createElement('div');
+  elapsedEl.className = 'progress-elapsed';
+  elapsedEl.textContent = '0.0s';
+  headerEl.appendChild(titleEl);
+  headerEl.appendChild(elapsedEl);
+  progressCardEl.appendChild(headerEl);
+
+  // Overall progress bar
+  var overallBarEl = document.createElement('div');
+  overallBarEl.className = 'progress-overall-bar';
+  var overallFillEl = document.createElement('div');
+  overallFillEl.className = 'progress-overall-fill';
+  overallBarEl.appendChild(overallFillEl);
+  progressCardEl.appendChild(overallBarEl);
+
+  // Source rows container
+  var sourcesEl = document.createElement('div');
+  progressCardEl.appendChild(sourcesEl);
+
+  // Done text (hidden initially)
+  var doneEl = document.createElement('div');
+  doneEl.className = 'progress-done';
+  doneEl.textContent = 'READY';
+  doneEl.setAttribute('hidden', '');
+  progressCardEl.appendChild(doneEl);
+
   document.body.appendChild(overlay);
   _progressOverlay = overlay;
-  _progressCard = progressCard;
 
-  var steps = [
-    { id: 'meta', label: 'Connecting to data source' },
-    { id: 'registry', label: 'Reading model definition' },
-    { id: 'layout', label: 'Preparing dashboard layout' },
-    { id: 'data', label: 'Loading data' },
+  // Loading state tracking
+  var LOADING_SOURCES = [
+    { id: 'meta', label: 'Cube Metadata' },
+    { id: 'data', label: 'Data Stream' },
   ];
+  var loadingState = {};
+  var loadingDom = {};
+  var loadingStartTime = performance.now();
+  var loadingTimer = null;
 
-  function updateProgress(activeIdx, summary) {
-    var html = '';
-    for (var i = 0; i < steps.length; ++i) {
-      var cls = i < activeIdx ? 'progress-step--done' : i === activeIdx ? 'progress-step--active' : '';
-      html += '<div class="progress-step ' + cls + '">' +
-        '<span class="progress-dot"></span>' +
-        '<span>' + steps[i].label + (i < activeIdx ? ' &#10003;' : '') + '</span>' +
-      '</div>';
+  function formatBytes(n) {
+    if (n == null || n === 0) return '0 B';
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+
+  function formatNumber(n) {
+    if (n == null) return '0';
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  // Build loading UI rows
+  for (var li = 0; li < LOADING_SOURCES.length; ++li) {
+    var src = LOADING_SOURCES[li];
+    loadingState[src.id] = {
+      status: 'waiting', bytesLoaded: 0, totalBytes: null,
+      rowsLoaded: 0, batchesLoaded: 0, startTime: null, endTime: null, error: null,
+    };
+
+    var row = document.createElement('div');
+    row.className = 'progress-source-row';
+
+    var label = document.createElement('div');
+    label.className = 'progress-source-label';
+    label.textContent = src.label;
+
+    var badge = document.createElement('div');
+    badge.className = 'progress-source-badge progress-badge-waiting';
+    badge.textContent = 'WAITING';
+
+    var barWrap = document.createElement('div');
+    barWrap.className = 'progress-source-bar';
+    var barFill = document.createElement('div');
+    barFill.className = 'progress-source-bar-fill progress-bar-waiting';
+    barWrap.appendChild(barFill);
+
+    var stats = document.createElement('div');
+    stats.className = 'progress-source-stats';
+
+    row.appendChild(label);
+    row.appendChild(badge);
+    row.appendChild(barWrap);
+    row.appendChild(stats);
+    sourcesEl.appendChild(row);
+
+    loadingDom[src.id] = { row: row, badge: badge, barFill: barFill, stats: stats };
+  }
+
+  function markSource(id, status, extra) {
+    var st = loadingState[id];
+    if (!st) return;
+    st.status = status;
+    if (!st.startTime && status !== 'waiting') st.startTime = performance.now();
+    if (status === 'ready' || status === 'error') st.endTime = performance.now();
+    if (extra) {
+      if (extra.bytesLoaded != null) st.bytesLoaded = extra.bytesLoaded;
+      if (extra.totalBytes != null) st.totalBytes = extra.totalBytes;
+      if (extra.rowsLoaded != null) st.rowsLoaded = extra.rowsLoaded;
+      if (extra.batchesLoaded != null) st.batchesLoaded = extra.batchesLoaded;
+      if (extra.error != null) st.error = extra.error;
     }
-    if (summary) {
-      html += '<div class="progress-summary">' + escapeHtml(summary) + '</div>';
+    renderLoadingProgress();
+  }
+
+  function renderLoadingProgress() {
+    var totalBytes = 0;
+    var loadedBytes = 0;
+
+    for (var i = 0; i < LOADING_SOURCES.length; ++i) {
+      var src = LOADING_SOURCES[i];
+      var st = loadingState[src.id];
+      var d = loadingDom[src.id];
+      if (!d) continue;
+
+      // Badge
+      var badgeText, badgeClass, barClass;
+      if (st.status === 'waiting') {
+        badgeText = 'WAITING'; badgeClass = 'progress-badge-waiting'; barClass = 'progress-bar-waiting';
+      } else if (st.status === 'error') {
+        badgeText = 'ERROR'; badgeClass = 'progress-badge-error'; barClass = 'progress-bar-error';
+      } else if (st.status === 'ready') {
+        badgeText = 'READY'; badgeClass = 'progress-badge-ready'; barClass = 'progress-bar-ready';
+      } else {
+        badgeText = 'ACTIVE'; badgeClass = 'progress-badge-active'; barClass = 'progress-bar-active';
+      }
+      d.badge.textContent = badgeText;
+      d.badge.className = 'progress-source-badge ' + badgeClass;
+
+      // Bar
+      d.barFill.className = 'progress-source-bar-fill ' + barClass;
+      if (st.status === 'ready' || st.status === 'error') {
+        d.barFill.style.width = '100%';
+        d.barFill.classList.remove('progress-bar-indeterminate');
+      } else if (st.totalBytes && st.totalBytes > 0) {
+        var pct = Math.min(100, Math.round(st.bytesLoaded / st.totalBytes * 100));
+        d.barFill.style.width = pct + '%';
+        d.barFill.classList.remove('progress-bar-indeterminate');
+      } else if (st.status !== 'waiting') {
+        d.barFill.style.width = '';
+        d.barFill.className = 'progress-source-bar-fill progress-bar-indeterminate';
+      } else {
+        d.barFill.style.width = '0%';
+        d.barFill.classList.remove('progress-bar-indeterminate');
+      }
+
+      // Stats
+      var statParts = [];
+      if (st.bytesLoaded > 0) statParts.push(formatBytes(st.bytesLoaded));
+      if (st.rowsLoaded > 0) statParts.push(formatNumber(st.rowsLoaded) + ' rows');
+      if (st.batchesLoaded > 1) statParts.push(st.batchesLoaded + ' batches');
+      if (st.startTime) {
+        var elapsed = st.endTime
+          ? ((st.endTime - st.startTime) / 1000).toFixed(1)
+          : ((performance.now() - st.startTime) / 1000).toFixed(1);
+        statParts.push(elapsed + 's');
+      }
+      d.stats.textContent = statParts.join(' \u00b7 ');
+
+      // Error text
+      var existingErr = d.row.querySelector('.progress-source-error');
+      if (st.status === 'error' && st.error) {
+        if (!existingErr) {
+          existingErr = document.createElement('div');
+          existingErr.className = 'progress-source-error';
+          d.row.appendChild(existingErr);
+        }
+        existingErr.textContent = st.error;
+      } else if (existingErr) {
+        existingErr.remove();
+      }
+
+      // Overall bar
+      if (st.totalBytes) {
+        totalBytes += st.totalBytes;
+        loadedBytes += st.bytesLoaded;
+      }
     }
-    progressCard.innerHTML = html;
+
+    if (totalBytes > 0) {
+      var overallPct = Math.min(100, Math.round(loadedBytes / totalBytes * 100));
+      overallFillEl.style.width = overallPct + '%';
+    }
+  }
+
+  // Elapsed timer — ticks every 200ms
+  loadingTimer = setInterval(function () {
+    var elapsed = ((performance.now() - loadingStartTime) / 1000).toFixed(1);
+    elapsedEl.textContent = elapsed + 's';
+    renderLoadingProgress();
+  }, 200);
+
+  function stopLoadingTimer() {
+    if (loadingTimer) { clearInterval(loadingTimer); loadingTimer = null; }
   }
 
   function dismissProgress() {
-    overlay.classList.add('progress-overlay--done');
-    setTimeout(function () { overlay.remove(); }, 600);
+    stopLoadingTimer();
+    overallFillEl.style.width = '100%';
+    renderLoadingProgress();
+    doneEl.removeAttribute('hidden');
+    setTimeout(function () { doneEl.classList.add('visible'); }, 50);
+    setTimeout(function () { overlay.classList.add('fade-out'); }, 600);
+    setTimeout(function () { overlay.remove(); }, 1100);
   }
 
   try {
@@ -3378,16 +3792,14 @@ async function main() {
 
     filterState = readUrlState(); // Principle 3: read URL state early (no network needed)
 
-    updateProgress(0);
+    markSource('meta', 'active');
     var metaResponse = await fetchCubeMeta();
+    markSource('meta', 'ready');
 
-    updateProgress(1);
     var registry = buildCubeRegistry(metaResponse, config.cube);
     console.log('[dashboard] Cube registry:', registry.name, '\u2014',
       Object.keys(registry.dimensions).length, 'dims,',
       Object.keys(registry.measures).length, 'measures');
-
-    updateProgress(2, registry.title);
 
     // Extract model-level metadata (grain, period, granularity, refresh)
     var modelMeta = extractModelMeta(registry);
@@ -3400,7 +3812,19 @@ async function main() {
       '| period:', modelPeriod ? modelPeriod.earliest + ' \u2013 ' + modelPeriod.latest : 'not declared',
       '| granularity:', granOptions.join(', '), '(default:', granDefault + ')');
 
-    var resolvedPanels = resolvePanels(config, registry);
+    var allResolvedPanels = resolvePanels(config, registry);
+
+    // Split into main and lazy panels
+    var resolvedPanels = [];
+    var lazyPanels = [];
+    for (var sp = 0; sp < allResolvedPanels.length; ++sp) {
+      if (allResolvedPanels[sp]._lazy) {
+        lazyPanels.push(allResolvedPanels[sp]);
+      } else {
+        resolvedPanels.push(allResolvedPanels[sp]);
+      }
+    }
+    _lazyPanels = lazyPanels.length > 0 ? lazyPanels : null;
 
     // Attach model period and granularity to time-series panels
     for (var rp = 0; rp < resolvedPanels.length; ++rp) {
@@ -3420,7 +3844,9 @@ async function main() {
       }
     }
 
-    var sections = resolveSections(config, resolvedPanels);
+    // Use all panels (main + lazy) for layout, so lazy sections render in DOM
+    var allPanelsForLayout = resolvedPanels.concat(lazyPanels);
+    var sections = resolveSections(config, allPanelsForLayout);
 
     // Render dashboard immediately — visible under the overlay
     buildDashboardDOM(container, config, sections, registry);
@@ -3486,7 +3912,7 @@ async function main() {
 
     console.log('[dashboard] Dashboard rendered, loading data...');
 
-    updateProgress(3, 'Connecting to data source...');
+    markSource('data', 'active');
 
     var data = await createDashboardData(config, registry, resolvedPanels);
     _dashboardData = data;
@@ -3495,25 +3921,34 @@ async function main() {
 
     data.on('progress', function(payload) {
       if (payload.status === 'starting') {
-        updateProgress(3, 'Connecting...');
+        markSource('data', 'active');
       } else if (payload.status === 'downloading') {
-        var pct = payload.fetch.percent;
-        var label = pct != null ? Math.round(pct * 100) + '% downloaded' : 'Downloading...';
-        updateProgress(3, label);
+        markSource('data', 'active', {
+          bytesLoaded: payload.fetch ? payload.fetch.bytesLoaded : 0,
+          totalBytes: payload.fetch ? payload.fetch.totalBytes : null,
+        });
       } else if (payload.status === 'streaming') {
-        updateProgress(3, payload.load.rowsLoaded.toLocaleString() + ' rows loaded');
+        markSource('data', 'active', {
+          bytesLoaded: payload.fetch ? payload.fetch.bytesLoaded : 0,
+          totalBytes: payload.fetch ? payload.fetch.totalBytes : null,
+          rowsLoaded: payload.load ? payload.load.rowsLoaded : 0,
+          batchesLoaded: payload.load ? payload.load.batchesLoaded : 0,
+        });
       }
+    });
+
+    // Progressive rendering: render charts as data streams in
+    data.on('snapshot', function(response) {
+      renderAllPanels(resolvedPanels, response, registry);
     });
 
     data.on('error', function(payload) {
       var msg = payload && payload.message ? payload.message : 'Data loading failed';
-      progressCard.innerHTML = '<div class="progress-step progress-step--error">' +
-        '<span class="progress-dot"></span>' +
-        '<span>' + escapeHtml(msg) + '</span>' +
-      '</div>';
+      markSource('data', 'error', { error: msg });
     });
 
     await data.ready;
+    markSource('data', 'ready');
     console.log('[dashboard] Data loaded, rendering charts...');
 
     // Restore breakdown from URL state (must happen before initial query)
@@ -3536,6 +3971,8 @@ async function main() {
       _dashboardData.query(newFilterState).then(function(response) {
         renderAllPanels(_dashboardPanels, response, _dashboardRegistry);
       });
+      // Refresh lazy panels (direct Cube query with updated filters)
+      refreshLazyPanels();
     });
 
     var initialResponse = await data.query(filterState);
@@ -3544,7 +3981,22 @@ async function main() {
     dismissProgress();
     wireChartResize();
 
+    // Lazy panels: direct Cube API query (no crossfilter worker needed)
+    if (lazyPanels.length > 0) {
+      // Set _groupId and _dimField on lazy panels (not processed by scanPanels)
+      for (var lpi = 0; lpi < lazyPanels.length; ++lpi) {
+        var lp = lazyPanels[lpi];
+        if (!lp._groupId) lp._groupId = lp.id;
+        if (!lp._dimField) lp._dimField = lp.dimension;
+      }
+      _lazyConfig = { cube: config.cube, registry: registry };
+      console.log('[dashboard] Lazy panels:', lazyPanels.length, '(direct Cube query)');
+      refreshLazyPanels();
+    }
+
   } catch (err) {
+    stopLoadingTimer();
+    if (overlay.parentNode) overlay.remove();
     container.innerHTML = '<div class="error-banner" style="display:block">' +
       'Dashboard error: ' + escapeHtml(err.message) + '</div>';
     console.error('[dashboard]', err);
