@@ -209,7 +209,8 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
     }
     if (!lcCube) continue;
 
-    // Classify dimensions by likely cardinality based on type and naming patterns
+    // Classify dimensions by cardinality using metadata signals only.
+    // No hardcoded field names — this must work for any cube.
     var safeDims = [];
     var lazyDims = [];
     var lcDims = lcCube.dimensions || [];
@@ -220,50 +221,50 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
       var ltype = ldim.type || 'string';
       var lmeta = ldim.meta || {};
 
-      // Boolean and time dims are always safe (booleans are 2-3 values, time is handled specially)
-      if (ltype === 'boolean' || ltype === 'time') {
+      // Boolean dims are always safe (2-3 values: true, false, null)
+      if (ltype === 'boolean') {
         safeDims.push(lname);
         continue;
       }
 
-      // Dimensions with color_map have known enum values — check count
+      // Time dims are handled specially by the engine — not in group-by
+      if (ltype === 'time') {
+        safeDims.push(lname);
+        continue;
+      }
+
+      // Dimensions with color_map have known enum values — use the count
       if (lmeta.color_map) {
         var enumCount = Object.keys(lmeta.color_map).length;
         if (enumCount <= 20) { safeDims.push(lname); } else { lazyDims.push(lname); }
         continue;
       }
 
-      // Dimensions with color_scale are numeric tiers — usually <10
+      // Dimensions with color_scale are numeric tier dimensions — typically <10 tiers
       if (lmeta.color_scale) {
         safeDims.push(lname);
         continue;
       }
 
-      // Known high-cardinality patterns
-      var highCardPatterns = ['name', 'city', 'street', 'postal', 'booking', 'car', 'geohash',
-        'model', 'longitude', 'latitude', 'locality', 'municipality', 'zipcode', 'code'];
-      var isHighCard = false;
-      for (var hp = 0; hp < highCardPatterns.length; ++hp) {
-        if (lname.toLowerCase().indexOf(highCardPatterns[hp]) >= 0) { isHighCard = true; break; }
+      // Dimensions with an explicit cardinality hint in meta
+      if (lmeta.cardinality) {
+        if (lmeta.cardinality === 'low' || (typeof lmeta.cardinality === 'number' && lmeta.cardinality <= 20)) {
+          safeDims.push(lname);
+        } else {
+          lazyDims.push(lname);
+        }
+        continue;
       }
 
-      // Known low-cardinality patterns
-      var lowCardPatterns = ['type', 'class', 'tier', 'dow', 'region', 'country', 'division',
-        'partition', 'nr', 'category', 'subcategory', 'channel', 'status'];
-      var isLowCard = false;
-      for (var lp = 0; lp < lowCardPatterns.length; ++lp) {
-        if (lname.toLowerCase().indexOf(lowCardPatterns[lp]) >= 0) { isLowCard = true; break; }
-      }
-
-      // Number type dimensions are often continuous/high-cardinality
-      if (ltype === 'number' && !isLowCard) {
+      // Number type dimensions without tier metadata are continuous → high cardinality
+      if (ltype === 'number') {
         lazyDims.push(lname);
         continue;
       }
 
-      if (isHighCard) { lazyDims.push(lname); }
-      else if (isLowCard) { safeDims.push(lname); }
-      else { lazyDims.push(lname); } // default to lazy for unknown string dims
+      // String dims: default to lazy (assume high cardinality) unless metadata says otherwise
+      // This is the safe default — it's better to be lazy unnecessarily than to crash
+      lazyDims.push(lname);
     }
 
     lines.push('### ' + cubeNames[lc]);
@@ -446,18 +447,15 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
   lines.push('This avoids the cross-product explosion of adding high-cardinality dims to the main worker.');
   lines.push('');
   lines.push('**Rules:**');
-  lines.push('- Selectors, dropdowns, and lists for high-cardinality dimensions (municipality, locality, poi_name, location_name, vehicle_model, customer_city) MUST be in a lazy section');
+  lines.push('- Any dimension listed in the "MUST be in lazy: true sections" list (see Lazy Loading Classification above) MUST be in a lazy section');
+  lines.push('- Selectors, dropdowns, and searchable lists for high-cardinality dimensions MUST be in a lazy section');
   lines.push('- Bar/pie charts for dimensions with 30+ unique values SHOULD be in a lazy section');
   lines.push('- KPIs, gauges, and single-value panels do NOT need lazy (they use measures, not group-by dimensions)');
   lines.push('- Time series (line charts using the time dimension) do NOT need lazy — the time dimension is handled specially');
   lines.push('- Toggles and ranges in the modelbar do NOT need lazy — they become server-side filters, not group-by dimensions');
-  lines.push('- Charts using low-cardinality dimensions (<20 unique values: region, fuel_type, drive_type, stay_type, activity_type, car_class) are FINE in the main query');
+  lines.push('- Charts using dimensions from the "Safe for main query" list are FINE in the main query');
   lines.push('- Sankey, treemap, sunburst with high-cardinality levels SHOULD be in a lazy section');
   lines.push('- Tables are always lazy-safe — put them in a lazy section');
-  lines.push('');
-  lines.push('**Example — main vs lazy:**');
-  lines.push('- Main: KPIs, line chart (stay_ended_at), bar chart (region — 8 values), pie (fuel_type — 4 values), pie (stay_type — 4 values)');
-  lines.push('- Lazy: selector (municipality — 70+ values), selector (poi_name — 1000+ values), bar (vehicle_model — 50+ values), table');
   lines.push('');
   lines.push('**If in doubt, make it lazy.** The only cost is slightly slower refresh on that section (it re-queries Cube). The benefit is preventing data explosion.');
   lines.push('');
@@ -478,7 +476,7 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
   lines.push('- Do not collapse a section with only 1 panel — merge it into an adjacent section or leave it expanded');
   lines.push('- Do not use heatmap with two numeric dimensions — heatmap needs categorical axes. Use scatter for numeric×numeric');
   lines.push('- Do not omit the modelbar — every dashboard should have at least one boolean toggle or numeric range control');
-  lines.push('- **NEVER put municipality, locality, poi_name, location_name, vehicle_model, customer_city, car, booking, street, or postal_code in a non-lazy section** — these are high-cardinality and WILL crash the dashboard');
+  lines.push('- **NEVER put high-cardinality dimensions (30+ unique values) in a non-lazy section** — this WILL crash the dashboard. Check the Lazy Loading Classification section for each cube.');
   lines.push('');
 
   // Config rules
