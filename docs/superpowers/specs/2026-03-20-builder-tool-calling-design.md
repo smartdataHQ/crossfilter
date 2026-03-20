@@ -293,7 +293,7 @@ The `member` field aligns with the Cube.dev filter API. Both dimensions and meas
 
 **Note on nullable parameters:** `current_config` uses `type: ["string", "null"]` in the strict schema.
 
-**Server-side `currentConfig` tracking:** The `runAgentLoop` function maintains a `currentConfig` variable (outside the conversation messages) that is set whenever `generate_dashboard` succeeds. When the LLM passes `current_config: "CURRENT"`, the server substitutes the actual config JSON. This avoids the LLM re-serializing a multi-KB JSON string in a tool call argument — it simply passes the sentinel `"CURRENT"` and the server handles the rest.
+**Server-side `currentConfig` tracking:** The `runAgentLoop` function maintains a `currentConfig` variable (outside the conversation messages) that is set whenever `generate_dashboard` succeeds. On loop startup, `currentConfig` is seeded by reading `demo/dashboards/_draft.json` if it exists — this ensures the "CURRENT" sentinel works across separate requests (user sends message 1 to generate, then message 2 to update in a new request). When the LLM passes `current_config: "CURRENT"`, the server substitutes the actual config JSON. This avoids the LLM re-serializing a multi-KB JSON string in a tool call argument — it simply passes the sentinel `"CURRENT"` and the server handles the rest.
 
 **Auto-save:** On success, the config is automatically written to `demo/dashboards/_draft.json`. This eliminates the need for a separate `save_draft` call in the common case — one tool call generates and saves.
 
