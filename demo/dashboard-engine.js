@@ -957,6 +957,106 @@ function renderGaugeChart(panelEl, panel, kpiValue, registry) {
   return instance;
 }
 
+function renderScatterChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+
+  var chartDef = getChartType(panel.chart);
+  var scatterData = [];
+  for (var i = 0; i < entries.length; ++i) {
+    var e = entries[i];
+    scatterData.push([e.key, e.value.value]);
+  }
+
+  var seriesOpts = {
+    type: chartDef ? chartDef.ecType : 'scatter',
+    data: scatterData,
+    symbolSize: 8,
+  };
+
+  // Apply chart-type-specific options
+  if (chartDef && chartDef.ecOptions) {
+    var ec = chartDef.ecOptions;
+    if (ec.effectType) seriesOpts.effectType = ec.effectType;
+  }
+
+  var option = {
+    tooltip: { trigger: 'item' },
+    grid: { left: 10, right: 10, top: 10, bottom: 10, containLabel: true },
+    xAxis: { type: 'value' },
+    yAxis: { type: 'value' },
+    series: [seriesOpts],
+  };
+
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  option.animation = false;
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
+  return instance;
+}
+
+function renderHeatmapChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+
+  // Detect split data (heatmap y axis via splitField)
+  var firstEntry = entries[0];
+  var isSplit = firstEntry && firstEntry.value && typeof firstEntry.value.value === 'undefined';
+
+  var xCategories = [];
+  var yCategories = {};
+  var heatData = [];
+
+  if (isSplit) {
+    // Collect all y-axis keys
+    for (var si = 0; si < entries.length; ++si) {
+      xCategories.push(String(entries[si].key));
+      for (var yk in entries[si].value) yCategories[yk] = true;
+    }
+    var yKeys = Object.keys(yCategories);
+
+    for (var xi = 0; xi < entries.length; ++xi) {
+      for (var yi = 0; yi < yKeys.length; ++yi) {
+        var cell = entries[xi].value[yKeys[yi]];
+        var cellVal = cell && cell.value ? cell.value : 0;
+        heatData.push([xi, yi, cellVal]);
+      }
+    }
+
+    var maxVal = 0;
+    for (var h = 0; h < heatData.length; ++h) {
+      if (heatData[h][2] > maxVal) maxVal = heatData[h][2];
+    }
+
+    var option = {
+      tooltip: { position: 'top' },
+      grid: { left: 10, right: 10, top: 10, bottom: 10, containLabel: true },
+      xAxis: { type: 'category', data: xCategories, splitArea: { show: true } },
+      yAxis: { type: 'category', data: yKeys, splitArea: { show: true } },
+      visualMap: { min: 0, max: maxVal || 1, calculable: true, orient: 'horizontal', left: 'center', bottom: 0, inRange: { color: ['#e0f3ff', '#3d8bfd'] } },
+      series: [{ type: 'heatmap', data: heatData, label: { show: false }, emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.3)' } } }],
+    };
+
+    var instance = echarts.getInstanceByDom(panelEl);
+    if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+    option.animation = false;
+    instance.clear();
+    instance.setOption(option, { notMerge: true });
+    return instance;
+  } else {
+    // Simple heatmap (e.g., heatmap.calendar) — single-axis entries
+    panelEl.innerHTML = '<div class="panel-empty">No split data for heatmap</div>';
+    return null;
+  }
+}
+
 function renderLineChart(panelEl, panel, groupData) {
   var entries = groupData.entries || [];
   if (!entries.length) {
@@ -1464,6 +1564,10 @@ function renderAllPanels(panels, response, registry) {
         instance = renderBarChart(chartEl, panel, groupData);
       } else if (ecType === 'pie' || ecType === 'funnel') {
         instance = renderPieChart(chartEl, panel, groupData);
+      } else if (ecType === 'scatter' || ecType === 'effectScatter') {
+        instance = renderScatterChart(chartEl, panel, groupData);
+      } else if (ecType === 'heatmap') {
+        instance = renderHeatmapChart(chartEl, panel, groupData);
       }
 
       if (instance && !_chartInstances[panel.id]) {
@@ -2285,6 +2389,11 @@ function buildPanelCard(panel, accentIdx, registry) {
         '</div>' +
       '</div>';
     }
+
+  } else if (panelFamily === 'numeric') {
+    body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
+      buildSkeletonBars(6) +
+    '</div>';
 
   } else {
     // Check if chart type is known but unimplemented

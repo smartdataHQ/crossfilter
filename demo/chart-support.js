@@ -29,6 +29,12 @@ var SUPPORTED = {
   'line.area.stacked': true,
   'line.area.normalized': true,
   'line.bump': true,
+  // numeric family
+  scatter: true,
+  'scatter.bubble': true,
+  'scatter.effect': true,
+  heatmap: true,
+  'heatmap.calendar': true,
   // single family
   kpi: true,
   gauge: true,

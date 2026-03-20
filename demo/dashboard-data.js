@@ -114,6 +114,23 @@ function scanPanels(panels, registry) {
           splitField: panel.stack || null,
         });
         panel._groupId = panel.id;
+      } else if (family === 'numeric') {
+        // Scatter/heatmap need the x dimension as group-by
+        if (panel._dimField) groupByDims.add(panel._dimField);
+        // For heatmap: y is also a dimension → add as group-by + use as splitField
+        if (panel.y && registry.dimensions[panel.y]) groupByDims.add(panel.y);
+        // For scatter.bubble: color is a dimension
+        if (panel.color && registry.dimensions[panel.color]) groupByDims.add(panel.color);
+
+        var numMeasField = panel._measField;
+        var numOp = numMeasField ? inferReduceOp(numMeasField, registry) : 'count';
+        groups.push({
+          id: panel.id,
+          field: panel._dimField,
+          metrics: [{ id: 'value', field: numOp === 'count' ? null : numMeasField, op: numOp }],
+          splitField: (panel.y && registry.dimensions[panel.y]) ? panel.y : null,
+        });
+        panel._groupId = panel.id;
       } else if (family === 'category' || family === 'control') {
         // Bar/pie/selector/dropdown → group-by dimension
         groupByDims.add(panel._dimField);
