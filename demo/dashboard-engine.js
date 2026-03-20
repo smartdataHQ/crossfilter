@@ -753,17 +753,20 @@ function renderLineChart(panelEl, panel, groupData) {
   // Sort by time key (ascending)
   entries.sort(function(a, b) { return a.key - b.key; });
 
-  var xData = [];
-  var yData = [];
+  // Build [timestamp, value] pairs for ECharts time axis
+  var seriesData = [];
+  var xData = [];  // keep for dataZoom range calculations
   for (var i = 0; i < entries.length; ++i) {
-    xData.push(entries[i].key);
-    yData.push(entries[i].value.value);
+    var ts = entries[i].key;
+    var val = entries[i].value.value;
+    seriesData.push([ts, val]);
+    xData.push(ts);
   }
 
   var chartDef = getChartType(panel.chart);
   var seriesOpts = {
     type: 'line',
-    data: yData,
+    data: seriesData,
     showSymbol: false,
     areaStyle: { opacity: 0.15 },
   };
@@ -791,15 +794,16 @@ function renderLineChart(panelEl, panel, groupData) {
       trigger: 'axis',
       formatter: function(params) {
         var p = params[0];
-        var d = new Date(p.axisValue);
+        var ts = Array.isArray(p.value) ? p.value[0] : p.axisValue;
+        var d = new Date(ts);
         var dateStr = d.toISOString().slice(0, 10);
-        return dateStr + '<br>' + p.seriesName + ': ' + (p.value != null ? p.value.toLocaleString() : '\u2014');
+        var count = Array.isArray(p.value) ? p.value[1] : p.value;
+        return dateStr + '<br>' + (count != null ? Number(count).toLocaleString() : '\u2014');
       },
     },
     grid: { left: 50, right: 20, top: 20, bottom: 80, containLabel: false },
     xAxis: {
       type: 'time',
-      data: xData,
       axisLabel: {
         formatter: function(val) {
           var d = new Date(val);
