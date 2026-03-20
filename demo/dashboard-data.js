@@ -131,6 +131,21 @@ function scanPanels(panels, registry) {
           splitField: (panel.y && registry.dimensions[panel.y]) ? panel.y : null,
         });
         panel._groupId = panel.id;
+      } else if (family === 'relation') {
+        // source and target are both dimensions
+        if (panel.source) groupByDims.add(panel.source);
+        if (panel.target) groupByDims.add(panel.target);
+
+        var relMeasField = panel._measField;
+        var relOp = relMeasField ? inferReduceOp(relMeasField, registry) : 'count';
+        // Group by source dim, split by target for cross-tabulation
+        groups.push({
+          id: panel.id,
+          field: panel.source || panel._dimField,
+          metrics: [{ id: 'value', field: relOp === 'count' ? null : relMeasField, op: relOp }],
+          splitField: panel.target || null,
+        });
+        panel._groupId = panel.id;
       } else if (family === 'category' || family === 'control') {
         // Bar/pie/selector/dropdown → group-by dimension
         groupByDims.add(panel._dimField);

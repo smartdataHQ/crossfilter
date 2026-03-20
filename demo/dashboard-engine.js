@@ -1057,6 +1057,125 @@ function renderHeatmapChart(panelEl, panel, groupData) {
   }
 }
 
+function renderSankeyChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+
+  var nodeSet = {};
+  var links = [];
+
+  for (var i = 0; i < entries.length; ++i) {
+    var sourceName = String(entries[i].key);
+    nodeSet[sourceName] = true;
+    var targets = entries[i].value;
+    for (var t in targets) {
+      if (t === 'value') continue;
+      nodeSet[t] = true;
+      var val = targets[t] && targets[t].value || 0;
+      if (val > 0) {
+        links.push({ source: sourceName, target: t, value: val });
+      }
+    }
+  }
+
+  var nodes = Object.keys(nodeSet).map(function (n) { return { name: n }; });
+  var chartDef = getChartType(panel.chart);
+  var seriesOpts = {
+    type: 'sankey',
+    data: nodes,
+    links: links,
+    emphasis: { focus: 'adjacency' },
+    lineStyle: { color: 'gradient', curveness: 0.5 },
+  };
+  if (chartDef && chartDef.ecOptions && chartDef.ecOptions.orient) {
+    seriesOpts.orient = chartDef.ecOptions.orient;
+  }
+
+  var option = {
+    tooltip: { trigger: 'item' },
+    series: [seriesOpts],
+  };
+
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  option.animation = false;
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
+  return instance;
+}
+
+function renderGraphChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+
+  var nodeSet = {};
+  var nodeTotals = {};
+  var links = [];
+
+  for (var i = 0; i < entries.length; ++i) {
+    var sourceName = String(entries[i].key);
+    nodeSet[sourceName] = true;
+    if (!nodeTotals[sourceName]) nodeTotals[sourceName] = 0;
+    var targets = entries[i].value;
+    for (var t in targets) {
+      if (t === 'value') continue;
+      nodeSet[t] = true;
+      if (!nodeTotals[t]) nodeTotals[t] = 0;
+      var val = targets[t] && targets[t].value || 0;
+      if (val > 0) {
+        nodeTotals[sourceName] += val;
+        nodeTotals[t] += val;
+        links.push({ source: sourceName, target: t, value: val });
+      }
+    }
+  }
+
+  // Scale node sizes
+  var maxTotal = 1;
+  for (var n in nodeTotals) {
+    if (nodeTotals[n] > maxTotal) maxTotal = nodeTotals[n];
+  }
+  var nodes = Object.keys(nodeSet).map(function (n) {
+    return { name: n, symbolSize: Math.max(8, Math.round((nodeTotals[n] || 0) / maxTotal * 40)) };
+  });
+
+  var chartDef = getChartType(panel.chart);
+  var layout = (chartDef && chartDef.ecOptions && chartDef.ecOptions.layout) || 'force';
+
+  var seriesOpts = {
+    type: 'graph',
+    layout: layout,
+    data: nodes,
+    links: links,
+    roam: true,
+    label: { show: true, position: 'right', fontSize: 10 },
+    force: { repulsion: 100, gravity: 0.1, edgeLength: [50, 200] },
+    lineStyle: { curveness: 0.3, opacity: 0.6 },
+    emphasis: { focus: 'adjacency', lineStyle: { width: 3 } },
+  };
+  if (layout === 'circular') {
+    seriesOpts.circular = { rotateLabel: true };
+  }
+
+  var option = {
+    tooltip: {},
+    series: [seriesOpts],
+  };
+
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  option.animation = false;
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
+  return instance;
+}
+
 function renderLineChart(panelEl, panel, groupData) {
   var entries = groupData.entries || [];
   if (!entries.length) {
@@ -1568,6 +1687,10 @@ function renderAllPanels(panels, response, registry) {
         instance = renderScatterChart(chartEl, panel, groupData);
       } else if (ecType === 'heatmap') {
         instance = renderHeatmapChart(chartEl, panel, groupData);
+      } else if (ecType === 'sankey') {
+        instance = renderSankeyChart(chartEl, panel, groupData);
+      } else if (ecType === 'graph') {
+        instance = renderGraphChart(chartEl, panel, groupData);
       }
 
       if (instance && !_chartInstances[panel.id]) {
@@ -2391,6 +2514,11 @@ function buildPanelCard(panel, accentIdx, registry) {
     }
 
   } else if (panelFamily === 'numeric') {
+    body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
+      buildSkeletonBars(6) +
+    '</div>';
+
+  } else if (panelFamily === 'relation') {
     body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
       buildSkeletonBars(6) +
     '</div>';
