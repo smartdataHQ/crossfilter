@@ -294,13 +294,23 @@ function buildGroupQueries(panels) {
   for (var i = 0; i < panels.length; ++i) {
     var p = panels[i];
     if (!p._groupId) continue;
-    queries[p._groupId] = {
-      limit: p._expanded ? null : p.limit,
-      sort: 'desc',
-      sortMetric: 'value',
-      includeTotals: true,
-      visibleOnly: true,
-    };
+    // Time-series panels need all entries (no limit), sorted by key (time)
+    if (p._isTimeSeries) {
+      queries[p._groupId] = {
+        limit: null,
+        sort: 'natural',
+        includeTotals: false,
+        visibleOnly: false,
+      };
+    } else {
+      queries[p._groupId] = {
+        limit: p._expanded ? null : p.limit,
+        sort: 'desc',
+        sortMetric: 'value',
+        includeTotals: true,
+        visibleOnly: true,
+      };
+    }
   }
   return queries;
 }
