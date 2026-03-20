@@ -714,6 +714,15 @@ function renderBarChart(panelEl, panel, groupData) {
   }
   option.animation = false;
   option.animationDuration = 0;
+  option.animationDurationUpdate = 0;
+  // Also force on each series — ECharts 6 can ignore top-level animation settings
+  if (option.series) {
+    for (var si = 0; si < option.series.length; ++si) {
+      option.series[si].animation = false;
+      option.series[si].animationDuration = 0;
+      option.series[si].animationDurationUpdate = 0;
+    }
+  }
   instance.setOption(option, true);
   return instance;
 }
@@ -774,6 +783,15 @@ function renderPieChart(panelEl, panel, groupData) {
   }
   option.animation = false;
   option.animationDuration = 0;
+  option.animationDurationUpdate = 0;
+  // Also force on each series — ECharts 6 can ignore top-level animation settings
+  if (option.series) {
+    for (var si = 0; si < option.series.length; ++si) {
+      option.series[si].animation = false;
+      option.series[si].animationDuration = 0;
+      option.series[si].animationDurationUpdate = 0;
+    }
+  }
   instance.setOption(option, true);
   return instance;
 }
@@ -821,6 +839,15 @@ function renderGaugeChart(panelEl, panel, kpiValue, registry) {
   }
   option.animation = false;
   option.animationDuration = 0;
+  option.animationDurationUpdate = 0;
+  // Also force on each series — ECharts 6 can ignore top-level animation settings
+  if (option.series) {
+    for (var si = 0; si < option.series.length; ++si) {
+      option.series[si].animation = false;
+      option.series[si].animationDuration = 0;
+      option.series[si].animationDurationUpdate = 0;
+    }
+  }
   instance.setOption(option, true);
   return instance;
 }
