@@ -277,6 +277,9 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
   lines.push('- Use map.lines when the cube has travel/commute source→target coordinate pairs');
   lines.push('- Geographic maps should be full-width or in a 1-2 column layout — they need space to be useful');
   lines.push('');
+  lines.push('**NOTE:** Geographic map chart types (map, map.scatter, map.bubble, map.heatmap, map.lines, map.effect) are NOT YET AVAILABLE in the rendering engine. Do not use them. Use bar charts with location dimensions instead until map support is added.');
+  lines.push('');
+
   lines.push('### Travel Chain & Flow Patterns');
   lines.push('When the cube has prev_*/next_* dimension pairs (previous/next location, locality, municipality, region), these represent travel chains — where entities came from and where they went next.');
   lines.push('- Use **sankey** to show flows: source=prev_region, target=region shows travel between regions');
