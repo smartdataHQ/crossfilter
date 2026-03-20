@@ -862,7 +862,8 @@ function renderLineChart(panelEl, panel, groupData) {
     if (ec.areaStyle) seriesOpts.areaStyle = ec.areaStyle;
   }
   // Stacked bar/area
-  if (activeViz === 'bar.stacked' || activeViz === 'line.area.stacked') {
+  if (activeViz === 'bar.stacked' || activeViz === 'bar.normalized' ||
+      activeViz === 'line.area.stacked' || activeViz === 'line.area.normalized') {
     seriesOpts.stack = 'timeline';
   }
 
@@ -1028,12 +1029,51 @@ function renderLineChart(panelEl, panel, groupData) {
         if (vizDef.ecOptions.step) lineSeries.step = vizDef.ecOptions.step;
         if (vizDef.ecOptions.areaStyle) lineSeries.areaStyle = vizDef.ecOptions.areaStyle;
       }
-      // Stacked
-      if (activeChartType === 'bar.stacked' || activeChartType === 'line.area.stacked' || activeChartType === 'line.bump') {
+      // Stacked / normalized
+      var isStacked = activeChartType === 'bar.stacked' || activeChartType === 'bar.normalized' ||
+        activeChartType === 'line.area.stacked' || activeChartType === 'line.area.normalized' ||
+        activeChartType === 'line.bump';
+      if (isStacked) {
         lineSeries.stack = 'breakdown';
-        if (!lineSeries.areaStyle) lineSeries.areaStyle = {};
+        if (!isBarSplit) lineSeries.areaStyle = lineSeries.areaStyle || {};
       }
       seriesList.push(lineSeries);
+    }
+
+    // Normalize to 100% if requested
+    var isNormalized = activeChartType === 'bar.normalized' || activeChartType === 'line.area.normalized';
+    if (isNormalized && seriesList.length > 0) {
+      // Compute total per time bucket
+      var bucketTotals = {};
+      for (var ns = 0; ns < seriesList.length; ++ns) {
+        var nsData = seriesList[ns].data;
+        for (var nd = 0; nd < nsData.length; ++nd) {
+          var nk = nsData[nd][0];
+          bucketTotals[nk] = (bucketTotals[nk] || 0) + nsData[nd][1];
+        }
+      }
+      // Normalize each value to percentage
+      for (var ns2 = 0; ns2 < seriesList.length; ++ns2) {
+        var nsData2 = seriesList[ns2].data;
+        for (var nd2 = 0; nd2 < nsData2.length; ++nd2) {
+          var nk2 = nsData2[nd2][0];
+          var total = bucketTotals[nk2] || 1;
+          nsData2[nd2] = [nk2, +(nsData2[nd2][1] / total * 100).toFixed(2)];
+        }
+      }
+      // Set y-axis to percentage
+      option.yAxis.max = 100;
+      option.yAxis.axisLabel = { formatter: '{value}%' };
+      option.tooltip.formatter = function(params) {
+        var ts = params[0] ? (Array.isArray(params[0].value) ? params[0].value[0] : params[0].axisValue) : '';
+        var d = new Date(ts);
+        var html = d.toISOString().slice(0, 10);
+        for (var tp = 0; tp < params.length; ++tp) {
+          var pv = Array.isArray(params[tp].value) ? params[tp].value[1] : params[tp].value;
+          html += '<br>' + params[tp].marker + ' ' + params[tp].seriesName + ': ' + pv + '%';
+        }
+        return html;
+      };
     }
 
     option.series = seriesList;
@@ -1982,9 +2022,11 @@ function buildPanelCard(panel, accentIdx, registry) {
       { value: 'line.smooth', label: 'Smooth' },
       { value: 'line.area', label: 'Area' },
       { value: 'line.area.stacked', label: 'Stacked Area' },
+      { value: 'line.area.normalized', label: '100% Area' },
       { value: 'line.step', label: 'Step' },
       { value: 'bar', label: 'Bar' },
       { value: 'bar.stacked', label: 'Stacked Bar' },
+      { value: 'bar.normalized', label: '100% Bar' },
       { value: 'line.bump', label: 'Bump' },
     ];
     var currentViz = filterState['_timeChart'] || panel.chart;
