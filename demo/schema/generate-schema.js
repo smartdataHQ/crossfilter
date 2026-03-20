@@ -11,9 +11,14 @@
 //   node demo/schema/generate-schema.js [cubeName...]
 //   Reads .env credentials, fetches meta, prints the schema JSON.
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { allTypeNames, getChartType } from '../chart-types.js';
 import { buildFullSchema } from './dashboard-schema-base.js';
 import { isChartSupported } from '../chart-support.js';
+
+var __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Extract enums from cube metadata ────────────────────────────────
 
@@ -104,13 +109,24 @@ export function generateDashboardSchema(metaResponse, cubeNames, options) {
 
 export function generateSystemPrompt(metaResponse, cubeNames) {
   var cubes = metaResponse && metaResponse.cubes || [];
+
+  // Build dynamic sections
+  var cubeCatalogs = buildCubeCatalogs(cubes, cubeNames);
+  var lazyClassification = buildLazyClassification(cubes, cubeNames);
+  var chartTypes = buildChartTypeCatalog();
+
+  // Load template and inject dynamic sections
+  var template = fs.readFileSync(path.resolve(__dirname, '..', 'prompts', 'generator-system.md'), 'utf8');
+  return template
+    .replace('{{CUBE_CATALOGS}}', cubeCatalogs)
+    .replace('{{LAZY_CLASSIFICATION}}', lazyClassification)
+    .replace('{{CHART_TYPES}}', chartTypes);
+}
+
+// ── Dynamic section builders (used by generateSystemPrompt) ─────────
+
+function buildCubeCatalogs(cubes, cubeNames) {
   var lines = [];
-
-  lines.push('You are a dashboard configuration generator. You produce JSON configs that define analytical dashboards.');
-  lines.push('The output must conform to the provided JSON Schema exactly.');
-  lines.push('');
-
-  // Per-cube field catalogs
   for (var c = 0; c < cubeNames.length; ++c) {
     var cubeName = cubeNames[c];
     var cube = null;
@@ -123,7 +139,6 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
     if (cube.title) lines.push('Title: ' + cube.title);
     if (cube.description) lines.push('Description: ' + cube.description.trim());
 
-    // Cube-level meta
     var cm = cube.meta || {};
     if (cm.grain) lines.push('Grain: ' + cm.grain + (cm.grain_description ? ' — ' + cm.grain_description : ''));
     if (cm.time_dimension) lines.push('Time dimension: ' + cm.time_dimension);
@@ -139,7 +154,6 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
     }
     lines.push('');
 
-    // Dimensions
     var dims = cube.dimensions || [];
     lines.push('### Dimensions (' + dims.length + ')');
     for (var d = 0; d < dims.length; ++d) {
@@ -161,7 +175,6 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
     }
     lines.push('');
 
-    // Measures
     var measures = cube.measures || [];
     lines.push('### Measures (' + measures.length + ')');
     for (var m = 0; m < measures.length; ++m) {
@@ -174,7 +187,6 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
     }
     lines.push('');
 
-    // Segments
     var segs = cube.segments || [];
     if (segs.length > 0) {
       lines.push('### Segments (' + segs.length + ')');
@@ -182,7 +194,6 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
         var seg = segs[s];
         var sShort = seg.name.split('.').pop();
         var sTitle = seg.title || sShort;
-        // Strip cube title prefix
         if (cube.title && sTitle.startsWith(cube.title + ' ')) {
           sTitle = sTitle.slice(cube.title.length + 1);
         }
@@ -194,8 +205,11 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
       lines.push('');
     }
   }
+  return lines.join('\n');
+}
 
-  // Per-cube lazy loading classification
+function buildLazyClassification(cubes, cubeNames) {
+  var lines = [];
   lines.push('## Lazy Loading Classification (per cube)');
   lines.push('');
   lines.push('The dashboard engine loads all non-lazy dimensions into ONE query. High-cardinality dimensions cause a Cartesian product explosion.');
@@ -221,32 +235,14 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
       var ltype = ldim.type || 'string';
       var lmeta = ldim.meta || {};
 
-      // Boolean dims are always safe (2-3 values: true, false, null)
-      if (ltype === 'boolean') {
-        safeDims.push(lname);
-        continue;
-      }
-
-      // Time dims are handled specially by the engine — not in group-by
-      if (ltype === 'time') {
-        safeDims.push(lname);
-        continue;
-      }
-
-      // Dimensions with color_map have known enum values — use the count
+      if (ltype === 'boolean') { safeDims.push(lname); continue; }
+      if (ltype === 'time') { safeDims.push(lname); continue; }
       if (lmeta.color_map) {
         var enumCount = Object.keys(lmeta.color_map).length;
         if (enumCount <= 20) { safeDims.push(lname); } else { lazyDims.push(lname); }
         continue;
       }
-
-      // Dimensions with color_scale are numeric tier dimensions — typically <10 tiers
-      if (lmeta.color_scale) {
-        safeDims.push(lname);
-        continue;
-      }
-
-      // Dimensions with an explicit cardinality hint in meta
+      if (lmeta.color_scale) { safeDims.push(lname); continue; }
       if (lmeta.cardinality) {
         if (lmeta.cardinality === 'low' || (typeof lmeta.cardinality === 'number' && lmeta.cardinality <= 20)) {
           safeDims.push(lname);
@@ -255,15 +251,8 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
         }
         continue;
       }
-
-      // Number type dimensions without tier metadata are continuous → high cardinality
-      if (ltype === 'number') {
-        lazyDims.push(lname);
-        continue;
-      }
-
-      // String dims: default to lazy (assume high cardinality) unless metadata says otherwise
-      // This is the safe default — it's better to be lazy unnecessarily than to crash
+      if (ltype === 'number') { lazyDims.push(lname); continue; }
+      // String dims: default to lazy (safe default)
       lazyDims.push(lname);
     }
 
@@ -278,8 +267,11 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
     lines.push('If a section contains ANY dimension from the lazy list above, the ENTIRE section must have lazy: true.');
     lines.push('');
   }
+  return lines.join('\n');
+}
 
-  // Chart type catalog
+function buildChartTypeCatalog() {
+  var lines = [];
   lines.push('## Chart Types');
   lines.push('');
 
@@ -310,190 +302,6 @@ export function generateSystemPrompt(metaResponse, cubeNames) {
     }
     lines.push('');
   }
-
-  // Dashboard design guidelines
-  lines.push('## Dashboard Design Guidelines');
-  lines.push('');
-  lines.push('### Primary Selector');
-  lines.push('Most dashboards have one dimension that is the primary entry point — the thing the user selects first to scope all analysis. Examples: a store selector, a POI selector, a product selector.');
-  lines.push('Mark this panel with "primary": true. The engine renders it prominently as a searchable control that drives the entire dashboard.');
-  lines.push('- Use chart type "selector" or "dropdown" with primary: true and searchable: true');
-  lines.push('- Place the primary selector in the MODELBAR section (location: "modelbar") so it is always visible at the top as a filter control, not buried in the main body');
-  lines.push('- Only one panel per dashboard should be primary');
-  lines.push('- Choose the dimension that best matches the user\'s stated focus (e.g. "POI analysis" → poi_name is primary, "store performance" → sold_location is primary)');
-  lines.push('- If the user\'s request does not imply a single-entity focus, do not set any panel as primary');
-  lines.push('');
-  lines.push('### Information Hierarchy');
-  lines.push('A dashboard has a clear visual hierarchy. The user sees the most important information first and can drill into details on demand.');
-  lines.push('');
-  lines.push('1. **KPIs at the top** — 3-5 key metrics in a single row (section with columns: 4 or 5). Use chart type "kpi".');
-  lines.push('2. **Time series** — a single full-width line chart (width: "full", columns: 1) showing the primary metric over time.');
-  lines.push('3. **Primary breakdowns** — 2-3 categorical charts in a 2- or 3-column grid showing the most important dimensions.');
-  lines.push('4. **Secondary breakdowns** — additional charts in their own section. Collapse if supplementary.');
-  lines.push('5. **Detail/drill-down sections** — high-cardinality dimensions in collapsed sections with selectors.');
-  lines.push('6. **Data table** — if included, put it last. Full width.');
-  lines.push('The primary selector (if any) is in the modelbar, not in the main body.');
-  lines.push('');
-  lines.push('### Model Bar (location: "modelbar")');
-  lines.push('The model bar is a compact control strip at the top of the dashboard. It holds filter controls that scope the data without taking up dashboard real estate.');
-  lines.push('- Boolean dimensions as "toggle" controls (Yes/No/All)');
-  lines.push('- Numeric dimensions as "range" controls (dual-handle slider)');
-  lines.push('- ALWAYS include at least one modelbar section with relevant boolean toggles and/or numeric ranges from the cube');
-  lines.push('- The model bar is NOT for KPIs, charts, or high-cardinality selectors. Keep it to 2-4 compact controls.');
-  lines.push('');
-  lines.push('### Collapsed Sections');
-  lines.push('Use collapsed: true for sections that contain:');
-  lines.push('- High-cardinality dimension lists (50+ unique values) that are not the primary focus');
-  lines.push('- Secondary analysis that most users do not need on every visit');
-  lines.push('- Detail tables');
-  lines.push('');
-  lines.push('Rules:');
-  lines.push('- NEVER collapse a section with fewer than 2 panels — either merge it into another section or leave it expanded');
-  lines.push('- NEVER collapse sections that are central to the user\'s stated purpose — if they asked for "POI analysis", the POI section must be expanded');
-  lines.push('- NEVER collapse geographic/map sections when the dashboard focus is location-based');
-  lines.push('');
-  lines.push('### Geographic & Location-Based Dashboards');
-  lines.push('When the user\'s request involves locations, places, geography, POIs, or spatial analysis:');
-  lines.push('- Include map visualizations in a PROMINENT (not collapsed) section');
-  lines.push('- Use map.scatter or map.bubble for point data when the cube has lat/lng dimensions');
-  lines.push('- Use map for choropleth when the cube has named regions');
-  lines.push('- Use map.heatmap for density visualization of point clusters');
-  lines.push('- Use map.lines when the cube has travel/commute source→target coordinate pairs');
-  lines.push('- Geographic maps should be full-width or in a 1-2 column layout — they need space to be useful');
-  lines.push('');
-  lines.push('**NOTE:** Geographic map chart types (map, map.scatter, map.bubble, map.heatmap, map.lines, map.effect) are NOT YET AVAILABLE in the rendering engine. Do not use them. Use bar charts with location dimensions instead until map support is added.');
-  lines.push('');
-
-  lines.push('### Travel Chain & Flow Patterns');
-  lines.push('When the cube has prev_*/next_* dimension pairs (previous/next location, locality, municipality, region), these represent travel chains — where entities came from and where they went next.');
-  lines.push('- Use **sankey** to show flows: source=prev_region, target=region shows travel between regions');
-  lines.push('- Use **sankey** at multiple geographic levels: prev_locality→locality, prev_municipality→municipality');
-  lines.push('- Use **map.lines** when coordinate pairs are available: sourceLng=prev_longitude, sourceLat=prev_latitude, targetLng=longitude, targetLat=latitude');
-  lines.push('- Sankey is ideal for answering "where did visitors come from?" and "where did they go next?"');
-  lines.push('- When the user mentions travel patterns, routes, flows, arrivals, departures, or transitions — always include at least one sankey or map.lines panel');
-  lines.push('- Pair sankey with a selector for the dimension being analyzed (e.g. select a region, see its inflow/outflow)');
-  lines.push('');
-  lines.push('### Chart Type Selection');
-  lines.push('Choose chart types based on the data shape, not for visual variety. The right chart makes the data self-explanatory.');
-  lines.push('');
-  lines.push('**Categorical data (dimension → count/measure):**');
-  lines.push('- <8 values: **pie** or **pie.donut** (part-to-whole) or **pie.rose** (when values have wide range)');
-  lines.push('- 8-30 values: **bar** (vertical, sorted by value) or **bar.horizontal** (long labels)');
-  lines.push('- 30+ values: **selector** with searchable: true — NOT a chart');
-  lines.push('- Composition/proportion: **pie.half** for single-metric progress, **pie.nested** for two-level breakdown (e.g. category + subcategory)');
-  lines.push('');
-  lines.push('**Stacked/grouped comparisons:**');
-  lines.push('- Absolute stacked: **bar.stacked** (category + stack dimension)');
-  lines.push('- 100% composition: **bar.normalized** (shows proportions, not absolutes — ideal for "what percentage of X is Y?")');
-  lines.push('- Sequential gains/losses: **bar.waterfall** (shows incremental changes — revenue breakdown, funnel drop-offs)');
-  lines.push('');
-  lines.push('**Time series:**');
-  lines.push('- Standard trend: **line** or **line.smooth**');
-  lines.push('- Volume over time: **line.area** (filled area emphasizes magnitude)');
-  lines.push('- Discrete steps: **line.step** (rate changes, pricing tiers)');
-  lines.push('- Stacked composition over time: **line.area.stacked** (how parts contribute to total over time)');
-  lines.push('- Ranking changes over time: **line.bump** (who was #1 each period)');
-  lines.push('- One time series per dashboard is usually enough. Two if comparing different measures.');
-  lines.push('');
-  lines.push('**Numeric relationships:**');
-  lines.push('- Two measures correlated: **scatter** (x vs y)');
-  lines.push('- Three measures: **scatter.bubble** (x, y, size) — add color dimension for 4th encoding');
-  lines.push('- Highlighted points: **scatter.effect** (ripple animation draws attention)');
-  lines.push('- Two categorical axes + value: **heatmap** (must be categorical axes, NOT numeric)');
-  lines.push('- Date + value density: **heatmap.calendar** (GitHub-style contribution grid)');
-  lines.push('');
-  lines.push('**Geographic/spatial:**');
-  lines.push('- Named regions colored by value: **map** (choropleth)');
-  lines.push('- Points on map by lat/lng: **map.scatter** or **map.bubble** (sized by measure)');
-  lines.push('- Point density: **map.heatmap**');
-  lines.push('- Highlighted locations: **map.effect** (ripple on key points)');
-  lines.push('- Routes/flows between coordinates: **map.lines**');
-  lines.push('');
-  lines.push('**Hierarchical data:**');
-  lines.push('- Area-based breakdown: **treemap** (nested rectangles — shows part-to-whole with drill-down)');
-  lines.push('- Ring-based breakdown: **sunburst** (concentric rings — better for 3+ levels)');
-  lines.push('- Structural relationships: **tree** or **tree.radial** (parent-child, no value encoding)');
-  lines.push('');
-  lines.push('**Flow/relationship data:**');
-  lines.push('- Flow between categories: **sankey** (source → target, width = volume). Ideal for prev_region → region, stage transitions, traffic flows');
-  lines.push('- Vertical flow: **sankey.vertical** (top-to-bottom instead of left-to-right)');
-  lines.push('- Network connections: **graph** (force-directed layout) or **graph.circular** (nodes in a circle)');
-  lines.push('- Circular relationships: **chord** (symmetric flows between categories)');
-  lines.push('');
-  lines.push('**Single metrics:**');
-  lines.push('- Dashboard headline number: **kpi** (big number with label — the default for important metrics)');
-  lines.push('- Progress toward target: **gauge.progress** (modern minimal) or **gauge.ring** (donut-style)');
-  lines.push('- Classic speedometer: **gauge** (only when the metaphor fits — speed, temperature, pressure)');
-  lines.push('');
-  lines.push('**Specialized:**');
-  lines.push('- Multi-axis comparison: **radar** (comparing entities across multiple measures)');
-  lines.push('- Financial OHLC: **candlestick** or **candlestick.ohlc** (open/high/low/close)');
-  lines.push('- Statistical distribution: **boxplot** (min/Q1/median/Q3/max)');
-  lines.push('- Category volume over time: **themeRiver** (multiple streams flowing over time axis)');
-  lines.push('- Multi-dimensional exploration: **parallel** (one axis per dimension)');
-  lines.push('- Staged conversion: **funnel** (descending) or **funnel.ascending** (building up)');
-  lines.push('');
-  lines.push('**Controls (not charts):**');
-  lines.push('- Boolean dimension: **toggle** in the modelbar');
-  lines.push('- Numeric range: **range** in the modelbar');
-  lines.push('- Entity selection: **selector** (searchable list) or **dropdown** (compact select)');
-  lines.push('');
-  lines.push('### Lazy Sections (CRITICAL for performance)');
-  lines.push('The dashboard engine loads ALL non-lazy dimensions into a single Cube.dev query and builds a crossfilter worker from the result.');
-  lines.push('When many dimensions are in the main query, the Cartesian product explodes and the dataset becomes too large to load.');
-  lines.push('');
-  lines.push('**Set `lazy: true` on any section whose panels use high-cardinality dimensions** (50+ unique values) that do NOT need instant cross-filtering with other charts.');
-  lines.push('Lazy sections query Cube independently — each panel sends its own small query with only its dimension + count + any active filters.');
-  lines.push('This avoids the cross-product explosion of adding high-cardinality dims to the main worker.');
-  lines.push('');
-  lines.push('**Rules:**');
-  lines.push('- Any dimension listed in the "MUST be in lazy: true sections" list (see Lazy Loading Classification above) MUST be in a lazy section');
-  lines.push('- Selectors, dropdowns, and searchable lists for high-cardinality dimensions MUST be in a lazy section');
-  lines.push('- Bar/pie charts for dimensions with 30+ unique values SHOULD be in a lazy section');
-  lines.push('- KPIs, gauges, and single-value panels do NOT need lazy (they use measures, not group-by dimensions)');
-  lines.push('- Time series (line charts using the time dimension) do NOT need lazy — the time dimension is handled specially');
-  lines.push('- Toggles and ranges in the modelbar do NOT need lazy — they become server-side filters, not group-by dimensions');
-  lines.push('- Charts using dimensions from the "Safe for main query" list are FINE in the main query');
-  lines.push('- Sankey, treemap, sunburst with high-cardinality levels SHOULD be in a lazy section');
-  lines.push('- Tables are always lazy-safe — put them in a lazy section');
-  lines.push('');
-  lines.push('**If in doubt, make it lazy.** The only cost is slightly slower refresh on that section (it re-queries Cube). The benefit is preventing data explosion.');
-  lines.push('');
-  lines.push('### Section Layout');
-  lines.push('- KPI sections: columns: 4 or 5 (one KPI per column)');
-  lines.push('- Chart sections: columns: 2 or 3');
-  lines.push('- Map sections: columns: 1 or 2 (maps need width)');
-  lines.push('- Full-width panels (time series, tables, primary selectors): columns: 1 or set width: "full"');
-  lines.push('- Collapsed detail sections: columns: 2 or 3');
-  lines.push('');
-  lines.push('### What NOT to do');
-  lines.push('- Do not put KPIs in the modelbar — they belong in a visible KPI row');
-  lines.push('- Do not use pie/donut for dimensions with more than 8 values — too many slices');
-  lines.push('- Do not use toggle for non-boolean dimensions — toggle is Yes/No/All only');
-  lines.push('- Do not put every dimension on the dashboard — select the 5-10 most analytically useful ones');
-  lines.push('- Do not create more than 6-7 sections — consolidate related panels');
-  lines.push('- Do not leave all sections expanded — use collapsed: true for secondary content');
-  lines.push('- Do not collapse a section with only 1 panel — merge it into an adjacent section or leave it expanded');
-  lines.push('- Do not use heatmap with two numeric dimensions — heatmap needs categorical axes. Use scatter for numeric×numeric');
-  lines.push('- Do not omit the modelbar — every dashboard should have at least one boolean toggle or numeric range control');
-  lines.push('- **NEVER put high-cardinality dimensions (30+ unique values) in a non-lazy section** — this WILL crash the dashboard. Check the Lazy Loading Classification section for each cube.');
-  lines.push('');
-
-  // Config rules
-  lines.push('## Config Rules');
-  lines.push('');
-  lines.push('- Simple charts (bar, pie, line, kpi, gauge, selector, toggle, range, dropdown) use "dimension" and "measure" directly on the panel.');
-  lines.push('- When measure is null, the engine counts records.');
-  lines.push('- When chart is null, the engine defaults to "bar".');
-  lines.push('- Complex charts (scatter.bubble, heatmap, sankey, treemap, radar, etc.) use the slot fields (x, y, size, color, source, target, levels, etc.) directly on the panel.');
-  lines.push('- Table panels use the "columns" array.');
-  lines.push('- Stacked charts (bar.stacked, line.area.stacked) use "dimension", "measure", and "stack".');
-  lines.push('- Set primary: true on at most one panel to mark it as the dashboard\'s primary entity selector. Set primary: false on all other panels.');
-  lines.push('- Every chart panel supports click-to-filter — this is automatic, not a config option.');
-  lines.push('- For multi-cube dashboards, set "cube" on each panel and declare "sharedFilters" for cross-cube filter bridging.');
-  lines.push('- **Sections with lazy: true query Cube independently per panel.** Any section containing high-cardinality dimensions (30+ values) MUST have lazy: true. This is not optional — the dashboard will fail to load without it.');
-  lines.push('');
-
   return lines.join('\n');
 }
 
