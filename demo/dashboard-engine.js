@@ -2834,6 +2834,12 @@ function buildPanelCard(panel, accentIdx, registry) {
       buildSkeletonBars(6) +
     '</div>';
 
+  } else if (panel.chart === 'gauge' || panel.chart === 'gauge.progress' || panel.chart === 'gauge.ring') {
+    // Gauge has ecType: null but renders via ECharts — needs a chart-wrap div
+    body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
+      buildSkeletonBars(1) +
+    '</div>';
+
   } else {
     // Check if chart type is known but unimplemented
     var _chartDef = getChartType(panel.chart);
