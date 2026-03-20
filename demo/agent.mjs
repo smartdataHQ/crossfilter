@@ -351,3 +351,267 @@ var TOOL_DEFINITIONS = [
     },
   },
 ];
+
+// ── Tool implementations ────────────────────────────────────────────
+
+function toolListCubes(args, ctx) {
+  var cubes = ctx.metaResponse && ctx.metaResponse.cubes || [];
+  return JSON.stringify({
+    cubes: cubes.map(function (c) {
+      var meta = c.meta || {};
+      return {
+        name: c.name,
+        title: c.title || c.name,
+        description: meta.grain_description || c.description || '',
+        grain: meta.grain || null,
+        dimensions: (c.dimensions || []).length,
+        measures: (c.measures || []).length,
+        segments: (c.segments || []).length,
+      };
+    }),
+  });
+}
+
+function toolDescribeCube(args, ctx) {
+  var cube = findCube(ctx.metaResponse, args.cube_name);
+  if (!cube) {
+    return suggestMatch(args.cube_name, allCubeNames(ctx.metaResponse), 'Cube');
+  }
+
+  var meta = cube.meta || {};
+  var dims = (cube.dimensions || []).map(function (d) {
+    var shortName = d.name.split('.').pop();
+    var dm = d.meta || {};
+    return {
+      name: shortName,
+      type: d.type || 'string',
+      description: d.description || '',
+      color_map: dm.color_map || null,
+      color_scale: dm.color_scale || null,
+    };
+  });
+
+  var measures = (cube.measures || []).map(function (m) {
+    var mShort = m.name.split('.').pop();
+    return {
+      name: mShort,
+      type: m.type || 'number',
+      agg: m.aggType || '',
+      format: m.format || '',
+      description: m.description || '',
+    };
+  });
+
+  var segments = (cube.segments || []).map(function (s) {
+    var sShort = s.name.split('.').pop();
+    var sTitle = s.title || sShort;
+    if (cube.title && sTitle.startsWith(cube.title + ' ')) {
+      sTitle = sTitle.slice(cube.title.length + 1);
+    }
+    return { name: sShort, title: sTitle, description: s.description || '' };
+  });
+
+  return JSON.stringify({
+    name: cube.name,
+    title: cube.title || cube.name,
+    grain: meta.grain || null,
+    grain_description: meta.grain_description || null,
+    time_dimension: meta.time_dimension || null,
+    period: meta.period || null,
+    granularity: meta.granularity || null,
+    dimensions: dims,
+    measures: measures,
+    segments: segments,
+  });
+}
+
+function toolGetChartSupport(args, ctx) {
+  var allTypes = ctx.chartTypes.allTypeNames();
+  var families = ctx.chartTypes.allFamilies();
+
+  if (args.family != null) {
+    if (families.indexOf(args.family) < 0) {
+      return "Family '" + args.family + "' not found. Available families: " + families.join(', ') + '.';
+    }
+  }
+
+  var supported = [];
+  var unsupported = [];
+
+  for (var i = 0; i < allTypes.length; ++i) {
+    var typeName = allTypes[i];
+    var entry = ctx.chartTypes.getChartType(typeName);
+    if (!entry) continue;
+    if (args.family != null && entry.family !== args.family) continue;
+
+    if (ctx.chartSupport.isChartSupported(typeName)) {
+      var slotDesc = entry.slots.map(function (s) {
+        var desc = s.name + ':' + s.accepts;
+        if (s.array) desc += '[]';
+        desc += s.required ? '!' : '?';
+        return desc;
+      }).join(', ');
+      supported.push({ type: typeName, family: entry.family, slots: slotDesc });
+    } else {
+      unsupported.push(typeName);
+    }
+  }
+
+  var familyLabel = args.family ? ' in ' + args.family + ' family' : '';
+  return JSON.stringify({
+    supported: supported,
+    unsupported: unsupported,
+    summary: supported.length + ' supported, ' + unsupported.length + ' unsupported' + familyLabel,
+  });
+}
+
+function toolQueryCube(args, ctx) {
+  var cube = findCube(ctx.metaResponse, args.cube_name);
+  if (!cube) {
+    return Promise.resolve(suggestMatch(args.cube_name, allCubeNames(ctx.metaResponse), 'Cube'));
+  }
+
+  // Build field lookup: short name → full name
+  var dimLookup = {};
+  var measLookup = {};
+  var allFields = {};
+  (cube.dimensions || []).forEach(function (d) {
+    var short = d.name.split('.').pop();
+    dimLookup[short] = d.name;
+    allFields[short] = d.name;
+  });
+  (cube.measures || []).forEach(function (m) {
+    var short = m.name.split('.').pop();
+    measLookup[short] = m.name;
+    allFields[short] = m.name;
+  });
+
+  // Validate dimension names
+  var fullDims = [];
+  for (var di = 0; di < args.dimensions.length; ++di) {
+    var dName = args.dimensions[di];
+    if (!dimLookup[dName]) {
+      return Promise.resolve(suggestMatch(dName, Object.keys(dimLookup), 'Dimension'));
+    }
+    fullDims.push(dimLookup[dName]);
+  }
+
+  // Validate measure names
+  var fullMeas = [];
+  for (var mi = 0; mi < args.measures.length; ++mi) {
+    var mName = args.measures[mi];
+    if (!measLookup[mName]) {
+      return Promise.resolve(suggestMatch(mName, Object.keys(measLookup), 'Measure'));
+    }
+    fullMeas.push(measLookup[mName]);
+  }
+
+  if (fullMeas.length === 0) {
+    return Promise.resolve('At least one measure is required. Available measures: ' +
+      Object.keys(measLookup).slice(0, 15).join(', '));
+  }
+
+  // Build Cube.dev query
+  var cubeQuery = {
+    dimensions: fullDims,
+    measures: fullMeas,
+    limit: Math.min(args.limit || 100, 1000),
+  };
+
+  // Translate filters
+  if (args.filters && args.filters.length > 0) {
+    cubeQuery.filters = [];
+    for (var fi = 0; fi < args.filters.length; ++fi) {
+      var f = args.filters[fi];
+      var fullName = allFields[f.member];
+      if (!fullName) {
+        return Promise.resolve(suggestMatch(f.member, Object.keys(allFields), 'Field'));
+      }
+      cubeQuery.filters.push({ member: fullName, operator: f.operator, values: f.values });
+    }
+  }
+
+  // Translate order (string format: "field_name:asc" or "field_name:desc")
+  if (args.order) {
+    var orderParts = args.order.split(':');
+    var oField = orderParts[0];
+    var oDir = orderParts[1] || 'desc';
+    if (!allFields[oField]) {
+      return Promise.resolve(suggestMatch(oField, Object.keys(allFields), 'Field'));
+    }
+    cubeQuery.order = {};
+    cubeQuery.order[allFields[oField]] = oDir;
+  }
+
+  // Execute via Cube.dev API
+  var env = readEnvConfig();
+  var token = env.CUBE_TOKEN || process.env.CUBE_TOKEN || '';
+  if (token && !token.startsWith('Bearer ')) token = 'Bearer ' + token;
+  var datasourceId = env.CUBE_DATASOURCE || process.env.CUBE_DATASOURCE || '';
+  var branchId = env.CUBE_BRANCH || process.env.CUBE_BRANCH || '';
+
+  if (!token || !datasourceId || !branchId) {
+    return Promise.resolve('Cube query requires live credentials. Set CUBE_TOKEN, CUBE_DATASOURCE, CUBE_BRANCH in .env.');
+  }
+
+  var bodyStr = JSON.stringify({ query: cubeQuery });
+  var startTime = Date.now();
+
+  return new Promise(function (resolve) {
+    var req = https.request({
+      hostname: 'dbx.fraios.dev',
+      port: 443, path: '/api/v1/load', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': token,
+        'x-hasura-datasource-id': datasourceId,
+        'x-hasura-branch-id': branchId,
+        'Content-Length': Buffer.byteLength(bodyStr),
+      },
+    }, function (res) {
+      var chunks = [];
+      res.on('data', function (c) { chunks.push(c); });
+      res.on('end', function () {
+        var elapsed = Date.now() - startTime;
+        if (res.statusCode !== 200) {
+          var errBody = Buffer.concat(chunks).toString().slice(0, 300);
+          resolve('Cube query failed (HTTP ' + res.statusCode + '): ' + errBody +
+            '. Try simplifying: reduce dimensions or add filters.');
+          return;
+        }
+        try {
+          var parsed = JSON.parse(Buffer.concat(chunks).toString());
+          var data = parsed.data || [];
+          // Map fully qualified keys back to short names
+          var rows = data.map(function (row) {
+            var mapped = {};
+            var keys = Object.keys(row);
+            for (var k = 0; k < keys.length; ++k) {
+              var short = keys[k].split('.').pop();
+              mapped[short] = row[keys[k]];
+            }
+            return mapped;
+          });
+          var limit = cubeQuery.limit;
+          resolve(JSON.stringify({
+            rows: rows,
+            rowCount: rows.length,
+            truncated: rows.length >= limit,
+            query_time_ms: elapsed,
+          }));
+        } catch (e) {
+          resolve('Cube query response parse error: ' + e.message);
+        }
+      });
+    });
+    req.setTimeout(30000, function () {
+      req.destroy();
+      resolve('Cube query timed out after 30s. Try adding a filter to reduce data volume or use fewer dimensions.');
+    });
+    req.on('error', function (err) {
+      resolve('Cube query error: ' + err.message);
+    });
+    req.write(bodyStr);
+    req.end();
+  });
+}
