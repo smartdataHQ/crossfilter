@@ -633,6 +633,7 @@ function toolGenerateDashboard(args, ctx) {
 
     // Update context
     ctx.currentConfig = config;
+    ctx.onConfigGenerated();
 
     // Track inner call usage
     var usage = response.usage || {};
@@ -810,6 +811,9 @@ export async function runAgentLoop(userMessages, metaResponse) {
     }
   } catch (_) {}
 
+  // Track whether generate_dashboard was called this session
+  var configGeneratedThisSession = false;
+
   // Context object shared across all tool calls
   var ctx = {
     metaResponse: metaResponse,
@@ -819,6 +823,7 @@ export async function runAgentLoop(userMessages, metaResponse) {
     generateSystemPrompt: schemaGen.generateSystemPrompt,
     generateDashboardSchema: schemaGen.generateDashboardSchema,
     usage: { prompt_tokens: 0, completion_tokens: 0 },
+    onConfigGenerated: function () { configGeneratedThisSession = true; },
   };
 
   // Build messages: system + user conversation
@@ -842,7 +847,7 @@ export async function runAgentLoop(userMessages, metaResponse) {
     if (!choice || !choice.message) {
       return {
         reply: 'No response from the assistant. Please try again.',
-        config: ctx.currentConfig,
+        config: configGeneratedThisSession ? ctx.currentConfig : null,
         usage: buildUsage(ctx, totalToolCalls, iter + 1),
       };
     }
@@ -854,7 +859,7 @@ export async function runAgentLoop(userMessages, metaResponse) {
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
       return {
         reply: msg.content || '',
-        config: ctx.currentConfig,
+        config: configGeneratedThisSession ? ctx.currentConfig : null,
         usage: buildUsage(ctx, totalToolCalls, iter + 1),
       };
     }
@@ -882,7 +887,7 @@ export async function runAgentLoop(userMessages, metaResponse) {
   // Max iterations reached
   return {
     reply: 'I made too many tool calls without producing a response. This usually means the request is too complex. Try breaking it into smaller steps.',
-    config: ctx.currentConfig,
+    config: configGeneratedThisSession ? ctx.currentConfig : null,
     usage: buildUsage(ctx, totalToolCalls, MAX_ITERATIONS),
   };
 }
