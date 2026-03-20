@@ -1176,6 +1176,274 @@ function renderGraphChart(panelEl, panel, groupData) {
   return instance;
 }
 
+function renderHierarchyChart(panelEl, panel, response, registry) {
+  var levelGroupIds = panel._allLevelGroupIds || [];
+  var levelGroups = [];
+  for (var lg = 0; lg < levelGroupIds.length; ++lg) {
+    var gdata = response.groups[levelGroupIds[lg]];
+    if (gdata) levelGroups.push(gdata);
+  }
+  if (!levelGroups.length || !levelGroups[0].entries || !levelGroups[0].entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+
+  // Level 0: root children from flat entries
+  var rootChildren = [];
+  var entries0 = levelGroups[0].entries;
+  for (var i = 0; i < entries0.length; ++i) {
+    rootChildren.push({
+      name: String(entries0[i].key),
+      value: entries0[i].value.value,
+      children: [],
+    });
+  }
+
+  // Level 1+: nest children using split data
+  if (levelGroups.length > 1) {
+    var entries1 = levelGroups[1].entries || [];
+    for (var j = 0; j < entries1.length; ++j) {
+      var childName = String(entries1[j].key);
+      var splits = entries1[j].value;
+      for (var parentName in splits) {
+        if (parentName === 'value') continue;
+        var parentNode = null;
+        for (var rn = 0; rn < rootChildren.length; ++rn) {
+          if (rootChildren[rn].name === parentName) { parentNode = rootChildren[rn]; break; }
+        }
+        if (parentNode && splits[parentName] && splits[parentName].value) {
+          parentNode.children.push({ name: childName, value: splits[parentName].value });
+        }
+      }
+    }
+  }
+
+  // Remove empty children arrays for leaf nodes
+  function cleanLeaves(nodes) {
+    for (var n = 0; n < nodes.length; ++n) {
+      if (nodes[n].children && nodes[n].children.length === 0) {
+        delete nodes[n].children;
+      } else if (nodes[n].children) {
+        cleanLeaves(nodes[n].children);
+      }
+    }
+  }
+  cleanLeaves(rootChildren);
+
+  var chartDef = getChartType(panel.chart);
+  var ecType = chartDef ? chartDef.ecType : 'treemap';
+  var option;
+
+  if (ecType === 'treemap') {
+    option = {
+      tooltip: { trigger: 'item', formatter: '{b}: {c}' },
+      series: [{
+        type: 'treemap',
+        data: rootChildren,
+        leafDepth: 1,
+        label: { show: true, formatter: '{b}' },
+        breadcrumb: { show: true },
+      }],
+    };
+  } else if (ecType === 'sunburst') {
+    option = {
+      tooltip: { trigger: 'item' },
+      series: [{
+        type: 'sunburst',
+        data: rootChildren,
+        radius: ['10%', '90%'],
+        label: { fontSize: 10, rotate: 'radial' },
+      }],
+    };
+  } else if (ecType === 'tree') {
+    var layout = (chartDef && chartDef.ecOptions && chartDef.ecOptions.layout) || 'orthogonal';
+    option = {
+      tooltip: { trigger: 'item' },
+      series: [{
+        type: 'tree',
+        data: [{ name: panel.label || 'Root', children: rootChildren }],
+        layout: layout,
+        label: { fontSize: 10 },
+        leaves: { label: { fontSize: 9 } },
+      }],
+    };
+  }
+
+  if (!option) {
+    panelEl.innerHTML = '<div class="panel-empty">Unknown hierarchy type</div>';
+    return null;
+  }
+
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  option.animation = false;
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
+  return instance;
+}
+
+function renderRadarChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+  var indicator = [];
+  var dataValues = [];
+  for (var i = 0; i < entries.length; ++i) {
+    indicator.push({ name: String(entries[i].key) });
+    dataValues.push(entries[i].value.value || 0);
+  }
+  var option = {
+    tooltip: {},
+    radar: { indicator: indicator },
+    series: [{ type: 'radar', data: [{ value: dataValues, name: panel.label || '' }] }],
+  };
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  option.animation = false;
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
+  return instance;
+}
+
+function renderCandlestickChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+  entries.sort(function(a, b) { return a.key - b.key; });
+  var categories = [];
+  var ohlcData = [];
+  for (var i = 0; i < entries.length; ++i) {
+    var e = entries[i];
+    var ts = e.key;
+    categories.push(typeof ts === 'number' && ts > 1e9 ? new Date(ts).toISOString().slice(0, 10) : String(ts));
+    var v = e.value;
+    ohlcData.push([
+      v.open ? v.open.value || 0 : 0,
+      v.close ? v.close.value || 0 : 0,
+      v.low ? v.low.value || 0 : 0,
+      v.high ? v.high.value || 0 : 0,
+    ]);
+  }
+  var option = {
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+    grid: { left: 10, right: 10, top: 10, bottom: 10, containLabel: true },
+    xAxis: { type: 'category', data: categories },
+    yAxis: { type: 'value' },
+    series: [{ type: 'candlestick', data: ohlcData }],
+  };
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  option.animation = false;
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
+  return instance;
+}
+
+function renderBoxplotChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+  var categories = [];
+  var boxData = [];
+  for (var i = 0; i < entries.length; ++i) {
+    var e = entries[i];
+    categories.push(String(e.key));
+    var v = e.value;
+    boxData.push([
+      v.min ? v.min.value || 0 : 0,
+      v.q1 ? v.q1.value || 0 : 0,
+      v.median ? v.median.value || 0 : 0,
+      v.q3 ? v.q3.value || 0 : 0,
+      v.max ? v.max.value || 0 : 0,
+    ]);
+  }
+  var option = {
+    tooltip: { trigger: 'item' },
+    grid: { left: 10, right: 10, top: 10, bottom: 10, containLabel: true },
+    xAxis: { type: 'category', data: categories },
+    yAxis: { type: 'value' },
+    series: [{ type: 'boxplot', data: boxData }],
+  };
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  option.animation = false;
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
+  return instance;
+}
+
+function renderThemeRiverChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+  // Detect split data (stream dimension via splitField)
+  var firstEntry = entries[0];
+  var isSplit = firstEntry && firstEntry.value && typeof firstEntry.value.value === 'undefined';
+  var riverData = [];
+  if (isSplit) {
+    for (var i = 0; i < entries.length; ++i) {
+      var dateKey = entries[i].key;
+      var dateStr = typeof dateKey === 'number' && dateKey > 1e9 ? new Date(dateKey).toISOString().slice(0, 10) : String(dateKey);
+      for (var stream in entries[i].value) {
+        var sv = entries[i].value[stream];
+        if (sv && sv.value != null) {
+          riverData.push([dateStr, sv.value, stream]);
+        }
+      }
+    }
+  } else {
+    for (var j = 0; j < entries.length; ++j) {
+      var dk = entries[j].key;
+      var ds = typeof dk === 'number' && dk > 1e9 ? new Date(dk).toISOString().slice(0, 10) : String(dk);
+      riverData.push([ds, entries[j].value.value || 0, panel.label || 'value']);
+    }
+  }
+  var option = {
+    tooltip: { trigger: 'axis' },
+    singleAxis: { type: 'time', top: 50, bottom: 30 },
+    series: [{ type: 'themeRiver', data: riverData, label: { show: false } }],
+  };
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  option.animation = false;
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
+  return instance;
+}
+
+function renderParallelChart(panelEl, panel, groupData) {
+  var entries = groupData.entries || [];
+  if (!entries.length) {
+    panelEl.innerHTML = '<div class="panel-empty">No data</div>';
+    return null;
+  }
+  var parallelData = [];
+  for (var i = 0; i < entries.length; ++i) {
+    parallelData.push([entries[i].key, entries[i].value.value || 0]);
+  }
+  var option = {
+    parallelAxis: [
+      { dim: 0, name: panel.dimension || 'Dimension' },
+      { dim: 1, name: panel.measure || 'Value' },
+    ],
+    series: [{ type: 'parallel', data: parallelData, lineStyle: { width: 1, opacity: 0.3 } }],
+  };
+  var instance = echarts.getInstanceByDom(panelEl);
+  if (!instance) instance = echarts.init(panelEl, THEME_NAME, { renderer: 'canvas' });
+  option.animation = false;
+  instance.clear();
+  instance.setOption(option, { notMerge: true });
+  return instance;
+}
+
 function renderLineChart(panelEl, panel, groupData) {
   var entries = groupData.entries || [];
   if (!entries.length) {
@@ -1668,6 +1936,29 @@ function renderAllPanels(panels, response, registry) {
         continue;
       }
 
+      // Table panels — DOM-based, no ECharts
+      if (panel._isTable) {
+        var bodyEl = document.getElementById('table-body-' + panel.id);
+        var countEl = document.getElementById('table-count-' + panel.id);
+        if (bodyEl) {
+          var tableEntries = groupData.entries || [];
+          var html = '';
+          for (var te = 0; te < Math.min(tableEntries.length, 50); ++te) {
+            var row = tableEntries[te];
+            html += '<tr>';
+            html += '<td>' + escapeHtml(String(row.key)) + '</td>';
+            var colCount = (panel.columns || []).length;
+            for (var tc = 1; tc < colCount; ++tc) {
+              html += '<td>' + (row.value && row.value.value != null ? row.value.value.toLocaleString() : '\u2014') + '</td>';
+            }
+            html += '</tr>';
+          }
+          bodyEl.innerHTML = html;
+          if (countEl) countEl.textContent = (groupData.total || tableEntries.length) + ' rows';
+        }
+        continue;
+      }
+
       var chartEl = document.getElementById('chart-' + panel.id);
       if (!chartEl) continue;
 
@@ -1691,6 +1982,18 @@ function renderAllPanels(panels, response, registry) {
         instance = renderSankeyChart(chartEl, panel, groupData);
       } else if (ecType === 'graph') {
         instance = renderGraphChart(chartEl, panel, groupData);
+      } else if (ecType === 'treemap' || ecType === 'sunburst' || ecType === 'tree') {
+        instance = renderHierarchyChart(chartEl, panel, response, registry);
+      } else if (ecType === 'radar') {
+        instance = renderRadarChart(chartEl, panel, groupData);
+      } else if (ecType === 'candlestick') {
+        instance = renderCandlestickChart(chartEl, panel, groupData);
+      } else if (ecType === 'boxplot') {
+        instance = renderBoxplotChart(chartEl, panel, groupData);
+      } else if (ecType === 'themeRiver') {
+        instance = renderThemeRiverChart(chartEl, panel, groupData);
+      } else if (ecType === 'parallel') {
+        instance = renderParallelChart(chartEl, panel, groupData);
       }
 
       if (instance && !_chartInstances[panel.id]) {
@@ -2517,6 +2820,16 @@ function buildPanelCard(panel, accentIdx, registry) {
     '</div>';
 
   } else if (panelFamily === 'relation') {
+    body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
+      buildSkeletonBars(6) +
+    '</div>';
+
+  } else if (panelFamily === 'hierarchy') {
+    body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
+      buildSkeletonBars(6) +
+    '</div>';
+
+  } else if (panelFamily === 'specialized') {
     body = '<div id="chart-' + panel.id + '" class="chart-wrap">' +
       buildSkeletonBars(6) +
     '</div>';

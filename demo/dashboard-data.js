@@ -161,6 +161,87 @@ function scanPanels(panels, registry) {
       }
     }
 
+    if (family === 'specialized') {
+      if (panel._dimField) groupByDims.add(panel._dimField);
+      if (panel.stream) groupByDims.add(panel.stream);
+      if (panel.axes && Array.isArray(panel.axes)) {
+        for (var ai = 0; ai < panel.axes.length; ++ai) {
+          if (registry.dimensions[panel.axes[ai]]) groupByDims.add(panel.axes[ai]);
+        }
+      }
+      // Multi-measure types: collect all measure slots as separate metrics
+      var specMetrics = [];
+      var measSlots = ['value', 'open', 'close', 'low', 'high', 'min', 'q1', 'median', 'q3', 'max'];
+      for (var ms = 0; ms < measSlots.length; ++ms) {
+        var mField = panel[measSlots[ms]];
+        if (mField && registry.measures[mField]) {
+          measures.add(mField);
+          specMetrics.push({ id: measSlots[ms], field: mField, op: inferReduceOp(mField, registry) });
+        }
+      }
+      if (specMetrics.length === 0) {
+        specMetrics.push({ id: 'value', field: null, op: 'count' });
+      }
+      groups.push({
+        id: panel.id,
+        field: panel._dimField || (panel.axes && panel.axes[0]) || null,
+        metrics: specMetrics,
+      });
+      panel._groupId = panel.id;
+    }
+
+    if (family === 'tabular') {
+      var cols = panel.columns;
+      if (Array.isArray(cols)) {
+        for (var ci = 0; ci < cols.length; ++ci) {
+          if (registry.dimensions[cols[ci]]) groupByDims.add(cols[ci]);
+          if (registry.measures[cols[ci]]) measures.add(cols[ci]);
+        }
+      }
+      // Use first dimension column as the group key
+      var firstDimCol = null;
+      if (Array.isArray(cols)) {
+        for (var fc = 0; fc < cols.length; ++fc) {
+          if (registry.dimensions[cols[fc]]) { firstDimCol = cols[fc]; break; }
+        }
+      }
+      if (firstDimCol) {
+        var tblOp = 'count';
+        groups.push({
+          id: panel.id,
+          field: firstDimCol,
+          metrics: [{ id: 'value', field: null, op: tblOp }],
+        });
+        panel._groupId = panel.id;
+      }
+      panel._isTable = true;
+    }
+
+    if (family === 'hierarchy') {
+      var levels = panel.levels;
+      if (Array.isArray(levels)) {
+        for (var lv = 0; lv < levels.length; ++lv) {
+          groupByDims.add(levels[lv]);
+        }
+      }
+      var hierMeasField = panel._measField;
+      var hierOp = hierMeasField ? inferReduceOp(hierMeasField, registry) : 'count';
+      if (Array.isArray(levels)) {
+        for (var lg = 0; lg < levels.length; ++lg) {
+          groups.push({
+            id: panel.id + '__level' + lg,
+            field: levels[lg],
+            metrics: [{ id: 'value', field: hierOp === 'count' ? null : hierMeasField, op: hierOp }],
+            splitField: lg > 0 ? levels[lg - 1] : null,
+          });
+        }
+      }
+      panel._groupId = panel.id + '__level0';
+      panel._allLevelGroupIds = Array.isArray(levels)
+        ? levels.map(function (_, idx) { return panel.id + '__level' + idx; })
+        : [];
+    }
+
     // KPI/gauge → classify as local (crossfilter) or remote (Cube query)
     // count and sum can be reduced locally; countDistinct and computed need Cube
     if (family === 'single' && panel._measField) {
@@ -348,6 +429,17 @@ function buildGroupQueries(panels) {
         includeTotals: false,
         visibleOnly: false,
       };
+    } else if (p._allLevelGroupIds && p._allLevelGroupIds.length > 0) {
+      // Hierarchy panels: register all level groups (no limit, all entries)
+      for (var lv = 0; lv < p._allLevelGroupIds.length; ++lv) {
+        queries[p._allLevelGroupIds[lv]] = {
+          limit: null,
+          sort: 'desc',
+          sortMetric: 'value',
+          includeTotals: false,
+          visibleOnly: true,
+        };
+      }
     } else {
       queries[p._groupId] = {
         limit: p._expanded ? null : p.limit,

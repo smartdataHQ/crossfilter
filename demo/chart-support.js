@@ -50,6 +50,19 @@ var SUPPORTED = {
   'sankey.vertical': true,
   graph: true,
   'graph.circular': true,
+  // tabular family
+  table: true,
+  // hierarchy family
+  treemap: true,
+  sunburst: true,
+  tree: true,
+  'tree.radial': true,
+  // specialized family
+  radar: true,
+  candlestick: true,
+  boxplot: true,
+  themeRiver: true,
+  parallel: true,
 };
 
 export function isChartSupported(typeName) {
