@@ -831,23 +831,31 @@ function renderLineChart(panelEl, panel, groupData) {
     }
   }
 
-  // Store time range bounds on panel for brush full-range detection
+  // Store time data on panel for brush range detection and click snapping
+  panel._timeData = xData;
   if (xData.length) {
     panel._timeRange = { min: xData[0], max: xData[xData.length - 1] };
   }
 
+  // Make the line itself clickable (not just symbols)
+  seriesOpts.triggerLineEvent = true;
+
+  // Vertical marker line on selected time slice
   if (selectedTimestamp != null) {
-    // Find the y value at the selected timestamp
-    var markY = null;
-    for (var mi = 0; mi < seriesData.length; ++mi) {
-      if (seriesData[mi][0] === selectedTimestamp) { markY = seriesData[mi][1]; break; }
-    }
-    if (markY != null) {
-      seriesOpts.markPoint = {
-        data: [{ coord: [selectedTimestamp, markY], symbol: 'circle', symbolSize: 12 }],
-        itemStyle: { color: '#3d8bfd' },
-      };
-    }
+    seriesOpts.markLine = {
+      silent: true,
+      symbol: 'none',
+      lineStyle: { type: 'solid', color: '#3d8bfd', width: 2, opacity: 0.6 },
+      label: {
+        formatter: function() {
+          return new Date(selectedTimestamp).toISOString().slice(0, 10);
+        },
+        position: 'start',
+        fontSize: 10,
+        color: '#3d8bfd',
+      },
+      data: [{ xAxis: selectedTimestamp }],
+    };
   }
 
   var option = {
@@ -956,6 +964,7 @@ function renderLineChart(panelEl, panel, groupData) {
         name: lineKey,
         data: lineData,
         showSymbol: false,
+        triggerLineEvent: true,
       };
       if (vizDef && vizDef.ecOptions) {
         if (vizDef.ecOptions.smooth) lineSeries.smooth = true;
@@ -1028,14 +1037,24 @@ function wireLineBrush(instance, panel) {
     }, 200);
   });
 
-  // Single time-slice click
+  // Single time-slice click — snap to nearest time bucket
   instance.on('click', function(params) {
     var ts = Array.isArray(params.value) ? params.value[0] : params.value;
     if (ts == null) return;
     ts = Number(ts);
 
+    // Snap to nearest bucket in xData
+    if (panel._timeData && panel._timeData.length) {
+      var bestIdx = 0;
+      var bestDist = Math.abs(panel._timeData[0] - ts);
+      for (var si = 1; si < panel._timeData.length; ++si) {
+        var dist = Math.abs(panel._timeData[si] - ts);
+        if (dist < bestDist) { bestDist = dist; bestIdx = si; }
+      }
+      ts = panel._timeData[bestIdx];
+    }
+
     var current = filterState[dim];
-    // Toggle: if same single timestamp, clear; otherwise set single
     var isSame = false;
     if (!Array.isArray(current)) {
       isSame = Number(current) === ts;
@@ -1901,16 +1920,14 @@ function buildPanelCard(panel, accentIdx, registry) {
   if (panel.chart === 'selector' || panel.chart === 'list') {
     headRight += '<span class="group-size-badge" id="count-' + panel.id + '"></span>';
   }
-  // Breakdown toggle — uses panel.dimension (set by resolvePanels before DOM build)
+  // Breakdown: double-click on card title activates breakdown
   var panelChartDef = getChartType(panel.chart);
   var panelFamily = panelChartDef ? panelChartDef.family : null;
-  if (panel.dimension && (panelFamily === 'category' || panelFamily === 'control') && panel.chart !== 'toggle' && panel.chart !== 'range') {
-    var isActiveBreakdown = filterState['_breakdown'] === panel.id;
-    headRight += '<sl-button size="small" variant="' + (isActiveBreakdown ? 'primary' : 'text') + '" class="breakdown-toggle" data-panel="' + panel.id + '" data-dim="' + escapeHtml(panel.dimension) + '" title="Break down time chart by ' + escapeHtml(panel.label) + '">\u2261</sl-button>';
-  }
+  var canBreakdown = panel.dimension && (panelFamily === 'category' || panelFamily === 'control') && panel.chart !== 'toggle' && panel.chart !== 'range';
+  var breakdownAttr = canBreakdown ? ' data-breakdown-panel="' + panel.id + '" data-breakdown-dim="' + escapeHtml(panel.dimension) + '"' : '';
 
-  var head = '<div class="card-head">' +
-    '<span class="card-t">' + escapeHtml(panel.label) + (dimDesc ? infoIcon(dimDesc) : '') + '</span>' +
+  var head = '<div class="card-head"' + breakdownAttr + '>' +
+    '<span class="card-t"' + (canBreakdown ? ' style="cursor:pointer" title="Double-click to break down time chart"' : '') + '>' + escapeHtml(panel.label) + (dimDesc ? infoIcon(dimDesc) : '') + '</span>' +
     '<div class="card-filters">' + headRight + '</div>' +
   '</div>';
 
@@ -2561,11 +2578,11 @@ async function main() {
       notifyFilterChange();
     });
 
-    // Wire breakdown toggles on category panels
-    container.addEventListener('click', function(e) {
-      var btn = e.target.closest('.breakdown-toggle');
-      if (!btn) return;
-      var panelId = btn.dataset.panel;
+    // Wire breakdown: double-click on card header activates breakdown
+    container.addEventListener('dblclick', function(e) {
+      var head = e.target.closest('[data-breakdown-panel]');
+      if (!head) return;
+      var panelId = head.dataset.breakdownPanel;
       var current = filterState['_breakdown'];
       if (current === panelId) {
         delete filterState['_breakdown'];
@@ -2573,11 +2590,6 @@ async function main() {
         filterState['_breakdown'] = panelId;
       }
       writeUrlState(filterState);
-      // Update all breakdown button states
-      var allBtns = container.querySelectorAll('.breakdown-toggle');
-      for (var b = 0; b < allBtns.length; ++b) {
-        allBtns[b].variant = allBtns[b].dataset.panel === filterState['_breakdown'] ? 'primary' : 'text';
-      }
       triggerBreakdownChange();
     });
 
