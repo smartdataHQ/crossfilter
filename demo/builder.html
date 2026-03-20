@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard Builder</title>
+  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Lato', system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; background: #f5f9ff; color: #000e4a; }
+
+    .builder-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; background: #fff; border-bottom: 1px solid rgba(63,101,135,0.1); flex-shrink: 0; }
+    .builder-title { font-size: 14px; font-weight: 700; color: #3f6587; }
+    .builder-status { font-size: 11px; color: #99b8cc; font-family: 'JetBrains Mono', monospace; }
+
+    .builder-body { flex: 1; display: flex; min-height: 0; }
+
+    .chat-panel { width: 380px; display: flex; flex-direction: column; border-right: 1px solid rgba(63,101,135,0.1); background: #fff; flex-shrink: 0; }
+    .chat-messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .chat-input-wrap { padding: 10px 12px; border-top: 1px solid rgba(63,101,135,0.1); display: flex; gap: 8px; }
+    .chat-input { flex: 1; border: 1px solid rgba(63,101,135,0.15); border-radius: 8px; padding: 10px 14px; font-family: inherit; font-size: 13px; resize: none; outline: none; min-height: 44px; max-height: 120px; }
+    .chat-input:focus { border-color: #3d8bfd; }
+    .chat-send { background: #3d8bfd; color: #fff; border: none; border-radius: 8px; padding: 10px 18px; font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+    .chat-send:hover { background: #2b7af0; }
+    .chat-send:disabled { background: #99b8cc; cursor: not-allowed; }
+
+    .msg { padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; max-width: 95%; word-wrap: break-word; }
+    .msg-user { background: #3d8bfd; color: #fff; align-self: flex-end; }
+    .msg-assistant { background: rgba(63,101,135,0.06); color: #000e4a; align-self: flex-start; }
+    .msg-system { background: rgba(0,201,120,0.08); color: #3f6587; align-self: center; font-size: 11px; text-align: center; }
+    .msg-error { background: rgba(239,69,101,0.08); color: #ef4565; align-self: center; font-size: 11px; }
+    .msg-config { font-family: 'JetBrains Mono', monospace; font-size: 10px; background: rgba(63,101,135,0.04); padding: 6px 10px; border-radius: 6px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; color: #3f6587; align-self: flex-start; max-width: 100%; cursor: pointer; }
+    .msg-config:hover { background: rgba(63,101,135,0.08); }
+
+    .preview-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    .preview-toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: rgba(63,101,135,0.03); border-bottom: 1px solid rgba(63,101,135,0.08); flex-shrink: 0; }
+    .preview-toolbar button { background: #fff; border: 1px solid rgba(63,101,135,0.15); border-radius: 6px; padding: 5px 12px; font-size: 11px; cursor: pointer; font-family: inherit; color: #3f6587; }
+    .preview-toolbar button:hover { border-color: #3d8bfd; color: #3d8bfd; }
+    .preview-label { font-size: 11px; color: #99b8cc; flex: 1; }
+    .preview-frame { flex: 1; border: none; background: #f5f9ff; }
+
+    .typing { display: inline-flex; gap: 4px; padding: 10px 14px; }
+    .typing span { width: 6px; height: 6px; border-radius: 50%; background: #99b8cc; animation: bounce 1.2s infinite; }
+    .typing span:nth-child(2) { animation-delay: 0.2s; }
+    .typing span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes bounce { 0%, 80%, 100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
+  </style>
+</head>
+<body>
+  <div class="builder-header">
+    <span class="builder-title">Dashboard Builder</span>
+    <span class="builder-status" id="status"></span>
+  </div>
+  <div class="builder-body">
+    <div class="chat-panel">
+      <div class="chat-messages" id="messages">
+        <div class="msg msg-system">Describe the dashboard you want to build. The AI will generate it and you can iterate.</div>
+      </div>
+      <div class="chat-input-wrap">
+        <textarea class="chat-input" id="input" placeholder="Describe your dashboard..." rows="1"></textarea>
+        <button class="chat-send" id="send">Send</button>
+      </div>
+    </div>
+    <div class="preview-panel">
+      <div class="preview-toolbar">
+        <span class="preview-label" id="preview-label">No dashboard yet</span>
+        <button id="btn-download">Download JSON</button>
+        <button id="btn-reload">Reload</button>
+      </div>
+      <iframe class="preview-frame" id="preview" src="about:blank"></iframe>
+    </div>
+  </div>
+
+<script>
+(function () {
+  var messagesEl = document.getElementById('messages');
+  var inputEl = document.getElementById('input');
+  var sendBtn = document.getElementById('send');
+  var statusEl = document.getElementById('status');
+  var previewEl = document.getElementById('preview');
+  var previewLabel = document.getElementById('preview-label');
+  var btnDownload = document.getElementById('btn-download');
+  var btnReload = document.getElementById('btn-reload');
+
+  // Conversation state
+  var conversation = []; // { role, content } — sent to OpenAI
+  var currentConfig = null;
+  var generating = false;
+
+  function addMessage(role, text) {
+    var el = document.createElement('div');
+    el.className = 'msg msg-' + role;
+    el.textContent = text;
+    messagesEl.appendChild(el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return el;
+  }
+
+  function addConfigPreview(config) {
+    var el = document.createElement('div');
+    el.className = 'msg-config';
+    var sections = (config.sections || []).length;
+    var panels = (config.sections || []).reduce(function (s, sec) { return s + (sec.panels || []).length; }, 0);
+    el.textContent = '"' + config.title + '" — ' + sections + ' sections, ' + panels + ' panels (click to expand)';
+    el.addEventListener('click', function () {
+      if (el.dataset.expanded === 'true') {
+        el.textContent = '"' + config.title + '" — ' + sections + ' sections, ' + panels + ' panels (click to expand)';
+        el.dataset.expanded = 'false';
+      } else {
+        el.textContent = JSON.stringify(config, null, 2);
+        el.dataset.expanded = 'true';
+      }
+    });
+    messagesEl.appendChild(el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function showTyping() {
+    var el = document.createElement('div');
+    el.className = 'msg msg-assistant typing';
+    el.id = 'typing';
+    el.innerHTML = '<span></span><span></span><span></span>';
+    messagesEl.appendChild(el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function hideTyping() {
+    var el = document.getElementById('typing');
+    if (el) el.remove();
+  }
+
+  function setGenerating(state) {
+    generating = state;
+    sendBtn.disabled = state;
+    sendBtn.textContent = state ? '...' : 'Send';
+    statusEl.textContent = state ? 'Generating...' : '';
+  }
+
+  async function generate(userMessage) {
+    // Add user message to conversation
+    conversation.push({ role: 'user', content: userMessage });
+    addMessage('user', userMessage);
+
+    // If we have a current config, inject it as assistant context
+    // so the LLM knows what to modify
+    var messagesToSend = conversation.slice();
+
+    // On subsequent turns, prepend the current config as context
+    if (currentConfig && conversation.length > 1) {
+      // Find the last assistant message and ensure config is there
+      var configContext = 'Current dashboard config:\n' + JSON.stringify(currentConfig, null, 2) +
+        '\n\nThe user wants to modify this dashboard. Update the config based on their feedback. Return the complete updated config.';
+      messagesToSend.push({ role: 'user', content: configContext });
+    }
+
+    setGenerating(true);
+    showTyping();
+
+    try {
+      var res = await fetch('/api/dashboard/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: messagesToSend }),
+      });
+
+      hideTyping();
+
+      if (!res.ok) {
+        var errData = await res.json().catch(function () { return { error: res.statusText }; });
+        throw new Error(errData.error || 'HTTP ' + res.status);
+      }
+
+      var data = await res.json();
+      currentConfig = data.config;
+
+      // Validate against supported chart types
+      var supportRes = await fetch('/api/chart-support');
+      var support = await supportRes.json();
+      var unsupportedSet = {};
+      for (var u = 0; u < support.unsupported.length; ++u) {
+        unsupportedSet[support.unsupported[u]] = true;
+      }
+
+      var issues = [];
+      var configSections = currentConfig.sections || [];
+      for (var si = 0; si < configSections.length; ++si) {
+        var sectionPanels = configSections[si].panels || [];
+        for (var pi = 0; pi < sectionPanels.length; ++pi) {
+          if (sectionPanels[pi].chart && unsupportedSet[sectionPanels[pi].chart]) {
+            issues.push(sectionPanels[pi].chart + ' ("' + (sectionPanels[pi].label || 'unnamed') + '")');
+          }
+        }
+      }
+      if (issues.length > 0) {
+        addMessage('error', 'Warning: ' + issues.length + ' panel(s) use unsupported chart types: ' +
+          issues.join(', ') + '. These will show placeholder panels.');
+      }
+
+      // Add assistant response to conversation (the config)
+      var assistantContent = JSON.stringify(currentConfig);
+      conversation.push({ role: 'assistant', content: assistantContent });
+
+      // Show summary
+      var sections = (currentConfig.sections || []).length;
+      var panels = (currentConfig.sections || []).reduce(function (s, sec) { return s + (sec.panels || []).length; }, 0);
+      var usage = data.usage || {};
+      var tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+      addMessage('system', 'Generated: ' + sections + ' sections, ' + panels + ' panels (' + tokens + ' tokens)');
+      addConfigPreview(currentConfig);
+
+      // Update preview
+      previewLabel.textContent = currentConfig.title || 'Dashboard';
+      previewEl.src = '/demo/dashboards/_draft';
+
+    } catch (err) {
+      hideTyping();
+      addMessage('error', 'Error: ' + err.message);
+    }
+
+    setGenerating(false);
+  }
+
+  // Send on click or Enter (Shift+Enter for newline)
+  sendBtn.addEventListener('click', function () {
+    var text = inputEl.value.trim();
+    if (!text || generating) return;
+    inputEl.value = '';
+    inputEl.style.height = 'auto';
+    generate(text);
+  });
+
+  inputEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendBtn.click();
+    }
+  });
+
+  // Auto-resize textarea
+  inputEl.addEventListener('input', function () {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+  });
+
+  // Download
+  btnDownload.addEventListener('click', function () {
+    if (!currentConfig) return;
+    var blob = new Blob([JSON.stringify(currentConfig, null, 2)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (currentConfig.title || 'dashboard').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.json';
+    a.click();
+  });
+
+  // Reload preview
+  btnReload.addEventListener('click', function () {
+    if (previewEl.src && previewEl.src !== 'about:blank') {
+      previewEl.src = previewEl.src;
+    }
+  });
+
+  inputEl.focus();
+})();
+</script>
+</body>
+</html>
