@@ -361,12 +361,11 @@ function buildKpiCubeQuery(cubeName, kpiMeasures, scanResult, registry, serverSt
     querySegments.push(cubeName + '.' + activeSegments[si]);
   }
 
-  // Time dimensions
-  var granularity = serverState.granularity ||
-    (registry._cubeMeta.granularity && registry._cubeMeta.granularity.default) || 'week';
+  // Time dimensions — NO granularity for KPIs (we want one aggregated row, not per-bucket)
+  // Only apply dateRange if set, to constrain the time window
   var timeDimensions = [];
   for (var t = 0; t < scanResult.timeDims.length; ++t) {
-    var td = { dimension: cubeName + '.' + scanResult.timeDims[t], granularity: granularity };
+    var td = { dimension: cubeName + '.' + scanResult.timeDims[t] };
     if (serverState.dateRange) td.dateRange = serverState.dateRange;
     timeDimensions.push(td);
   }
