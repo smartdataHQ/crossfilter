@@ -779,14 +779,38 @@ function renderLineChart(panelEl, panel, groupData) {
     if (ec.areaStyle) seriesOpts.areaStyle = ec.areaStyle;
   }
 
-  // Read current brush range from filterState to set initial dataZoom
   var dim = panel._dimField;
-  var currentRange = dim ? filterState[dim] : null;
-  var startValue = null;
-  var endValue = null;
-  if (currentRange && Array.isArray(currentRange) && currentRange.length === 2) {
-    startValue = Number(currentRange[0]);
-    endValue = Number(currentRange[1]);
+  var currentFilter = dim ? filterState[dim] : null;
+  var selectedTimestamp = null;
+  var rangeStart = null;
+  var rangeEnd = null;
+
+  if (currentFilter != null) {
+    if (Array.isArray(currentFilter) && currentFilter.length === 2) {
+      rangeStart = Number(currentFilter[0]);
+      rangeEnd = Number(currentFilter[1]);
+    } else {
+      selectedTimestamp = Number(Array.isArray(currentFilter) ? currentFilter[0] : currentFilter);
+    }
+  }
+
+  // Store time range bounds on panel for brush full-range detection
+  if (xData.length) {
+    panel._timeRange = { min: xData[0], max: xData[xData.length - 1] };
+  }
+
+  if (selectedTimestamp != null) {
+    // Find the y value at the selected timestamp
+    var markY = null;
+    for (var mi = 0; mi < seriesData.length; ++mi) {
+      if (seriesData[mi][0] === selectedTimestamp) { markY = seriesData[mi][1]; break; }
+    }
+    if (markY != null) {
+      seriesOpts.markPoint = {
+        data: [{ coord: [selectedTimestamp, markY], symbol: 'circle', symbolSize: 12 }],
+        itemStyle: { color: '#3d8bfd' },
+      };
+    }
   }
 
   var option = {
@@ -821,10 +845,10 @@ function renderLineChart(panelEl, panel, groupData) {
         filterMode: 'none',
         height: 30,
         bottom: 10,
-        startValue: startValue,
-        endValue: endValue,
-        start: startValue == null ? 0 : undefined,
-        end: endValue == null ? 100 : undefined,
+        startValue: rangeStart,
+        endValue: rangeEnd,
+        start: rangeStart == null ? 0 : undefined,
+        end: rangeEnd == null ? 100 : undefined,
         labelFormatter: function(val) {
           var d = new Date(val);
           return d.toISOString().slice(0, 10);
@@ -853,38 +877,50 @@ function wireLineBrush(instance, panel) {
   var dim = panel._dimField;
   var debounceTimer = 0;
 
-  instance.on('datazoom', function(params) {
-    // Get the current visible range from the xAxis
+  // Range brush via dataZoom
+  instance.on('datazoom', function() {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(function() {
       var option = instance.getOption();
       var zoom = option.dataZoom && option.dataZoom[0];
       if (!zoom) return;
 
-      var xAxis = option.xAxis && option.xAxis[0];
-      var xData = xAxis ? xAxis.data : [];
-      if (!xData.length) return;
+      var startVal = zoom.startValue;
+      var endVal = zoom.endValue;
 
-      // Calculate the start/end values from percentage or absolute
-      var startVal, endVal;
-      if (zoom.startValue != null && zoom.endValue != null) {
-        startVal = zoom.startValue;
-        endVal = zoom.endValue;
-      } else {
-        var startIdx = Math.round((zoom.start / 100) * (xData.length - 1));
-        var endIdx = Math.round((zoom.end / 100) * (xData.length - 1));
-        startVal = xData[Math.max(0, startIdx)];
-        endVal = xData[Math.min(xData.length - 1, endIdx)];
+      // If we have percentage-based values, convert using the time range
+      if (startVal == null && panel._timeRange) {
+        var range = panel._timeRange;
+        var span = range.max - range.min;
+        startVal = range.min + (zoom.start / 100) * span;
+        endVal = range.min + (zoom.end / 100) * span;
       }
 
-      // If full range, clear filter; otherwise set range
-      var isFullRange = startVal <= xData[0] && endVal >= xData[xData.length - 1];
-      if (isFullRange) {
+      if (startVal == null || endVal == null) return;
+
+      // Detect full range — clear filter
+      var tr = panel._timeRange;
+      if (tr && startVal <= tr.min && endVal >= tr.max) {
         setFilter(dim, null);
       } else {
-        setFilter(dim, [startVal, endVal]);
+        setFilter(dim, [Math.round(startVal), Math.round(endVal)]);
       }
     }, 200);
+  });
+
+  // Single time-slice click
+  instance.on('click', function(params) {
+    var ts = Array.isArray(params.value) ? params.value[0] : params.value;
+    if (ts == null) return;
+    ts = Number(ts);
+
+    var current = filterState[dim];
+    // Toggle: if same single timestamp, clear; otherwise set single
+    var isSame = false;
+    if (!Array.isArray(current)) {
+      isSame = Number(current) === ts;
+    }
+    setFilter(dim, isSame ? null : ts);
   });
 }
 
