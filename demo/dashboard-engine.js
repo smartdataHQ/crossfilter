@@ -893,22 +893,24 @@ function renderAllPanels(panels, response, registry) {
       var groupData = response.groups[panel._groupId];
       if (!groupData) continue;
 
+      // Selector/list panels — DOM-based, no ECharts, no chart-wrap
+      var chartDef = getChartType(panel.chart);
+      var ecType = chartDef ? chartDef.ecType : null;
+
+      if (!ecType && (panel.chart === 'selector' || panel.chart === 'dropdown')) {
+        renderSelectorList(panel, groupData);
+        continue;
+      }
+
       var chartEl = document.getElementById('chart-' + panel.id);
       if (!chartEl) continue;
 
       var instance = null;
-      var chartDef = getChartType(panel.chart);
-      var ecType = chartDef ? chartDef.ecType : null;
 
       if (ecType === 'bar' || ecType === 'pictorialBar') {
         instance = renderBarChart(chartEl, panel, groupData);
       } else if (ecType === 'pie' || ecType === 'funnel') {
         instance = renderPieChart(chartEl, panel, groupData);
-      }
-
-      // Selector/list panels — DOM-based, no ECharts
-      if (!ecType && (panel.chart === 'selector' || panel.chart === 'dropdown')) {
-        renderSelectorList(panel, groupData);
       }
 
       if (instance && !_chartInstances[panel.id]) {
