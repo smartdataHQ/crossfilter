@@ -719,11 +719,26 @@ function wireChartClick(instance, panel) {
     var dim = panel._dimField;
     var clickedValue = params.name || (params.data && params.data.name);
     if (!clickedValue) return;
+
     var current = filterState[dim];
-    if (current === clickedValue || (Array.isArray(current) && current.length === 1 && current[0] === clickedValue)) {
-      setFilter(dim, null);
+    var isMulti = params.event && params.event.event &&
+      (params.event.event.metaKey || params.event.event.ctrlKey);
+
+    if (isMulti) {
+      // Cmd/Ctrl+click: toggle value in multi-select array
+      var arr = current ? (Array.isArray(current) ? current.slice() : [current]) : [];
+      var idx = arr.indexOf(clickedValue);
+      if (idx >= 0) {
+        arr.splice(idx, 1);
+      } else {
+        arr.push(clickedValue);
+      }
+      setFilter(dim, arr.length ? arr : null);
     } else {
-      setFilter(dim, clickedValue);
+      // Normal click: radio toggle (select one or deselect)
+      var isSame = current === clickedValue ||
+        (Array.isArray(current) && current.length === 1 && current[0] === clickedValue);
+      setFilter(dim, isSame ? null : clickedValue);
     }
   });
 }
@@ -2028,9 +2043,10 @@ async function main() {
     await data.ready;
     console.log('[dashboard] Data loaded, rendering charts...');
 
+    // Use module-scoped _dashboardData so this listener survives reloads
     filterListeners.push(function(newFilterState) {
-      data.query(newFilterState).then(function(response) {
-        renderAllPanels(resolvedPanels, response, registry);
+      _dashboardData.query(newFilterState).then(function(response) {
+        renderAllPanels(_dashboardPanels, response, _dashboardRegistry);
       });
     });
 
