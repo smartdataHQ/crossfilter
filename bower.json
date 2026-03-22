@@ -1,6 +1,6 @@
 {
-  "name": "crossfilter2",
-  "description": "Fast multidimensional filtering for coordinated views.",
+  "name": "crossfilter3",
+  "description": "Fast multidimensional filtering with Arrow streaming, WASM filters, and worker-backed dashboard runtimes.",
   "main": "crossfilter.min.js",
   "license": "Apache-2.0",
   "keywords": [

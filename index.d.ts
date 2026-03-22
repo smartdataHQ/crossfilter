@@ -131,7 +131,9 @@ declare namespace crossfilter {
     append(records: TRecord[]): number;
     appendArrowTable(table: ArrowTableLike, options?: ColumnarOptions<TRecord>): number;
     appendColumns(columns: Record<string, ColumnSource>, options?: ColumnarOptions<TRecord>): number;
+    createGroup(spec: DashboardGroupSpec): string;
     dispose(): void;
+    disposeGroup(id: string): void;
     query(request?: DashboardQueryRequest): { rows: TRecord[]; snapshot: DashboardSnapshot };
     removeFiltered(selection?: DashboardRemoveSelection): number;
     reset(): RuntimeInfo;
@@ -144,7 +146,9 @@ declare namespace crossfilter {
 
   export interface AsyncDashboardRuntime {
     append(records: Array<Record<string, unknown>>): Promise<number>;
+    createGroup(spec: DashboardGroupSpec): Promise<string>;
     dispose(): Promise<void>;
+    disposeGroup(id: string): Promise<void>;
     query(request?: DashboardQueryRequest): Promise<{ rows: Array<Record<string, unknown>>; snapshot: DashboardSnapshot }>;
     removeFiltered(selection?: DashboardRemoveSelection): Promise<number>;
     reset(): Promise<RuntimeInfo>;

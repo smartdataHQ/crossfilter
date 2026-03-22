@@ -1,4 +1,4 @@
-// https://github.com/smartdataHQ/crossfilter v2.0.1 Copyright 2026 SmartData HQ
+// https://github.com/smartdataHQ/crossfilter v3.0.0 Copyright 2026 Mike Bostock
 (function (global, factory) {
   typeof exports === 'object' && typeof module !== 'undefined' ? module.exports = factory() :
   typeof define === 'function' && define.amd ? define(factory) :
@@ -570,8 +570,8 @@
   };
 
   const COLUMNAR_BATCH_KEY = typeof Symbol !== "undefined"
-    ? Symbol.for("crossfilter2.columnarBatch")
-    : "__crossfilter2ColumnarBatch__";
+    ? Symbol.for("crossfilter3.columnarBatch")
+    : "__crossfilter3ColumnarBatch__";
 
   function isArrayIndex(prop) {
     if (typeof prop === "symbol") {
@@ -2269,10 +2269,11 @@
       dimensions[dimensionFields[fieldIndex]] = cf.dimension(dimensionFields[fieldIndex]);
     }
 
-    for (var groupIndex = 0; groupIndex < groupSpecs.length; ++groupIndex) {
-      var groupSpec = groupSpecs[groupIndex];
+    var nextGroupIndex = 0;
+    for (nextGroupIndex = 0; nextGroupIndex < groupSpecs.length; ++nextGroupIndex) {
+      var groupSpec = groupSpecs[nextGroupIndex];
       var groupDimension = ensureDimension(dimensions, dimensionFields, cf, groupSpec.field);
-      var groupRuntime = createGroupRuntime(groupDimension, groupSpec, groupIndex);
+      var groupRuntime = createGroupRuntime(groupDimension, groupSpec, nextGroupIndex);
       groupRuntimes[groupRuntime.id] = groupRuntime;
     }
 
@@ -2560,8 +2561,7 @@
       },
       createGroup: function(spec) {
         var groupDimension = ensureDimension(dimensions, dimensionFields, cf, spec.field);
-        var groupIndex = Object.keys(groupRuntimes).length;
-        var groupRuntime = createGroupRuntime(groupDimension, spec, groupIndex);
+        var groupRuntime = createGroupRuntime(groupDimension, spec, nextGroupIndex++);
         groupRuntimes[groupRuntime.id] = groupRuntime;
         return groupRuntime.id;
       },
@@ -2692,6 +2692,9 @@
       "  var message = event.data || {};",
       "  var id = message.id;",
       "  try {",
+      "    if (message.type !== 'init' && message.type !== 'dispose') {",
+      "      if (!runtime) throw new Error('Dashboard worker is not initialized.');",
+      "    }",
       "    switch (message.type) {",
       "      case 'init': {",
       "        var arrow = self.Arrow;",
@@ -2719,69 +2722,36 @@
       "        return;",
       "      }",
       "      case 'snapshot':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.snapshot(message.payload.filters, message.payload.options || null));",
       "        return;",
       "      case 'groups':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.groups(message.payload.request));",
       "        return;",
       "      case 'bounds':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.bounds(message.payload.request));",
       "        return;",
       "      case 'query':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.query(message.payload.request));",
       "        return;",
       "      case 'rows':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.rows(message.payload.query));",
       "        return;",
       "      case 'rowSets':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.rowSets(message.payload.request));",
       "        return;",
       "      case 'append':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.append(message.payload.records || []));",
       "        return;",
       "      case 'removeFiltered':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.removeFiltered(message.payload.selection));",
       "        return;",
       "      case 'updateFilters':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.updateFilters(message.payload.filters));",
       "        return;",
       "      case 'reset':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.reset());",
       "        return;",
       "      case 'runtimeInfo':",
-      "        if (!runtime) {",
-      "          throw new Error('Dashboard worker is not initialized.');",
-      "        }",
       "        respond(id, runtime.runtimeInfo());",
       "        return;",
       "      case 'dispose':",
@@ -3876,6 +3846,9 @@ self.onmessage = async function(event) {
   var message = event.data || {};
   var id = message.id;
   try {
+    if (message.type !== 'initStreaming' && message.type !== 'dispose') {
+      if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+    }
     switch (message.type) {
       case 'initStreaming': {
         runtimeConfig = {
@@ -3895,55 +3868,42 @@ self.onmessage = async function(event) {
         return;
       }
       case 'snapshot':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.snapshot(message.payload.filters, message.payload.options || null));
         return;
       case 'groups':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.groups(message.payload.request));
         return;
       case 'bounds':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.bounds(message.payload.request));
         return;
       case 'query':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.query(message.payload.request));
         return;
       case 'append':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.append(message.payload.records || []));
         return;
       case 'updateFilters':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.updateFilters(message.payload.filters));
         return;
       case 'createGroup':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.createGroup(message.payload.spec));
         return;
       case 'disposeGroup':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.disposeGroup(message.payload.id));
         return;
       case 'rows':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.rows(message.payload.query));
         return;
       case 'rowSets':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.rowSets(message.payload.request));
         return;
       case 'removeFiltered':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.removeFiltered(message.payload.selection));
         return;
       case 'reset':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.reset());
         return;
       case 'runtimeInfo':
-        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.runtimeInfo());
         return;
       case 'dispose':
@@ -7492,7 +7452,7 @@ self.onmessage = async function(event) {
         : 0x100000000;
   }
 
-  var version = "2.0.1";
+  var version = "3.0.0";
 
   // Note(cg): exporting current version for umd build.
   crossfilter.version = version;

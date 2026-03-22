@@ -1,10 +1,10 @@
-# @smartdatahq/crossfilter
+# crossfilter3
 
 > **A streaming-first, zero-copy analytics engine for the browser.**
 
-Crossfilter2 is already the fastest way to filter large datasets client-side. This fork turns it into a complete dashboard runtime — data streams in as Arrow IPC, decodes and filters inside a Web Worker (main thread never blocks), WASM accelerates the hot filter scan, and partial snapshots render the UI progressively before the download even finishes.
+Crossfilter3 is built on top of crossfilter2, already the fastest way to filter large datasets client-side. This fork turns it into a complete dashboard runtime — data streams in as Arrow IPC, decodes and filters inside a Web Worker (main thread never blocks), WASM accelerates the hot filter scan, and partial snapshots render the UI progressively before the download even finishes.
 
-### What this fork adds to crossfilter2
+### What crossfilter3 adds to crossfilter2
 
 | Layer | What changed | Why it matters |
 |-------|-------------|----------------|
@@ -93,7 +93,7 @@ The demo's store manager dashboard previously used 4 identical `rowSets` (stocko
 ## Installation
 
 ```bash
-npm install @smartdatahq/crossfilter apache-arrow
+npm install crossfilter3 apache-arrow
 ```
 
 The streaming worker needs UMD bundles of both libraries available at public HTTP URLs. In a **Next.js** project, copy them into `public/` with a postinstall script:
@@ -102,7 +102,7 @@ The streaming worker needs UMD bundles of both libraries available at public HTT
 // package.json
 {
   "scripts": {
-    "postinstall": "mkdir -p public/vendor && cp node_modules/@smartdatahq/crossfilter/crossfilter.js public/vendor/ && cp node_modules/apache-arrow/Arrow.es2015.min.js public/vendor/"
+    "postinstall": "mkdir -p public/vendor && cp node_modules/crossfilter3/crossfilter.js public/vendor/ && cp node_modules/apache-arrow/Arrow.es2015.min.js public/vendor/"
   }
 }
 ```
@@ -120,7 +120,7 @@ const runtime = await crossfilter.createStreamingDashboardWorker({
 ## Quick start
 
 ```js
-import crossfilter from '@smartdatahq/crossfilter';
+import crossfilter from 'crossfilter3';
 
 const runtime = await crossfilter.createStreamingDashboardWorker({
   crossfilterUrl: '/vendor/crossfilter.js',
@@ -260,7 +260,7 @@ await runtime.removeFiltered('excluded');
 For smaller datasets or environments where workers are unavailable:
 
 ```js
-import crossfilter from '@smartdatahq/crossfilter';
+import crossfilter from 'crossfilter3';
 import { tableFromIPC } from 'apache-arrow';
 
 const buffer = await fetch('/data/result.arrow').then(r => r.arrayBuffer());
@@ -286,7 +286,7 @@ const snapshot = runtime.snapshot({
 The original crossfilter API is still fully available:
 
 ```js
-import crossfilter from '@smartdatahq/crossfilter';
+import crossfilter from 'crossfilter3';
 
 const cf = crossfilter(records);
 const country = cf.dimension('country');
