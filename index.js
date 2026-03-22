@@ -1,6 +1,6 @@
-// Note(cg): exporting current version for umd build.
 import crossfilter from './src/index.js';
-import { version } from './package.json';
+import { version } from './src/version.js';
+
 crossfilter.version = version;
 
 export default crossfilter;
