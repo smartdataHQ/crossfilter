@@ -119,6 +119,12 @@ function createWorkerSource(crossfilterUrl, arrowUrl) {
     "      case 'query':",
     "        respond(id, runtime.query(message.payload.request));",
     "        return;",
+    "      case 'createGroup':",
+    "        respond(id, runtime.createGroup(message.payload.spec));",
+    "        return;",
+    "      case 'disposeGroup':",
+    "        respond(id, runtime.disposeGroup(message.payload.id));",
+    "        return;",
     "      case 'rows':",
     "        respond(id, runtime.rows(message.payload.query));",
     "        return;",
@@ -288,6 +294,12 @@ export function createDashboardWorker(options) {
       },
       query: function(request) {
         return call('query', { request: request || null });
+      },
+      createGroup: function(spec) {
+        return call("createGroup", { spec: spec });
+      },
+      disposeGroup: function(groupId) {
+        return call("disposeGroup", { id: groupId });
       },
       groups: function(request) {
         return call("groups", { request: request || null });

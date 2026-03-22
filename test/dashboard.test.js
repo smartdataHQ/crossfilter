@@ -796,6 +796,91 @@ describe("dashboard runtime", () => {
     })).toThrow("requires non-empty `lookup.keyFields` and `lookup.valueFields`");
   });
 
+  it("supports dynamic groups in the non-streaming worker runtime", async () => {
+    function createStubWorker() {
+      const listeners = {
+        error: new Set(),
+        message: new Set(),
+      };
+
+      function emit(type, event) {
+        listeners[type].forEach((listener) => {
+          listener(event);
+        });
+      }
+
+      return {
+        addEventListener(type, listener) {
+          listeners[type].add(listener);
+        },
+        postMessage(message) {
+          queueMicrotask(() => {
+            switch (message.type) {
+              case "init":
+                emit("message", {
+                  data: {
+                    id: message.id,
+                    ok: true,
+                    payload: {
+                      runtime: {
+                        active: "js",
+                        lastError: null,
+                        wasmEnabled: true,
+                        wasmSupported: true,
+                      },
+                    },
+                  },
+                });
+                return;
+              case "createGroup":
+                emit("message", {
+                  data: {
+                    id: message.id,
+                    ok: true,
+                    payload: "countries",
+                  },
+                });
+                return;
+              case "dispose":
+              case "disposeGroup":
+                emit("message", {
+                  data: {
+                    id: message.id,
+                    ok: true,
+                    payload: null,
+                  },
+                });
+                return;
+              default:
+                emit("message", {
+                  data: {
+                    id: message.id,
+                    ok: true,
+                    payload: undefined,
+                  },
+                });
+            }
+          });
+        },
+        terminate() {},
+      };
+    }
+
+    const runtime = await crossfilter.createDashboardWorker({
+      arrowBuffer: new Uint8Array([1, 2, 3]),
+      workerFactory: createStubWorker,
+    });
+
+    await expect(runtime.createGroup({
+      field: "country",
+      id: "countries",
+      metrics: [{ id: "rows", op: "count" }],
+    })).resolves.toBe("countries");
+    await expect(runtime.disposeGroup("countries")).resolves.toBeNull();
+
+    await runtime.dispose();
+  });
+
   it("splitField produces nested aggregates keyed by split dimension", () => {
     const runtime = crossfilter.createDashboardRuntime({
       dimensions: ["date", "store", "product"],

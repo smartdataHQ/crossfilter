@@ -26,6 +26,19 @@ const config = {
 export default [
   config,
   {
+    input: `index.js`,
+    output: {
+      file: `${name}.cjs`,
+      format: "cjs",
+      exports: "default",
+      indent: true,
+      banner: config.output.banner
+    },
+    plugins: [
+      ...config.plugins
+    ]
+  },
+  {
     ...config,
     output: {
       ...config.output,

@@ -1,4 +1,5 @@
-export = crossfilter;
+export default crossfilter;
+export as namespace crossfilter;
 
 declare function crossfilter<T>(records?: T[]): crossfilter.Crossfilter<T>;
 
@@ -89,6 +90,8 @@ declare namespace crossfilter {
     field: string;
     id?: string;
     metrics?: DashboardMetricSpec[];
+    sortMetric?: string;
+    splitField?: string;
   }
 
   export type DashboardFilter =
@@ -103,6 +106,7 @@ declare namespace crossfilter {
   export type DashboardRemoveSelection = 'included' | 'excluded';
 
   export interface DashboardRowQuery {
+    columnar?: boolean;
     direction?: DashboardRowDirection;
     fields?: string[];
     limit?: number;
@@ -110,9 +114,89 @@ declare namespace crossfilter {
     sortBy?: string;
   }
 
+  export interface DashboardColumnarRows {
+    columns: Record<string, ColumnSource>;
+    fields: string[];
+    length: number;
+  }
+
+  export type DashboardRowsResult<TRecord = Record<string, unknown>> =
+    | TRecord[]
+    | DashboardColumnarRows;
+
+  export interface DashboardBoundsRequest {
+    fields?: string[];
+  }
+
+  export interface DashboardBoundsResult {
+    [field: string]: {
+      max: NaturallyOrderedValue | null;
+      min: NaturallyOrderedValue | null;
+    };
+  }
+
+  export interface DashboardGroupQuery {
+    includeKeys?: NaturallyOrderedValue[];
+    includeTotals?: boolean;
+    keys?: NaturallyOrderedValue[];
+    limit?: number;
+    nonEmptyKeys?: boolean;
+    offset?: number;
+    search?: string;
+    sort?: 'asc' | 'desc' | 'natural';
+    sortMetric?: string;
+    visibleOnly?: boolean;
+  }
+
+  export interface DashboardGroupResultEntry {
+    key: NaturallyOrderedValue;
+    value: Record<string, unknown>;
+  }
+
+  export interface DashboardGroupQueryResult {
+    entries: DashboardGroupResultEntry[];
+    limit: number | null;
+    offset: number;
+    sort: 'asc' | 'desc' | 'natural';
+    sortMetric: string | null;
+    total?: number;
+  }
+
+  export type DashboardGroupResult =
+    | DashboardGroupResultEntry[]
+    | DashboardGroupQueryResult;
+
+  export type DashboardGroupsRequest = Record<string, DashboardGroupQuery | false | null | undefined>;
+  export type DashboardGroupsResult = Record<string, DashboardGroupResult>;
+
+  export type DashboardRowSetsRequest = Record<string, DashboardRowQuery | false | null | undefined>;
+  export type DashboardRowSetsResult<TRecord = Record<string, unknown>> = Record<
+    string,
+    DashboardRowsResult<TRecord>
+  >;
+
+  export interface DashboardSnapshotRequest {
+    groups?: DashboardGroupsRequest | false | null;
+  }
+
   export interface DashboardQueryRequest {
+    bounds?: DashboardBoundsRequest | null;
     filters?: DashboardFilterState | null;
+    groups?: DashboardGroupsRequest | null;
+    isolatedFilters?: DashboardFilterState | null;
+    rowCount?: boolean;
     rows?: DashboardRowQuery | null;
+    rowSets?: DashboardRowSetsRequest | null;
+    snapshot?: DashboardSnapshotRequest | false | null;
+  }
+
+  export interface DashboardQueryResponse<TRecord = Record<string, unknown>> {
+    bounds?: DashboardBoundsResult;
+    groups?: DashboardGroupsResult;
+    rowCount?: number;
+    rows: DashboardRowsResult<TRecord>;
+    rowSets?: DashboardRowSetsResult<TRecord>;
+    snapshot: DashboardSnapshot | null;
   }
 
   export interface DashboardSnapshot {
@@ -120,7 +204,7 @@ declare namespace crossfilter {
       string,
       Array<{
         key: NaturallyOrderedValue;
-        value: Record<string, number | null>;
+        value: Record<string, unknown>;
       }>
     >;
     kpis: Record<string, number | null>;
@@ -131,30 +215,38 @@ declare namespace crossfilter {
     append(records: TRecord[]): number;
     appendArrowTable(table: ArrowTableLike, options?: ColumnarOptions<TRecord>): number;
     appendColumns(columns: Record<string, ColumnSource>, options?: ColumnarOptions<TRecord>): number;
+    bounds(request?: DashboardBoundsRequest): DashboardBoundsResult;
     createGroup(spec: DashboardGroupSpec): string;
     dispose(): void;
     disposeGroup(id: string): void;
-    query(request?: DashboardQueryRequest): { rows: TRecord[]; snapshot: DashboardSnapshot };
+    groups(request?: { filters?: DashboardFilterState | null; groups?: DashboardGroupsRequest | null } | DashboardGroupsRequest): DashboardGroupsResult;
+    query(request?: DashboardQueryRequest): DashboardQueryResponse<TRecord>;
     removeFiltered(selection?: DashboardRemoveSelection): number;
     reset(): RuntimeInfo;
-    rows(query?: DashboardRowQuery): TRecord[];
+    rowCount(request?: { filters?: DashboardFilterState | null }): number;
+    rows(query?: DashboardRowQuery): DashboardRowsResult<TRecord>;
+    rowSets(request?: { filters?: DashboardFilterState | null; rowSets?: DashboardRowSetsRequest | null } | DashboardRowSetsRequest): DashboardRowSetsResult<TRecord>;
     runtimeInfo(): RuntimeInfo;
     size(): number;
-    snapshot(filters?: DashboardFilterState): DashboardSnapshot;
+    snapshot(filters?: DashboardFilterState, options?: DashboardSnapshotRequest): DashboardSnapshot;
     updateFilters(filters?: DashboardFilterState): RuntimeInfo;
   }
 
   export interface AsyncDashboardRuntime {
     append(records: Array<Record<string, unknown>>): Promise<number>;
+    bounds(request?: DashboardBoundsRequest): Promise<DashboardBoundsResult>;
     createGroup(spec: DashboardGroupSpec): Promise<string>;
     dispose(): Promise<void>;
     disposeGroup(id: string): Promise<void>;
-    query(request?: DashboardQueryRequest): Promise<{ rows: Array<Record<string, unknown>>; snapshot: DashboardSnapshot }>;
+    groups(request?: { filters?: DashboardFilterState | null; groups?: DashboardGroupsRequest | null } | DashboardGroupsRequest): Promise<DashboardGroupsResult>;
+    query(request?: DashboardQueryRequest): Promise<DashboardQueryResponse<Record<string, unknown>>>;
     removeFiltered(selection?: DashboardRemoveSelection): Promise<number>;
     reset(): Promise<RuntimeInfo>;
-    rows(query?: DashboardRowQuery): Promise<Array<Record<string, unknown>>>;
+    rowCount(request?: { filters?: DashboardFilterState | null }): Promise<number>;
+    rows(query?: DashboardRowQuery): Promise<DashboardRowsResult<Record<string, unknown>>>;
+    rowSets(request?: { filters?: DashboardFilterState | null; rowSets?: DashboardRowSetsRequest | null } | DashboardRowSetsRequest): Promise<DashboardRowSetsResult<Record<string, unknown>>>;
     runtimeInfo(): Promise<RuntimeInfo>;
-    snapshot(filters?: DashboardFilterState): Promise<DashboardSnapshot>;
+    snapshot(filters?: DashboardFilterState, options?: DashboardSnapshotRequest): Promise<DashboardSnapshot>;
     updateFilters(filters?: DashboardFilterState): Promise<RuntimeInfo>;
     workerRuntime: RuntimeInfo;
   }
@@ -182,7 +274,7 @@ declare namespace crossfilter {
     | 'error'
     | 'aborted';
 
-  export type DashboardProjectionTransform = 'timestampMs';
+  export type DashboardProjectionTransform = 'timestampMs' | 'number' | 'constantOne';
 
   export interface DashboardStreamProjection {
     fields?: string[];

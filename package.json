@@ -1,6 +1,6 @@
 {
   "name": "crossfilter3",
-  "version": "3.0.1",
+  "version": "3.0.2",
   "description": "Fork of crossfilter2 adding Arrow streaming, WASM-accelerated filters, declarative dashboard runtimes, and Web Worker support.",
   "license": "Apache-2.0",
   "keywords": [
@@ -34,7 +34,7 @@
     }
   ],
   "homepage": "https://github.com/smartdataHQ/crossfilter",
-  "main": "./crossfilter.js",
+  "main": "./crossfilter.cjs",
   "module": "main.js",
   "types": "./index.d.ts",
   "unpkg": "./crossfilter.min.js",
@@ -43,6 +43,21 @@
     "url": "https://github.com/smartdataHQ/crossfilter.git"
   },
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./main.js",
+      "require": "./crossfilter.cjs",
+      "default": "./main.js"
+    },
+    "./main.js": "./main.js",
+    "./index.js": "./index.js",
+    "./crossfilter.cjs": "./crossfilter.cjs",
+    "./crossfilter.js": "./crossfilter.js",
+    "./crossfilter.min.js": "./crossfilter.min.js",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
   "dependencies": {
     "@ranfdev/deepobj": "1.0.2"
   },
@@ -65,14 +80,15 @@
     "benchmark": "node test/benchmark.js",
     "benchmark:arrow": "node test/benchmark-arrow.mjs",
     "build": "rollup -c rollup.config.js",
-    "clean": "rm -f crossfilter.js crossfilter.min.js",
-    "test": "vitest && eslint src/"
+    "clean": "rm -f crossfilter.cjs crossfilter.js crossfilter.min.js",
+    "test": "vitest run && eslint src/"
   },
   "files": [
     "index.js",
     "main.js",
     "src/**",
     "index.d.ts",
+    "crossfilter.cjs",
     "crossfilter.js",
     "crossfilter.min.js"
   ],

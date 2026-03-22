@@ -1,4 +1,4 @@
-// https://github.com/smartdataHQ/crossfilter v3.0.1 Copyright 2026 Mike Bostock
+// https://github.com/smartdataHQ/crossfilter v3.0.2 Copyright 2026 Mike Bostock
 (function (global, factory) {
   typeof exports === 'object' && typeof module !== 'undefined' ? module.exports = factory() :
   typeof define === 'function' && define.amd ? define(factory) :
@@ -2733,6 +2733,12 @@
       "      case 'query':",
       "        respond(id, runtime.query(message.payload.request));",
       "        return;",
+      "      case 'createGroup':",
+      "        respond(id, runtime.createGroup(message.payload.spec));",
+      "        return;",
+      "      case 'disposeGroup':",
+      "        respond(id, runtime.disposeGroup(message.payload.id));",
+      "        return;",
       "      case 'rows':",
       "        respond(id, runtime.rows(message.payload.query));",
       "        return;",
@@ -2902,6 +2908,12 @@
         },
         query: function(request) {
           return call('query', { request: request || null });
+        },
+        createGroup: function(spec) {
+          return call("createGroup", { spec: spec });
+        },
+        disposeGroup: function(groupId) {
+          return call("disposeGroup", { id: groupId });
         },
         groups: function(request) {
           return call("groups", { request: request || null });
@@ -7452,9 +7464,8 @@ self.onmessage = async function(event) {
         : 0x100000000;
   }
 
-  var version = "3.0.1";
+  const version = "3.0.2";
 
-  // Note(cg): exporting current version for umd build.
   crossfilter.version = version;
 
   return crossfilter;
