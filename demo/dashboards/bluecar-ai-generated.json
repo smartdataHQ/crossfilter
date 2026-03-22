@@ -1,0 +1,278 @@
+{
+  "title": "Iceland Tourism Analytics",
+  "cubes": [
+    "bluecar_stays"
+  ],
+  "sharedFilters": [
+    {
+      "dimension": "stay_ended_at",
+      "cubes": [
+        "bluecar_stays"
+      ]
+    },
+    {
+      "dimension": "stay_duration_tier",
+      "cubes": [
+        "bluecar_stays"
+      ]
+    },
+    {
+      "dimension": "vehicle_make",
+      "cubes": [
+        "bluecar_stays"
+      ]
+    },
+    {
+      "dimension": "activity_type",
+      "cubes": [
+        "bluecar_stays"
+      ]
+    }
+  ],
+  "sections": [
+    {
+      "id": "stay_patterns",
+      "label": "Stay Patterns Overview",
+      "location": "main",
+      "columns": 2,
+      "collapsed": false,
+      "panels": [
+        {
+          "chart": "kpi",
+          "cube": "bluecar_stays",
+          "label": "Total Stay Events",
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "count"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_stays",
+          "label": "Median Stay Duration (s)",
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "median_stay_duration_s"
+        },
+        {
+          "chart": "line.area",
+          "cube": "bluecar_stays",
+          "label": "Stay Events Over Time",
+          "limit": null,
+          "searchable": false,
+          "width": "full",
+          "x": "stay_ended_at",
+          "y": "count"
+        },
+        {
+          "chart": "bar",
+          "cube": "bluecar_stays",
+          "label": "Stay Duration Distribution",
+          "limit": null,
+          "searchable": false,
+          "width": "full",
+          "category": "stay_duration_tier",
+          "value": null
+        }
+      ]
+    },
+    {
+      "id": "vehicle_fleet",
+      "label": "Vehicle Fleet Breakdown",
+      "location": "main",
+      "columns": 2,
+      "collapsed": false,
+      "panels": [
+        {
+          "chart": "pie.rose",
+          "cube": "bluecar_stays",
+          "label": "Vehicle Make Distribution",
+          "limit": null,
+          "searchable": true,
+          "width": "full",
+          "name": "vehicle_make",
+          "value": null
+        },
+        {
+          "chart": "bar.horizontal",
+          "cube": "bluecar_stays",
+          "label": "Fuel Type Distribution",
+          "limit": null,
+          "searchable": false,
+          "width": "full",
+          "category": "fuel_type",
+          "value": null
+        },
+        {
+          "chart": "bar.stacked",
+          "cube": "bluecar_stays",
+          "label": "Vehicles by Class and Drive Type",
+          "limit": null,
+          "searchable": false,
+          "width": "full",
+          "category": "car_class",
+          "value": null,
+          "stack": "drive_type"
+        }
+      ]
+    },
+    {
+      "id": "geographic_distribution",
+      "label": "Geographic Distribution",
+      "location": "main",
+      "columns": 2,
+      "collapsed": false,
+      "panels": [
+        {
+          "chart": "heatmap",
+          "cube": "bluecar_stays",
+          "label": "Stays by Region and Municipality",
+          "limit": null,
+          "searchable": true,
+          "width": "full",
+          "x": "region",
+          "y": "municipality",
+          "value": "count"
+        },
+        {
+          "chart": "treemap",
+          "cube": "bluecar_stays",
+          "label": "Geographic Hierarchy",
+          "limit": null,
+          "searchable": false,
+          "width": "full",
+          "levels": [
+            "country",
+            "region",
+            "municipality"
+          ],
+          "value": "count"
+        }
+      ]
+    },
+    {
+      "id": "poi_analysis",
+      "label": "Points of Interest Analysis",
+      "location": "main",
+      "columns": 2,
+      "collapsed": false,
+      "panels": [
+        {
+          "chart": "gauge",
+          "cube": "bluecar_stays",
+          "label": "POI Match Rate",
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "poi_match_rate"
+        },
+        {
+          "chart": "line",
+          "cube": "bluecar_stays",
+          "label": "POI vs Non-POI Stay Events Over Time",
+          "limit": null,
+          "searchable": false,
+          "width": "full",
+          "x": "stay_ended_at",
+          "y": "poi_stay_count"
+        },
+        {
+          "chart": "funnel.ascending",
+          "cube": "bluecar_stays",
+          "label": "Top POI Categories",
+          "limit": 5,
+          "searchable": true,
+          "width": "full",
+          "name": "poi_category",
+          "value": "poi_stay_count"
+        },
+        {
+          "chart": "scatter.bubble",
+          "cube": "bluecar_stays",
+          "label": "POI Match Score vs Distance",
+          "limit": 100,
+          "searchable": false,
+          "width": "full",
+          "x": "poi_match_score",
+          "y": "avg_poi_distance_m",
+          "size": "poi_stay_count",
+          "color": "poi_category"
+        }
+      ]
+    },
+    {
+      "id": "filter_controls",
+      "label": "Filter Controls",
+      "location": "modelbar",
+      "columns": null,
+      "collapsed": false,
+      "panels": [
+        {
+          "chart": "range",
+          "cube": "bluecar_stays",
+          "label": "Stay Duration Tier",
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "dimension": "stay_duration_tier"
+        },
+        {
+          "chart": "toggle",
+          "cube": "bluecar_stays",
+          "label": "Activity Type",
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "dimension": "activity_type"
+        },
+        {
+          "chart": "selector",
+          "cube": "bluecar_stays",
+          "label": "Vehicle Make Selector",
+          "limit": null,
+          "searchable": true,
+          "width": "auto",
+          "dimension": "vehicle_make",
+          "value": null
+        }
+      ]
+    },
+    {
+      "id": "kpis",
+      "label": "Key Performance Indicators",
+      "location": "modelbar",
+      "columns": null,
+      "collapsed": false,
+      "panels": [
+        {
+          "chart": "kpi",
+          "cube": "bluecar_stays",
+          "label": "Unique Bookings",
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "unique_bookings"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_stays",
+          "label": "Active Vehicles",
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "unique_cars"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_stays",
+          "label": "Unique Locations Visited",
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "unique_locations"
+        }
+      ]
+    }
+  ]
+}

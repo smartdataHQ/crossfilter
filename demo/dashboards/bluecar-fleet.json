@@ -1,0 +1,66 @@
+{
+  "title": "Vehicle Fleet Overview",
+  "cubes": ["bluecar_stays"],
+  "sharedFilters": [],
+  "sections": [
+    {
+      "id": "kpis",
+      "label": null,
+      "location": "main",
+      "columns": 4,
+      "collapsed": false,
+      "panels": [
+        { "chart": "kpi", "label": "Total Stays", "primary": false, "value": "count" },
+        { "chart": "kpi", "label": "Vehicles", "primary": false, "value": "unique_cars" },
+        { "chart": "kpi", "label": "Bookings", "primary": false, "value": "unique_bookings" },
+        { "chart": "kpi", "label": "Avg Stay (hrs)", "primary": false, "value": "avg_stay_duration_hours" }
+      ]
+    },
+    {
+      "id": "timeline",
+      "label": null,
+      "location": "main",
+      "columns": 1,
+      "collapsed": false,
+      "panels": [
+        { "chart": "line", "label": "Stays Over Time", "primary": false, "width": "full", "x": "stay_started_at", "y": "count" }
+      ]
+    },
+    {
+      "id": "fleet",
+      "label": "Fleet Breakdown",
+      "location": "main",
+      "columns": 2,
+      "collapsed": false,
+      "panels": [
+        { "chart": "bar", "label": "Vehicle Make", "primary": false, "limit": 15, "category": "vehicle_make" },
+        { "chart": "bar", "label": "Car Class", "primary": false, "category": "car_class" },
+        { "chart": "pie", "label": "Fuel Type", "primary": false, "name": "fuel_type" },
+        { "chart": "pie", "label": "Drive Type", "primary": false, "name": "drive_type" }
+      ]
+    },
+    {
+      "id": "modelbar",
+      "label": null,
+      "location": "modelbar",
+      "columns": null,
+      "collapsed": false,
+      "panels": [
+        { "chart": "range", "label": "Stay Duration (hrs)", "primary": false, "dimension": "stay_duration_hours" }
+      ]
+    },
+    {
+      "id": "details",
+      "label": "Details",
+      "location": "main",
+      "columns": 1,
+      "collapsed": false,
+      "panels": [
+        {
+          "chart": "table", "label": "Vehicle Records", "primary": false, "width": "full",
+          "columns": ["vehicle_make", "car_class", "fuel_type", "drive_type", "stay_duration_hours", "stay_started_at"]
+        }
+      ]
+    }
+  ]
+}

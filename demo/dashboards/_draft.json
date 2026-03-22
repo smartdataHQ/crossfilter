@@ -1,0 +1,356 @@
+{
+  "title": "Tire Wear Risk Overview",
+  "cubes": [
+    "bluecar_vehicles"
+  ],
+  "sharedFilters": [],
+  "sections": [
+    {
+      "id": "modelbar_filters",
+      "label": "Filters",
+      "location": "modelbar",
+      "columns": 4,
+      "collapsed": false,
+      "lazy": false,
+      "panels": [
+        {
+          "chart": "dropdown",
+          "cube": "bluecar_vehicles",
+          "label": "Drive Type",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "dimension": "drive_type"
+        },
+        {
+          "chart": "dropdown",
+          "cube": "bluecar_vehicles",
+          "label": "Fuel Type",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "dimension": "fuel_type"
+        },
+        {
+          "chart": "dropdown",
+          "cube": "bluecar_vehicles",
+          "label": "Surface Risk Tier",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "dimension": "surface_risk_tier"
+        },
+        {
+          "chart": "range",
+          "cube": "bluecar_vehicles",
+          "label": "Wear Score Range",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "dimension": "wear_score"
+        }
+      ]
+    },
+    {
+      "id": "kpi_overview",
+      "label": "Fleet Tire-Wear Proxy Overview",
+      "location": "main",
+      "columns": 5,
+      "collapsed": false,
+      "lazy": false,
+      "panels": [
+        {
+          "chart": "kpi",
+          "cube": "bluecar_vehicles",
+          "label": "Vehicles",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "count"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_vehicles",
+          "label": "Total Distance (km)",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "sum_total_distance_km"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Distance per Vehicle (km)",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "avg_total_distance_km"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Gravel Exposure %",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "avg_lifetime_gravel_pct"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_vehicles",
+          "label": "Avg F-Road Exposure %",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "avg_lifetime_froad_pct"
+        }
+      ]
+    },
+    {
+      "id": "kpi_behavior_context",
+      "label": "Behavior Stress Context",
+      "location": "main",
+      "columns": 4,
+      "collapsed": false,
+      "lazy": false,
+      "panels": [
+        {
+          "chart": "kpi",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Speeding Distance (km)",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "avg_total_speeding_km"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Harsh Braking Alerts",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "avg_harsh_braking_alerts"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Harsh Cornering Alerts",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "avg_harsh_cornering_alerts"
+        },
+        {
+          "chart": "kpi",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Wear Score (Context Only)",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "value": "avg_wear_score"
+        }
+      ]
+    },
+    {
+      "id": "fleet_proxy_breakdowns",
+      "label": "Tire-Wear Risk Proxies Across Fleet Segments",
+      "location": "main",
+      "columns": 3,
+      "collapsed": false,
+      "lazy": false,
+      "panels": [
+        {
+          "chart": "bar",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Tire-Wear Proxy Score by Drive Type",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "category": "drive_type",
+          "value": "avg_wear_score"
+        },
+        {
+          "chart": "bar",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Tire-Wear Proxy Score by Surface Risk Tier",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "category": "surface_risk_tier",
+          "value": "avg_wear_score"
+        },
+        {
+          "chart": "bar",
+          "cube": "bluecar_vehicles",
+          "label": "Vehicles by Distance Tier",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "category": "distance_tier",
+          "value": "count"
+        },
+        {
+          "chart": "bar",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Tire-Wear Proxy Score by Alert Risk Tier",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "category": "alert_risk_tier",
+          "value": "avg_wear_score"
+        },
+        {
+          "chart": "bar",
+          "cube": "bluecar_vehicles",
+          "label": "Vehicles by Speeding Risk Tier",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "category": "speeding_risk_tier",
+          "value": "count"
+        },
+        {
+          "chart": "pie.donut",
+          "cube": "bluecar_vehicles",
+          "label": "Fleet by Fuel Type",
+          "primary": false,
+          "limit": null,
+          "searchable": false,
+          "width": "auto",
+          "name": "fuel_type",
+          "value": "count"
+        }
+      ]
+    },
+    {
+      "id": "drivetrain_class_comparison",
+      "label": "Drivetrain and Class Comparison",
+      "location": "main",
+      "columns": 2,
+      "collapsed": false,
+      "lazy": true,
+      "panels": [
+        {
+          "chart": "bar",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Tire-Wear Proxy Score by Car Class",
+          "primary": false,
+          "limit": 15,
+          "searchable": false,
+          "width": "auto",
+          "category": "car_class",
+          "value": "avg_wear_score"
+        },
+        {
+          "chart": "bar",
+          "cube": "bluecar_vehicles",
+          "label": "Avg Distance per Vehicle by Car Class",
+          "primary": false,
+          "limit": 15,
+          "searchable": false,
+          "width": "auto",
+          "category": "car_class",
+          "value": "avg_total_distance_km"
+        }
+      ]
+    },
+    {
+      "id": "top_tire_wear_risk_vehicles",
+      "label": "Top Tire-Wear Risk Vehicles",
+      "location": "main",
+      "columns": 2,
+      "collapsed": true,
+      "lazy": true,
+      "panels": [
+        {
+          "chart": "bar.horizontal",
+          "cube": "bluecar_vehicles",
+          "label": "Top Vehicles by Rough-Surface Distance Proxy",
+          "primary": false,
+          "limit": 20,
+          "searchable": false,
+          "width": "auto",
+          "category": "car",
+          "value": "avg_total_gravel_km"
+        },
+        {
+          "chart": "bar.horizontal",
+          "cube": "bluecar_vehicles",
+          "label": "Top Vehicles by Harsh Cornering Proxy",
+          "primary": false,
+          "limit": 20,
+          "searchable": false,
+          "width": "auto",
+          "category": "car",
+          "value": "avg_harsh_cornering_alerts"
+        }
+      ]
+    },
+    {
+      "id": "vehicle_ranking",
+      "label": "Individual Vehicle Ranking",
+      "location": "main",
+      "columns": 2,
+      "collapsed": true,
+      "lazy": true,
+      "panels": [
+        {
+          "chart": "selector",
+          "cube": "bluecar_vehicles",
+          "label": "Find Vehicle",
+          "primary": true,
+          "limit": 100,
+          "searchable": true,
+          "width": "full",
+          "dimension": "car",
+          "value": null
+        },
+        {
+          "chart": "table",
+          "cube": "bluecar_vehicles",
+          "label": "Vehicle Tire-Wear Proxy Ranking Table",
+          "primary": false,
+          "limit": 100,
+          "searchable": false,
+          "width": "full",
+          "columns": [
+            "car",
+            "vehicle_make",
+            "vehicle_model",
+            "vehicle_year",
+            "drive_type",
+            "total_distance_km",
+            "lifetime_gravel_pct",
+            "lifetime_unpaved_pct",
+            "lifetime_froad_pct",
+            "total_gravel_speeding_km",
+            "total_unpaved_speeding_km",
+            "harsh_cornering_total_count",
+            "harsh_braking_total_count",
+            "speeding_trip_pct",
+            "wear_score"
+          ]
+        }
+      ]
+    }
+  ]
+}

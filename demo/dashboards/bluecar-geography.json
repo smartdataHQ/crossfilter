@@ -1,0 +1,77 @@
+{
+  "title": "Geography & POI Analysis",
+  "cubes": ["bluecar_stays"],
+  "sharedFilters": [],
+  "sections": [
+    {
+      "id": "kpis",
+      "label": null,
+      "location": "main",
+      "columns": 4,
+      "collapsed": false,
+      "panels": [
+        { "chart": "kpi", "label": "Total Stays", "primary": false, "value": "count" },
+        { "chart": "kpi", "label": "Locations", "primary": false, "value": "unique_locations" },
+        { "chart": "kpi", "label": "POI Match Rate", "primary": false, "value": "poi_match_rate" },
+        { "chart": "kpi", "label": "Avg POI Distance (m)", "primary": false, "value": "avg_poi_distance_m" }
+      ]
+    },
+    {
+      "id": "timeline",
+      "label": null,
+      "location": "main",
+      "columns": 1,
+      "collapsed": false,
+      "panels": [
+        { "chart": "line", "label": "Stays Over Time", "primary": false, "width": "full", "x": "stay_started_at", "y": "count" }
+      ]
+    },
+    {
+      "id": "geo",
+      "label": "Geographic Breakdown",
+      "location": "main",
+      "columns": 3,
+      "collapsed": false,
+      "panels": [
+        { "chart": "bar", "label": "Region", "primary": false, "category": "region" },
+        { "chart": "pie", "label": "Activity Type", "primary": false, "name": "activity_type" },
+        { "chart": "bar", "label": "POI Category", "primary": false, "category": "poi_category" }
+      ]
+    },
+    {
+      "id": "places",
+      "label": "Places",
+      "location": "main",
+      "columns": 3,
+      "collapsed": true,
+      "panels": [
+        { "chart": "selector", "label": "Municipality", "primary": false, "searchable": true, "dimension": "municipality" },
+        { "chart": "selector", "label": "Locality", "primary": false, "searchable": true, "dimension": "locality" },
+        { "chart": "selector", "label": "POI Name", "primary": false, "searchable": true, "dimension": "poi_name" }
+      ]
+    },
+    {
+      "id": "modelbar",
+      "label": null,
+      "location": "modelbar",
+      "columns": null,
+      "collapsed": false,
+      "panels": [
+        { "chart": "toggle", "label": "POI Match", "primary": false, "dimension": "has_poi_match" }
+      ]
+    },
+    {
+      "id": "details",
+      "label": "Details",
+      "location": "main",
+      "columns": 1,
+      "collapsed": false,
+      "panels": [
+        {
+          "chart": "table", "label": "Stay Records", "primary": false, "width": "full",
+          "columns": ["region", "municipality", "locality", "poi_name", "poi_category", "activity_type"]
+        }
+      ]
+    }
+  ]
+}
