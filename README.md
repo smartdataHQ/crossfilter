@@ -17,8 +17,6 @@ Crossfilter3 is built on top of crossfilter2, already the fastest way to filter 
 | **Progressive UI** | Partial snapshot emission during streaming load (throttled at 250ms default), separate fetch-percent and rows-loaded progress events (throttled at 100ms) | Charts and KPIs appear within seconds even on million-row datasets |
 | **Live mutation** | `append()` slots new rows into existing lazy indexes incrementally; `removeFiltered()` rebuilds `codeCounts` safely and re-filters | Dashboards stay live without full rebuild |
 | **Instance extensions** | `cf.allFilteredIndexes()`, `cf.isElementFiltered(index)`, `cf.takeColumns(indexes, fields)`, `cf.configureRuntime()` / `cf.runtimeInfo()` for per-instance WASM control | Columnar extraction and filter introspection without materializing rows |
-| **Demo** | Two production-grade stockout dashboards — a **store manager** view (7 panels, 3 coordinated crossfilter workers, ECharts, Cube.dev meta-driven colors) and an **operator** view (priority queue, focus panel, DOW guidance, category/trend charts) | Proves the architecture end-to-end: columnar-native rendering, URL-driven state, faceted store selector, peer comparison, isolated filters, sensitivity toggles |
-
 The original crossfilter API (`cf.dimension()`, `group.all()`, etc.) is fully preserved — everything above is additive.
 
 ### Performance and memory estimates
@@ -62,33 +60,12 @@ In upstream crossfilter, every record is a JS object from the start. In this for
 
 The columnar arrays themselves (one typed/string array per field) are the same size either way — the saving is entirely in not creating N row objects with N × fields property slots.
 
-#### Worker round-trip savings
-
-The demo's store manager dashboard previously used 4 identical `rowSets` (stockout, forecast, risk, warning) all requesting the same 20+ fields with limit 10,000. Consolidating to a single `rowSet` cuts structured-clone serialization by ~75% per refresh cycle.
-
-| Metric | Before (4 rowSets) | After (1 rowSet) | Savings |
-|--------|--------------------|--------------------|---------|
-| Structured-clone per refresh | ~4 × columnar payload | 1 × columnar payload | ~75% less serialization |
-| postMessage overhead | 4 typed-array transfers | 1 typed-array transfer | 3 fewer Transferable handoffs |
-
 #### Append performance (lazy path)
 
 | Operation | Upstream | This fork (lazy encoded) | Why |
 |-----------|----------|--------------------------|-----|
 | Append 10K rows to 90K | O(n log n) re-sort + full reduce | O(m) codes extension + incremental codeCounts | Codes buffer grows 2x amortized; existing sorted indexes untouched |
 | groupAll after append | O(n) full scan | O(1) mark update | Singleton groups skip sorted-key rebuild |
-
-#### Panel rendering optimizations (demo-stockout)
-
-| Optimization | Per-render savings estimate |
-|-------------|---------------------------|
-| Direct column rendering (skip `materializeRows`) | Avoid allocating N row objects per render cycle |
-| O(1) lookup predicates (vs `String().toUpperCase()`) | ~10-50 µs saved per 10K-row filter pass |
-| `colorFor()` memoization | Eliminates repeated meta lookup + threshold scan for same field/value pairs |
-| Single-pass `populateSelects` | 1 loop instead of 2 over the same index array |
-| Row-outer DOW loop (N×7 vs 7×N) | Better cache locality for columnar access |
-| Store filter caching | Avoids re-filtering 4 arrays on every render when store hasn't changed |
-| Day button class toggle | DOM class swap instead of full innerHTML rebuild on click |
 
 ## Installation
 
@@ -345,6 +322,8 @@ console.log(group.all());
 | `runtime.rows(query)` | `Promise<RowResult>` | Paged row data only |
 | `runtime.updateFilters(filters)` | `Promise` | Update filters without reading results |
 | `runtime.append(records)` | `Promise<number>` | Add rows, returns new dataset size |
+| `runtime.createGroup(spec)` | `Promise<string>` | Add a group at runtime, returns its ID |
+| `runtime.disposeGroup(id)` | `Promise<void>` | Remove a dynamically created group |
 | `runtime.removeFiltered(selection)` | `Promise<number>` | Remove `'included'` or `'excluded'` rows |
 | `runtime.bounds(request)` | `Promise` | Get min/max for fields |
 | `runtime.groups(request)` | `Promise` | Ad-hoc group queries |
