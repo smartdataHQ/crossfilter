@@ -1,10 +1,10 @@
-# @smartdatahq/crossfilter
+# crossfilter3
 
 > **A streaming-first, zero-copy analytics engine for the browser.**
 
-Crossfilter2 is already the fastest way to filter large datasets client-side. This fork turns it into a complete dashboard runtime — data streams in as Arrow IPC, decodes and filters inside a Web Worker (main thread never blocks), WASM accelerates the hot filter scan, and partial snapshots render the UI progressively before the download even finishes.
+Crossfilter3 is built on top of crossfilter2, already the fastest way to filter large datasets client-side. This fork turns it into a complete dashboard runtime — data streams in as Arrow IPC, decodes and filters inside a Web Worker (main thread never blocks), WASM accelerates the hot filter scan, and partial snapshots render the UI progressively before the download even finishes.
 
-### What this fork adds to crossfilter2
+### What crossfilter3 adds to crossfilter2
 
 | Layer | What changed | Why it matters |
 |-------|-------------|----------------|
@@ -17,8 +17,6 @@ Crossfilter2 is already the fastest way to filter large datasets client-side. Th
 | **Progressive UI** | Partial snapshot emission during streaming load (throttled at 250ms default), separate fetch-percent and rows-loaded progress events (throttled at 100ms) | Charts and KPIs appear within seconds even on million-row datasets |
 | **Live mutation** | `append()` slots new rows into existing lazy indexes incrementally; `removeFiltered()` rebuilds `codeCounts` safely and re-filters | Dashboards stay live without full rebuild |
 | **Instance extensions** | `cf.allFilteredIndexes()`, `cf.isElementFiltered(index)`, `cf.takeColumns(indexes, fields)`, `cf.configureRuntime()` / `cf.runtimeInfo()` for per-instance WASM control | Columnar extraction and filter introspection without materializing rows |
-| **Demo** | Two production-grade stockout dashboards — a **store manager** view (7 panels, 3 coordinated crossfilter workers, ECharts, Cube.dev meta-driven colors) and an **operator** view (priority queue, focus panel, DOW guidance, category/trend charts) | Proves the architecture end-to-end: columnar-native rendering, URL-driven state, faceted store selector, peer comparison, isolated filters, sensitivity toggles |
-
 The original crossfilter API (`cf.dimension()`, `group.all()`, etc.) is fully preserved — everything above is additive.
 
 ### Performance and memory estimates
@@ -62,15 +60,6 @@ In upstream crossfilter, every record is a JS object from the start. In this for
 
 The columnar arrays themselves (one typed/string array per field) are the same size either way — the saving is entirely in not creating N row objects with N × fields property slots.
 
-#### Worker round-trip savings
-
-The demo's store manager dashboard previously used 4 identical `rowSets` (stockout, forecast, risk, warning) all requesting the same 20+ fields with limit 10,000. Consolidating to a single `rowSet` cuts structured-clone serialization by ~75% per refresh cycle.
-
-| Metric | Before (4 rowSets) | After (1 rowSet) | Savings |
-|--------|--------------------|--------------------|---------|
-| Structured-clone per refresh | ~4 × columnar payload | 1 × columnar payload | ~75% less serialization |
-| postMessage overhead | 4 typed-array transfers | 1 typed-array transfer | 3 fewer Transferable handoffs |
-
 #### Append performance (lazy path)
 
 | Operation | Upstream | This fork (lazy encoded) | Why |
@@ -78,22 +67,10 @@ The demo's store manager dashboard previously used 4 identical `rowSets` (stocko
 | Append 10K rows to 90K | O(n log n) re-sort + full reduce | O(m) codes extension + incremental codeCounts | Codes buffer grows 2x amortized; existing sorted indexes untouched |
 | groupAll after append | O(n) full scan | O(1) mark update | Singleton groups skip sorted-key rebuild |
 
-#### Panel rendering optimizations (demo-stockout)
-
-| Optimization | Per-render savings estimate |
-|-------------|---------------------------|
-| Direct column rendering (skip `materializeRows`) | Avoid allocating N row objects per render cycle |
-| O(1) lookup predicates (vs `String().toUpperCase()`) | ~10-50 µs saved per 10K-row filter pass |
-| `colorFor()` memoization | Eliminates repeated meta lookup + threshold scan for same field/value pairs |
-| Single-pass `populateSelects` | 1 loop instead of 2 over the same index array |
-| Row-outer DOW loop (N×7 vs 7×N) | Better cache locality for columnar access |
-| Store filter caching | Avoids re-filtering 4 arrays on every render when store hasn't changed |
-| Day button class toggle | DOM class swap instead of full innerHTML rebuild on click |
-
 ## Installation
 
 ```bash
-npm install @smartdatahq/crossfilter apache-arrow
+npm install crossfilter3 apache-arrow
 ```
 
 The streaming worker needs UMD bundles of both libraries available at public HTTP URLs. In a **Next.js** project, copy them into `public/` with a postinstall script:
@@ -102,7 +79,7 @@ The streaming worker needs UMD bundles of both libraries available at public HTT
 // package.json
 {
   "scripts": {
-    "postinstall": "mkdir -p public/vendor && cp node_modules/@smartdatahq/crossfilter/crossfilter.js public/vendor/ && cp node_modules/apache-arrow/Arrow.es2015.min.js public/vendor/"
+    "postinstall": "mkdir -p public/vendor && cp node_modules/crossfilter3/crossfilter.js public/vendor/ && cp node_modules/apache-arrow/Arrow.es2015.min.js public/vendor/"
   }
 }
 ```
@@ -120,7 +97,7 @@ const runtime = await crossfilter.createStreamingDashboardWorker({
 ## Quick start
 
 ```js
-import crossfilter from '@smartdatahq/crossfilter';
+import crossfilter from 'crossfilter3';
 
 const runtime = await crossfilter.createStreamingDashboardWorker({
   crossfilterUrl: '/vendor/crossfilter.js',
@@ -260,7 +237,7 @@ await runtime.removeFiltered('excluded');
 For smaller datasets or environments where workers are unavailable:
 
 ```js
-import crossfilter from '@smartdatahq/crossfilter';
+import crossfilter from 'crossfilter3';
 import { tableFromIPC } from 'apache-arrow';
 
 const buffer = await fetch('/data/result.arrow').then(r => r.arrayBuffer());
@@ -286,7 +263,7 @@ const snapshot = runtime.snapshot({
 The original crossfilter API is still fully available:
 
 ```js
-import crossfilter from '@smartdatahq/crossfilter';
+import crossfilter from 'crossfilter3';
 
 const cf = crossfilter(records);
 const country = cf.dimension('country');
@@ -345,6 +322,8 @@ console.log(group.all());
 | `runtime.rows(query)` | `Promise<RowResult>` | Paged row data only |
 | `runtime.updateFilters(filters)` | `Promise` | Update filters without reading results |
 | `runtime.append(records)` | `Promise<number>` | Add rows, returns new dataset size |
+| `runtime.createGroup(spec)` | `Promise<string>` | Add a group at runtime, returns its ID |
+| `runtime.disposeGroup(id)` | `Promise<void>` | Remove a dynamically created group |
 | `runtime.removeFiltered(selection)` | `Promise<number>` | Remove `'included'` or `'excluded'` rows |
 | `runtime.bounds(request)` | `Promise` | Get min/max for fields |
 | `runtime.groups(request)` | `Promise` | Ad-hoc group queries |

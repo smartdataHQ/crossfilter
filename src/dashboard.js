@@ -983,10 +983,11 @@ export function createDashboardRuntime(crossfilter, options) {
     dimensions[dimensionFields[fieldIndex]] = cf.dimension(dimensionFields[fieldIndex]);
   }
 
-  for (var groupIndex = 0; groupIndex < groupSpecs.length; ++groupIndex) {
-    var groupSpec = groupSpecs[groupIndex];
+  var nextGroupIndex = 0;
+  for (nextGroupIndex = 0; nextGroupIndex < groupSpecs.length; ++nextGroupIndex) {
+    var groupSpec = groupSpecs[nextGroupIndex];
     var groupDimension = ensureDimension(dimensions, dimensionFields, cf, groupSpec.field);
-    var groupRuntime = createGroupRuntime(groupDimension, groupSpec, groupIndex);
+    var groupRuntime = createGroupRuntime(groupDimension, groupSpec, nextGroupIndex);
     groupRuntimes[groupRuntime.id] = groupRuntime;
   }
 
@@ -1274,8 +1275,7 @@ export function createDashboardRuntime(crossfilter, options) {
     },
     createGroup: function(spec) {
       var groupDimension = ensureDimension(dimensions, dimensionFields, cf, spec.field);
-      var groupIndex = Object.keys(groupRuntimes).length;
-      var groupRuntime = createGroupRuntime(groupDimension, spec, groupIndex);
+      var groupRuntime = createGroupRuntime(groupDimension, spec, nextGroupIndex++);
       groupRuntimes[groupRuntime.id] = groupRuntime;
       return groupRuntime.id;
     },

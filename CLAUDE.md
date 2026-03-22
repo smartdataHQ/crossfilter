@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Crossfilter2 is a JavaScript library for fast multidimensional filtering of large datasets, commonly used with coordinated visualization views (e.g., dc.js). It uses sorted indexes and bitwise filter arrays for incremental filtering/reducing. Published as `crossfilter2` on npm.
+Crossfilter3 is a JavaScript library for fast multidimensional filtering of large datasets, commonly used with coordinated visualization views (e.g., dc.js). It uses sorted indexes and bitwise filter arrays for incremental filtering/reducing. Published as `crossfilter3` on npm.
 
 ## Commands
 

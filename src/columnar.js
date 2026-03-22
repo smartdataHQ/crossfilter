@@ -1,6 +1,6 @@
 export const COLUMNAR_BATCH_KEY = typeof Symbol !== "undefined"
-  ? Symbol.for("crossfilter2.columnarBatch")
-  : "__crossfilter2ColumnarBatch__";
+  ? Symbol.for("crossfilter3.columnarBatch")
+  : "__crossfilter3ColumnarBatch__";
 
 function isArrayIndex(prop) {
   if (typeof prop === "symbol") {

@@ -1,28 +1,36 @@
 {
-  "name": "@smartdatahq/crossfilter",
-  "version": "2.0.1",
-  "description": "Fast multidimensional filtering with Arrow streaming, WASM filters, and worker-backed dashboard runtimes.",
+  "name": "crossfilter3",
+  "version": "3.0.1",
+  "description": "Fork of crossfilter2 adding Arrow streaming, WASM-accelerated filters, declarative dashboard runtimes, and Web Worker support.",
   "license": "Apache-2.0",
   "keywords": [
     "analytics",
     "arrow",
     "crossfilter",
+    "crossfilter2",
+    "crossfilter3",
     "dashboard",
+    "filtering",
     "visualization",
-    "wasm"
+    "wasm",
+    "worker"
   ],
   "author": {
-    "name": "SmartData HQ",
-    "url": "https://github.com/smartdataHQ"
+    "name": "Mike Bostock",
+    "url": "http://bost.ocks.org/mike"
   },
   "contributors": [
     {
-      "name": "Mike Bostock",
-      "url": "http://bost.ocks.org/mike"
-    },
-    {
       "name": "Jason Davies",
       "url": "http://www.jasondavies.com/"
+    },
+    {
+      "name": "crossfilter2 contributors",
+      "url": "https://github.com/crossfilter/crossfilter"
+    },
+    {
+      "name": "Stefan Baxter / SmartData HQ",
+      "url": "https://github.com/smartdataHQ"
     }
   ],
   "homepage": "https://github.com/smartdataHQ/crossfilter",
@@ -35,9 +43,6 @@
     "url": "https://github.com/smartdataHQ/crossfilter.git"
   },
   "type": "module",
-  "publishConfig": {
-    "access": "public"
-  },
   "dependencies": {
     "@ranfdev/deepobj": "1.0.2"
   },
