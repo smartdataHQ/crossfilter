@@ -2558,6 +2558,19 @@
           dimensions[dimensionFields[dimensionIndex]].dispose();
         }
       },
+      createGroup: function(spec) {
+        var groupDimension = ensureDimension(dimensions, dimensionFields, cf, spec.field);
+        var groupIndex = Object.keys(groupRuntimes).length;
+        var groupRuntime = createGroupRuntime(groupDimension, spec, groupIndex);
+        groupRuntimes[groupRuntime.id] = groupRuntime;
+        return groupRuntime.id;
+      },
+      disposeGroup: function(id) {
+        if (groupRuntimes[id]) {
+          groupRuntimes[id].dispose();
+          delete groupRuntimes[id];
+        }
+      },
       query: function(request) {
         return queryRuntime(request);
       },
@@ -3905,6 +3918,14 @@ self.onmessage = async function(event) {
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.updateFilters(message.payload.filters));
         return;
+      case 'createGroup':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.createGroup(message.payload.spec));
+        return;
+      case 'disposeGroup':
+        if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
+        respond(id, runtime.disposeGroup(message.payload.id));
+        return;
       case 'rows':
         if (!runtime) throw new Error('Streaming dashboard worker is not initialized.');
         respond(id, runtime.rows(message.payload.query));
@@ -4153,6 +4174,12 @@ self.onmessage = async function(event) {
         },
         updateFilters: function(filters) {
           return call("updateFilters", { filters: filters || null });
+        },
+        createGroup: function(spec) {
+          return call("createGroup", { spec: spec });
+        },
+        disposeGroup: function(groupId) {
+          return call("disposeGroup", { id: groupId });
         },
         workerRuntime: initPayload.runtime
       };
