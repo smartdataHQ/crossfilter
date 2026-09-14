@@ -2,6 +2,23 @@ import crossfilter from "../main.js";
 import { describe, expect, it } from "vitest";
 
 describe("dashboard runtime", () => {
+  it("replaces a dynamic group without losing the old group on invalid input", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["country", "class"],
+      groups: [{ id: "summary", field: "country", metrics: [{ id: "events", field: "events", op: "sum" }] }],
+      records: [{ country: "IS", class: "A", events: 2 }, { country: "UK", class: "B", events: 3 }],
+    });
+    const snapshot = () => runtime.groups({ groups: { summary: { sort: "natural" } } }).summary.entries;
+    const previous = snapshot();
+    expect(() => runtime.createGroup({ id: "summary", field: "country", metrics: [{ op: "invalid" }] })).toThrow();
+    expect(snapshot()).toEqual(previous);
+    runtime.createGroup({ id: "summary", field: "class", metrics: [{ id: "events", field: "events", op: "sum" }] });
+    expect(snapshot()).toEqual([{ key: "A", value: { events: 2 } }, { key: "B", value: { events: 3 } }]);
+    runtime.append([{ country: "IS", class: "A", events: 4 }]);
+    expect(snapshot()).toEqual([{ key: "A", value: { events: 6 } }, { key: "B", value: { events: 3 } }]);
+    runtime.dispose();
+  });
+
   it("builds KPI and group snapshots from declarative specs", () => {
     const runtime = crossfilter.createDashboardRuntime({
       dimensions: ["country", "event", "time"],
@@ -760,6 +777,62 @@ describe("dashboard runtime", () => {
     runtime.dispose();
   });
 
+  it("reuses loaded rows for dynamic groups under the current filters", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["country", "class"],
+      groups: [{ id: "countries", field: "country", metrics: [{ id: "events", field: "events", op: "sum" }] }],
+      records: [
+        { country: "IS", class: "A", events: 2 },
+        { country: "IS", class: "B", events: 3 },
+        { country: "UK", class: "A", events: 5 },
+      ],
+    });
+
+    runtime.createGroup({
+      id: "classes",
+      field: "class",
+      metrics: [{ id: "events", field: "events", op: "sum" }],
+    });
+    expect(runtime.query({
+      filters: { country: { type: "exact", value: "IS" } },
+      snapshot: {
+        groups: {
+          countries: { sort: "natural" },
+          classes: { sort: "natural" },
+        },
+      },
+    }).snapshot.groups).toMatchObject({
+      countries: {
+        entries: [
+          { key: "IS", value: { events: 5 } },
+          { key: "UK", value: { events: 5 } },
+        ],
+        sort: "natural",
+      },
+      classes: {
+        entries: [
+          { key: "A", value: { events: 2 } },
+          { key: "B", value: { events: 3 } },
+        ],
+        sort: "natural",
+      },
+    });
+
+    runtime.disposeGroup("classes");
+    runtime.createGroup({
+      id: "classes",
+      field: "class",
+      metrics: [{ id: "rows", op: "count" }],
+    });
+    expect(runtime.groups({ groups: { classes: { sort: "natural" } } }).classes.entries).toEqual([
+      { key: "A", value: { rows: 1 } },
+      { key: "B", value: { rows: 1 } },
+    ]);
+    runtime.disposeGroup("classes");
+    expect(() => runtime.groups({ groups: { classes: {} } })).toThrow("Unknown dashboard group: classes");
+    runtime.dispose();
+  });
+
   it("validates worker source options before attempting to spawn a worker", () => {
     function createStubWorker() {
       return {
@@ -993,4 +1066,41 @@ describe("dashboard runtime", () => {
     const freshResult = runtime.query({ snapshot: {} });
     expect(freshResult.snapshot.kpis.rows).toBe(2);
   });
+
+  it("computes ratio metrics locally as summed numerator over summed denominator", () => {
+    const runtime = crossfilter.createDashboardRuntime({
+      dimensions: ["g", "n"],
+      groups: [{ id: "byG", field: "g", metrics: [{ id: "r", op: "ratio", field: "n", denominator: "d" }] }],
+      kpis: [{ id: "r", op: "ratio", field: "n", denominator: "d" }],
+      records: [
+        { g: "a", n: 1, d: 4 },
+        { g: "a", n: 2, d: 4 },
+        { g: "b", n: 0, d: 2 }
+      ]
+    });
+
+    const groupOf = () => Object.fromEntries(runtime.snapshot().groups.byG.map((e) => [e.key, e.value.r]));
+    const g0 = groupOf();
+    expect(g0.a).toBe(3 / 8);
+    expect(g0.b).toBe(0);
+    expect(runtime.snapshot().kpis.r).toBe(3 / 10);
+
+    // A filter re-derives both numerator and denominator sums, no server round-trip.
+    runtime.updateFilters({ n: { type: "range", range: [0, 1.5] } });
+    const g1 = groupOf();
+    expect(g1.a).toBe(1 / 4);
+    expect(g1.b).toBe(0);
+    expect(runtime.snapshot().kpis.r).toBe(1 / 6);
+
+    runtime.dispose();
+  });
+
+  it("rejects a ratio metric with no denominator", () => {
+    expect(() => crossfilter.createDashboardRuntime({
+      dimensions: ["g"],
+      groups: [{ id: "byG", field: "g", metrics: [{ id: "r", op: "ratio", field: "n" }] }],
+      records: [{ g: "a", n: 1, d: 2 }]
+    })).toThrow(/denominator/);
+  });
+
 });

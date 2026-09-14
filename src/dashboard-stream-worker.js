@@ -1025,6 +1025,7 @@ export function createStreamingDashboardWorker(options) {
     ready: new Set(),
     snapshot: new Set()
   };
+  var latestEvents = Object.create(null);
   var disposed = false;
   var readyResolve;
   var readyReject;
@@ -1048,6 +1049,7 @@ export function createStreamingDashboardWorker(options) {
   }
 
   function emit(eventType, payload) {
+    latestEvents[eventType] = payload;
     listeners[eventType].forEach(function(listener) {
       listener(payload);
     });
@@ -1158,6 +1160,9 @@ export function createStreamingDashboardWorker(options) {
           throw new Error("Unsupported streaming dashboard event: " + eventType);
         }
         listeners[eventType].add(listener);
+        if (Object.prototype.hasOwnProperty.call(latestEvents, eventType)) {
+          listener(latestEvents[eventType]);
+        }
         return function() {
           listeners[eventType].delete(listener);
         };

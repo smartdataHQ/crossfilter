@@ -310,6 +310,16 @@ function crossfilter() {
             state[metric.id].count += delta;
           }
           break;
+        case 'ratio':
+          value = getFieldValue(rowIndex, metric.field);
+          if (isFiniteMetricNumber(value)) {
+            state[metric.id].num += delta * value;
+          }
+          value = getFieldValue(rowIndex, metric.denominator);
+          if (isFiniteMetricNumber(value)) {
+            state[metric.id].den += delta * value;
+          }
+          break;
       }
     }
 
