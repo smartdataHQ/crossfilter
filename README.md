@@ -110,7 +110,11 @@ const runtime = await crossfilter.createStreamingDashboardWorker({
   dimensions: ['event', 'country', 'region', 'time'],
 
   // Global aggregate metrics
-  kpis: [{ id: 'count', field: 'count', op: 'sum' }],
+  kpis: [
+    { id: 'count', field: 'count', op: 'sum' },
+    // A rate re-derived locally from two summed components on every filter:
+    { id: 'hitRate', field: 'hits', denominator: 'attempts', op: 'ratio' },
+  ],
 
   // Pre-computed group-by aggregations for charts
   groups: [
@@ -308,8 +312,17 @@ console.log(group.all());
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | `string` | Key in the result (`snapshot.kpis[id]`, `group.value[id]`) |
-| `field` | `string` | Column to aggregate (not needed for `'count'`) |
-| `op` | `string` | `'count'`, `'sum'`, `'avg'`, `'avgNonZero'` |
+| `field` | `string` | Column to aggregate (not needed for `'count'`); the **numerator** column for `'ratio'` |
+| `op` | `string` | `'count'`, `'sum'`, `'avg'`, `'avgNonZero'`, `'ratio'` |
+| `denominator` | `string` | Required for `'ratio'`: the column summed as the divisor |
+
+**`ratio`** sums the `field` (numerator) and the `denominator` independently and
+finalizes to `sum(field) / sum(denominator)` (or `null` when the denominator
+sums to zero). Because both components are re-summed on every filter, a rate or
+an average can be re-derived from pre-aggregated rows entirely client-side —
+no re-query. An average is just `{ op: 'ratio', field: <sum-of-x>, denominator:
+<count> }`; a rate is `{ op: 'ratio', field: <numerator-count>, denominator:
+<base-count> }`. The two component columns must themselves be summable.
 
 ### Async runtime methods
 
