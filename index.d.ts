@@ -75,7 +75,10 @@ declare namespace crossfilter {
   export interface DashboardMetricSpec {
     field?: string;
     id?: string;
-    op: 'count' | 'sum' | 'avg' | 'avgNonZero';
+    op: 'count' | 'sum' | 'avg' | 'avgNonZero' | 'ratio';
+    /** Required for op 'ratio': the field summed as the divisor. `field` is the
+     *  numerator. The metric finalizes to sum(field) / sum(denominator). */
+    denominator?: string;
   }
 
   export type DashboardTimeBucketGranularity = 'minute' | 'hour' | 'day' | 'week' | 'month';

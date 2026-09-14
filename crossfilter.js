@@ -1,4 +1,4 @@
-// https://github.com/smartdataHQ/crossfilter v3.0.2 Copyright 2026 Mike Bostock
+// https://github.com/smartdataHQ/crossfilter v3.0.3 Copyright 2026 Mike Bostock
 (function (global, factory) {
   typeof exports === 'object' && typeof module !== 'undefined' ? module.exports = factory() :
   typeof define === 'function' && define.amd ? define(factory) :
@@ -1315,14 +1315,18 @@
       if (metric.op !== "count" && !metric.field) {
         throw new Error("Dashboard metric `" + id + "` requires a field.");
       }
-      if (metric.op !== "count" && metric.op !== "sum" && metric.op !== "avg" && metric.op !== "avgNonZero") {
+      if (metric.op !== "count" && metric.op !== "sum" && metric.op !== "avg" && metric.op !== "avgNonZero" && metric.op !== "ratio") {
         throw new Error("Unsupported dashboard metric op: " + metric.op);
+      }
+      if (metric.op === "ratio" && !metric.denominator) {
+        throw new Error("Dashboard metric `" + id + "` with op `ratio` requires a denominator.");
       }
 
       return {
         field: metric.field,
         id: id,
-        op: metric.op || "count"
+        op: metric.op || "count",
+        denominator: metric.denominator || null
       };
     });
 
@@ -1400,6 +1404,7 @@
     var metricSpec = metrics.map(function(metric) {
       return {
         field: metric.field || null,
+        denominator: metric.denominator || null,
         id: metric.id,
         op: metric.op
       };
@@ -1411,6 +1416,8 @@
         var metric = metrics[metricIndex];
         if (metric.op === "avg" || metric.op === "avgNonZero") {
           bucket[metric.id] = { count: 0, sum: 0 };
+        } else if (metric.op === "ratio") {
+          bucket[metric.id] = { num: 0, den: 0 };
         } else {
           bucket[metric.id] = 0;
         }
@@ -1424,6 +1431,8 @@
         var value = bucket[metric.id];
         if (metric.op === "avg" || metric.op === "avgNonZero") {
           if (value && value.count > 0) return false;
+        } else if (metric.op === "ratio") {
+          if (value && (value.num !== 0 || value.den !== 0)) return false;
         } else if (metric.op === "count") {
           if (value > 0) return false;
         } else {
@@ -1462,6 +1471,16 @@
               bucket[metric.id].count += 1;
             }
             break;
+          case "ratio":
+            value = row[metric.field];
+            if (isFiniteNumber(value)) {
+              bucket[metric.id].num += value;
+            }
+            value = row[metric.denominator];
+            if (isFiniteNumber(value)) {
+              bucket[metric.id].den += value;
+            }
+            break;
         }
       }
     }
@@ -1495,6 +1514,16 @@
               bucket[metric.id].count -= 1;
             }
             break;
+          case "ratio":
+            value = row[metric.field];
+            if (isFiniteNumber(value)) {
+              bucket[metric.id].num -= value;
+            }
+            value = row[metric.denominator];
+            if (isFiniteNumber(value)) {
+              bucket[metric.id].den -= value;
+            }
+            break;
         }
       }
     }
@@ -1506,6 +1535,8 @@
         var value = bucket[metric.id];
         if (metric.op === "avg" || metric.op === "avgNonZero") {
           result[metric.id] = value.count ? value.sum / value.count : null;
+        } else if (metric.op === "ratio") {
+          result[metric.id] = value.den !== 0 ? value.num / value.den : null;
         } else {
           result[metric.id] = value;
         }
@@ -1775,6 +1806,10 @@
       return value && value.count ? value.sum / value.count : null;
     }
 
+    if (metric.op === "ratio") {
+      return value && value.den !== 0 ? value.num / value.den : null;
+    }
+
     return typeof value === "number" ? value : 0;
   }
 
@@ -1875,6 +1910,8 @@
             var bv = bucket[metric.id];
             if (typeof bv === "object" && bv.count != null) {
               total += bv.sum || 0;
+            } else if (typeof bv === "object" && bv.den != null) {
+              total += bv.num || 0;
             } else {
               total += bv;
             }
@@ -2562,6 +2599,9 @@
       createGroup: function(spec) {
         var groupDimension = ensureDimension(dimensions, dimensionFields, cf, spec.field);
         var groupRuntime = createGroupRuntime(groupDimension, spec, nextGroupIndex++);
+        // Replace only after construction succeeds; a failed definition keeps
+        // the previous group usable, while successful replacement releases it.
+        if (groupRuntimes[groupRuntime.id]) groupRuntimes[groupRuntime.id].dispose();
         groupRuntimes[groupRuntime.id] = groupRuntime;
         return groupRuntime.id;
       },
@@ -3979,6 +4019,7 @@ self.onmessage = async function(event) {
       ready: new Set(),
       snapshot: new Set()
     };
+    var latestEvents = Object.create(null);
     var disposed = false;
     var readyResolve;
     var readyReject;
@@ -4002,6 +4043,7 @@ self.onmessage = async function(event) {
     }
 
     function emit(eventType, payload) {
+      latestEvents[eventType] = payload;
       listeners[eventType].forEach(function(listener) {
         listener(payload);
       });
@@ -4112,6 +4154,9 @@ self.onmessage = async function(event) {
             throw new Error("Unsupported streaming dashboard event: " + eventType);
           }
           listeners[eventType].add(listener);
+          if (Object.prototype.hasOwnProperty.call(latestEvents, eventType)) {
+            listener(latestEvents[eventType]);
+          }
           return function() {
             listeners[eventType].delete(listener);
           };
@@ -4443,6 +4488,16 @@ self.onmessage = async function(event) {
             if (isFiniteMetricNumber(value) && value !== 0) {
               state[metric.id].sum += delta * value;
               state[metric.id].count += delta;
+            }
+            break;
+          case 'ratio':
+            value = getFieldValue(rowIndex, metric.field);
+            if (isFiniteMetricNumber(value)) {
+              state[metric.id].num += delta * value;
+            }
+            value = getFieldValue(rowIndex, metric.denominator);
+            if (isFiniteMetricNumber(value)) {
+              state[metric.id].den += delta * value;
             }
             break;
         }
@@ -7464,7 +7519,7 @@ self.onmessage = async function(event) {
         : 0x100000000;
   }
 
-  const version = "3.0.2";
+  const version = "3.0.3";
 
   crossfilter.version = version;
 

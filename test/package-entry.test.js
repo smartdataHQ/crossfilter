@@ -33,7 +33,7 @@ describe("package entry points", function() {
       encoding: "utf8"
     }).trim();
 
-    expect(output).toBe("function 3.0.2");
+    expect(output).toBe("function 3.0.3");
   });
 
   it("resolves the published package root for CommonJS consumers", function() {
@@ -46,6 +46,6 @@ describe("package entry points", function() {
       encoding: "utf8"
     }).trim();
 
-    expect(output).toBe("function 3.0.2");
+    expect(output).toBe("function 3.0.3");
   });
 });
