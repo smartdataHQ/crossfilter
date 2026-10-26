@@ -339,7 +339,7 @@ declare namespace crossfilter {
     ): () => void;
     on(
       eventType: 'error',
-      listener: (payload: DashboardStreamProgress) => void,
+      listener: (payload: DashboardStreamProgress & { message?: string; code?: string | null; status?: number | null }) => void,
     ): () => void;
     ready: Promise<DashboardStreamProgress>;
   }
@@ -370,6 +370,8 @@ declare namespace crossfilter {
   }
 
   export interface StreamingDashboardWorkerOptions extends DashboardWorkerOptions {
+    maxRows?: number;
+    maxBytes?: number;
     batchCoalesceRows?: number;
     emitSnapshots?: boolean;
     initialFilters?: DashboardFilterState;

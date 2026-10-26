@@ -291,6 +291,8 @@ console.log(group.all());
 | `wasm` | `boolean` | Enable WASM-accelerated filter scans (default `true`) |
 | `emitSnapshots` | `boolean` | Emit partial snapshots during streaming load |
 | `batchCoalesceRows` | `number` | Buffer this many rows before flushing to the runtime (default `65536`) |
+| `maxRows` | `number` | Optional positive safe integer limiting total input rows across base and lookup sources, checked before projection/ingestion |
+| `maxBytes` | `number` | Optional positive safe integer limiting total encoded input bytes across sources, checked before decoding; bounded fetches require a readable response body |
 | `progressThrottleMs` | `number` | Min interval between progress events (default `100`) |
 | `snapshotThrottleMs` | `number` | Min interval between snapshot events (default `250`) |
 | `workerFactory` | `() => Worker` | Custom worker factory (skips `importScripts` entirely) |
