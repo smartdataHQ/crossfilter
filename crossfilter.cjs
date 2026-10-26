@@ -1528,6 +1528,7 @@ function buildMetricReducer(metrics, splitField) {
     var result = {};
     for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
       var metric = metrics[metricIndex];
+      if (metric.hidden) continue;
       var value = bucket[metric.id];
       if (metric.op === "avg" || metric.op === "avgNonZero") {
         result[metric.id] = value.count ? value.sum / value.count : null;
@@ -1862,6 +1863,11 @@ function createKpiRuntime(cf, metrics) {
 
 function createGroupRuntime(dimension, spec, index) {
   var metrics = normalizeMetrics(spec.metrics, spec.id || "group_" + index);
+  // A category shows while rows contribute to it, as Cube's GROUP BY returns it, whatever
+  // its value: a hidden row count proves that when no metric counts rows.
+  if (!metrics.some(function(metric) { return metric.op === "count"; })) {
+    metrics = metrics.concat([{ field: undefined, id: "__rows", op: "count", denominator: null, hidden: true }]);
+  }
   var metricsById = {};
   var metricIndex;
   var splitField = spec.splitField || null;

@@ -337,7 +337,8 @@ describe("dashboard runtime", () => {
         offset: 0,
         sort: "desc",
         sortMetric: "count",
-        total: 2
+        // US has a row whose sum is 0: it is a group, as Cube's GROUP BY returns it.
+        total: 3
       }
     });
 
