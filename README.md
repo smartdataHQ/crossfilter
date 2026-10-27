@@ -307,7 +307,7 @@ console.log(group.all());
 | `dataFetchInit` | `RequestInit` | Fetch options (method, headers, body) |
 | `arrowBuffer` | `ArrayBuffer` | Pre-loaded Arrow buffer (alternative to `dataUrl`) |
 | `projection.rename` | `Record<string, string>` | Rename Arrow columns to internal field names |
-| `projection.transforms` | `Record<string, string>` | Type coercion: `'timestampMs'`, `'number'`, `'constantOne'` |
+| `projection.transforms` | `Record<string, string>` | Type coercion: `'timestampMs'`, `'number'`, `'boolean'` (`'true'`, `'false'` or null), `'constantOne'` |
 
 ### Metric spec
 

@@ -3289,6 +3289,20 @@ function normalizeNumericValue(value) {
   var numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : 0;
 }
+// A yes/no field as the semantic layer answers it: 'true', 'false', or null for
+// a missing value (never folded into false, as a numeric transform would).
+function normalizeBooleanValue(value) {
+  if (value == null) {
+    return null;
+  }
+  if (value === true || value === 1 || value === 1n || value === 'true' || value === '1') {
+    return 'true';
+  }
+  if (value === false || value === 0 || value === 0n || value === 'false' || value === '0') {
+    return 'false';
+  }
+  return String(value);
+}
 function projectBatch(batch, projection) {
   var actualFields = getFieldNames(batch);
   var inputFields = projection && Array.isArray(projection.fields) && projection.fields.length
@@ -3336,6 +3350,12 @@ function projectBatch(batch, projection) {
       values = new Float64Array(length);
       for (rowIndex = 0; rowIndex < length; ++rowIndex) {
         values[rowIndex] = normalizeNumericValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+      }
+      columns[outputName] = values;
+    } else if (transform === 'boolean') {
+      values = new Array(length);
+      for (rowIndex = 0; rowIndex < length; ++rowIndex) {
+        values[rowIndex] = normalizeBooleanValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
       }
       columns[outputName] = values;
     } else if (transform === 'constantOne') {

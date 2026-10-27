@@ -277,7 +277,7 @@ declare namespace crossfilter {
     | 'error'
     | 'aborted';
 
-  export type DashboardProjectionTransform = 'timestampMs' | 'number' | 'constantOne';
+  export type DashboardProjectionTransform = 'timestampMs' | 'number' | 'boolean' | 'constantOne';
 
   export interface DashboardStreamProjection {
     fields?: string[];
