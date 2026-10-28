@@ -1532,6 +1532,7 @@
       var result = {};
       for (var metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
         var metric = metrics[metricIndex];
+        if (metric.hidden) continue;
         var value = bucket[metric.id];
         if (metric.op === "avg" || metric.op === "avgNonZero") {
           result[metric.id] = value.count ? value.sum / value.count : null;
@@ -1866,6 +1867,11 @@
 
   function createGroupRuntime(dimension, spec, index) {
     var metrics = normalizeMetrics(spec.metrics, spec.id || "group_" + index);
+    // A category shows while rows contribute to it, as Cube's GROUP BY returns it, whatever
+    // its value: a hidden row count proves that when no metric counts rows.
+    if (!metrics.some(function(metric) { return metric.op === "count"; })) {
+      metrics = metrics.concat([{ field: undefined, id: "__rows", op: "count", denominator: null, hidden: true }]);
+    }
     var metricsById = {};
     var metricIndex;
     var splitField = spec.splitField || null;
@@ -3259,6 +3265,8 @@ function respond(id, payload) {
 function fail(id, error) {
   self.postMessage({ id: id, ok: false, error: {
     message: String(error && error.message || error),
+    code: error && typeof error.code === 'string' ? error.code : null,
+    status: error && typeof error.status === 'number' ? error.status : null,
     stack: error && error.stack ? String(error.stack) : null
   } });
 }
@@ -3280,6 +3288,20 @@ function normalizeNumericValue(value) {
   }
   var numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : 0;
+}
+// A yes/no field as the semantic layer answers it: 'true', 'false', or null for
+// a missing value (never folded into false, as a numeric transform would).
+function normalizeBooleanValue(value) {
+  if (value == null) {
+    return null;
+  }
+  if (value === true || value === 1 || value === 1n || value === 'true' || value === '1') {
+    return 'true';
+  }
+  if (value === false || value === 0 || value === 0n || value === 'false' || value === '0') {
+    return 'false';
+  }
+  return String(value);
 }
 function projectBatch(batch, projection) {
   var actualFields = getFieldNames(batch);
@@ -3328,6 +3350,12 @@ function projectBatch(batch, projection) {
       values = new Float64Array(length);
       for (rowIndex = 0; rowIndex < length; ++rowIndex) {
         values[rowIndex] = normalizeNumericValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+      }
+      columns[outputName] = values;
+    } else if (transform === 'boolean') {
+      values = new Array(length);
+      for (rowIndex = 0; rowIndex < length; ++rowIndex) {
+        values[rowIndex] = normalizeBooleanValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
       }
       columns[outputName] = values;
     } else if (transform === 'constantOne') {
@@ -3408,9 +3436,12 @@ async function readResponseErrorDetail(response) {
     }
     try {
       var parsed = JSON.parse(text);
-      return parsed && (parsed.error || parsed.message) ? String(parsed.error || parsed.message) : text;
+      return {
+        message: parsed && (parsed.error || parsed.message) ? String(parsed.error || parsed.message) : text,
+        code: parsed && typeof parsed.code === 'string' ? parsed.code : null
+      };
     } catch (_) {
-      return text;
+      return { message: text, code: null };
     }
   } catch (_) {
     return null;
@@ -3538,10 +3569,25 @@ function publishProgress(status, force, extra) {
   progressTimer = now;
   publish('progress', progressPayload(status, extra));
 }
+function reserveInput(kind, amount) {
+  if (!Number.isSafeInteger(amount) || amount < 0) throw new Error('Invalid input ' + kind + ' count.');
+  var limit = runtimeConfig[kind === 'rows' ? 'maxRows' : 'maxBytes'];
+  var key = kind === 'rows' ? 'inputRows' : 'inputBytes';
+  var next = runtimeConfig[key] + amount;
+  if (limit != null && next > limit) {
+    throw Object.assign(new Error('Dashboard input ' + kind + ' budget exceeded (' + next + ' > ' + limit + ').'), {
+      code: kind === 'rows' ? 'dashboard_input_rows_exceeded' : 'dashboard_input_bytes_exceeded',
+      status: 413
+    });
+  }
+  runtimeConfig[key] = next;
+}
 async function* responseChunks(sourceId, response) {
   var sourceProgress = progress.sources[sourceId];
   if (!response.body || typeof response.body.getReader !== 'function') {
+    if (runtimeConfig.maxBytes != null) throw new Error('Byte-bounded loading requires a readable response body.');
     var buffer = await response.arrayBuffer();
+    reserveInput('bytes', buffer.byteLength);
     sourceProgress.bytesLoaded = buffer.byteLength;
     sourceProgress.status = 'downloading';
     publishProgress('downloading', true);
@@ -3556,11 +3602,15 @@ async function* responseChunks(sourceId, response) {
         return;
       }
       var value = chunk.value;
+      reserveInput('bytes', value.byteLength || value.length || 0);
       sourceProgress.bytesLoaded += value.byteLength || value.length || 0;
       sourceProgress.status = 'downloading';
       publishProgress('downloading', false);
       yield value;
     }
+  } catch (error) {
+    if (reader.cancel) await reader.cancel(error).catch(function() {});
+    throw error;
   } finally {
     if (reader.releaseLock) reader.releaseLock();
   }
@@ -3579,7 +3629,10 @@ async function getSourceInput(source) {
     var response = await fetch(source.dataUrl, fetchInit);
     if (!response.ok) {
       var responseErrorDetail = await readResponseErrorDetail(response);
-      throw new Error('Failed to fetch Arrow stream for ' + source.id + ': ' + response.status + ' ' + response.statusText + (responseErrorDetail ? ' — ' + responseErrorDetail : ''));
+      var responseError = new Error('Failed to fetch Arrow stream for ' + source.id + ': ' + response.status + ' ' + response.statusText + (responseErrorDetail ? ' — ' + responseErrorDetail.message : ''));
+      responseError.status = response.status;
+      responseError.code = responseErrorDetail ? responseErrorDetail.code : null;
+      throw responseError;
     }
     var headerValue = response.headers && response.headers.get ? response.headers.get('content-length') : null;
     sourceProgress.response = response.headers && response.headers.get ? {
@@ -3594,6 +3647,7 @@ async function getSourceInput(source) {
     return responseChunks(source.id, response);
   }
   sourceProgress.totalBytes = source.arrowBuffer.byteLength || null;
+  reserveInput('bytes', source.arrowBuffer.byteLength);
   sourceProgress.bytesLoaded = sourceProgress.totalBytes || 0;
   sourceProgress.status = 'downloading';
   publishProgress('downloading', true);
@@ -3622,6 +3676,7 @@ async function streamBaseSourceIntoRuntime(source) {
   var bufferedRows = 0;
 
   for await (var batch of reader) {
+    reserveInput('rows', batch.numRows);
     var projected = projectBatch(batch, source.projection);
     if (!runtime) {
       ensureRuntimeFromColumns(projected);
@@ -3664,6 +3719,7 @@ async function loadProjectedBatchesFromSource(source) {
   var rowCount = 0;
 
   for await (var batch of reader) {
+    reserveInput('rows', batch.numRows);
     var projected = projectBatch(batch, source.projection);
     batches.push(projected);
     if (!fields.length) {
@@ -3695,6 +3751,7 @@ async function buildLookupIndexFromSource(source) {
   var valueKinds = new Array(valueFields.length);
 
   for await (var batch of reader) {
+    reserveInput('rows', batch.numRows);
     var projected = projectBatch(batch, source.projection);
     var keyKinds = new Array(source.lookup.keyFields.length);
     for (var ki = 0; ki < source.lookup.keyFields.length; ++ki) {
@@ -3884,12 +3941,17 @@ async function startStreaming(payload) {
     await maybePublishSnapshot(true);
     publish('ready', progressPayload('ready'));
   } catch (error) {
+    releaseAbortControllers();
+    if (runtime) runtime.dispose();
+    runtime = null;
     if (error && error.name === 'AbortError') {
       publishProgress('aborted', true);
       return;
     }
     publish('error', Object.assign(progressPayload('error'), {
       message: String(error && error.message || error),
+      code: error && typeof error.code === 'string' ? error.code : null,
+      status: error && typeof error.status === 'number' ? error.status : null,
       stack: error && error.stack ? String(error.stack) : null
     }));
   }
@@ -3904,6 +3966,10 @@ self.onmessage = async function(event) {
     switch (message.type) {
       case 'initStreaming': {
         runtimeConfig = {
+          maxRows: message.payload.maxRows,
+          maxBytes: message.payload.maxBytes,
+          inputRows: 0,
+          inputBytes: 0,
           batchCoalesceRows: typeof message.payload.batchCoalesceRows === 'number' && message.payload.batchCoalesceRows > 0
             ? Math.floor(message.payload.batchCoalesceRows)
             : 65536,
@@ -3980,6 +4046,11 @@ self.onmessage = async function(event) {
 
   function createStreamingDashboardWorker(options) {
     options = options || {};
+    for (var limitName of ['maxRows', 'maxBytes']) {
+      if (options[limitName] != null && (!Number.isSafeInteger(options[limitName]) || options[limitName] < 1)) {
+        throw new Error(limitName + ' must be a positive safe integer.');
+      }
+    }
 
     var hasSources = Array.isArray(options.sources) && options.sources.length > 0;
     var modeCount = (options.arrowBuffer ? 1 : 0) + (options.dataUrl ? 1 : 0) + (hasSources ? 1 : 0);
@@ -4073,7 +4144,10 @@ self.onmessage = async function(event) {
         if (message.eventType === "ready") {
           readyResolve(message.payload);
         } else if (message.eventType === "error") {
-          readyReject(new Error(message.payload && message.payload.message || "Streaming dashboard worker failed."));
+          readyReject(Object.assign(new Error(message.payload && message.payload.message || "Streaming dashboard worker failed."), {
+            code: message.payload && message.payload.code,
+            status: message.payload && message.payload.status
+          }));
         }
         return;
       }
@@ -4091,6 +4165,8 @@ self.onmessage = async function(event) {
       }
 
       var error = new Error(message.error && message.error.message || "Streaming dashboard worker request failed.");
+      error.code = message.error && message.error.code;
+      error.status = message.error && message.error.status;
       if (message.error && message.error.stack) {
         error.stack = message.error.stack;
       }
@@ -4119,6 +4195,8 @@ self.onmessage = async function(event) {
       snapshotThrottleMs: options.snapshotThrottleMs,
       sources: sources,
       batchCoalesceRows: options.batchCoalesceRows,
+      maxRows: options.maxRows,
+      maxBytes: options.maxBytes,
       wasm: options.wasm !== false
     };
 
