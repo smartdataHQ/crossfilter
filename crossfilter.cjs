@@ -3087,13 +3087,21 @@ function resolveStreamingSources(options, transfer) {
 function createWorkerSource(crossfilterUrl, arrowUrl) {
   return `
 'use strict';
-importScripts(${JSON.stringify(crossfilterUrl)}, ${JSON.stringify(arrowUrl)});
+// The two libraries load when streaming starts, not here. importScripts blocks this thread, and
+// at the top it held the first data request back until both scripts had been fetched and run.
+var runtimeScriptsLoaded = false;
+function ensureRuntimeScripts() {
+  if (runtimeScriptsLoaded) return;
+  importScripts(${JSON.stringify(crossfilterUrl)}, ${JSON.stringify(arrowUrl)});
+  runtimeScriptsLoaded = true;
+}
 var runtime = null;
 var runtimeConfig = null;
 var abortControllers = [];
 var progress = null;
 var progressTimer = 0;
 var snapshotTimer = 0;
+var sourceResponses = Object.create(null);
 function getRecordBatchReader(module) {
   return module && (module.RecordBatchReader || (module.default && module.default.RecordBatchReader)) || null;
 }
@@ -3611,18 +3619,27 @@ async function* responseChunks(sourceId, response) {
     if (reader.releaseLock) reader.releaseLock();
   }
 }
+// Issues a source's request. Called for every URL source as streaming starts, before the
+// libraries load, so the data is on its way while the import blocks. Nothing else moves:
+// progress events and reading the response stay where they were, in getSourceInput.
+function requestSource(source) {
+  var controller = typeof AbortController === 'function' ? new AbortController() : null;
+  var fetchInit = source.dataFetchInit || {};
+  if (controller) {
+    fetchInit = Object.assign({}, fetchInit, { signal: controller.signal });
+    abortControllers.push(controller);
+  }
+  var response = sourceResponses[source.id] = fetch(source.dataUrl, fetchInit);
+  // A failure before getSourceInput awaits it is getSourceInput's to report, not an unhandled rejection.
+  response.catch(function() {});
+  return response;
+}
 async function getSourceInput(source) {
   var sourceProgress = progress.sources[source.id];
   if (source.dataUrl) {
     sourceProgress.status = 'requesting';
     publishProgress('starting', true);
-    var controller = typeof AbortController === 'function' ? new AbortController() : null;
-    var fetchInit = source.dataFetchInit || {};
-    if (controller) {
-      fetchInit = Object.assign({}, fetchInit, { signal: controller.signal });
-      abortControllers.push(controller);
-    }
-    var response = await fetch(source.dataUrl, fetchInit);
+    var response = await (sourceResponses[source.id] || requestSource(source));
     if (!response.ok) {
       var responseErrorDetail = await readResponseErrorDetail(response);
       var responseError = new Error('Failed to fetch Arrow stream for ' + source.id + ': ' + response.status + ' ' + response.statusText + (responseErrorDetail ? ' — ' + responseErrorDetail.message : ''));
@@ -3868,12 +3885,6 @@ function buildRuntimeFromBatches(batches) {
   }
 }
 async function startStreaming(payload) {
-  var arrow = self.Arrow;
-  var RecordBatchReader = getRecordBatchReader(arrow);
-  if (!RecordBatchReader || !RecordBatchReader.from) {
-    throw new Error('Apache Arrow RecordBatchReader is not available in the worker.');
-  }
-
   var sources = payload.sources && payload.sources.length
     ? payload.sources.slice()
     : [{
@@ -3886,6 +3897,27 @@ async function startStreaming(payload) {
         role: 'base'
       }];
 
+  abortControllers = [];
+  sourceResponses = Object.create(null);
+  for (var requestIndex = 0; requestIndex < sources.length; ++requestIndex) {
+    if (sources[requestIndex].dataUrl) requestSource(sources[requestIndex]);
+  }
+
+  try {
+    ensureRuntimeScripts();
+    var RecordBatchReader = getRecordBatchReader(self.Arrow);
+    if (!RecordBatchReader || !RecordBatchReader.from) {
+      throw new Error('Apache Arrow RecordBatchReader is not available in the worker.');
+    }
+  } catch (error) {
+    // The libraries are missing or unusable, so there is no runtime info to report progress
+    // with: abort what was asked for and say why. The caller does not await this function, so
+    // a throw from here would reach no one.
+    releaseAbortControllers();
+    publish('error', { message: String(error && error.message || error), code: null, status: null, stack: error && error.stack ? String(error.stack) : null });
+    return;
+  }
+
   progress = {
     emitSnapshots: payload.emitSnapshots === true,
     progressThrottleMs: typeof payload.progressThrottleMs === 'number' ? payload.progressThrottleMs : 100,
@@ -3896,7 +3928,6 @@ async function startStreaming(payload) {
 
   progressTimer = 0;
   snapshotTimer = 0;
-  abortControllers = [];
 
   for (var sourceIndex = 0; sourceIndex < sources.length; ++sourceIndex) {
     progress.sources[sources[sourceIndex].id] = createSourceProgress(sources[sourceIndex]);
