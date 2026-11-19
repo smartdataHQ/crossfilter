@@ -10,7 +10,7 @@ const workerSource = runInNewContext(factory + '; createWorkerSource("crossfilte
 const bytes = Arrow.tableToIPC(Arrow.tableFromArrays({ country: ["IS", "UK"], count: [2, 3] }), "stream");
 
 // A worker scope with no libraries until importScripts runs, as in a browser.
-function createWorker(fetchImpl, importImpl) {
+function createWorker(fetchImpl, importImpl, arrowModule = Arrow) {
   const calls = [];
   const events = [];
   const waiters = [];
@@ -27,7 +27,7 @@ function createWorker(fetchImpl, importImpl) {
     importScripts(...urls) {
       calls.push(["importScripts", ...urls]);
       if (importImpl) importImpl();
-      self.Arrow = Arrow;
+      self.Arrow = arrowModule;
       self.crossfilter = crossfilter;
     },
     fetch(url, init) {
@@ -85,6 +85,15 @@ describe("streaming worker start", () => {
     const result = await worker.init({ dataUrl: "https://example.test/data" });
     expect(result.eventType).toBe("error");
     expect(result.payload.message).toContain("script failed to load");
+    expect(signal.aborted).toBe(true);
+  });
+
+  it("reports an Arrow build without a stream reader instead of throwing where no one listens", async () => {
+    let signal;
+    const worker = createWorker((_url, init) => { signal = init.signal; return new Promise(() => {}); }, null, {});
+    const result = await worker.init({ dataUrl: "https://example.test/data" });
+    expect(result.eventType).toBe("error");
+    expect(result.payload.message).toContain("RecordBatchReader is not available");
     expect(signal.aborted).toBe(true);
   });
 

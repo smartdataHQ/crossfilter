@@ -3905,16 +3905,17 @@ async function startStreaming(payload) {
 
   try {
     ensureRuntimeScripts();
+    var RecordBatchReader = getRecordBatchReader(self.Arrow);
+    if (!RecordBatchReader || !RecordBatchReader.from) {
+      throw new Error('Apache Arrow RecordBatchReader is not available in the worker.');
+    }
   } catch (error) {
-    // No library, so no runtime info to report progress with: abort what was asked for and say why.
+    // The libraries are missing or unusable, so there is no runtime info to report progress
+    // with: abort what was asked for and say why. The caller does not await this function, so
+    // a throw from here would reach no one.
     releaseAbortControllers();
     publish('error', { message: String(error && error.message || error), code: null, status: null, stack: error && error.stack ? String(error.stack) : null });
     return;
-  }
-  var RecordBatchReader = getRecordBatchReader(self.Arrow);
-  if (!RecordBatchReader || !RecordBatchReader.from) {
-    releaseAbortControllers();
-    throw new Error('Apache Arrow RecordBatchReader is not available in the worker.');
   }
 
   progress = {
