@@ -168,6 +168,12 @@ function isBigIntTypedArray(arr) {
   var tag = typedArrayToString.call(arr);
   return tag === '[object BigInt64Array]' || tag === '[object BigUint64Array]';
 }
+function hasValidNullBitmap(chunk) {
+  if (!chunk || chunk.nullCount === 0) return true;
+  if (!chunk.nullBitmap || typeof chunk.nullBitmap.length !== 'number') return false;
+  var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+  return chunk.nullBitmap.length >= ((chunkOff + chunk.length + 7) >>> 3);
+}
 function extractArrowNumericChunks(sourceColumn, length, mode) {
   if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
     return null;
@@ -179,11 +185,14 @@ function extractArrowNumericChunks(sourceColumn, length, mode) {
     return null;
   }
   var chunks = sourceColumn.data;
-  var c, chunk, chunkLen, vals, j, v;
+  var c, chunk, chunkLen, vals, j, v, nullBitmap, chunkOff, bitIdx;
   var total = 0;
   for (c = 0; c < chunks.length; ++c) {
     chunk = chunks[c];
-    if (!chunk || chunk.nullCount !== 0 || !ArrayBuffer.isView(chunk.values)) {
+    if (!chunk || !ArrayBuffer.isView(chunk.values)) {
+      return null;
+    }
+    if (mode === 'raw' ? chunk.nullCount !== 0 : !hasValidNullBitmap(chunk)) {
       return null;
     }
     chunkLen = chunk.length;
@@ -191,6 +200,9 @@ function extractArrowNumericChunks(sourceColumn, length, mode) {
       return null;
     }
     if (typeId === 2 && chunk.type && chunk.type.bitWidth > 32 && !isBigIntTypedArray(chunk.values)) {
+      return null;
+    }
+    if (typeId === 3 && chunk.type && chunk.type.precision === 0) {
       return null;
     }
     if (!isStandardNumericTypedArray(chunk.values) && !isBigIntTypedArray(chunk.values)) {
@@ -216,30 +228,76 @@ function extractArrowNumericChunks(sourceColumn, length, mode) {
     chunk = chunks[c];
     chunkLen = chunk.length;
     vals = chunk.values;
+    nullBitmap = chunk.nullCount > 0 ? chunk.nullBitmap : null;
+    chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
     if (mode === 'number') {
-      if (isIntegerTypedArray(vals)) {
-        out.set(vals.length === chunkLen ? vals : vals.subarray(0, chunkLen), outOffset);
+      if (!nullBitmap) {
+        if (isIntegerTypedArray(vals)) {
+          out.set(vals.length === chunkLen ? vals : vals.subarray(0, chunkLen), outOffset);
+        } else if (isBigIntTypedArray(vals)) {
+          for (j = 0; j < chunkLen; ++j) {
+            v = Number(vals[j]);
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          }
+        } else {
+          for (j = 0; j < chunkLen; ++j) {
+            v = vals[j];
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          }
+        }
       } else if (isBigIntTypedArray(vals)) {
         for (j = 0; j < chunkLen; ++j) {
-          v = Number(vals[j]);
-          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          bitIdx = chunkOff + j;
+          if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+            out[outOffset + j] = 0;
+          } else {
+            v = Number(vals[j]);
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          }
         }
       } else {
         for (j = 0; j < chunkLen; ++j) {
-          v = vals[j];
-          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          bitIdx = chunkOff + j;
+          if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+            out[outOffset + j] = 0;
+          } else {
+            v = vals[j];
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          }
         }
       }
     } else if (mode === 'timestampMs') {
-      if (isBigIntTypedArray(vals)) {
+      if (!nullBitmap) {
+        if (isBigIntTypedArray(vals)) {
+          for (j = 0; j < chunkLen; ++j) {
+            v = Number(vals[j]);
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+          }
+        } else {
+          for (j = 0; j < chunkLen; ++j) {
+            v = vals[j];
+            out[outOffset + j] = v < 1e12 ? v * 1000 : v;
+          }
+        }
+      } else if (isBigIntTypedArray(vals)) {
         for (j = 0; j < chunkLen; ++j) {
-          v = Number(vals[j]);
-          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+          bitIdx = chunkOff + j;
+          if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+            out[outOffset + j] = 0;
+          } else {
+            v = Number(vals[j]);
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+          }
         }
       } else {
         for (j = 0; j < chunkLen; ++j) {
-          v = vals[j];
-          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+          bitIdx = chunkOff + j;
+          if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+            out[outOffset + j] = 0;
+          } else {
+            v = vals[j];
+            out[outOffset + j] = v < 1e12 ? v * 1000 : v;
+          }
         }
       }
     }
@@ -247,24 +305,23 @@ function extractArrowNumericChunks(sourceColumn, length, mode) {
   }
   return out;
 }
-function extractArrowDictionaryColumn(sourceColumn, length) {
+function copyArrowDictionaryInto(target, targetOffset, sourceColumn, length) {
   if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
-    return null;
+    return false;
   }
   var chunks = sourceColumn.data;
   var c, chunk, total = 0;
   for (c = 0; c < chunks.length; ++c) {
     chunk = chunks[c];
-    if (!chunk || !chunk.dictionary || typeof chunk.dictionary.get !== 'function' || chunk.nullCount !== 0 || !ArrayBuffer.isView(chunk.values) || chunk.values.length < chunk.length) {
-      return null;
+    if (!chunk || !chunk.dictionary || typeof chunk.dictionary.get !== 'function' || !hasValidNullBitmap(chunk) || !ArrayBuffer.isView(chunk.values) || chunk.values.length < chunk.length) {
+      return false;
     }
     total += chunk.length;
   }
   if (total !== length) {
-    return null;
+    return false;
   }
-  var out = new Array(length);
-  var outOffset = 0;
+  var outOffset = targetOffset;
   for (c = 0; c < chunks.length; ++c) {
     chunk = chunks[c];
     var dict = chunk.dictionary;
@@ -276,12 +333,24 @@ function extractArrowDictionaryColumn(sourceColumn, length) {
     }
     var indices = chunk.values;
     var chunkLen = chunk.length;
-    for (var j = 0; j < chunkLen; ++j) {
-      out[outOffset + j] = dictVals[indices[j]];
+    var nullBitmap = chunk.nullCount > 0 ? chunk.nullBitmap : null;
+    var j;
+    if (!nullBitmap) {
+      for (j = 0; j < chunkLen; ++j) {
+        target[outOffset + j] = dictVals[indices[j]];
+      }
+    } else {
+      var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+      for (j = 0; j < chunkLen; ++j) {
+        var bitIdx = chunkOff + j;
+        target[outOffset + j] = (nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))
+          ? dictVals[indices[j]]
+          : null;
+      }
     }
     outOffset += chunkLen;
   }
-  return out;
+  return true;
 }
 function resolveColumnAccessor(column) {
   if (column == null) return null;
@@ -295,15 +364,26 @@ function getValueByKind(column, index, kind) {
   if (kind === 'at') return column.at(index);
   return column[index];
 }
-function allocateMergedColumn(column, length) {
-  if (ArrayBuffer.isView(column) && typeof column.constructor === 'function' && typeof column.BYTES_PER_ELEMENT === 'number') {
-    return new column.constructor(length);
+function allocateMergedColumnForBatches(batches, field, length) {
+  var first = batches[0].columns[field];
+  if (!ArrayBuffer.isView(first) || typeof first.constructor !== 'function' || typeof first.BYTES_PER_ELEMENT !== 'number') {
+    return new Array(length);
   }
-  return new Array(length);
+  var firstTag = typedArrayToString.call(first);
+  for (var b = 1; b < batches.length; ++b) {
+    var col = batches[b].columns[field];
+    if (!ArrayBuffer.isView(col) || typedArrayToString.call(col) !== firstTag) {
+      return new Array(length);
+    }
+  }
+  return new first.constructor(length);
 }
 function copyColumnValues(target, targetOffset, source, length) {
-  if (ArrayBuffer.isView(target) && ArrayBuffer.isView(source) && source.constructor === target.constructor && typeof source.length === 'number') {
-    target.set(source, targetOffset);
+  if (ArrayBuffer.isView(target) && ArrayBuffer.isView(source) && typedArrayToString.call(source) === typedArrayToString.call(target) && typeof source.length === 'number') {
+    target.set(source.length === length ? source : source.subarray(0, length), targetOffset);
+    return;
+  }
+  if (copyArrowDictionaryInto(target, targetOffset, source, length)) {
     return;
   }
   var sourceKind = resolveColumnAccessor(source);
@@ -328,7 +408,8 @@ function mergeProjectedBatches(batches) {
   }
 
   for (var fieldIndex = 0; fieldIndex < fields.length; ++fieldIndex) {
-    columns[fields[fieldIndex]] = allocateMergedColumn(batches[0].columns[fields[fieldIndex]], totalLength);
+    var mergeField = fields[fieldIndex];
+    columns[mergeField] = allocateMergedColumnForBatches(batches, mergeField, totalLength);
   }
 
   var offset = 0;
@@ -525,8 +606,7 @@ function projectBatch(batch, projection) {
       values.fill(1);
       columns[outputName] = values;
     } else {
-      var fastRaw = extractArrowNumericChunks(sourceColumn, length, 'raw')
-        || extractArrowDictionaryColumn(sourceColumn, length);
+      var fastRaw = extractArrowNumericChunks(sourceColumn, length, 'raw');
       columns[outputName] = fastRaw || sourceColumn;
     }
   }

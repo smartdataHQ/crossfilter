@@ -1081,3 +1081,584 @@ describe("crossfilter3 differential fuzz oracle & deep edge-case coverage", () =
     rt.dispose();
   });
 });
+
+describe("v3.1.1 systematic correctness fixes and performance fast paths", () => {
+  function expectCloseRecord(actual, expected) {
+    expect(Object.keys(actual).sort()).toEqual(Object.keys(expected).sort());
+    for (const k of Object.keys(expected)) {
+      if (expected[k] === null) {
+        expect(actual[k]).toBeNull();
+      } else {
+        expect(actual[k]).toBeCloseTo(expected[k], 7);
+      }
+    }
+  }
+
+  it("ensureLazyBucketLayout does not alias a reappearing bucket code into slot 0 after remove + add", () => {
+    const day0 = Date.UTC(2025, 0, 1);
+    const day1 = Date.UTC(2025, 0, 2);
+    const day2 = Date.UTC(2025, 0, 3);
+    // Use JS array (non-TypedArray) so ts stays in lazyEncodedState + lazyBucketMode
+    const cf = crossfilter.fromColumns({
+      ts: [day0, day1, day2, day0],
+      tag: ["keep", "drop", "keep", "keep"],
+      rev: new Float64Array([10, 20, 30, 40]),
+    });
+    const tsDim = cf.dimension("ts");
+    const tagDim = cf.dimension("tag");
+    const dayBucket = (v) => Math.floor(v / 86400000) * 86400000;
+    dayBucket._xfilterPureMonotonic = true;
+    const grp = tsDim.group(dayBucket).reduceCount();
+
+    expect(grp.all()).toEqual([
+      { key: day0, value: 2 },
+      { key: day1, value: 1 },
+      { key: day2, value: 1 },
+    ]);
+
+    // Remove all rows belonging to day1 -> code for day1 has count 0
+    tagDim.filterExact("drop");
+    cf.remove();
+    tagDim.filterAll();
+
+    // Trigger full rebuild while day1 has count 0
+    expect(grp.all()).toEqual([
+      { key: day0, value: 2 },
+      { key: day2, value: 1 },
+    ]);
+
+    // Re-add rows with day1 (reuses existing code < bucketCodeCount!)
+    cf.add(crossfilter.rowsFromColumns({
+      ts: [day1, day1, day2],
+      tag: ["keep", "keep", "keep"],
+      rev: new Float64Array([5, 6, 7]),
+    }));
+
+    // day1 must get its own bucket (count 2) and NOT alias into day0 (count must stay 2, not 4!)
+    expect(grp.all()).toEqual([
+      { key: day0, value: 2 },
+      { key: day1, value: 2 },
+      { key: day2, value: 2 },
+    ]);
+  });
+
+  it("dimension.dispose() disposes ALL attached groups without skipping on splice", () => {
+    const cf = crossfilter.fromColumns({
+      a: ["x", "y", "x", "z"],
+      b: ["p", "p", "q", "q"],
+      v: new Float64Array([1, 2, 3, 4]),
+    });
+    const dimA = cf.dimension("a");
+    const dimB = cf.dimension("b");
+    const calls = [0, 0, 0, 0];
+    const groups = [0, 1, 2, 3].map((idx) =>
+      dimA.group().reduce(
+        (p, d) => { calls[idx] += 1; return p + d.v; },
+        (p, d) => { calls[idx] += 1; return p - d.v; },
+        () => 0
+      )
+    );
+    // Materialize initial state for all 4 groups
+    groups.forEach((g) => g.all());
+    const before = calls.slice();
+
+    // Dispose dimA -> must dispose ALL 4 groups (previously skipped every 2nd group)
+    dimA.dispose();
+
+    // Filtering dimB or adding new data must invoke ZERO callbacks on any of the 4 disposed groups
+    dimB.filterExact("p");
+    dimB.filterAll();
+    cf.add(crossfilter.rowsFromColumns({ a: ["x"], b: ["p"], v: new Float64Array([99]) }));
+    expect(calls).toEqual(before);
+  });
+
+  it("metric sum sharing, count-sum fusion, avg-count fusion, and sum-pairing match brute-force oracle across clean and NaN/Infinity data", () => {
+    const testCases = [
+      { name: "clean", rev: [10, 20, 30, 40, 50, 60, 70, 80], cost: [3, 6, 9, 12, 15, 18, 21, 24], qty: [1, 2, 3, 4, 5, 6, 7, 8] },
+      { name: "with NaN/Inf", rev: [10, NaN, 30, Infinity, 50, 60, -Infinity, 80], cost: [3, 6, NaN, 12, 15, Infinity, 21, 24], qty: [1, 2, 3, 4, NaN, 6, 7, 8] },
+    ];
+    const metricSets = [
+      // Heavy sharing: count + sum(rev) + avg(rev) + dup sum(rev) + dup avg(rev) + ratio(cost, rev) + ratio(rev, rev) + ratio(rev, cost)
+      [
+        { id: "rows", op: "count" },
+        { id: "revSum", op: "sum", field: "rev" },
+        { id: "revAvg", op: "avg", field: "rev" },
+        { id: "revSum2", op: "sum", field: "rev" },
+        { id: "revAvg2", op: "avg", field: "rev" },
+        { id: "costOverRev", op: "ratio", field: "cost", denominator: "rev" },
+        { id: "revOverRev", op: "ratio", field: "rev", denominator: "rev" },
+        { id: "revOverCost", op: "ratio", field: "rev", denominator: "cost" },
+      ],
+      // Avg-only (triggers hidden __rows + firstAvgIndex fusion!)
+      [{ id: "avgRev", op: "avg", field: "rev" }],
+      // Sum-pair + avg + ratio (no explicit count -> hidden __rows + fused sum + sum-pair)
+      [
+        { id: "revSum", op: "sum", field: "rev" },
+        { id: "qtySum", op: "sum", field: "qty" },
+        { id: "avgCost", op: "avg", field: "cost" },
+        { id: "ratioRQ", op: "ratio", field: "rev", denominator: "qty" },
+      ],
+      // Sharing from secondary buffer of an earlier ratio!
+      [
+        { id: "ratioRC", op: "ratio", field: "rev", denominator: "cost" },
+        { id: "costSum", op: "sum", field: "cost" },
+        { id: "revSum", op: "sum", field: "rev" },
+        { id: "costAvg", op: "avg", field: "cost" },
+      ],
+    ];
+
+    const cats = ["A", "B", "A", "B", "A", "C", "B", "C"];
+    const splits = ["s1", "s1", "s2", "s2", "s1", "s2", "s1", "s2"];
+    const flags = ["f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7"]; // allows 1-row (<25%) incremental delta!
+
+    for (const tc of testCases) {
+      const rows = cats.map((cat, i) => ({
+        cat,
+        split: splits[i],
+        flag: flags[i],
+        rev: tc.rev[i],
+        cost: tc.cost[i],
+        qty: tc.qty[i],
+      }));
+
+      const calc = (subset, metrics) => {
+        const res = {};
+        for (const m of metrics) {
+          if (m.op === "count") res[m.id] = subset.length;
+          else if (m.op === "sum") res[m.id] = subset.reduce((s, r) => s + (Number.isFinite(r[m.field]) ? r[m.field] : 0), 0);
+          else if (m.op === "avg") {
+            let s = 0, c = 0;
+            for (const r of subset) if (Number.isFinite(r[m.field])) { s += r[m.field]; c += 1; }
+            res[m.id] = c ? s / c : null;
+          } else if (m.op === "ratio") {
+            let n = 0, d = 0;
+            for (const r of subset) {
+              if (Number.isFinite(r[m.field])) n += r[m.field];
+              if (Number.isFinite(r[m.denominator])) d += r[m.denominator];
+            }
+            res[m.id] = d !== 0 ? n / d : null;
+          }
+        }
+        return res;
+      };
+
+      for (const metrics of metricSets) {
+        const rt = crossfilter.createDashboardRuntime({
+          columns: {
+            cat: cats.slice(),
+            split: splits.slice(),
+            flag: flags.slice(),
+            rev: Float64Array.from(tc.rev),
+            cost: Float64Array.from(tc.cost),
+            qty: Float64Array.from(tc.qty),
+          },
+          dimensions: ["cat", "split", "flag"],
+          kpis: metrics,
+          groups: [
+            { id: "flat", field: "cat", metrics },
+            { id: "dense", field: "cat", splitField: "split", metrics },
+          ],
+        });
+
+        const verify = (pred) => {
+          const snap = rt.snapshot();
+          const active = rows.filter(pred);
+          expectCloseRecord(snap.kpis, calc(active, metrics));
+          for (const entry of snap.groups.flat) {
+            const sub = active.filter((r) => r.cat === entry.key);
+            expectCloseRecord(entry.value, calc(sub, metrics));
+          }
+          for (const entry of snap.groups.dense) {
+            const bySplit = {};
+            for (const sp of ["s1", "s2"]) {
+              const sub = active.filter((r) => r.cat === entry.key && r.split === sp);
+              if (sub.length) bySplit[sp] = calc(sub, metrics);
+            }
+            expect(Object.keys(entry.value).sort()).toEqual(Object.keys(bySplit).sort());
+            for (const sp of Object.keys(bySplit)) {
+              expectCloseRecord(entry.value[sp], bySplit[sp]);
+            }
+          }
+        };
+
+        // 1. Unfiltered reset (reduceGroupedAll / reduceSplitDenseAll / reduceScalarAll)
+        verify(() => true);
+        // 2. Small incremental removal (<25% delta: exclude 1 of 8 rows via filterIn of 7 flags!)
+        rt.updateFilters({ flag: { type: "in", values: flags.slice(1) } });
+        verify((r) => r.flag !== "f0");
+        // 3. Small incremental add-back + remove (swap f0 back in, drop f1 -> 2/8 = 25% <= n>>>2)
+        rt.updateFilters({ flag: { type: "in", values: ["f0", "f2", "f3", "f4", "f5", "f6", "f7"] } });
+        verify((r) => r.flag !== "f1");
+        // 4. Large filter (>25% forceReset -> reduceGroupedIndexed / reduceSplitDenseIndexed / reduceScalarIndexed reset)
+        rt.updateFilters({ split: { type: "exact", value: "s1" } });
+        verify((r) => r.split === "s1");
+        // 5. Clear back to unfiltered
+        rt.updateFilters({});
+        verify(() => true);
+
+        rt.dispose();
+      }
+    }
+  });
+
+  it("handles nullable Arrow Dictionary & numeric vectors (including non-byte-aligned slices) in fromArrowTable and streaming worker", async () => {
+    const n = 80;
+    const cats = Array.from({ length: n }, (_, i) => (i % 7 === 0 ? null : `cat_${i % 5}`));
+    const splits = Array.from({ length: n }, (_, i) => (i % 9 === 0 ? null : `ch_${i % 3}`));
+    const amts = Array.from({ length: n }, (_, i) => (i % 11 === 0 ? null : (i + 1) * 1.5));
+    const ints = Array.from({ length: n }, (_, i) => (i % 6 === 0 ? null : i * 2));
+    const tsVals = Array.from({ length: n }, (_, i) => (i % 13 === 0 ? null : BigInt(Date.UTC(2025, 0, 1) + i * 3600000)));
+
+    const dictType = new Arrow.Dictionary(new Arrow.Utf8(), new Arrow.Int32());
+    const table = Arrow.tableFromArrays({
+      cat: Arrow.vectorFromArray(cats, dictType),
+      split: Arrow.vectorFromArray(splits, dictType),
+      amt: Arrow.vectorFromArray(amts, new Arrow.Float64()),
+      qty: Arrow.vectorFromArray(ints, new Arrow.Int32()),
+      ts: Arrow.vectorFromArray(tsVals, new Arrow.Int64()),
+    });
+    // Non-byte-aligned slice (offset = 7!) exercises nullBitmap bit indexing (chunk.offset + j)
+    const sliced = table.slice(7, 67); // 60 rows
+
+    const rt = crossfilter.createDashboardRuntime({
+      table: sliced,
+      dimensions: ["cat", "split", "amt"],
+      kpis: [
+        { id: "rows", op: "count" },
+        { id: "amtSum", op: "sum", field: "amt" },
+        { id: "qtySum", op: "sum", field: "qty" },
+      ],
+      groups: [
+        { id: "byCat", field: "cat", metrics: [{ id: "rows", op: "count" }, { id: "amtSum", op: "sum", field: "amt" }] },
+        { id: "byCatSplit", field: "cat", splitField: "split", metrics: [{ id: "rows", op: "count" }, { id: "amtSum", op: "sum", field: "amt" }] },
+      ],
+    });
+
+    const expectedRows = [];
+    for (let i = 7; i < 67; ++i) {
+      expectedRows.push({ cat: cats[i], split: splits[i], amt: amts[i], qty: ints[i] });
+    }
+    const snap = rt.snapshot();
+    expect(snap.kpis.rows).toBe(60);
+    expect(snap.kpis.amtSum).toBeCloseTo(expectedRows.reduce((s, r) => s + (r.amt ?? 0), 0), 7);
+    expect(snap.kpis.qtySum).toBe(expectedRows.reduce((s, r) => s + (r.qty ?? 0), 0));
+
+    // Verify null bucket & every category bucket match exactly
+    const nullEntry = snap.groups.byCat.find((e) => e.key === null);
+    expect(nullEntry.value.rows).toBe(expectedRows.filter((r) => r.cat === null).length);
+    expect(nullEntry.value.amtSum).toBeCloseTo(
+      expectedRows.filter((r) => r.cat === null).reduce((s, r) => s + (r.amt ?? 0), 0),
+      7
+    );
+
+    // Verify splitField __unknown__ bucket for null Arrow Dictionary entries
+    const cat0Split = snap.groups.byCatSplit.find((e) => e.key === "cat_0");
+    const expectedUnknown = expectedRows.filter((r) => r.cat === "cat_0" && r.split === null).length;
+    if (expectedUnknown > 0) {
+      expect(cat0Split.value.__unknown__.rows).toBe(expectedUnknown);
+    }
+
+    // Verify single-batch Arrow Dictionary takeColumns (>32 rows triggers direct dict decode!)
+    const taken = crossfilter.fromArrowTable(sliced).takeColumns(
+      Array.from({ length: 60 }, (_, i) => i),
+      ["cat", "split", "amt"]
+    );
+    expect(taken.columns.cat).toEqual(expectedRows.map((r) => r.cat));
+    expect(taken.columns.split).toEqual(expectedRows.map((r) => r.split));
+    const rtRows = rt.rows({ columnar: true, fields: ["cat", "split", "amt"], limit: 60 });
+    expect(rtRows.columns.cat).toEqual(expectedRows.map((r) => r.cat));
+    rt.dispose();
+
+    // Also test nullable Arrow IPC + mixed zero-null batch 0 & nullable batch 1 through streaming worker with batchCoalesceRows!
+    const b0 = Arrow.tableFromArrays({
+      cat: Arrow.vectorFromArray(["a", "b", "a", "c"], dictType),
+      amt: Arrow.vectorFromArray([10, 20, 30, 40], new Arrow.Float64()),
+      rawNum: Arrow.vectorFromArray([1, 2, 3, 4], new Arrow.Float64()),
+      ts: Arrow.vectorFromArray([BigInt(1700000000000), BigInt(1700000001000), BigInt(1700000002000), BigInt(1700000003000)], new Arrow.Int64()),
+    });
+    const b1 = Arrow.tableFromArrays({
+      cat: Arrow.vectorFromArray(["a", null, "b", null], dictType),
+      amt: Arrow.vectorFromArray([5, null, 15, 25], new Arrow.Float64()),
+      rawNum: Arrow.vectorFromArray([5, null, 7, 8], new Arrow.Float64()),
+      ts: Arrow.vectorFromArray([BigInt(1700000004000), null, BigInt(1700000006000), BigInt(1700000007000)], new Arrow.Int64()),
+    });
+    const ipcBytes = Arrow.tableToIPC(new Arrow.Table([...b0.batches, ...b1.batches]), "stream");
+
+    const workerSrc = readFileSync(new URL("../src/dashboard-stream-worker.js", import.meta.url), "utf8");
+    const m = workerSrc.match(/function createWorkerSource\(crossfilterUrl, arrowUrl\)\s*\{\s*return `([\s\S]*?)`;\s*\}/);
+    const cfBundle = readFileSync(new URL("../crossfilter.js", import.meta.url), "utf8");
+    const resolved = m[1].replace("${JSON.stringify(crossfilterUrl)}", JSON.stringify("cf.js")).replace("${JSON.stringify(arrowUrl)}", JSON.stringify("arrow.js"));
+
+    const responses = new Map();
+    let resolveReady;
+    const readyPromise = new Promise((r) => { resolveReady = r; });
+    const sandbox = {
+      console, setTimeout, clearTimeout, URL, TextDecoder, TextEncoder, AbortController,
+      ReadableStream, Response, Uint8Array, Int32Array, Float64Array, Float32Array, BigInt64Array, Map, Set, Promise,
+      fetch: async () => new Response(ipcBytes, { status: 200 }),
+      importScripts: () => { sandbox.Arrow = Arrow; runInNewContext(cfBundle, sandbox); },
+      postMessage: (msg) => {
+        if (msg.id && responses.has(msg.id)) {
+          const { resolve, reject } = responses.get(msg.id);
+          responses.delete(msg.id);
+          if (msg.ok) resolve(msg.payload);
+          else reject(new Error(msg.error?.message || "worker error"));
+        } else if (msg.eventType === "ready") {
+          resolveReady(msg.payload);
+        }
+      },
+    };
+    sandbox.self = sandbox;
+    runInNewContext(resolved, sandbox);
+    const call = (type, payload) => new Promise((resolve, reject) => {
+      const id = `m_${Math.random()}`;
+      responses.set(id, { resolve, reject });
+      sandbox.onmessage({ data: { id, type, payload } });
+    });
+
+    await call("initStreaming", {
+      batchCoalesceRows: 100, // forces merging b0 (no nulls) + b1 (with nulls) in mergeProjectedBatches!
+      sources: [{
+        id: "base",
+        role: "base",
+        dataUrl: "https://example.test/nullable.arrow",
+        projection: {
+          fields: ["cat", "amt", "rawNum", "ts"],
+          transforms: { amt: "number", ts: "timestampMs" },
+        },
+      }],
+      dimensions: ["cat", "rawNum"],
+      kpis: [
+        { id: "rows", op: "count" },
+        { id: "amtSum", op: "sum", field: "amt" },
+      ],
+      groups: [{ id: "byCat", field: "cat", metrics: [{ id: "rows", op: "count" }, { id: "amtSum", op: "sum", field: "amt" }] }],
+    });
+    await readyPromise;
+
+    const q = await call("query", { request: { snapshot: true, rows: { columnar: true, fields: ["cat", "amt", "rawNum", "ts"], limit: 10 } } });
+    expect(q.snapshot.kpis).toEqual({ rows: 8, amtSum: 145 });
+    expect(q.snapshot.groups.byCat.find((e) => e.key === null).value).toEqual({ rows: 2, amtSum: 25 });
+    // Crucial: rawNum null in batch 1 MUST remain null (not coerced to 0 when merged with Float64Array batch 0!)
+    expect(q.rows.columns.rawNum[5]).toBeNull();
+    expect(q.rows.columns.ts[5]).toBe(0);
+    expect(q.rows.columns.ts[0]).toBe(1700000000000);
+  });
+
+  it("multi-batch and mixed-batch takeColumns matches brute-force row extraction across sorted, reversed, and shuffled indices", () => {
+    const cf = crossfilter([{ k: "obj0", x: 100, f: 1.5 }, { k: "obj1", x: 200, f: 2.5 }]);
+    // Mixed object rows + single columnar batch (exercises batchCount === 1 && !singleFullBatch)
+    cf.add(crossfilter.rowsFromColumns({
+      k: ["b1_0", "b1_1", "b1_2"],
+      x: new Int32Array([300, 400, 500]),
+      f: new Float64Array([3.5, 4.5, 5.5]),
+    }));
+    const mixed = cf.takeColumns([4, 0, 2, 1, 3], ["k", "x", "f"]);
+    expect(mixed.columns.k).toEqual(["b1_2", "obj0", "b1_0", "obj1", "b1_1"]);
+    expect(mixed.columns.x).toEqual([500, 100, 300, 200, 400]);
+    expect(mixed.columns.f).toEqual([5.5, 1.5, 3.5, 2.5, 4.5]);
+
+    // 6 uniform columnar batches (exercises cached numericColumns + multi-batch cached cursor!)
+    const cfMulti = crossfilter();
+    const allK = [], allX = [], allF = [];
+    for (let b = 0; b < 6; ++b) {
+      const k = [], x = new Int32Array(25), f = new Float64Array(25);
+      for (let i = 0; i < 25; ++i) {
+        const g = b * 25 + i;
+        k.push(`k_${g}`);
+        x[i] = g * 3;
+        f[i] = g * 0.25;
+        allK.push(`k_${g}`);
+        allX.push(g * 3);
+        allF.push(g * 0.25);
+      }
+      cfMulti.add(crossfilter.rowsFromColumns({ k, x, f }));
+    }
+    // Second multi-batch instance with numericColumns["f"] primed via rawNumericState dimension("f")
+    const cfMultiPrimed = crossfilter();
+    for (let b = 0; b < 6; ++b) {
+      cfMultiPrimed.add(crossfilter.rowsFromColumns({
+        k: allK.slice(b * 25, (b + 1) * 25),
+        x: Int32Array.from(allX.slice(b * 25, (b + 1) * 25)),
+        f: Float64Array.from(allF.slice(b * 25, (b + 1) * 25)),
+      }));
+    }
+    cfMultiPrimed.dimension("f");
+
+    const indexOrders = [
+      Array.from({ length: 150 }, (_, i) => i), // monotonic
+      Array.from({ length: 150 }, (_, i) => 149 - i), // reversed
+      [149, 0, 74, 25, 124, 50, 99, 1, 148, 33, 66, 111], // shuffled across batches
+    ];
+    for (const idxs of indexOrders) {
+      for (const inst of [cfMulti, cfMultiPrimed]) {
+        const out = inst.takeColumns(idxs, ["k", "x", "f"]);
+        expect(out.columns.x).toBeInstanceOf(Int32Array);
+        expect(out.columns.f).toBeInstanceOf(Float64Array);
+        expect(out.columns.k).toEqual(idxs.map((i) => allK[i]));
+        expect(Array.from(out.columns.x)).toEqual(idxs.map((i) => allX[i]));
+        expect(Array.from(out.columns.f)).toEqual(idxs.map((i) => allF[i]));
+      }
+    }
+  });
+
+  it("forceReset skips large deltas safely for built-in groups while preserving exact callbacks for custom JS reducers", () => {
+    const n = 200;
+    const cat = Array.from({ length: n }, (_, i) => `c${i % 10}`);
+    const grp = Array.from({ length: n }, (_, i) => `g${i % 4}`);
+    const num = Float64Array.from({ length: n }, (_, i) => i);
+    const val = Float64Array.from({ length: n }, (_, i) => (i % 7) + 1);
+
+    // Part 1: Built-in only (triggers forceReset on >25% transitions for both lazyEncodedState and rawNumericState)
+    const rt = crossfilter.createDashboardRuntime({
+      columns: { cat, grp, num, val },
+      dimensions: ["cat", "grp", "num"],
+      kpis: [{ id: "rows", op: "count" }, { id: "sum", op: "sum", field: "val" }],
+      groups: [
+        { id: "byCat", field: "cat", metrics: [{ id: "rows", op: "count" }, { id: "sum", op: "sum", field: "val" }] },
+        { id: "byGrp", field: "grp", metrics: [{ id: "rows", op: "count" }, { id: "sum", op: "sum", field: "val" }] },
+      ],
+    });
+    const fullCat = rt.snapshot().groups.byCat;
+    // Filter cat to 10% (90% masked -> forceReset=true); byCat MUST stay unaffected while byGrp & KPI reflect 10%
+    rt.updateFilters({ cat: { type: "exact", value: "c0" } });
+    let snap = rt.snapshot();
+    expect(snap.groups.byCat).toEqual(fullCat);
+    expect(snap.kpis.rows).toBe(20);
+    // Switch cat from 10% to 70% (|70%-10%| = 60% > 25% -> forceReset=true)
+    rt.updateFilters({ cat: { type: "in", values: ["c0", "c1", "c2", "c3", "c4", "c5", "c6"] } });
+    expect(rt.snapshot().kpis.rows).toBe(140);
+    // Clear cat (70% -> 100%, 30% > 25% -> forceReset=true)
+    rt.updateFilters({});
+    expect(rt.snapshot().kpis.rows).toBe(200);
+    // rawNumericState range filter (>75% masked -> mid-loop bailout + forceReset=true) and clear!
+    rt.updateFilters({ num: { type: "range", range: [0, 30] } });
+    expect(rt.snapshot().kpis.rows).toBe(30);
+    rt.updateFilters({ num: { type: "range", range: [10, 190] } });
+    expect(rt.snapshot().kpis.rows).toBe(180);
+    rt.updateFilters({});
+    expect(rt.snapshot().kpis.rows).toBe(200);
+    rt.dispose();
+
+    // Part 2: Custom JS reducer MUST still receive exact incremental add/remove calls with noPrior === false
+    const cf = crossfilter.fromColumns({ cat, grp, num, val });
+    const dimCat = cf.dimension("cat");
+    const dimNum = cf.dimension("num");
+    const dimGrp = cf.dimension("grp");
+    let customAdds = 0;
+    let customRemoves = 0;
+    const customGroup = dimGrp.group().reduce(
+      (p, d, nf) => { if (!nf) customAdds += 1; return p + d.val; },
+      (p, d, nf) => { if (!nf) customRemoves += 1; return p - d.val; },
+      () => 0
+    );
+    const totalVal = val.reduce((a, b) => a + b, 0);
+    expect(customGroup.all().reduce((s, e) => s + e.value, 0)).toBe(totalVal);
+
+    // Filter 90% out via lazyEncodedState -> custom group must receive 180 removes!
+    dimCat.filterExact("c0");
+    expect(customRemoves).toBe(180);
+    expect(customGroup.all().reduce((s, e) => s + e.value, 0)).toBe(
+      val.reduce((s, v, i) => s + (cat[i] === "c0" ? v : 0), 0)
+    );
+    dimCat.filterAll();
+    expect(customAdds).toBe(180);
+    expect(customGroup.all().reduce((s, e) => s + e.value, 0)).toBe(totalVal);
+
+    // Filter 85% out via rawNumericState -> custom group must receive 170 removes!
+    customAdds = 0;
+    customRemoves = 0;
+    dimNum.filterRange([0, 30]);
+    expect(customRemoves).toBe(170);
+    expect(customGroup.all().reduce((s, e) => s + e.value, 0)).toBe(
+      val.reduce((s, v, i) => s + (i < 30 ? v : 0), 0)
+    );
+    dimNum.filterAll();
+    expect(customAdds).toBe(170);
+    expect(customGroup.all().reduce((s, e) => s + e.value, 0)).toBe(totalVal);
+  });
+
+  it("promotes empty-initialized numeric dimensions and timeBucket groups to rawNumericState/rawBucketMode on first columnar add", () => {
+    const day0 = Date.UTC(2025, 0, 1);
+    const rt = crossfilter.createDashboardRuntime({
+      records: [],
+      dimensions: ["ts", "price"],
+      kpis: [{ id: "rows", op: "count" }, { id: "sum", op: "sum", field: "price" }],
+      groups: [{
+        id: "byDay",
+        field: "ts",
+        bucket: { type: "timeBucket", granularity: "day" },
+        metrics: [{ id: "rows", op: "count" }, { id: "sum", op: "sum", field: "price" }],
+      }],
+    });
+    // Set a numeric range filter BEFORE batch 1 arrives
+    rt.updateFilters({ price: { type: "range", range: [10, 50] } });
+
+    // Stream 3 batches (exercises promotion on batch 0 + geometric growth on batches 1..2)
+    for (let b = 0; b < 3; ++b) {
+      const ts = new Float64Array(40);
+      const price = new Float64Array(40);
+      for (let i = 0; i < 40; ++i) {
+        ts[i] = day0 + ((b * 40 + i) % 5) * 86400000 + i * 1000;
+        price[i] = (b * 40 + i) % 60;
+      }
+      rt.appendColumns({ ts, price });
+    }
+
+    const snap = rt.snapshot();
+    // 120 rows: prices 0..59 twice -> [10, 50) matches 40 * 2 = 80 rows
+    expect(snap.kpis.rows).toBe(80);
+    expect(snap.groups.byDay.length).toBe(5);
+    expect(snap.groups.byDay.reduce((s, e) => s + e.value.rows, 0)).toBe(80);
+    expect(rt.bounds({ fields: ["price"] }).price).toEqual({ min: 10, max: 49 });
+
+    // Appending a NaN later still upgrades cleanly out of rawNumericState/rawBucketMode
+    rt.appendColumns({ ts: new Float64Array([day0]), price: new Float64Array([NaN]) });
+    rt.updateFilters({});
+    expect(rt.snapshot().kpis.rows).toBe(121);
+    rt.dispose();
+  });
+
+  it("zero-copy Float64Array borrowing never mutates caller buffers and lazy pure-numeric sorting handles +/-Infinity", () => {
+    // 1. Finite Float64Array borrowed zero-copy, then extended via cf.add() -> caller buffer untouched
+    const callerVals = new Float64Array([10, 20, 30]);
+    const cf = crossfilter.fromColumns({ k: ["a", "b", "a"], v: callerVals });
+    const rt = crossfilter.createDashboardRuntime({
+      columns: { k: ["a", "b", "a"], v: callerVals },
+      dimensions: ["k"],
+      kpis: [{ id: "sum", op: "sum", field: "v" }],
+    });
+    expect(rt.snapshot().kpis.sum).toBe(60);
+    rt.appendColumns({ k: ["c"], v: new Float64Array([40]) });
+    expect(rt.snapshot().kpis.sum).toBe(100);
+    expect(Array.from(callerVals)).toEqual([10, 20, 30]);
+    rt.dispose();
+
+    // 2. Float64Array containing Infinity -> caller buffer stays Infinity while metric treats it as NaN
+    const infVals = new Float64Array([5, Infinity, -Infinity, 15]);
+    const rtInf = crossfilter.createDashboardRuntime({
+      columns: { k: ["a", "a", "b", "b"], v: infVals },
+      dimensions: ["k"],
+      kpis: [{ id: "sum", op: "sum", field: "v" }],
+    });
+    expect(rtInf.snapshot().kpis.sum).toBe(20);
+    expect(infVals[1]).toBe(Infinity);
+    expect(infVals[2]).toBe(-Infinity);
+    rtInf.dispose();
+
+    // 3. Lazy pure-numeric sorting with -Infinity, -10, 0, 10, Infinity (must not produce Infinity - Infinity = NaN!)
+    const cfInf = crossfilter.fromColumns({ x: [Infinity, 10, -Infinity, 0, -10, Infinity, -Infinity] });
+    const dimX = cfInf.dimension("x");
+    const grpX = dimX.group().reduceCount();
+    expect(grpX.all()).toEqual([
+      { key: -Infinity, value: 2 },
+      { key: -10, value: 1 },
+      { key: 0, value: 1 },
+      { key: 10, value: 1 },
+      { key: Infinity, value: 2 },
+    ]);
+    expect(dimX.topIndex(3).map((i) => [Infinity, 10, -Infinity, 0, -10, Infinity, -Infinity][i])).toEqual([Infinity, Infinity, 10]);
+    expect(dimX.bottomIndex(3).map((i) => [Infinity, 10, -Infinity, 0, -10, Infinity, -Infinity][i])).toEqual([-Infinity, -Infinity, -10]);
+    cf.dispose && cf.dispose();
+  });
+});

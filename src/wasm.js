@@ -260,8 +260,10 @@ function buildRuntime() {
         new Uint32Array(buffer, markPtr, maxTargetCode + 1).fill(0);
         this.marksDirty = false;
         this.lastMarkPtr = markPtr;
-        this.lastMarkMax = maxTargetCode;
       }
+      // Always track the exact mark upper bound because outPtr starts immediately
+      // after maxTargetCode and overwrites any previously-zeroed marks above it.
+      this.lastMarkMax = maxTargetCode;
 
       var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
       // SAFETY: returned view is only valid until next matchSmall/matchMarked call

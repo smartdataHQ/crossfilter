@@ -161,6 +161,67 @@ function crossfilter() {
     return tag === '[object Float64Array]' || tag === '[object Float32Array]';
   }
 
+  function hasValidArrowNullBitmap(chunk) {
+    if (!chunk || chunk.nullCount === 0) return true;
+    if (!chunk.nullBitmap || typeof chunk.nullBitmap.length !== 'number') return false;
+    var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+    return chunk.nullBitmap.length >= ((chunkOff + chunk.length + 7) >>> 3);
+  }
+
+  function resolveArrowDictionaryChunks(col) {
+    if (!col || !Array.isArray(col.data) || !col.data.length) return null;
+    var chunks = col.data;
+    var total = 0;
+    for (var c = 0; c < chunks.length; ++c) {
+      var chunk = chunks[c];
+      if (
+        !chunk
+        || !chunk.dictionary
+        || typeof chunk.dictionary.get !== 'function'
+        || typeof chunk.dictionary.length !== 'number'
+        || !isGuaranteedFiniteTypedArray(chunk.values)
+        || chunk.values.length < chunk.length
+        || !hasValidArrowNullBitmap(chunk)
+      ) {
+        return null;
+      }
+      total += chunk.length;
+    }
+    if (typeof col.length === 'number' && total !== col.length) return null;
+    return chunks;
+  }
+
+  function resolveArrowNumericChunks(col) {
+    if (!col || !Array.isArray(col.data) || !col.data.length) return null;
+    var colType = col.type || col.data[0].type;
+    if (!colType) return null;
+    var typeId = colType.typeId;
+    if (typeId === 2) {
+      if (!(colType.bitWidth > 0 && colType.bitWidth <= 32)) return null;
+    } else if (typeId === 3) {
+      if (!(colType.precision >= 1)) return null;
+    } else {
+      return null;
+    }
+    var chunks = col.data;
+    var total = 0;
+    for (var c = 0; c < chunks.length; ++c) {
+      var chunk = chunks[c];
+      if (
+        !chunk
+        || chunk.dictionary
+        || !(isGuaranteedFiniteTypedArray(chunk.values) || isFloatTypedArray(chunk.values))
+        || chunk.values.length < chunk.length
+        || !hasValidArrowNullBitmap(chunk)
+      ) {
+        return null;
+      }
+      total += chunk.length;
+    }
+    if (typeof col.length === 'number' && total !== col.length) return null;
+    return chunks;
+  }
+
   function isPureNumericColumnSource(field) {
     if (!n || !columnarBatches.length) return false;
     var expectedStart = 0;
@@ -169,8 +230,17 @@ function crossfilter() {
       if (batch.start !== expectedStart) return false;
       expectedStart = batch.end;
       var col = batch.columns[field];
-      if (!(isFloatTypedArray(col) || isGuaranteedFiniteTypedArray(col))) {
+      if (isFloatTypedArray(col) || isGuaranteedFiniteTypedArray(col)) {
+        continue;
+      }
+      var arrowChunks = resolveArrowNumericChunks(col);
+      if (!arrowChunks) {
         return false;
+      }
+      for (var c = 0; c < arrowChunks.length; ++c) {
+        if (arrowChunks[c].nullCount !== 0) {
+          return false;
+        }
       }
     }
     return expectedStart === n;
@@ -272,8 +342,34 @@ function crossfilter() {
   function getNumericColumn(field) {
     var entry = numericColumns[field];
     if (!entry) {
+      if (n > 0 && columnarBatches.length === 1 && columnarBatches[0].start === 0 && columnarBatches[0].end === n) {
+        var onlyCol = columnarBatches[0].columns[field];
+        var directF64 = null;
+        if (ArrayBuffer.isView(onlyCol) && objToString.call(onlyCol) === '[object Float64Array]') {
+          directF64 = onlyCol;
+        } else {
+          var onlyArrow = resolveArrowNumericChunks(onlyCol);
+          if (onlyArrow && onlyArrow.length === 1 && onlyArrow[0].nullCount === 0 && objToString.call(onlyArrow[0].values) === '[object Float64Array]') {
+            directF64 = onlyArrow[0].values;
+          }
+        }
+        if (directF64 && directF64.length >= n) {
+          var nonFiniteFound = false;
+          for (var fi = 0; fi < n; ++fi) {
+            if (directF64[fi] - directF64[fi] !== 0) {
+              nonFiniteFound = true;
+              break;
+            }
+          }
+          if (!nonFiniteFound) {
+            entry = { values: directF64, hasNaN: false, length: n, shared: true };
+            numericColumns[field] = entry;
+            return entry;
+          }
+        }
+      }
       var initCap = n < 64 ? 64 : n;
-      entry = { values: new Float64Array(initCap), hasNaN: false, length: 0 };
+      entry = { values: new Float64Array(initCap), hasNaN: false, length: 0, shared: false };
       numericColumns[field] = entry;
     }
     if (entry.length >= n) {
@@ -281,7 +377,7 @@ function crossfilter() {
     }
 
     var values = entry.values;
-    if (values.length < n) {
+    if (entry.shared || values.length < n) {
       var nextCap = values.length || 64;
       while (nextCap < n) nextCap <<= 1;
       var nextValues = new Float64Array(nextCap);
@@ -289,6 +385,7 @@ function crossfilter() {
         nextValues.set(values.subarray(0, entry.length));
       }
       values = entry.values = nextValues;
+      entry.shared = false;
     }
 
     var cursor = entry.length;
@@ -321,7 +418,7 @@ function crossfilter() {
       } else if (isFloatTypedArray(col)) {
         for (i = localStart; i < localEnd; ++i) {
           v = col[i];
-          if (v === v && v !== Infinity && v !== -Infinity) {
+          if (v - v === 0) {
             values[segStart + i - localStart] = v;
           } else {
             values[segStart + i - localStart] = NaN;
@@ -331,28 +428,7 @@ function crossfilter() {
       } else if (Array.isArray(col)) {
         for (i = localStart; i < localEnd; ++i) {
           raw = col[i];
-          if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
-            values[segStart + i - localStart] = raw;
-          } else {
-            values[segStart + i - localStart] = NaN;
-            entry.hasNaN = true;
-          }
-        }
-      } else if (batch.accessors && batch.accessors[field]) {
-        accessor = batch.accessors[field];
-        for (i = localStart; i < localEnd; ++i) {
-          raw = accessor(i);
-          if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
-            values[segStart + i - localStart] = raw;
-          } else {
-            values[segStart + i - localStart] = NaN;
-            entry.hasNaN = true;
-          }
-        }
-      } else if (col != null) {
-        for (i = localStart; i < localEnd; ++i) {
-          raw = getColumnValue(col, i);
-          if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+          if (typeof raw === 'number' && raw - raw === 0) {
             values[segStart + i - localStart] = raw;
           } else {
             values[segStart + i - localStart] = NaN;
@@ -360,10 +436,84 @@ function crossfilter() {
           }
         }
       } else {
-        for (i = segStart; i < segEnd; ++i) {
-          values[i] = NaN;
+        var arrowNumChunks = resolveArrowNumericChunks(col);
+        if (arrowNumChunks) {
+          var chunkStart = 0;
+          for (var cIdx = 0; cIdx < arrowNumChunks.length; ++cIdx) {
+            var numChunk = arrowNumChunks[cIdx];
+            var chunkEnd = chunkStart + numChunk.length;
+            if (chunkEnd <= localStart) {
+              chunkStart = chunkEnd;
+              continue;
+            }
+            if (chunkStart >= localEnd) break;
+            var subStart = localStart > chunkStart ? localStart - chunkStart : 0;
+            var subEnd = localEnd < chunkEnd ? localEnd - chunkStart : numChunk.length;
+            var dstBase = segStart + (chunkStart + subStart - localStart);
+            var chunkVals = numChunk.values;
+            if (numChunk.nullCount === 0) {
+              if (isGuaranteedFiniteTypedArray(chunkVals)) {
+                values.set(chunkVals.subarray(subStart, subEnd), dstBase);
+              } else {
+                for (i = subStart; i < subEnd; ++i) {
+                  v = chunkVals[i];
+                  if (v - v === 0) {
+                    values[dstBase + i - subStart] = v;
+                  } else {
+                    values[dstBase + i - subStart] = NaN;
+                    entry.hasNaN = true;
+                  }
+                }
+              }
+            } else {
+              var numNullBitmap = numChunk.nullBitmap;
+              var numChunkOff = typeof numChunk.offset === 'number' ? numChunk.offset : 0;
+              var isIntChunk = isGuaranteedFiniteTypedArray(chunkVals);
+              for (i = subStart; i < subEnd; ++i) {
+                var numBitIdx = numChunkOff + i;
+                if (!(numNullBitmap[numBitIdx >>> 3] & (1 << (numBitIdx & 7)))) {
+                  values[dstBase + i - subStart] = NaN;
+                  entry.hasNaN = true;
+                } else {
+                  v = chunkVals[i];
+                  if (isIntChunk || v - v === 0) {
+                    values[dstBase + i - subStart] = v;
+                  } else {
+                    values[dstBase + i - subStart] = NaN;
+                    entry.hasNaN = true;
+                  }
+                }
+              }
+            }
+            chunkStart = chunkEnd;
+          }
+        } else if (batch.accessors && batch.accessors[field]) {
+          accessor = batch.accessors[field];
+          for (i = localStart; i < localEnd; ++i) {
+            raw = accessor(i);
+            if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+              values[segStart + i - localStart] = raw;
+            } else {
+              values[segStart + i - localStart] = NaN;
+              entry.hasNaN = true;
+            }
+          }
+        } else if (col != null) {
+          for (i = localStart; i < localEnd; ++i) {
+            raw = getColumnValue(col, i);
+            if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+              values[segStart + i - localStart] = raw;
+            } else {
+              values[segStart + i - localStart] = NaN;
+              entry.hasNaN = true;
+            }
+          }
+        } else {
+          for (i = segStart; i < segEnd; ++i) {
+            values[i] = NaN;
+          }
+          entry.hasNaN = true;
         }
-        entry.hasNaN = true;
       }
 
       cursor = segEnd;
@@ -452,18 +602,69 @@ function crossfilter() {
         for (i = localStart; i < localEnd; ++i) {
           codes[segStart + i - localStart] = encodeSplitValue(entry, col[i]);
         }
-      } else if (batch.accessors && batch.accessors[field]) {
-        accessor = batch.accessors[field];
-        for (i = localStart; i < localEnd; ++i) {
-          codes[segStart + i - localStart] = encodeSplitValue(entry, accessor(i));
-        }
-      } else if (col != null) {
-        for (i = localStart; i < localEnd; ++i) {
-          codes[segStart + i - localStart] = encodeSplitValue(entry, getColumnValue(col, i));
-        }
       } else {
-        var unknownCode = encodeSplitValue(entry, undefined);
-        codes.fill(unknownCode, segStart, segEnd);
+        var splitDictChunks = resolveArrowDictionaryChunks(col);
+        if (splitDictChunks) {
+          var sChunkStart = 0;
+          for (var scIdx = 0; scIdx < splitDictChunks.length; ++scIdx) {
+            var sChunk = splitDictChunks[scIdx];
+            var sChunkEnd = sChunkStart + sChunk.length;
+            if (sChunkEnd <= localStart) {
+              sChunkStart = sChunkEnd;
+              continue;
+            }
+            if (sChunkStart >= localEnd) break;
+            var sSubStart = localStart > sChunkStart ? localStart - sChunkStart : 0;
+            var sSubEnd = localEnd < sChunkEnd ? localEnd - sChunkStart : sChunk.length;
+            var sDstBase = segStart + (sChunkStart + sSubStart - localStart);
+            var sDict = sChunk.dictionary;
+            var sDictToCode = new Int32Array(sDict.length);
+            sDictToCode.fill(-1);
+            var sIndices = sChunk.values;
+            var sDIdx, sCode;
+            if (sChunk.nullCount === 0) {
+              for (i = sSubStart; i < sSubEnd; ++i) {
+                sDIdx = sIndices[i];
+                sCode = sDictToCode[sDIdx];
+                if (sCode < 0) {
+                  sCode = sDictToCode[sDIdx] = encodeSplitValue(entry, sDict.get(sDIdx));
+                }
+                codes[sDstBase + i - sSubStart] = sCode;
+              }
+            } else {
+              var sNullBitmap = sChunk.nullBitmap;
+              var sChunkOff = typeof sChunk.offset === 'number' ? sChunk.offset : 0;
+              var sNullCode = -1;
+              for (i = sSubStart; i < sSubEnd; ++i) {
+                var sBitIdx = sChunkOff + i;
+                if (!(sNullBitmap[sBitIdx >>> 3] & (1 << (sBitIdx & 7)))) {
+                  if (sNullCode < 0) sNullCode = encodeSplitValue(entry, null);
+                  codes[sDstBase + i - sSubStart] = sNullCode;
+                } else {
+                  sDIdx = sIndices[i];
+                  sCode = sDictToCode[sDIdx];
+                  if (sCode < 0) {
+                    sCode = sDictToCode[sDIdx] = encodeSplitValue(entry, sDict.get(sDIdx));
+                  }
+                  codes[sDstBase + i - sSubStart] = sCode;
+                }
+              }
+            }
+            sChunkStart = sChunkEnd;
+          }
+        } else if (batch.accessors && batch.accessors[field]) {
+          accessor = batch.accessors[field];
+          for (i = localStart; i < localEnd; ++i) {
+            codes[segStart + i - localStart] = encodeSplitValue(entry, accessor(i));
+          }
+        } else if (col != null) {
+          for (i = localStart; i < localEnd; ++i) {
+            codes[segStart + i - localStart] = encodeSplitValue(entry, getColumnValue(col, i));
+          }
+        } else {
+          var unknownCode = encodeSplitValue(entry, undefined);
+          codes.fill(unknownCode, segStart, segEnd);
+        }
       }
 
       cursor = segEnd;
@@ -557,7 +758,26 @@ function crossfilter() {
     }
   }
 
-  function notifyFilterListeners(filterOne, filterOffset, added, removed) {
+  // Returns:
+  //   0 = no active filter listener outside (dimOne, dimOffset)
+  //   1 = at least one other listener exists, and ALL are built-in resettable groups
+  //   2 = at least one other listener requires exact added/removed delta arrays
+  function inspectOtherFilterListeners(dimOne, dimOffset) {
+    var hasResettable = false;
+    for (var i = 0; i < filterListeners.length; ++i) {
+      var l = filterListeners[i];
+      if (l === cr_null) continue;
+      if (l._xfilterDimOne === dimOne && l._xfilterDimOffset === dimOffset) continue;
+      if (l._xfilterResettable === true) {
+        hasResettable = true;
+      } else {
+        return 2;
+      }
+    }
+    return hasResettable ? 1 : 0;
+  }
+
+  function notifyFilterListeners(filterOne, filterOffset, added, removed, forceReset) {
     activeRowsDirty = true;
     if (transientFilterDepth > 0) {
       return;
@@ -568,7 +788,16 @@ function crossfilter() {
       return;
     }
 
-    filterListeners.forEach(function(l) { l(filterOne, filterOffset, added, removed); });
+    var li;
+    if (forceReset) {
+      for (li = 0; li < filterListeners.length; ++li) {
+        filterListeners[li](filterOne, filterOffset, added, removed, false, true);
+      }
+    } else {
+      for (li = 0; li < filterListeners.length; ++li) {
+        filterListeners[li](filterOne, filterOffset, added, removed);
+      }
+    }
     triggerOnChange('filtered');
   }
 
@@ -768,12 +997,14 @@ function crossfilter() {
 
       var directColumn = batch.columns[field];
       var isDirectIndexable = Array.isArray(directColumn) || ArrayBuffer.isView(directColumn);
-      if (!isDirectIndexable && (!batch.accessors || !batch.accessors[field])) {
+      var arrowDictChunks = !isDirectIndexable ? resolveArrowDictionaryChunks(directColumn) : null;
+      if (!isDirectIndexable && !arrowDictChunks && (!batch.accessors || !batch.accessors[field])) {
         return null;
       }
 
       return {
         accessor: batch.accessors ? batch.accessors[field] : null,
+        arrowDictChunks: arrowDictChunks,
         column: isDirectIndexable ? directColumn : null,
         offset: start - batch.start
       };
@@ -998,36 +1229,115 @@ function crossfilter() {
           codeCounts = new Uint32Array(64),
           hasUnorderable = false,
           isPureNumeric = true,
+          isPureString = true,
           i,
           valueToEncode,
           code;
 
-      for (i = 0; i < length; ++i) {
-        valueToEncode = source ? source[offset + i] : accessor(offset + i);
-        if (!isLazyEncodedValue(valueToEncode)) {
-          return null;
-        }
-        code = valueToCode.get(valueToEncode);
-        if (code === undefined) {
-          code = codeToValue.length;
-          valueToCode.set(valueToEncode, code);
-          codeToValue.push(valueToEncode);
-          if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
-            hasUnorderable = true;
-            isPureNumeric = false;
-          } else if (typeof valueToEncode !== 'number') {
-            isPureNumeric = false;
+      if (source) {
+        if (offset === 0) {
+          for (i = 0; i < length; ++i) {
+            valueToEncode = source[i];
+            code = valueToCode.get(valueToEncode);
+            if (code === undefined) {
+              if (!isLazyEncodedValue(valueToEncode)) {
+                return null;
+              }
+              code = codeToValue.length;
+              valueToCode.set(valueToEncode, code);
+              codeToValue.push(valueToEncode);
+              if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                hasUnorderable = true;
+                isPureNumeric = false;
+                isPureString = false;
+              } else if (typeof valueToEncode === 'number') {
+                isPureString = false;
+              } else if (typeof valueToEncode === 'string') {
+                isPureNumeric = false;
+              } else {
+                isPureNumeric = false;
+                isPureString = false;
+              }
+              if (code >= codeCounts.length) {
+                var nextCountCap0 = codeCounts.length << 1;
+                while (nextCountCap0 <= code) nextCountCap0 <<= 1;
+                var nextCounts0 = new Uint32Array(nextCountCap0);
+                nextCounts0.set(codeCounts);
+                codeCounts = nextCounts0;
+              }
+            }
+            codes[i] = code;
+            ++codeCounts[code];
           }
-          if (code >= codeCounts.length) {
-            var nextCountCap = codeCounts.length << 1;
-            while (nextCountCap <= code) nextCountCap <<= 1;
-            var nextCounts = new Uint32Array(nextCountCap);
-            nextCounts.set(codeCounts);
-            codeCounts = nextCounts;
+        } else {
+          for (i = 0; i < length; ++i) {
+            valueToEncode = source[offset + i];
+            code = valueToCode.get(valueToEncode);
+            if (code === undefined) {
+              if (!isLazyEncodedValue(valueToEncode)) {
+                return null;
+              }
+              code = codeToValue.length;
+              valueToCode.set(valueToEncode, code);
+              codeToValue.push(valueToEncode);
+              if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                hasUnorderable = true;
+                isPureNumeric = false;
+                isPureString = false;
+              } else if (typeof valueToEncode === 'number') {
+                isPureString = false;
+              } else if (typeof valueToEncode === 'string') {
+                isPureNumeric = false;
+              } else {
+                isPureNumeric = false;
+                isPureString = false;
+              }
+              if (code >= codeCounts.length) {
+                var nextCountCap1 = codeCounts.length << 1;
+                while (nextCountCap1 <= code) nextCountCap1 <<= 1;
+                var nextCounts1 = new Uint32Array(nextCountCap1);
+                nextCounts1.set(codeCounts);
+                codeCounts = nextCounts1;
+              }
+            }
+            codes[i] = code;
+            ++codeCounts[code];
           }
         }
-        codes[i] = code;
-        ++codeCounts[code];
+      } else {
+        for (i = 0; i < length; ++i) {
+          valueToEncode = accessor(offset + i);
+          code = valueToCode.get(valueToEncode);
+          if (code === undefined) {
+            if (!isLazyEncodedValue(valueToEncode)) {
+              return null;
+            }
+            code = codeToValue.length;
+            valueToCode.set(valueToEncode, code);
+            codeToValue.push(valueToEncode);
+            if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+              hasUnorderable = true;
+              isPureNumeric = false;
+              isPureString = false;
+            } else if (typeof valueToEncode === 'number') {
+              isPureString = false;
+            } else if (typeof valueToEncode === 'string') {
+              isPureNumeric = false;
+            } else {
+              isPureNumeric = false;
+              isPureString = false;
+            }
+            if (code >= codeCounts.length) {
+              var nextCountCap2 = codeCounts.length << 1;
+              while (nextCountCap2 <= code) nextCountCap2 <<= 1;
+              var nextCounts2 = new Uint32Array(nextCountCap2);
+              nextCounts2.set(codeCounts);
+              codeCounts = nextCounts2;
+            }
+          }
+          codes[i] = code;
+          ++codeCounts[code];
+        }
       }
 
       var marksCap = codeToValue.length < 64 ? 64 : codeToValue.length;
@@ -1041,6 +1351,178 @@ function crossfilter() {
         hasActiveFilterMask: false,
         hasUnorderable: hasUnorderable,
         isPureNumeric: isPureNumeric,
+        isPureString: isPureString,
+        lastSelectedCount: -1,
+        selectionMarkVersion: 1,
+        selectionMarks: new Uint32Array(marksCap),
+        valueToCode: valueToCode,
+        version: 1
+      };
+    }
+
+    function createLazyEncodedStateFromArrowDict(chunks, startOffset, length) {
+      if (!accessorPath || iterable) {
+        return null;
+      }
+      runtimeController.canUseWasmScan();
+
+      var codesCapacity = length < 64 ? 64 : length,
+          codes = new Uint32Array(codesCapacity),
+          valueToCode = new Map(),
+          codeToValue = [undefined],
+          codeCounts = new Uint32Array(64),
+          hasUnorderable = false,
+          isPureNumeric = true,
+          isPureString = true,
+          localEnd = startOffset + length,
+          chunkStart = 0,
+          outIdx = 0,
+          nullCode = -1,
+          c,
+          j,
+          dIdx,
+          code,
+          val;
+
+      for (c = 0; c < chunks.length && outIdx < length; ++c) {
+        var chunk = chunks[c];
+        var chunkEnd = chunkStart + chunk.length;
+        if (chunkEnd <= startOffset) {
+          chunkStart = chunkEnd;
+          continue;
+        }
+        if (chunkStart >= localEnd) break;
+        var subStart = startOffset > chunkStart ? startOffset - chunkStart : 0;
+        var subEnd = localEnd < chunkEnd ? localEnd - chunkStart : chunk.length;
+        var dict = chunk.dictionary;
+        var dictLen = dict.length;
+        var dictToCode = new Int32Array(dictLen);
+        dictToCode.fill(-1);
+        var indices = chunk.values;
+
+        if (chunk.nullCount === 0) {
+          for (j = subStart; j < subEnd; ++j) {
+            dIdx = indices[j];
+            code = dictToCode[dIdx];
+            if (!(code >= 0)) {
+              if (dIdx < 0 || dIdx >= dictLen) return null;
+              val = dict.get(dIdx);
+              code = valueToCode.get(val);
+              if (code === undefined) {
+                if (!isLazyEncodedValue(val)) return null;
+                code = codeToValue.length;
+                valueToCode.set(val, code);
+                codeToValue.push(val);
+                if (val === undefined || !(val >= val)) {
+                  hasUnorderable = true;
+                  isPureNumeric = false;
+                  isPureString = false;
+                } else if (typeof val === 'number') {
+                  isPureString = false;
+                } else if (typeof val === 'string') {
+                  isPureNumeric = false;
+                } else {
+                  isPureNumeric = false;
+                  isPureString = false;
+                }
+                if (code >= codeCounts.length) {
+                  var nextCapA = codeCounts.length << 1;
+                  while (nextCapA <= code) nextCapA <<= 1;
+                  var nextCountsA = new Uint32Array(nextCapA);
+                  nextCountsA.set(codeCounts);
+                  codeCounts = nextCountsA;
+                }
+              }
+              dictToCode[dIdx] = code;
+            }
+            codes[outIdx++] = code;
+            ++codeCounts[code];
+          }
+        } else {
+          var nullBitmap = chunk.nullBitmap;
+          var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+          for (j = subStart; j < subEnd; ++j) {
+            var bitIdx = chunkOff + j;
+            if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+              if (nullCode < 0) {
+                code = valueToCode.get(null);
+                if (code === undefined) {
+                  code = codeToValue.length;
+                  valueToCode.set(null, code);
+                  codeToValue.push(null);
+                  isPureNumeric = false;
+                  isPureString = false;
+                  if (code >= codeCounts.length) {
+                    var nextCapN = codeCounts.length << 1;
+                    while (nextCapN <= code) nextCapN <<= 1;
+                    var nextCountsN = new Uint32Array(nextCapN);
+                    nextCountsN.set(codeCounts);
+                    codeCounts = nextCountsN;
+                  }
+                }
+                nullCode = code;
+              }
+              codes[outIdx++] = nullCode;
+              ++codeCounts[nullCode];
+            } else {
+              dIdx = indices[j];
+              code = dictToCode[dIdx];
+              if (!(code >= 0)) {
+                if (dIdx < 0 || dIdx >= dictLen) return null;
+                val = dict.get(dIdx);
+                code = valueToCode.get(val);
+                if (code === undefined) {
+                  if (!isLazyEncodedValue(val)) return null;
+                  code = codeToValue.length;
+                  valueToCode.set(val, code);
+                  codeToValue.push(val);
+                  if (val === undefined || !(val >= val)) {
+                    hasUnorderable = true;
+                    isPureNumeric = false;
+                    isPureString = false;
+                  } else if (typeof val === 'number') {
+                    isPureString = false;
+                  } else if (typeof val === 'string') {
+                    isPureNumeric = false;
+                  } else {
+                    isPureNumeric = false;
+                    isPureString = false;
+                  }
+                  if (code >= codeCounts.length) {
+                    var nextCapB = codeCounts.length << 1;
+                    while (nextCapB <= code) nextCapB <<= 1;
+                    var nextCountsB = new Uint32Array(nextCapB);
+                    nextCountsB.set(codeCounts);
+                    codeCounts = nextCountsB;
+                  }
+                }
+                dictToCode[dIdx] = code;
+              }
+              codes[outIdx++] = code;
+              ++codeCounts[code];
+            }
+          }
+        }
+        chunkStart = chunkEnd;
+      }
+
+      if (outIdx !== length) {
+        return null;
+      }
+
+      var marksCap = codeToValue.length < 64 ? 64 : codeToValue.length;
+      return {
+        codeCounts: codeCounts,
+        codeRank: null,
+        codeRankVersion: -1,
+        codesLength: length,
+        codeToValue: codeToValue,
+        codes: codes,
+        hasActiveFilterMask: false,
+        hasUnorderable: hasUnorderable,
+        isPureNumeric: isPureNumeric,
+        isPureString: isPureString,
+        lastSelectedCount: -1,
         selectionMarkVersion: 1,
         selectionMarks: new Uint32Array(marksCap),
         valueToCode: valueToCode,
@@ -1089,6 +1571,7 @@ function crossfilter() {
           appendedCodes = new Uint32Array(length),
           hasUnorderable = lazyEncodedState.hasUnorderable,
           isPureNumeric = lazyEncodedState.isPureNumeric,
+          isPureString = lazyEncodedState.isPureString,
           i,
           valueToEncode,
           code;
@@ -1102,33 +1585,270 @@ function crossfilter() {
         lazyEncodedState.codes = codes;
       }
 
-      for (i = 0; i < length; ++i) {
-        valueToEncode = source ? source[offset + i] : accessor(offset + i);
-        if (!isLazyEncodedValue(valueToEncode)) {
-          return null;
-        }
-        code = valueToCode.get(valueToEncode);
-        if (code === undefined) {
-          code = codeToValue.length;
-          valueToCode.set(valueToEncode, code);
-          codeToValue.push(valueToEncode);
-          if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
-            hasUnorderable = true;
-            isPureNumeric = false;
-          } else if (typeof valueToEncode !== 'number') {
-            isPureNumeric = false;
+      if (source) {
+        if (offset === 0) {
+          for (i = 0; i < length; ++i) {
+            valueToEncode = source[i];
+            code = valueToCode.get(valueToEncode);
+            if (code === undefined) {
+              if (!isLazyEncodedValue(valueToEncode)) {
+                return null;
+              }
+              code = codeToValue.length;
+              valueToCode.set(valueToEncode, code);
+              codeToValue.push(valueToEncode);
+              if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                hasUnorderable = true;
+                isPureNumeric = false;
+                isPureString = false;
+              } else if (typeof valueToEncode === 'number') {
+                isPureString = false;
+              } else if (typeof valueToEncode === 'string') {
+                isPureNumeric = false;
+              } else {
+                isPureNumeric = false;
+                isPureString = false;
+              }
+              if (code >= codeCounts.length) {
+                codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+              }
+            }
+            appendedCodes[i] = code;
+            codes[existingLength + i] = code;
+            ++codeCounts[code];
           }
-          if (code >= codeCounts.length) {
-            codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+        } else {
+          for (i = 0; i < length; ++i) {
+            valueToEncode = source[offset + i];
+            code = valueToCode.get(valueToEncode);
+            if (code === undefined) {
+              if (!isLazyEncodedValue(valueToEncode)) {
+                return null;
+              }
+              code = codeToValue.length;
+              valueToCode.set(valueToEncode, code);
+              codeToValue.push(valueToEncode);
+              if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                hasUnorderable = true;
+                isPureNumeric = false;
+                isPureString = false;
+              } else if (typeof valueToEncode === 'number') {
+                isPureString = false;
+              } else if (typeof valueToEncode === 'string') {
+                isPureNumeric = false;
+              } else {
+                isPureNumeric = false;
+                isPureString = false;
+              }
+              if (code >= codeCounts.length) {
+                codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+              }
+            }
+            appendedCodes[i] = code;
+            codes[existingLength + i] = code;
+            ++codeCounts[code];
           }
         }
-        appendedCodes[i] = code;
-        codes[existingLength + i] = code;
-        ++codeCounts[code];
+      } else {
+        for (i = 0; i < length; ++i) {
+          valueToEncode = accessor(offset + i);
+          code = valueToCode.get(valueToEncode);
+          if (code === undefined) {
+            if (!isLazyEncodedValue(valueToEncode)) {
+              return null;
+            }
+            code = codeToValue.length;
+            valueToCode.set(valueToEncode, code);
+            codeToValue.push(valueToEncode);
+            if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+              hasUnorderable = true;
+              isPureNumeric = false;
+              isPureString = false;
+            } else if (typeof valueToEncode === 'number') {
+              isPureString = false;
+            } else if (typeof valueToEncode === 'string') {
+              isPureNumeric = false;
+            } else {
+              isPureNumeric = false;
+              isPureString = false;
+            }
+            if (code >= codeCounts.length) {
+              codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+            }
+          }
+          appendedCodes[i] = code;
+          codes[existingLength + i] = code;
+          ++codeCounts[code];
+        }
       }
 
       lazyEncodedState.hasUnorderable = hasUnorderable;
       lazyEncodedState.isPureNumeric = isPureNumeric;
+      lazyEncodedState.isPureString = isPureString;
+      lazyEncodedState.codesLength = newLength;
+      lazyEncodedState.version += 1;
+      lazyEncodedState.codeRank = null;
+      ensureLazySelectionMarksSize(codeToValue.length);
+      return appendedCodes;
+    }
+
+    function appendLazyEncodedValuesFromArrowDict(chunks, startOffset, length) {
+      if (!lazyEncodedState) {
+        return null;
+      }
+
+      var existingLength = lazyEncodedState.codesLength,
+          newLength = existingLength + length,
+          codes = lazyEncodedState.codes,
+          codeCounts = lazyEncodedState.codeCounts,
+          valueToCode = lazyEncodedState.valueToCode,
+          codeToValue = lazyEncodedState.codeToValue,
+          appendedCodes = new Uint32Array(length),
+          hasUnorderable = lazyEncodedState.hasUnorderable,
+          isPureNumeric = lazyEncodedState.isPureNumeric,
+          isPureString = lazyEncodedState.isPureString,
+          localEnd = startOffset + length,
+          chunkStart = 0,
+          outIdx = 0,
+          nullCode = -1,
+          c,
+          j,
+          dIdx,
+          code,
+          val;
+
+      if (newLength > codes.length) {
+        var nextCapacity = codes.length || 64;
+        while (nextCapacity < newLength) nextCapacity <<= 1;
+        var nextCodes = new Uint32Array(nextCapacity);
+        nextCodes.set(codes.subarray(0, existingLength));
+        codes = nextCodes;
+        lazyEncodedState.codes = codes;
+      }
+
+      for (c = 0; c < chunks.length && outIdx < length; ++c) {
+        var chunk = chunks[c];
+        var chunkEnd = chunkStart + chunk.length;
+        if (chunkEnd <= startOffset) {
+          chunkStart = chunkEnd;
+          continue;
+        }
+        if (chunkStart >= localEnd) break;
+        var subStart = startOffset > chunkStart ? startOffset - chunkStart : 0;
+        var subEnd = localEnd < chunkEnd ? localEnd - chunkStart : chunk.length;
+        var dict = chunk.dictionary;
+        var dictLen = dict.length;
+        var dictToCode = new Int32Array(dictLen);
+        dictToCode.fill(-1);
+        var indices = chunk.values;
+
+        if (chunk.nullCount === 0) {
+          for (j = subStart; j < subEnd; ++j) {
+            dIdx = indices[j];
+            code = dictToCode[dIdx];
+            if (!(code >= 0)) {
+              if (dIdx < 0 || dIdx >= dictLen) return null;
+              val = dict.get(dIdx);
+              code = valueToCode.get(val);
+              if (code === undefined) {
+                if (!isLazyEncodedValue(val)) return null;
+                code = codeToValue.length;
+                valueToCode.set(val, code);
+                codeToValue.push(val);
+                if (val === undefined || !(val >= val)) {
+                  hasUnorderable = true;
+                  isPureNumeric = false;
+                  isPureString = false;
+                } else if (typeof val === 'number') {
+                  isPureString = false;
+                } else if (typeof val === 'string') {
+                  isPureNumeric = false;
+                } else {
+                  isPureNumeric = false;
+                  isPureString = false;
+                }
+                if (code >= codeCounts.length) {
+                  codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+                }
+              }
+              dictToCode[dIdx] = code;
+            }
+            appendedCodes[outIdx] = code;
+            codes[existingLength + outIdx] = code;
+            ++outIdx;
+            ++codeCounts[code];
+          }
+        } else {
+          var nullBitmap = chunk.nullBitmap;
+          var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+          for (j = subStart; j < subEnd; ++j) {
+            var bitIdx = chunkOff + j;
+            if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+              if (nullCode < 0) {
+                code = valueToCode.get(null);
+                if (code === undefined) {
+                  code = codeToValue.length;
+                  valueToCode.set(null, code);
+                  codeToValue.push(null);
+                  isPureNumeric = false;
+                  isPureString = false;
+                  if (code >= codeCounts.length) {
+                    codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+                  }
+                }
+                nullCode = code;
+              }
+              appendedCodes[outIdx] = nullCode;
+              codes[existingLength + outIdx] = nullCode;
+              ++outIdx;
+              ++codeCounts[nullCode];
+            } else {
+              dIdx = indices[j];
+              code = dictToCode[dIdx];
+              if (!(code >= 0)) {
+                if (dIdx < 0 || dIdx >= dictLen) return null;
+                val = dict.get(dIdx);
+                code = valueToCode.get(val);
+                if (code === undefined) {
+                  if (!isLazyEncodedValue(val)) return null;
+                  code = codeToValue.length;
+                  valueToCode.set(val, code);
+                  codeToValue.push(val);
+                  if (val === undefined || !(val >= val)) {
+                    hasUnorderable = true;
+                    isPureNumeric = false;
+                    isPureString = false;
+                  } else if (typeof val === 'number') {
+                    isPureString = false;
+                  } else if (typeof val === 'string') {
+                    isPureNumeric = false;
+                  } else {
+                    isPureNumeric = false;
+                    isPureString = false;
+                  }
+                  if (code >= codeCounts.length) {
+                    codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+                  }
+                }
+                dictToCode[dIdx] = code;
+              }
+              appendedCodes[outIdx] = code;
+              codes[existingLength + outIdx] = code;
+              ++outIdx;
+              ++codeCounts[code];
+            }
+          }
+        }
+        chunkStart = chunkEnd;
+      }
+
+      if (outIdx !== length) {
+        return null;
+      }
+
+      lazyEncodedState.hasUnorderable = hasUnorderable;
+      lazyEncodedState.isPureNumeric = isPureNumeric;
+      lazyEncodedState.isPureString = isPureString;
       lazyEncodedState.codesLength = newLength;
       lazyEncodedState.version += 1;
       lazyEncodedState.codeRank = null;
@@ -1145,9 +1865,9 @@ function crossfilter() {
       return codeCounts;
     }
 
-    function lazyCodesSelectAllRows(targetCodes) {
+    function countLazySelectedRows(targetCodes) {
       if (!lazyEncodedState || !targetCodes || !targetCodes.length) {
-        return false;
+        return 0;
       }
 
       var codeCounts = lazyEncodedState.codeCounts,
@@ -1155,7 +1875,7 @@ function crossfilter() {
       for (var codeIndex = 0; codeIndex < targetCodes.length; ++codeIndex) {
         selectedCount += codeCounts[targetCodes[codeIndex]] || 0;
       }
-      return selectedCount === n;
+      return selectedCount;
     }
 
     function nextLazyMarkVersion() {
@@ -1203,10 +1923,16 @@ function crossfilter() {
       }
 
       var f = filters[offset],
-          needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+          otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+            ? inspectOtherFilterListeners(one, offset)
+            : 0,
+          prevSelected = lazyEncodedState.lastSelectedCount,
+          useForceReset = otherMode === 1 && prevSelected >= 0 && (n - prevSelected) > (n >>> 2),
+          needDeltas = otherMode > 0 && !useForceReset,
           i;
 
       lazyEncodedState.hasActiveFilterMask = false;
+      lazyEncodedState.lastSelectedCount = -1;
 
       if (!needDeltas) {
         for (i = 0; i < n; ++i) {
@@ -1214,7 +1940,7 @@ function crossfilter() {
             f[i] &= zero;
           }
         }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
 
@@ -1249,15 +1975,28 @@ function crossfilter() {
       lo0 = 0;
       hi0 = 0;
 
-      if (n === 0 || lazyCodesSelectAllRows(targetCodes)) {
+      if (n === 0) {
+        return applyLazyClearFilter();
+      }
+      var selectedCount = countLazySelectedRows(targetCodes);
+      if (selectedCount === n) {
         return applyLazyClearFilter();
       }
 
       var hadMask = lazyEncodedState.hasActiveFilterMask,
+          prevSelected = lazyEncodedState.lastSelectedCount,
           codes = lazyEncodedState.codes,
           f = filters[offset],
           targetCount = targetCodes.length,
-          needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+          otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+            ? inspectOtherFilterListeners(one, offset)
+            : 0,
+          useForceReset = otherMode === 1 && (
+            !hadMask
+              ? (n - selectedCount) > (n >>> 2)
+              : (prevSelected >= 0 && Math.abs(selectedCount - prevSelected) > (n >>> 2))
+          ),
+          needDeltas = otherMode > 0 && !useForceReset,
           markVersion = 0,
           selectionMarks = null,
           t0 = 0,
@@ -1274,6 +2013,7 @@ function crossfilter() {
       }
 
       lazyEncodedState.hasActiveFilterMask = true;
+      lazyEncodedState.lastSelectedCount = selectedCount;
 
       if (!needDeltas) {
         if (targetCount === 0) {
@@ -1303,7 +2043,7 @@ function crossfilter() {
             }
           }
         }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
 
@@ -1508,6 +2248,7 @@ function crossfilter() {
       if (maskedAny) {
         lazyEncodedState.hasActiveFilterMask = true;
       }
+      lazyEncodedState.lastSelectedCount = -1;
     }
 
     function compactLazyEncodedState(reIndex) {
@@ -1543,14 +2284,21 @@ function crossfilter() {
       var codeCounts = buildCodeCounts(nextCodes, nextLength, codeToValue.length);
       var hasUnorderable = false;
       var isPureNumeric = true;
+      var isPureString = true;
       for (var c = 1; c < codeToValue.length; ++c) {
         if (codeCounts[c] > 0) {
           var v = codeToValue[c];
           if (v === undefined || !(v >= v)) {
             hasUnorderable = true;
             isPureNumeric = false;
-          } else if (typeof v !== 'number') {
+            isPureString = false;
+          } else if (typeof v === 'number') {
+            isPureString = false;
+          } else if (typeof v === 'string') {
             isPureNumeric = false;
+          } else {
+            isPureNumeric = false;
+            isPureString = false;
           }
         }
       }
@@ -1561,6 +2309,8 @@ function crossfilter() {
       lazyEncodedState.hasActiveFilterMask = hasActiveMask;
       lazyEncodedState.hasUnorderable = hasUnorderable;
       lazyEncodedState.isPureNumeric = isPureNumeric;
+      lazyEncodedState.isPureString = isPureString;
+      lazyEncodedState.lastSelectedCount = -1;
       lazyEncodedState.version += 1;
       lazyEncodedState.codeRank = null;
       lo0 = 0;
@@ -1580,15 +2330,29 @@ function crossfilter() {
           activeCodes.push(c);
         }
       }
-      activeCodes.sort(function(a, b) {
-        var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
-        return order || a - b;
-      });
+      var isFastOrder = lazyEncodedState.isPureNumeric || lazyEncodedState.isPureString;
+      if (isFastOrder) {
+        activeCodes.sort(function(a, b) {
+          var va = codeToValue[a], vb = codeToValue[b];
+          return va < vb ? -1 : va > vb ? 1 : a - b;
+        });
+      } else {
+        activeCodes.sort(function(a, b) {
+          var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
+          return order || a - b;
+        });
+      }
       var rankArr = new Uint32Array(codeToValue.length);
       var currentRank = 0;
       for (var i = 0; i < activeCodes.length; ++i) {
-        if (i > 0 && compareNaturalOrder(codeToValue[activeCodes[i - 1]], codeToValue[activeCodes[i]]) !== 0) {
-          ++currentRank;
+        if (i > 0) {
+          if (isFastOrder) {
+            if (codeToValue[activeCodes[i - 1]] !== codeToValue[activeCodes[i]]) {
+              ++currentRank;
+            }
+          } else if (compareNaturalOrder(codeToValue[activeCodes[i - 1]], codeToValue[activeCodes[i]]) !== 0) {
+            ++currentRank;
+          }
         }
         rankArr[activeCodes[i]] = currentRank;
       }
@@ -1625,14 +2389,19 @@ function crossfilter() {
         return dimension;
       }
       var f = filters[offset],
-          needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+          otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+            ? inspectOtherFilterListeners(one, offset)
+            : 0,
+          useForceReset = otherMode === 1 && rawNumericState.lastMaskedCount > (n >>> 2),
+          needDeltas = otherMode > 0 && !useForceReset,
           i;
       rawNumericState.hasActiveFilterMask = false;
+      rawNumericState.lastMaskedCount = -1;
       if (!needDeltas) {
         for (i = 0; i < n; ++i) {
           if (f[i] & one) f[i] &= zero;
         }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
       var useScratch = !deltaBufInUse,
@@ -1668,8 +2437,12 @@ function crossfilter() {
       var hadMask = rawNumericState.hasActiveFilterMask,
           vals = rawNumericState.values,
           f = filters[offset],
-          needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
-          anyMasked = false,
+          otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+            ? inspectOtherFilterListeners(one, offset)
+            : 0,
+          useForceReset = otherMode === 1 && !hadMask && kind === 0 && n > (n >>> 2),
+          needDeltas = otherMode > 0 && !useForceReset,
+          maskedCount = 0,
           i,
           v,
           match;
@@ -1678,48 +2451,49 @@ function crossfilter() {
       if (!needDeltas) {
         if (kind === 0) {
           for (i = 0; i < n; ++i) f[i] |= one;
-          anyMasked = true;
+          maskedCount = n;
         } else if (kind === 1) {
           if (!hadMask) {
             for (i = 0; i < n; ++i) {
-              if (vals[i] !== argA) { f[i] |= one; anyMasked = true; }
+              if (vals[i] !== argA) { f[i] |= one; ++maskedCount; }
             }
           } else {
             for (i = 0; i < n; ++i) {
               if (vals[i] === argA) f[i] &= zero;
-              else { f[i] |= one; anyMasked = true; }
+              else { f[i] |= one; ++maskedCount; }
             }
           }
         } else if (kind === 2) {
           if (!hadMask) {
             for (i = 0; i < n; ++i) {
               v = vals[i];
-              if (!(v >= argA && v < argB)) { f[i] |= one; anyMasked = true; }
+              if (!(v >= argA && v < argB)) { f[i] |= one; ++maskedCount; }
             }
           } else {
             for (i = 0; i < n; ++i) {
               v = vals[i];
               if (v >= argA && v < argB) f[i] &= zero;
-              else { f[i] |= one; anyMasked = true; }
+              else { f[i] |= one; ++maskedCount; }
             }
           }
         } else {
           if (!hadMask) {
             for (i = 0; i < n; ++i) {
-              if (!argA.has(vals[i])) { f[i] |= one; anyMasked = true; }
+              if (!argA.has(vals[i])) { f[i] |= one; ++maskedCount; }
             }
           } else {
             for (i = 0; i < n; ++i) {
               if (argA.has(vals[i])) f[i] &= zero;
-              else { f[i] |= one; anyMasked = true; }
+              else { f[i] |= one; ++maskedCount; }
             }
           }
         }
-        rawNumericState.hasActiveFilterMask = anyMasked;
-        if (!hadMask && !anyMasked) {
+        rawNumericState.hasActiveFilterMask = maskedCount > 0;
+        rawNumericState.lastMaskedCount = maskedCount;
+        if (!hadMask && maskedCount === 0) {
           return dimension;
         }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
 
@@ -1727,7 +2501,10 @@ function crossfilter() {
           added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
           removed = useScratch ? (deltaRemovedBuf = ensureUint32Capacity(deltaRemovedBuf, n)) : [],
           addedCount = 0,
-          removedCount = 0;
+          removedCount = 0,
+          canBail = otherMode === 1,
+          bailLimit = n >>> 2,
+          bailed = false;
       if (useScratch) deltaBufInUse = true;
 
       for (i = 0; i < n; ++i) {
@@ -1746,19 +2523,59 @@ function crossfilter() {
             f[i] &= zero;
             if (useScratch) added[addedCount++] = i;
             else added.push(i);
+            if (canBail && addedCount + removedCount > bailLimit) {
+              bailed = true;
+              ++i;
+              break;
+            }
           }
         } else {
-          anyMasked = true;
+          ++maskedCount;
           if (!hadMask || !(f[i] & one)) {
             f[i] |= one;
             if (useScratch) removed[removedCount++] = i;
             else removed.push(i);
+            if (canBail && addedCount + removedCount > bailLimit) {
+              bailed = true;
+              ++i;
+              break;
+            }
           }
         }
       }
 
-      rawNumericState.hasActiveFilterMask = anyMasked;
-      if (!hadMask && !anyMasked) {
+      if (bailed) {
+        if (kind === 0) {
+          for (; i < n; ++i) { f[i] |= one; ++maskedCount; }
+        } else if (kind === 1) {
+          if (!hadMask) {
+            for (; i < n; ++i) { if (vals[i] !== argA) { f[i] |= one; ++maskedCount; } }
+          } else {
+            for (; i < n; ++i) { if (vals[i] === argA) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
+          }
+        } else if (kind === 2) {
+          if (!hadMask) {
+            for (; i < n; ++i) { v = vals[i]; if (!(v >= argA && v < argB)) { f[i] |= one; ++maskedCount; } }
+          } else {
+            for (; i < n; ++i) { v = vals[i]; if (v >= argA && v < argB) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
+          }
+        } else {
+          if (!hadMask) {
+            for (; i < n; ++i) { if (!argA.has(vals[i])) { f[i] |= one; ++maskedCount; } }
+          } else {
+            for (; i < n; ++i) { if (argA.has(vals[i])) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
+          }
+        }
+        rawNumericState.hasActiveFilterMask = maskedCount > 0;
+        rawNumericState.lastMaskedCount = maskedCount;
+        if (useScratch) deltaBufInUse = false;
+        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, true);
+        return dimension;
+      }
+
+      rawNumericState.hasActiveFilterMask = maskedCount > 0;
+      rawNumericState.lastMaskedCount = maskedCount;
+      if (!hadMask && maskedCount === 0) {
         if (useScratch) deltaBufInUse = false;
         return dimension;
       }
@@ -1813,6 +2630,7 @@ function crossfilter() {
       if (maskedAny) {
         rawNumericState.hasActiveFilterMask = true;
       }
+      rawNumericState.lastMaskedCount = -1;
     }
 
     function materializeLazyEncodedState() {
@@ -2115,6 +2933,7 @@ function crossfilter() {
               rawNumericState = {
                 field: accessorPath,
                 hasActiveFilterMask: false,
+                lastMaskedCount: -1,
                 values: initNumCol.values,
                 version: 1
               };
@@ -2126,7 +2945,9 @@ function crossfilter() {
             }
           }
           lazyEncodedState = columnAccessorSegment
-            ? createLazyEncodedStateFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+            ? (columnAccessorSegment.arrowDictChunks
+              ? createLazyEncodedStateFromArrowDict(columnAccessorSegment.arrowDictChunks, columnAccessorSegment.offset, n1)
+              : createLazyEncodedStateFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1))
             : createLazyEncodedStateFromSource(ensureSourceValues(), null, 0, n1);
           if (lazyEncodedState) {
             applyLazyFilterToRange(0, n1);
@@ -2151,7 +2972,9 @@ function crossfilter() {
           upgradeRawNumericToLazy(n0);
           if (lazyEncodedState) {
             var upgradedAppendedCodes = columnAccessorSegment
-              ? appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+              ? (columnAccessorSegment.arrowDictChunks
+                ? appendLazyEncodedValuesFromArrowDict(columnAccessorSegment.arrowDictChunks, columnAccessorSegment.offset, n1)
+                : appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1))
               : appendLazyEncodedValuesFromSource(ensureSourceValues(), null, 0, n1);
             if (upgradedAppendedCodes) {
               applyLazyFilterToRange(n0, n1);
@@ -2163,8 +2986,51 @@ function crossfilter() {
           }
           materializeLazyEncodedState();
         } else if (lazyEncodedState && !values) {
+          if (
+            !n0
+            && n1 > 0
+            && lazyEncodedState.codesLength === 0
+            && !refilterFunction
+            && (!filterValuePresent || filterMode === 'all' || filterMode === 'in' || typeof filterValue === 'number' || (Array.isArray(filterValue) && typeof filterValue[0] === 'number' && typeof filterValue[1] === 'number'))
+            && isPureNumericColumnSource(accessorPath)
+          ) {
+            var canPromoteGroups = true;
+            for (var pgi = 0; pgi < dimensionGroups.length; ++pgi) {
+              if (!dimensionGroups[pgi]._canPromoteToRawNumeric) {
+                canPromoteGroups = false;
+                break;
+              }
+            }
+            if (canPromoteGroups) {
+              var promotedNumCol = getNumericColumn(accessorPath);
+              if (!promotedNumCol.hasNaN) {
+                rawNumericState = {
+                  field: accessorPath,
+                  hasActiveFilterMask: false,
+                  lastMaskedCount: -1,
+                  values: promotedNumCol.values,
+                  version: 1
+                };
+                lazyEncodedState = null;
+                lazyFilterTargetCodes = null;
+                lazyFilterTargetCodesVersion = 0;
+                for (var pgi2 = 0; pgi2 < dimensionGroups.length; ++pgi2) {
+                  if (typeof dimensionGroups[pgi2]._onRawNumericPromote === 'function') {
+                    dimensionGroups[pgi2]._onRawNumericPromote();
+                  }
+                }
+                applyRawNumericFilterToRange(0, n1);
+                lastAppendedCodes = null;
+                lo0 = 0;
+                hi0 = 0;
+                return;
+              }
+            }
+          }
           var appendedCodes = columnAccessorSegment
-            ? appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+            ? (columnAccessorSegment.arrowDictChunks
+              ? appendLazyEncodedValuesFromArrowDict(columnAccessorSegment.arrowDictChunks, columnAccessorSegment.offset, n1)
+              : appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1))
             : appendLazyEncodedValuesFromSource(ensureSourceValues(), null, 0, n1);
           if (appendedCodes) {
             applyLazyFilterToRange(n0, n1);
@@ -3395,7 +4261,9 @@ function crossfilter() {
         size: size,
         dispose: dispose,
         remove: dispose, // for backwards-compatibility
+        _canPromoteToRawNumeric: !!(groupAll || lazyBucketMode),
         _onDimensionMaterialize: onDimensionMaterialize,
+        _onRawNumericPromote: onRawNumericPromote,
         _onRawNumericUpgrade: onRawNumericUpgrade,
         _readColumnar: readColumnar
       };
@@ -3486,6 +4354,16 @@ function crossfilter() {
         return countBuf;
       }
 
+      function syncUpdateListenerMeta() {
+        var canReset = !iterable && reduceMode !== null;
+        updateMany._xfilterDimOne = one;
+        updateMany._xfilterDimOffset = offset;
+        updateMany._xfilterResettable = canReset;
+        updateOne._xfilterDimOne = one;
+        updateOne._xfilterDimOffset = offset;
+        updateOne._xfilterResettable = canReset;
+      }
+
       function ensureLazyOrder() {
         if (!lazyIdentityMode || !lazyEncodedState) {
           return;
@@ -3498,15 +4376,30 @@ function crossfilter() {
             sorted = [],
             c;
 
-        for (c = 1; c < codeToValue.length; ++c) {
-          if (codeCounts[c] > 0 && isNaturallyOrderable(codeToValue[c])) {
-            sorted.push(c);
+        if (!lazyEncodedState.hasUnorderable) {
+          for (c = 1; c < codeToValue.length; ++c) {
+            if (codeCounts[c] > 0) {
+              sorted.push(c);
+            }
+          }
+        } else {
+          for (c = 1; c < codeToValue.length; ++c) {
+            if (codeCounts[c] > 0 && isNaturallyOrderable(codeToValue[c])) {
+              sorted.push(c);
+            }
           }
         }
-        sorted.sort(function(a, b) {
-          var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
-          return order || a - b;
-        });
+        if (lazyEncodedState.isPureNumeric || lazyEncodedState.isPureString) {
+          sorted.sort(function(a, b) {
+            var va = codeToValue[a], vb = codeToValue[b];
+            return va < vb ? -1 : va > vb ? 1 : a - b;
+          });
+        } else {
+          sorted.sort(function(a, b) {
+            var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
+            return order || a - b;
+          });
+        }
 
         lazySortedCodes = sorted;
         k = sorted.length;
@@ -3553,12 +4446,15 @@ function crossfilter() {
             c,
             bk;
 
-        // Fast incremental extend when only new rows arrived and no new bucket key appeared.
+        // Fast incremental extend when only new rows arrived and no new or reappearing bucket key appeared.
         if (bucketKeyToSlot && bucketCodeToSlot && bucketCodeCount <= codeLen && bucketIndexedLength <= n && bucketOrderVersion > 0 && bucketIndexedLength > 0) {
           var canExtend = true;
           var newCodeToSlot = bucketCodeToSlot;
           if (newCodeToSlot.length < codeLen) {
-            var nextMap = new Uint32Array(codeLen);
+            var nextMapCap = newCodeToSlot.length || 64;
+            while (nextMapCap < codeLen) nextMapCap <<= 1;
+            var nextMap = new Uint32Array(nextMapCap);
+            nextMap.fill(0xffffffff);
             nextMap.set(bucketCodeToSlot);
             newCodeToSlot = nextMap;
           }
@@ -3577,17 +4473,27 @@ function crossfilter() {
             newCodeToSlot[c] = existingSlot;
           }
           if (canExtend && groupIndex) {
-            bucketCodeToSlot = newCodeToSlot;
-            bucketCodeCount = codeLen;
             if (groupIndex.length < n) {
-              groupIndex = xfilterArray.arrayLengthen(groupIndex, n);
+              var nextGroupCap = groupIndex.length || 64;
+              while (nextGroupCap < n) nextGroupCap <<= 1;
+              groupIndex = xfilterArray.arrayLengthen(groupIndex, nextGroupCap);
             }
+            var allMapped = true;
             for (i = bucketIndexedLength; i < n; ++i) {
-              groupIndex[i] = bucketCodeToSlot[codes[i]];
+              var mappedSlot = newCodeToSlot[codes[i]];
+              if (mappedSlot === 0xffffffff) {
+                allMapped = false;
+                break;
+              }
+              groupIndex[i] = mappedSlot;
             }
-            bucketIndexedLength = n;
-            bucketOrderVersion = lazyEncodedState.version;
-            return;
+            if (allMapped) {
+              bucketCodeToSlot = newCodeToSlot;
+              bucketCodeCount = codeLen;
+              bucketIndexedLength = n;
+              bucketOrderVersion = lazyEncodedState.version;
+              return;
+            }
           }
         }
 
@@ -3617,6 +4523,7 @@ function crossfilter() {
         }
 
         var codeToSlot = new Uint32Array(codeLen);
+        codeToSlot.fill(0xffffffff);
         var sentinel = uniqueKeys.length;
         for (c = 1; c < codeLen; ++c) {
           if (!codeCounts[c]) continue;
@@ -3677,7 +4584,8 @@ function crossfilter() {
         }
 
         if (!groupIndex || groupIndex.length < n) {
-          var nextCap = n < 64 ? 64 : n;
+          var nextCap = (groupIndex && groupIndex.length) ? groupIndex.length : 64;
+          while (nextCap < n) nextCap <<= 1;
           if (groupIndex && groupIndex.length > 0 && start > 0) {
             var grown = new Uint32Array(nextCap);
             grown.set(groupIndex.subarray(0, start));
@@ -3774,6 +4682,32 @@ function crossfilter() {
         valuesSynced = false;
       }
 
+      function onRawNumericPromote() {
+        if (groupAll) {
+          return;
+        }
+        lazyBucketMode = false;
+        bucketKeys = null;
+        bucketKeyToSlot = null;
+        bucketCodeToSlot = null;
+        bucketOrderVersion = -1;
+        bucketCodeCount = 0;
+        bucketIndexedLength = 0;
+        hasInvalidBucket = false;
+        rawBucketMode = true;
+        rawBucketKeys = null;
+        rawBucketMap = null;
+        rawBucketSortedOrder = null;
+        rawBucketSlotToGroup = null;
+        rawBucketIndexedLength = 0;
+        rawBucketVersion = -1;
+        groupIndex = null;
+        groups = null;
+        sparseLayoutVersionReset();
+        resetNeeded = true;
+        valuesSynced = false;
+      }
+
       function onRawNumericUpgrade() {
         if (!rawBucketMode) {
           return;
@@ -3830,9 +4764,7 @@ function crossfilter() {
         }
 
         var splitCodes = splitCol.codes,
-            pairIds = (sparsePairGroupIds && sparsePairGroupIds.length >= n)
-              ? sparsePairGroupIds
-              : new Uint32Array(n < 64 ? 64 : n),
+            pairIds = sparsePairGroupIds,
             head = new Int32Array(primarySlots),
             cap = primarySlots < 256 ? 256 : primarySlots,
             nextPair = new Int32Array(cap),
@@ -3844,6 +4776,12 @@ function crossfilter() {
             sc,
             pairKey,
             pid;
+
+        if (!pairIds || pairIds.length < n) {
+          var nextPairCap = (pairIds && pairIds.length) ? pairIds.length : 64;
+          while (nextPairCap < n) nextPairCap <<= 1;
+          pairIds = new Uint32Array(nextPairCap);
+        }
 
         head.fill(-1);
 
@@ -4397,7 +5335,7 @@ function crossfilter() {
       }
 
       // Reduces the specified selected or deselected records.
-      function updateMany(filterOne, filterOffset, added, removed, notFilter) {
+      function updateMany(filterOne, filterOffset, added, removed, notFilter, forceReset) {
         if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
 
         var i,
@@ -4436,7 +5374,7 @@ function crossfilter() {
         }
 
         if (reduceMode !== null) {
-          if (notFilter || added.length + removed.length > (n >>> 2)) {
+          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
             resetNeeded = true;
             valuesSynced = false;
             return;
@@ -4562,7 +5500,7 @@ function crossfilter() {
       }
 
       // Reduces the specified selected or deselected records (cardinality 1).
-      function updateOne(filterOne, filterOffset, added, removed, notFilter) {
+      function updateOne(filterOne, filterOffset, added, removed, notFilter, forceReset) {
         if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
 
         var i,
@@ -4571,7 +5509,7 @@ function crossfilter() {
             g;
 
         if (reduceMode !== null) {
-          if (notFilter || added.length + removed.length > (n >>> 2)) {
+          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
             resetNeeded = true;
             valuesSynced = false;
             return;
@@ -5027,6 +5965,7 @@ function crossfilter() {
         if (reduceMetricSpec && !iterable) {
           reduceMode = reduceSplitField ? 'splitMetricSpec' : 'metricSpec';
         }
+        syncUpdateListenerMeta();
         resetNeeded = true;
         valuesSynced = false;
         return group;
@@ -5036,6 +5975,7 @@ function crossfilter() {
       function reduceCount() {
         reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
         reduceMode = 'count';
+        syncUpdateListenerMeta();
         return group;
       }
 
@@ -5100,7 +6040,7 @@ function crossfilter() {
 
     // Removes this dimension and associated groups and event listeners.
     function dispose() {
-      dimensionGroups.forEach(function(group) { group.dispose(); });
+      dimensionGroups.slice().forEach(function(group) { group.dispose(); });
       var i = dataListeners.indexOf(preAdd);
       if (i >= 0) dataListeners.splice(i, 1);
       i = dataListeners.indexOf(postAdd);
@@ -5145,6 +6085,9 @@ function crossfilter() {
     // The group listens to the crossfilter for when any dimension changes, so
     // that it can update the reduce value. It must also listen to the parent
     // dimension for when data is added.
+    update._xfilterDimOne = -1;
+    update._xfilterDimOffset = -1;
+    update._xfilterResettable = false;
     filterListeners.push(update);
     dataListeners.push(add);
 
@@ -5199,7 +6142,7 @@ function crossfilter() {
     }
 
     // Reduces the specified selected or deselected records.
-    function update(filterOne, filterOffset, added, removed, notFilter) {
+    function update(filterOne, filterOffset, added, removed, notFilter, forceReset) {
       var i,
           k,
           len;
@@ -5207,7 +6150,7 @@ function crossfilter() {
       if (resetNeeded) return;
 
       if (reduceMode !== null) {
-        if (notFilter || added.length + removed.length > (n >>> 2)) {
+        if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
           resetNeeded = true;
           valueSynced = false;
           return;
@@ -5312,6 +6255,7 @@ function crossfilter() {
       metricPlan = reduceMetricSpec ? compileMetricPlan(reduceMetricSpec) : null;
       metricBuffers = null;
       reduceMode = reduceMetricSpec ? 'metricSpec' : null;
+      update._xfilterResettable = reduceMode !== null;
       resetNeeded = true;
       valueSynced = false;
       return group;
@@ -5321,6 +6265,7 @@ function crossfilter() {
     function reduceCount() {
       reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
       reduceMode = 'count';
+      update._xfilterResettable = true;
       return group;
     }
 
@@ -5421,15 +6366,21 @@ function crossfilter() {
     if (!columnarBatches.length) return null;
     var expectedStart = 0;
     var ctor = null;
-    var b, batch, col;
+    var firstTag = null;
+    var b, batch, col, tag;
     for (b = 0; b < columnarBatches.length; ++b) {
       batch = columnarBatches[b];
       if (batch.start !== expectedStart) return null;
       expectedStart = batch.end;
       col = batch.columns[field];
       if (!ArrayBuffer.isView(col) || typeof col.BYTES_PER_ELEMENT !== 'number') return null;
-      if (ctor === null) ctor = col.constructor;
-      else if (col.constructor !== ctor) return null;
+      tag = objToString.call(col);
+      if (ctor === null) {
+        ctor = col.constructor;
+        firstTag = tag;
+      } else if (tag !== firstTag) {
+        return null;
+      }
     }
     return expectedStart === n ? ctor : null;
   }
@@ -5440,7 +6391,8 @@ function crossfilter() {
     var rowCount = rowIndexes ? rowIndexes.length : 0;
     var fieldIndex;
     var rowIndex;
-    var singleFullBatch = columnarBatches.length === 1
+    var batchCount = columnarBatches.length;
+    var singleFullBatch = batchCount === 1
       && columnarBatches[0].start === 0
       && columnarBatches[0].end === n
       ? columnarBatches[0]
@@ -5452,6 +6404,17 @@ function crossfilter() {
         fields: [],
         length: rowCount
       };
+    }
+
+    var batchStarts = null;
+    var batchEnds = null;
+    if (batchCount > 0 && !singleFullBatch) {
+      batchStarts = new Uint32Array(batchCount);
+      batchEnds = new Uint32Array(batchCount);
+      for (var bi0 = 0; bi0 < batchCount; ++bi0) {
+        batchStarts[bi0] = columnarBatches[bi0].start;
+        batchEnds[bi0] = columnarBatches[bi0].end;
+      }
     }
 
     for (fieldIndex = 0; fieldIndex < selectedFields.length; ++fieldIndex) {
@@ -5466,23 +6429,97 @@ function crossfilter() {
           for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
             out[rowIndex] = srcCol[rowIndexes[rowIndex]];
           }
-        } else if (srcAcc) {
-          for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
-            out[rowIndex] = srcAcc(rowIndexes[rowIndex]);
-          }
         } else {
-          for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
-            out[rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+          var srcDictChunks = rowCount > 32 ? resolveArrowDictionaryChunks(srcCol) : null;
+          if (srcDictChunks && srcDictChunks.length === 1 && srcDictChunks[0].dictionary.length <= rowCount * 2) {
+            var dChunk = srcDictChunks[0];
+            var dDict = dChunk.dictionary;
+            var dLen = dDict.length;
+            var dVals = new Array(dLen);
+            for (var d = 0; d < dLen; ++d) dVals[d] = dDict.get(d);
+            var dIndices = dChunk.values;
+            if (dChunk.nullCount === 0) {
+              for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+                out[rowIndex] = dVals[dIndices[rowIndexes[rowIndex]]];
+              }
+            } else {
+              var dNull = dChunk.nullBitmap;
+              var dOff = typeof dChunk.offset === 'number' ? dChunk.offset : 0;
+              for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+                var dri = rowIndexes[rowIndex];
+                var dBitIdx = dOff + dri;
+                out[rowIndex] = (dNull[dBitIdx >>> 3] & (1 << (dBitIdx & 7))) ? dVals[dIndices[dri]] : null;
+              }
+            }
+          } else if (srcAcc) {
+            for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+              out[rowIndex] = srcAcc(rowIndexes[rowIndex]);
+            }
+          } else {
+            for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+              out[rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+            }
           }
         }
-      } else if (!columnarBatches.length) {
+      } else if (!batchCount) {
         for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
           var row = data[rowIndexes[rowIndex]];
           out[rowIndex] = row ? row[field] : undefined;
         }
       } else {
-        for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
-          out[rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+        var cachedNum = typedCtor ? numericColumns[field] : null;
+        if (cachedNum && cachedNum.length === n && !cachedNum.hasNaN && (isGuaranteedFiniteTypedArray(out) || isFloatTypedArray(out))) {
+          var cachedVals = cachedNum.values;
+          for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+            out[rowIndex] = cachedVals[rowIndexes[rowIndex]];
+          }
+        } else {
+          var batchDirect = new Array(batchCount);
+          var batchAcc = new Array(batchCount);
+          for (var bi = 0; bi < batchCount; ++bi) {
+            var bCol = columnarBatches[bi].columns[field];
+            if (ArrayBuffer.isView(bCol) || Array.isArray(bCol)) {
+              batchDirect[bi] = bCol;
+              batchAcc[bi] = null;
+            } else {
+              batchDirect[bi] = null;
+              batchAcc[bi] = (columnarBatches[bi].accessors && columnarBatches[bi].accessors[field]) || null;
+            }
+          }
+          var lastStart = -1;
+          var lastEnd = -1;
+          var lastDirect = null;
+          var lastAcc = null;
+          for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+            var ri = rowIndexes[rowIndex];
+            if (ri < lastStart || ri >= lastEnd) {
+              var bLo = 0, bHi = batchCount, found = -1;
+              while (bLo < bHi) {
+                var bMid = (bLo + bHi) >>> 1;
+                if (ri < batchStarts[bMid]) bHi = bMid;
+                else if (ri >= batchEnds[bMid]) bLo = bMid + 1;
+                else { found = bMid; break; }
+              }
+              if (found >= 0) {
+                lastStart = batchStarts[found];
+                lastEnd = batchEnds[found];
+                lastDirect = batchDirect[found];
+                lastAcc = batchAcc[found];
+              } else {
+                lastStart = -1;
+                lastEnd = -1;
+                lastDirect = null;
+                lastAcc = null;
+              }
+            }
+            if (lastDirect) {
+              out[rowIndex] = lastDirect[ri - lastStart];
+            } else if (lastAcc) {
+              out[rowIndex] = lastAcc(ri - lastStart);
+            } else {
+              out[rowIndex] = getFieldValue(ri, field);
+            }
+          }
         }
       }
 

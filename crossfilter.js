@@ -1,4 +1,4 @@
-// https://github.com/smartdataHQ/crossfilter v3.1.0 Copyright 2026 Mike Bostock
+// https://github.com/smartdataHQ/crossfilter v3.1.1 Copyright 2026 Mike Bostock
 (function (global, factory) {
   typeof exports === 'object' && typeof module !== 'undefined' ? module.exports = factory() :
   typeof define === 'function' && define.amd ? define(factory) :
@@ -1096,8 +1096,10 @@
           new Uint32Array(buffer, markPtr, maxTargetCode + 1).fill(0);
           this.marksDirty = false;
           this.lastMarkPtr = markPtr;
-          this.lastMarkMax = maxTargetCode;
         }
+        // Always track the exact mark upper bound because outPtr starts immediately
+        // after maxTargetCode and overwrites any previously-zeroed marks above it.
+        this.lastMarkMax = maxTargetCode;
 
         var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
         // SAFETY: returned view is only valid until next matchSmall/matchMarked call
@@ -1323,14 +1325,29 @@
     var fields = new Array(count);
     var denominators = new Array(count);
     var hidden = new Uint8Array(count);
+    var primarySumSourceIdx = new Int32Array(count);
+    var primarySumSourceSec = new Uint8Array(count);
+    var denomSumSourceIdx = new Int32Array(count);
+    var denomSumSourceSec = new Uint8Array(count);
+    var avgCountSourceIdx = new Int32Array(count);
+    var sumSourceByField = Object.create(null);
+    var avgSourceByField = Object.create(null);
     var firstCountIndex = -1;
-    var i, metric, op;
+    var fusedSumIndex = -1;
+    var firstAvgIndex = -1;
+    var i, metric, op, field, denom, src;
+
+    primarySumSourceIdx.fill(-1);
+    denomSumSourceIdx.fill(-1);
+    avgCountSourceIdx.fill(-1);
 
     for (i = 0; i < count; ++i) {
       metric = metricSpec[i];
       ids[i] = metric.id;
-      fields[i] = metric.field || null;
-      denominators[i] = metric.denominator || null;
+      field = metric.field || null;
+      denom = metric.denominator || null;
+      fields[i] = field;
+      denominators[i] = denom;
       hidden[i] = metric.hidden ? 1 : 0;
       switch (metric.op) {
         case 'count':
@@ -1339,15 +1356,58 @@
           break;
         case 'sum':
           op = OP_SUM;
+          if (field) {
+            src = sumSourceByField[field];
+            if (src) {
+              primarySumSourceIdx[i] = src.idx;
+              primarySumSourceSec[i] = src.sec;
+            } else {
+              sumSourceByField[field] = { idx: i, sec: 0 };
+              if (fusedSumIndex < 0) fusedSumIndex = i;
+            }
+          }
           break;
         case 'avg':
           op = OP_AVG;
+          if (field) {
+            src = sumSourceByField[field];
+            if (src) {
+              primarySumSourceIdx[i] = src.idx;
+              primarySumSourceSec[i] = src.sec;
+            } else {
+              sumSourceByField[field] = { idx: i, sec: 0 };
+              if (firstAvgIndex < 0) firstAvgIndex = i;
+            }
+            if (avgSourceByField[field] !== undefined) {
+              avgCountSourceIdx[i] = avgSourceByField[field];
+            } else {
+              avgSourceByField[field] = i;
+            }
+          }
           break;
         case 'avgNonZero':
           op = OP_AVG_NON_ZERO;
           break;
         case 'ratio':
           op = OP_RATIO;
+          if (field) {
+            src = sumSourceByField[field];
+            if (src) {
+              primarySumSourceIdx[i] = src.idx;
+              primarySumSourceSec[i] = src.sec;
+            } else {
+              sumSourceByField[field] = { idx: i, sec: 0 };
+            }
+          }
+          if (denom) {
+            src = sumSourceByField[denom];
+            if (src && src.idx < i) {
+              denomSumSourceIdx[i] = src.idx;
+              denomSumSourceSec[i] = src.sec;
+            } else if (!src) {
+              sumSourceByField[denom] = { idx: i, sec: 1 };
+            }
+          }
           break;
         default:
           op = OP_COUNT;
@@ -1356,13 +1416,20 @@
     }
 
     return {
+      avgCountSourceIdx: avgCountSourceIdx,
       count: count,
+      denomSumSourceIdx: denomSumSourceIdx,
+      denomSumSourceSec: denomSumSourceSec,
       denominators: denominators,
       fields: fields,
       firstCountIndex: firstCountIndex,
+      fusedAvgIndex: firstCountIndex >= 0 && fusedSumIndex < 0 ? firstAvgIndex : -1,
+      fusedSumIndex: firstCountIndex >= 0 ? fusedSumIndex : -1,
       hidden: hidden,
       ids: ids,
       ops: ops,
+      primarySumSourceIdx: primarySumSourceIdx,
+      primarySumSourceSec: primarySumSourceSec,
       spec: metricSpec
     };
   }
@@ -1426,22 +1493,747 @@
     }
   }
 
+  // ============================================================================
+  // Grouped-All leaf kernels (small functions for immediate V8 JIT compilation)
+  // ============================================================================
+
+  function gCountAll(acc, groupIds, n) {
+    for (var i = 0; i < n; ++i) acc[groupIds[i]] += 1;
+  }
+
+  function gCountSumAll(cntAcc, sumAcc, groupIds, vals, hasNaN, n) {
+    var i, g, v;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) {
+        g = groupIds[i];
+        cntAcc[g] += 1;
+        sumAcc[g] += vals[i];
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        g = groupIds[i];
+        cntAcc[g] += 1;
+        v = vals[i];
+        if (v === v) sumAcc[g] += v;
+      }
+    }
+  }
+
+  function gSumAll(acc, groupIds, vals, hasNaN, n) {
+    var i, v;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) acc[groupIds[i]] += vals[i];
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v) acc[groupIds[i]] += v;
+      }
+    }
+  }
+
+  function gValidCountAll(acc, groupIds, vals, n) {
+    var i, v;
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v) acc[groupIds[i]] += 1;
+    }
+  }
+
+  function gAvgAll(acc, acc2, groupIds, vals, hasNaN, n) {
+    var i, g, v;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) {
+        g = groupIds[i];
+        acc[g] += vals[i];
+        acc2[g] += 1;
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v) {
+          g = groupIds[i];
+          acc[g] += v;
+          acc2[g] += 1;
+        }
+      }
+    }
+  }
+
+  function gAvgNzAll(acc, acc2, groupIds, vals, hasNaN, n) {
+    var i, g, v;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v !== 0) {
+          g = groupIds[i];
+          acc[g] += v;
+          acc2[g] += 1;
+        }
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v && v !== 0) {
+          g = groupIds[i];
+          acc[g] += v;
+          acc2[g] += 1;
+        }
+      }
+    }
+  }
+
+  function gRatioAll(acc, acc2, groupIds, vals, hasNaN, vals2, hasNaN2, n) {
+    var i, g, v, v2;
+    if (!hasNaN && !hasNaN2) {
+      for (i = 0; i < n; ++i) {
+        g = groupIds[i];
+        acc[g] += vals[i];
+        acc2[g] += vals2[i];
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        g = groupIds[i];
+        v = vals[i];
+        if (v === v) acc[g] += v;
+        v2 = vals2[i];
+        if (v2 === v2) acc2[g] += v2;
+      }
+    }
+  }
+
+  // ============================================================================
+  // Grouped-Indexed leaf kernels
+  // ============================================================================
+
+  function gCountIdx(acc, groupIds, rowIndexes, rowCount, add) {
+    var j;
+    if (add) {
+      for (j = 0; j < rowCount; ++j) acc[groupIds[rowIndexes[j]]] += 1;
+    } else {
+      for (j = 0; j < rowCount; ++j) acc[groupIds[rowIndexes[j]]] -= 1;
+    }
+  }
+
+  function gCountSumIdx(cntAcc, sumAcc, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
+    var j, idx, g, v;
+    if (add) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          g = groupIds[idx];
+          cntAcc[g] += 1;
+          sumAcc[g] += vals[idx];
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          g = groupIds[idx];
+          cntAcc[g] += 1;
+          v = vals[idx];
+          if (v === v) sumAcc[g] += v;
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        cntAcc[g] -= 1;
+        sumAcc[g] -= vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        cntAcc[g] -= 1;
+        v = vals[idx];
+        if (v === v) sumAcc[g] -= v;
+      }
+    }
+  }
+
+  function gSumIdx(acc, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
+    var j, idx, v;
+    if (add) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          acc[groupIds[idx]] += vals[idx];
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v === v) acc[groupIds[idx]] += v;
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        acc[groupIds[idx]] -= vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) acc[groupIds[idx]] -= v;
+      }
+    }
+  }
+
+  function gValidCountIdx(acc, groupIds, vals, rowIndexes, rowCount) {
+    var j, idx, v;
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v === v) acc[groupIds[idx]] += 1;
+    }
+  }
+
+  function gAvgIdx(acc, acc2, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
+    var j, idx, g, v;
+    if (add) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          g = groupIds[idx];
+          acc[g] += vals[idx];
+          acc2[g] += 1;
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v === v) {
+            g = groupIds[idx];
+            acc[g] += v;
+            acc2[g] += 1;
+          }
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        acc[g] -= vals[idx];
+        acc2[g] -= 1;
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) {
+          g = groupIds[idx];
+          acc[g] -= v;
+          acc2[g] -= 1;
+        }
+      }
+    }
+  }
+
+  function gAvgNzIdx(acc, acc2, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
+    var j, idx, g, v;
+    if (add) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v !== 0) {
+            g = groupIds[idx];
+            acc[g] += v;
+            acc2[g] += 1;
+          }
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v === v && v !== 0) {
+            g = groupIds[idx];
+            acc[g] += v;
+            acc2[g] += 1;
+          }
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v !== 0) {
+          g = groupIds[idx];
+          acc[g] -= v;
+          acc2[g] -= 1;
+        }
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v && v !== 0) {
+          g = groupIds[idx];
+          acc[g] -= v;
+          acc2[g] -= 1;
+        }
+      }
+    }
+  }
+
+  function gRatioIdx(acc, acc2, groupIds, vals, hasNaN, vals2, hasNaN2, rowIndexes, rowCount, add) {
+    var j, idx, g, v, v2;
+    if (add) {
+      if (!hasNaN && !hasNaN2) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          g = groupIds[idx];
+          acc[g] += vals[idx];
+          acc2[g] += vals2[idx];
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          g = groupIds[idx];
+          v = vals[idx];
+          if (v === v) acc[g] += v;
+          v2 = vals2[idx];
+          if (v2 === v2) acc2[g] += v2;
+        }
+      }
+    } else if (!hasNaN && !hasNaN2) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        acc[g] -= vals[idx];
+        acc2[g] -= vals2[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        v = vals[idx];
+        if (v === v) acc[g] -= v;
+        v2 = vals2[idx];
+        if (v2 === v2) acc2[g] -= v2;
+      }
+    }
+  }
+
+  // ============================================================================
+  // Split-Dense-All leaf kernels
+  // ============================================================================
+
+  function sCountAll(acc, groupIds, splitCodes, stride, n) {
+    for (var i = 0; i < n; ++i) acc[groupIds[i] * stride + splitCodes[i]] += 1;
+  }
+
+  function sCountSumAll(cntAcc, sumAcc, groupIds, splitCodes, stride, vals, hasNaN, n) {
+    var i, cell, v;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) {
+        cell = groupIds[i] * stride + splitCodes[i];
+        cntAcc[cell] += 1;
+        sumAcc[cell] += vals[i];
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        cell = groupIds[i] * stride + splitCodes[i];
+        cntAcc[cell] += 1;
+        v = vals[i];
+        if (v === v) sumAcc[cell] += v;
+      }
+    }
+  }
+
+  function sSumAll(acc, groupIds, splitCodes, stride, vals, hasNaN, n) {
+    var i, v;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) acc[groupIds[i] * stride + splitCodes[i]] += vals[i];
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v) acc[groupIds[i] * stride + splitCodes[i]] += v;
+      }
+    }
+  }
+
+  function sValidCountAll(acc, groupIds, splitCodes, stride, vals, n) {
+    var i, v;
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v) acc[groupIds[i] * stride + splitCodes[i]] += 1;
+    }
+  }
+
+  function sAvgAll(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, n) {
+    var i, cell, v;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) {
+        cell = groupIds[i] * stride + splitCodes[i];
+        acc[cell] += vals[i];
+        acc2[cell] += 1;
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v) {
+          cell = groupIds[i] * stride + splitCodes[i];
+          acc[cell] += v;
+          acc2[cell] += 1;
+        }
+      }
+    }
+  }
+
+  function sAvgNzAll(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, n) {
+    var i, cell, v;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v !== 0) {
+          cell = groupIds[i] * stride + splitCodes[i];
+          acc[cell] += v;
+          acc2[cell] += 1;
+        }
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v && v !== 0) {
+          cell = groupIds[i] * stride + splitCodes[i];
+          acc[cell] += v;
+          acc2[cell] += 1;
+        }
+      }
+    }
+  }
+
+  function sRatioAll(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, vals2, hasNaN2, n) {
+    var i, cell, v, v2;
+    if (!hasNaN && !hasNaN2) {
+      for (i = 0; i < n; ++i) {
+        cell = groupIds[i] * stride + splitCodes[i];
+        acc[cell] += vals[i];
+        acc2[cell] += vals2[i];
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        cell = groupIds[i] * stride + splitCodes[i];
+        v = vals[i];
+        if (v === v) acc[cell] += v;
+        v2 = vals2[i];
+        if (v2 === v2) acc2[cell] += v2;
+      }
+    }
+  }
+
+  // ============================================================================
+  // Split-Dense-Indexed leaf kernels
+  // ============================================================================
+
+  function sCountIdx(acc, groupIds, splitCodes, stride, rowIndexes, rowCount, add) {
+    var j, idx;
+    if (add) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        acc[groupIds[idx] * stride + splitCodes[idx]] -= 1;
+      }
+    }
+  }
+
+  function sCountSumIdx(cntAcc, sumAcc, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
+    var j, idx, cell, v;
+    if (add) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          cntAcc[cell] += 1;
+          sumAcc[cell] += vals[idx];
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          cntAcc[cell] += 1;
+          v = vals[idx];
+          if (v === v) sumAcc[cell] += v;
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        cntAcc[cell] -= 1;
+        sumAcc[cell] -= vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        cntAcc[cell] -= 1;
+        v = vals[idx];
+        if (v === v) sumAcc[cell] -= v;
+      }
+    }
+  }
+
+  function sSumIdx(acc, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
+    var j, idx, v;
+    if (add) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          acc[groupIds[idx] * stride + splitCodes[idx]] += vals[idx];
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] += v;
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        acc[groupIds[idx] * stride + splitCodes[idx]] -= vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] -= v;
+      }
+    }
+  }
+
+  function sValidCountIdx(acc, groupIds, splitCodes, stride, vals, rowIndexes, rowCount) {
+    var j, idx, v;
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
+    }
+  }
+
+  function sAvgIdx(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
+    var j, idx, cell, v;
+    if (add) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          acc[cell] += vals[idx];
+          acc2[cell] += 1;
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v === v) {
+            cell = groupIds[idx] * stride + splitCodes[idx];
+            acc[cell] += v;
+            acc2[cell] += 1;
+          }
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        acc[cell] -= vals[idx];
+        acc2[cell] -= 1;
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) {
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          acc[cell] -= v;
+          acc2[cell] -= 1;
+        }
+      }
+    }
+  }
+
+  function sAvgNzIdx(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
+    var j, idx, cell, v;
+    if (add) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v !== 0) {
+            cell = groupIds[idx] * stride + splitCodes[idx];
+            acc[cell] += v;
+            acc2[cell] += 1;
+          }
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v === v && v !== 0) {
+            cell = groupIds[idx] * stride + splitCodes[idx];
+            acc[cell] += v;
+            acc2[cell] += 1;
+          }
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v !== 0) {
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          acc[cell] -= v;
+          acc2[cell] -= 1;
+        }
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v && v !== 0) {
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          acc[cell] -= v;
+          acc2[cell] -= 1;
+        }
+      }
+    }
+  }
+
+  function sRatioIdx(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, vals2, hasNaN2, rowIndexes, rowCount, add) {
+    var j, idx, cell, v, v2;
+    if (add) {
+      if (!hasNaN && !hasNaN2) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          acc[cell] += vals[idx];
+          acc2[cell] += vals2[idx];
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          v = vals[idx];
+          if (v === v) acc[cell] += v;
+          v2 = vals2[idx];
+          if (v2 === v2) acc2[cell] += v2;
+        }
+      }
+    } else if (!hasNaN && !hasNaN2) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        acc[cell] -= vals[idx];
+        acc2[cell] -= vals2[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        v = vals[idx];
+        if (v === v) acc[cell] -= v;
+        v2 = vals2[idx];
+        if (v2 === v2) acc2[cell] -= v2;
+      }
+    }
+  }
+
+  // ============================================================================
+  // Scalar leaf kernels
+  // ============================================================================
+
+  function scSumAll(vals, hasNaN, n) {
+    var s = 0, i, v;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) s += vals[i];
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v) s += v;
+      }
+    }
+    return s;
+  }
+
+  function scValidCountAll(vals, n) {
+    var c = 0, i, v;
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v) c += 1;
+    }
+    return c;
+  }
+
+  function scSumIdx(vals, hasNaN, rowIndexes, rowCount) {
+    var s = 0, j, v;
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        v = vals[rowIndexes[j]];
+        if (v === v) s += v;
+      }
+    }
+    return s;
+  }
+
+  function scValidCountIdx(vals, rowIndexes, rowCount) {
+    var c = 0, j, v;
+    for (j = 0; j < rowCount; ++j) {
+      v = vals[rowIndexes[j]];
+      if (v === v) c += 1;
+    }
+    return c;
+  }
+
+  // ============================================================================
+  // Orchestrators
+  // ============================================================================
+
   function reduceGroupedAll(buffers, plan, getNumericColumn, groupIds, n, slotCount) {
     var ops = plan.ops;
     var fields = plan.fields;
     var denominators = plan.denominators;
+    var primarySumSourceIdx = plan.primarySumSourceIdx;
+    var primarySumSourceSec = plan.primarySumSourceSec;
+    var denomSumSourceIdx = plan.denomSumSourceIdx;
+    var denomSumSourceSec = plan.denomSumSourceSec;
+    var avgCountSourceIdx = plan.avgCountSourceIdx;
     var primary = buffers.primary;
     var secondary = buffers.secondary;
     var metricCount = plan.count;
     var firstCountIndex = plan.firstCountIndex;
+    var fusedSumIndex = plan.fusedSumIndex;
+    var fusedAvgIndex = plan.fusedAvgIndex;
+    var ranFusedAvg = false;
     var countComputed = false;
-    var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, i, v, v2, g;
+    var pendingAcc = null;
+    var pendingCol = null;
+    var pendingIdx = -1;
+    var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
 
-    // Compute first count metric up front so non-NaN avg metrics can copy counts directly.
     if (firstCountIndex >= 0) {
-      acc = primary[firstCountIndex];
-      for (i = 0; i < n; ++i) {
-        acc[groupIds[i]] += 1;
+      if (fusedSumIndex >= 0) {
+        col = getNumericColumn(fields[fusedSumIndex]);
+        gCountSumAll(primary[firstCountIndex], primary[fusedSumIndex], groupIds, col.values, col.hasNaN, n);
+      } else if (fusedAvgIndex >= 0) {
+        col = getNumericColumn(fields[fusedAvgIndex]);
+        if (!col.hasNaN) {
+          gCountSumAll(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, col.values, false, n);
+          secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, slotCount));
+          ranFusedAvg = true;
+        } else {
+          gCountAll(primary[firstCountIndex], groupIds, n);
+        }
+      } else {
+        gCountAll(primary[firstCountIndex], groupIds, n);
       }
       countComputed = true;
     }
@@ -1455,97 +2247,117 @@
         if (countComputed) {
           acc.set(primary[firstCountIndex].subarray(0, slotCount));
         } else {
-          for (i = 0; i < n; ++i) {
-            acc[groupIds[i]] += 1;
-          }
+          gCountAll(acc, groupIds, n);
         }
         continue;
       }
 
-      col = getNumericColumn(fields[m]);
-      vals = col.values;
-      hasNaN = col.hasNaN;
+      if (m === fusedSumIndex || (ranFusedAvg && m === fusedAvgIndex)) continue;
+
+      srcIdx = primarySumSourceIdx[m];
+      if (pendingAcc && (srcIdx === pendingIdx || denomSumSourceIdx[m] === pendingIdx)) {
+        gSumAll(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, n);
+        pendingAcc = null;
+        pendingCol = null;
+        pendingIdx = -1;
+      }
 
       if (op === OP_SUM) {
-        if (!hasNaN) {
-          for (i = 0; i < n; ++i) {
-            acc[groupIds[i]] += vals[i];
-          }
+        if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, slotCount));
         } else {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v === v) {
-              acc[groupIds[i]] += v;
-            }
+          col = getNumericColumn(fields[m]);
+          if (pendingAcc) {
+            gRatioAll(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
           }
         }
       } else if (op === OP_AVG) {
         acc2 = secondary[m];
-        if (!hasNaN) {
-          if (countComputed) {
-            for (i = 0; i < n; ++i) {
-              acc[groupIds[i]] += vals[i];
-            }
+        col = getNumericColumn(fields[m]);
+        if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, slotCount));
+          if (!col.hasNaN && countComputed) {
             acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+          } else if (avgCountSourceIdx[m] >= 0) {
+            acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, slotCount));
+          } else if (!col.hasNaN) {
+            gCountAll(acc2, groupIds, n);
           } else {
-            for (i = 0; i < n; ++i) {
-              g = groupIds[i];
-              acc[g] += vals[i];
-              acc2[g] += 1;
-            }
+            gValidCountAll(acc2, groupIds, col.values, n);
+          }
+        } else if (!col.hasNaN && countComputed) {
+          acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+          if (pendingAcc) {
+            gRatioAll(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, false, n);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
           }
         } else {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v === v) {
-              g = groupIds[i];
-              acc[g] += v;
-              acc2[g] += 1;
-            }
-          }
+          gAvgAll(acc, acc2, groupIds, col.values, col.hasNaN, n);
         }
       } else if (op === OP_AVG_NON_ZERO) {
-        acc2 = secondary[m];
-        if (!hasNaN) {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v !== 0) {
-              g = groupIds[i];
-              acc[g] += v;
-              acc2[g] += 1;
-            }
-          }
-        } else {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v === v && v !== 0) {
-              g = groupIds[i];
-              acc[g] += v;
-              acc2[g] += 1;
-            }
-          }
-        }
+        col = getNumericColumn(fields[m]);
+        gAvgNzAll(acc, secondary[m], groupIds, col.values, col.hasNaN, n);
       } else if (op === OP_RATIO) {
         acc2 = secondary[m];
-        col2 = getNumericColumn(denominators[m]);
-        vals2 = col2.values;
-        hasNaN2 = col2.hasNaN;
-        if (!hasNaN && !hasNaN2) {
-          for (i = 0; i < n; ++i) {
-            g = groupIds[i];
-            acc[g] += vals[i];
-            acc2[g] += vals2[i];
+        denomIdx = denomSumSourceIdx[m];
+        if (srcIdx >= 0 && denomIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, slotCount));
+          srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+          acc2.set(srcBuf.subarray(0, slotCount));
+        } else if (denomIdx >= 0) {
+          srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+          acc2.set(srcBuf.subarray(0, slotCount));
+          col = getNumericColumn(fields[m]);
+          if (pendingAcc) {
+            gRatioAll(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
+          }
+        } else if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, slotCount));
+          col2 = getNumericColumn(denominators[m]);
+          if (pendingAcc) {
+            gRatioAll(pendingAcc, acc2, groupIds, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, n);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc2;
+            pendingCol = col2;
+            pendingIdx = m;
           }
         } else {
-          for (i = 0; i < n; ++i) {
-            g = groupIds[i];
-            v = vals[i];
-            if (v === v) acc[g] += v;
-            v2 = vals2[i];
-            if (v2 === v2) acc2[g] += v2;
-          }
+          col = getNumericColumn(fields[m]);
+          col2 = getNumericColumn(denominators[m]);
+          gRatioAll(acc, acc2, groupIds, col.values, col.hasNaN, col2.values, col2.hasNaN, n);
         }
       }
+    }
+
+    if (pendingAcc) {
+      gSumAll(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, n);
     }
   }
 
@@ -1555,18 +2367,43 @@
     var ops = plan.ops;
     var fields = plan.fields;
     var denominators = plan.denominators;
+    var primarySumSourceIdx = plan.primarySumSourceIdx;
+    var primarySumSourceSec = plan.primarySumSourceSec;
+    var denomSumSourceIdx = plan.denomSumSourceIdx;
+    var denomSumSourceSec = plan.denomSumSourceSec;
+    var avgCountSourceIdx = plan.avgCountSourceIdx;
     var primary = buffers.primary;
     var secondary = buffers.secondary;
     var metricCount = plan.count;
     var firstCountIndex = plan.firstCountIndex;
+    var fusedSumIndex = plan.fusedSumIndex;
+    var fusedAvgIndex = plan.fusedAvgIndex;
     var add = delta > 0;
-    var canShareCount = add && slotCount > 0 && firstCountIndex >= 0;
-    var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, j, idx, v, v2, g;
+    var isReset = add && slotCount > 0;
+    var canShareCount = isReset && firstCountIndex >= 0;
+    var ranFused = false;
+    var ranFusedAvg = false;
+    var pendingAcc = null;
+    var pendingCol = null;
+    var pendingIdx = -1;
+    var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
 
-    if (canShareCount) {
-      acc = primary[firstCountIndex];
-      for (j = 0; j < rowCount; ++j) {
-        acc[groupIds[rowIndexes[j]]] += 1;
+    if (firstCountIndex >= 0 && fusedSumIndex >= 0) {
+      col = getNumericColumn(fields[fusedSumIndex]);
+      gCountSumIdx(primary[firstCountIndex], primary[fusedSumIndex], groupIds, col.values, col.hasNaN, rowIndexes, rowCount, add);
+      ranFused = true;
+    } else if (canShareCount) {
+      if (fusedAvgIndex >= 0) {
+        col = getNumericColumn(fields[fusedAvgIndex]);
+        if (!col.hasNaN) {
+          gCountSumIdx(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, col.values, false, rowIndexes, rowCount, true);
+          secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, slotCount));
+          ranFusedAvg = true;
+        } else {
+          gCountIdx(primary[firstCountIndex], groupIds, rowIndexes, rowCount, true);
+        }
+      } else {
+        gCountIdx(primary[firstCountIndex], groupIds, rowIndexes, rowCount, true);
       }
     }
 
@@ -1575,210 +2412,161 @@
       acc = primary[m];
 
       if (op === OP_COUNT) {
+        if (m === firstCountIndex && (ranFused || canShareCount)) continue;
         if (canShareCount) {
-          if (m === firstCountIndex) continue;
           acc.set(primary[firstCountIndex].subarray(0, slotCount));
-        } else if (add) {
-          for (j = 0; j < rowCount; ++j) {
-            acc[groupIds[rowIndexes[j]]] += 1;
-          }
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            acc[groupIds[rowIndexes[j]]] -= 1;
-          }
+          gCountIdx(acc, groupIds, rowIndexes, rowCount, add);
         }
         continue;
       }
 
-      col = getNumericColumn(fields[m]);
-      vals = col.values;
-      hasNaN = col.hasNaN;
+      if ((ranFused && m === fusedSumIndex) || (ranFusedAvg && m === fusedAvgIndex)) continue;
+
+      srcIdx = isReset ? primarySumSourceIdx[m] : -1;
+      denomIdx = isReset ? denomSumSourceIdx[m] : -1;
+      if (pendingAcc && (srcIdx === pendingIdx || denomIdx === pendingIdx)) {
+        gSumIdx(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
+        pendingAcc = null;
+        pendingCol = null;
+        pendingIdx = -1;
+      }
 
       if (op === OP_SUM) {
-        if (add) {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              acc[groupIds[idx]] += vals[idx];
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v) acc[groupIds[idx]] += v;
-            }
-          }
+        if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, slotCount));
         } else {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              acc[groupIds[idx]] -= vals[idx];
-            }
+          col = getNumericColumn(fields[m]);
+          if (pendingAcc) {
+            gRatioIdx(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, add);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
           } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v) acc[groupIds[idx]] -= v;
-            }
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
           }
         }
       } else if (op === OP_AVG) {
         acc2 = secondary[m];
-        if (add) {
-          if (!hasNaN) {
-            if (canShareCount) {
-              for (j = 0; j < rowCount; ++j) {
-                idx = rowIndexes[j];
-                acc[groupIds[idx]] += vals[idx];
-              }
-              acc2.set(primary[firstCountIndex].subarray(0, slotCount));
-            } else {
-              for (j = 0; j < rowCount; ++j) {
-                idx = rowIndexes[j];
-                g = groupIds[idx];
-                acc[g] += vals[idx];
-                acc2[g] += 1;
-              }
-            }
+        col = getNumericColumn(fields[m]);
+        if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, slotCount));
+          if (!col.hasNaN && canShareCount) {
+            acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+          } else if (avgCountSourceIdx[m] >= 0) {
+            acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, slotCount));
+          } else if (!col.hasNaN) {
+            gCountIdx(acc2, groupIds, rowIndexes, rowCount, true);
           } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v) {
-                g = groupIds[idx];
-                acc[g] += v;
-                acc2[g] += 1;
-              }
-            }
+            gValidCountIdx(acc2, groupIds, col.values, rowIndexes, rowCount);
+          }
+        } else if (add && !col.hasNaN && canShareCount) {
+          acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+          if (pendingAcc) {
+            gRatioIdx(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, false, rowIndexes, rowCount, true);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
           }
         } else {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              g = groupIds[idx];
-              acc[g] -= vals[idx];
-              acc2[g] -= 1;
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v) {
-                g = groupIds[idx];
-                acc[g] -= v;
-                acc2[g] -= 1;
-              }
-            }
-          }
+          gAvgIdx(acc, acc2, groupIds, col.values, col.hasNaN, rowIndexes, rowCount, add);
         }
       } else if (op === OP_AVG_NON_ZERO) {
-        acc2 = secondary[m];
-        if (add) {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v !== 0) {
-                g = groupIds[idx];
-                acc[g] += v;
-                acc2[g] += 1;
-              }
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v && v !== 0) {
-                g = groupIds[idx];
-                acc[g] += v;
-                acc2[g] += 1;
-              }
-            }
-          }
-        } else {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v !== 0) {
-                g = groupIds[idx];
-                acc[g] -= v;
-                acc2[g] -= 1;
-              }
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v && v !== 0) {
-                g = groupIds[idx];
-                acc[g] -= v;
-                acc2[g] -= 1;
-              }
-            }
-          }
-        }
+        col = getNumericColumn(fields[m]);
+        gAvgNzIdx(acc, secondary[m], groupIds, col.values, col.hasNaN, rowIndexes, rowCount, add);
       } else if (op === OP_RATIO) {
         acc2 = secondary[m];
-        col2 = getNumericColumn(denominators[m]);
-        vals2 = col2.values;
-        hasNaN2 = col2.hasNaN;
-        if (add) {
-          if (!hasNaN && !hasNaN2) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              g = groupIds[idx];
-              acc[g] += vals[idx];
-              acc2[g] += vals2[idx];
-            }
+        if (srcIdx >= 0 && denomIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, slotCount));
+          srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+          acc2.set(srcBuf.subarray(0, slotCount));
+        } else if (denomIdx >= 0) {
+          srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+          acc2.set(srcBuf.subarray(0, slotCount));
+          col = getNumericColumn(fields[m]);
+          if (pendingAcc) {
+            gRatioIdx(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, true);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
           } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              g = groupIds[idx];
-              v = vals[idx];
-              if (v === v) acc[g] += v;
-              v2 = vals2[idx];
-              if (v2 === v2) acc2[g] += v2;
-            }
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
+          }
+        } else if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, slotCount));
+          col2 = getNumericColumn(denominators[m]);
+          if (pendingAcc) {
+            gRatioIdx(pendingAcc, acc2, groupIds, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, true);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc2;
+            pendingCol = col2;
+            pendingIdx = m;
           }
         } else {
-          if (!hasNaN && !hasNaN2) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              g = groupIds[idx];
-              acc[g] -= vals[idx];
-              acc2[g] -= vals2[idx];
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              g = groupIds[idx];
-              v = vals[idx];
-              if (v === v) acc[g] -= v;
-              v2 = vals2[idx];
-              if (v2 === v2) acc2[g] -= v2;
-            }
-          }
+          col = getNumericColumn(fields[m]);
+          col2 = getNumericColumn(denominators[m]);
+          gRatioIdx(acc, acc2, groupIds, col.values, col.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, add);
         }
       }
     }
+
+    if (pendingAcc) {
+      gSumIdx(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
+    }
   }
 
-  function reduceSplitDenseAll(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, n, slotCount) {
+  function reduceSplitDenseAll(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, n, totalCells) {
     var ops = plan.ops;
     var fields = plan.fields;
     var denominators = plan.denominators;
+    var primarySumSourceIdx = plan.primarySumSourceIdx;
+    var primarySumSourceSec = plan.primarySumSourceSec;
+    var denomSumSourceIdx = plan.denomSumSourceIdx;
+    var denomSumSourceSec = plan.denomSumSourceSec;
+    var avgCountSourceIdx = plan.avgCountSourceIdx;
     var primary = buffers.primary;
     var secondary = buffers.secondary;
     var metricCount = plan.count;
     var firstCountIndex = plan.firstCountIndex;
+    var fusedSumIndex = plan.fusedSumIndex;
+    var fusedAvgIndex = plan.fusedAvgIndex;
+    var ranFusedAvg = false;
     var countComputed = false;
-    var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, i, v, v2, cell;
+    var pendingAcc = null;
+    var pendingCol = null;
+    var pendingIdx = -1;
+    var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
 
     if (firstCountIndex >= 0) {
-      acc = primary[firstCountIndex];
-      for (i = 0; i < n; ++i) {
-        acc[groupIds[i] * stride + splitCodes[i]] += 1;
+      if (fusedSumIndex >= 0) {
+        col = getNumericColumn(fields[fusedSumIndex]);
+        sCountSumAll(primary[firstCountIndex], primary[fusedSumIndex], groupIds, splitCodes, stride, col.values, col.hasNaN, n);
+      } else if (fusedAvgIndex >= 0) {
+        col = getNumericColumn(fields[fusedAvgIndex]);
+        if (!col.hasNaN) {
+          sCountSumAll(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, splitCodes, stride, col.values, false, n);
+          secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, totalCells));
+          ranFusedAvg = true;
+        } else {
+          sCountAll(primary[firstCountIndex], groupIds, splitCodes, stride, n);
+        }
+      } else {
+        sCountAll(primary[firstCountIndex], groupIds, splitCodes, stride, n);
       }
       countComputed = true;
     }
@@ -1790,121 +2578,165 @@
       if (op === OP_COUNT) {
         if (m === firstCountIndex) continue;
         if (countComputed) {
-          acc.set(primary[firstCountIndex].subarray(0, slotCount));
+          acc.set(primary[firstCountIndex].subarray(0, totalCells));
         } else {
-          for (i = 0; i < n; ++i) {
-            acc[groupIds[i] * stride + splitCodes[i]] += 1;
-          }
+          sCountAll(acc, groupIds, splitCodes, stride, n);
         }
         continue;
       }
 
-      col = getNumericColumn(fields[m]);
-      vals = col.values;
-      hasNaN = col.hasNaN;
+      if (m === fusedSumIndex || (ranFusedAvg && m === fusedAvgIndex)) continue;
+
+      srcIdx = primarySumSourceIdx[m];
+      if (pendingAcc && (srcIdx === pendingIdx || denomSumSourceIdx[m] === pendingIdx)) {
+        sSumAll(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, n);
+        pendingAcc = null;
+        pendingCol = null;
+        pendingIdx = -1;
+      }
 
       if (op === OP_SUM) {
-        if (!hasNaN) {
-          for (i = 0; i < n; ++i) {
-            acc[groupIds[i] * stride + splitCodes[i]] += vals[i];
-          }
+        if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, totalCells));
         } else {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v === v) {
-              acc[groupIds[i] * stride + splitCodes[i]] += v;
-            }
+          col = getNumericColumn(fields[m]);
+          if (pendingAcc) {
+            sRatioAll(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
           }
         }
       } else if (op === OP_AVG) {
         acc2 = secondary[m];
-        if (!hasNaN) {
-          if (countComputed) {
-            for (i = 0; i < n; ++i) {
-              acc[groupIds[i] * stride + splitCodes[i]] += vals[i];
-            }
-            acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+        col = getNumericColumn(fields[m]);
+        if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, totalCells));
+          if (!col.hasNaN && countComputed) {
+            acc2.set(primary[firstCountIndex].subarray(0, totalCells));
+          } else if (avgCountSourceIdx[m] >= 0) {
+            acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, totalCells));
+          } else if (!col.hasNaN) {
+            sCountAll(acc2, groupIds, splitCodes, stride, n);
           } else {
-            for (i = 0; i < n; ++i) {
-              cell = groupIds[i] * stride + splitCodes[i];
-              acc[cell] += vals[i];
-              acc2[cell] += 1;
-            }
+            sValidCountAll(acc2, groupIds, splitCodes, stride, col.values, n);
+          }
+        } else if (!col.hasNaN && countComputed) {
+          acc2.set(primary[firstCountIndex].subarray(0, totalCells));
+          if (pendingAcc) {
+            sRatioAll(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, false, n);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
           }
         } else {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v === v) {
-              cell = groupIds[i] * stride + splitCodes[i];
-              acc[cell] += v;
-              acc2[cell] += 1;
-            }
-          }
+          sAvgAll(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, n);
         }
       } else if (op === OP_AVG_NON_ZERO) {
-        acc2 = secondary[m];
-        if (!hasNaN) {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v !== 0) {
-              cell = groupIds[i] * stride + splitCodes[i];
-              acc[cell] += v;
-              acc2[cell] += 1;
-            }
-          }
-        } else {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v === v && v !== 0) {
-              cell = groupIds[i] * stride + splitCodes[i];
-              acc[cell] += v;
-              acc2[cell] += 1;
-            }
-          }
-        }
+        col = getNumericColumn(fields[m]);
+        sAvgNzAll(acc, secondary[m], groupIds, splitCodes, stride, col.values, col.hasNaN, n);
       } else if (op === OP_RATIO) {
         acc2 = secondary[m];
-        col2 = getNumericColumn(denominators[m]);
-        vals2 = col2.values;
-        hasNaN2 = col2.hasNaN;
-        if (!hasNaN && !hasNaN2) {
-          for (i = 0; i < n; ++i) {
-            cell = groupIds[i] * stride + splitCodes[i];
-            acc[cell] += vals[i];
-            acc2[cell] += vals2[i];
+        denomIdx = denomSumSourceIdx[m];
+        if (srcIdx >= 0 && denomIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, totalCells));
+          srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+          acc2.set(srcBuf.subarray(0, totalCells));
+        } else if (denomIdx >= 0) {
+          srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+          acc2.set(srcBuf.subarray(0, totalCells));
+          col = getNumericColumn(fields[m]);
+          if (pendingAcc) {
+            sRatioAll(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
+          }
+        } else if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, totalCells));
+          col2 = getNumericColumn(denominators[m]);
+          if (pendingAcc) {
+            sRatioAll(pendingAcc, acc2, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, n);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc2;
+            pendingCol = col2;
+            pendingIdx = m;
           }
         } else {
-          for (i = 0; i < n; ++i) {
-            cell = groupIds[i] * stride + splitCodes[i];
-            v = vals[i];
-            if (v === v) acc[cell] += v;
-            v2 = vals2[i];
-            if (v2 === v2) acc2[cell] += v2;
-          }
+          col = getNumericColumn(fields[m]);
+          col2 = getNumericColumn(denominators[m]);
+          sRatioAll(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, col2.values, col2.hasNaN, n);
         }
       }
     }
+
+    if (pendingAcc) {
+      sSumAll(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, n);
+    }
   }
 
-  function reduceSplitDenseIndexed(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, rowIndexes, rowCount, delta, slotCount) {
+  function reduceSplitDenseIndexed(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, rowIndexes, rowCount, delta, totalCells) {
     if (!rowCount) return;
 
     var ops = plan.ops;
     var fields = plan.fields;
     var denominators = plan.denominators;
+    var primarySumSourceIdx = plan.primarySumSourceIdx;
+    var primarySumSourceSec = plan.primarySumSourceSec;
+    var denomSumSourceIdx = plan.denomSumSourceIdx;
+    var denomSumSourceSec = plan.denomSumSourceSec;
+    var avgCountSourceIdx = plan.avgCountSourceIdx;
     var primary = buffers.primary;
     var secondary = buffers.secondary;
     var metricCount = plan.count;
     var firstCountIndex = plan.firstCountIndex;
+    var fusedSumIndex = plan.fusedSumIndex;
+    var fusedAvgIndex = plan.fusedAvgIndex;
     var add = delta > 0;
-    var canShareCount = add && slotCount > 0 && firstCountIndex >= 0;
-    var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, j, idx, v, v2, cell;
+    var isReset = add && totalCells > 0;
+    var canShareCount = isReset && firstCountIndex >= 0;
+    var ranFused = false;
+    var ranFusedAvg = false;
+    var pendingAcc = null;
+    var pendingCol = null;
+    var pendingIdx = -1;
+    var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
 
-    if (canShareCount) {
-      acc = primary[firstCountIndex];
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
+    if (firstCountIndex >= 0 && fusedSumIndex >= 0) {
+      col = getNumericColumn(fields[fusedSumIndex]);
+      sCountSumIdx(primary[firstCountIndex], primary[fusedSumIndex], groupIds, splitCodes, stride, col.values, col.hasNaN, rowIndexes, rowCount, add);
+      ranFused = true;
+    } else if (canShareCount) {
+      if (fusedAvgIndex >= 0) {
+        col = getNumericColumn(fields[fusedAvgIndex]);
+        if (!col.hasNaN) {
+          sCountSumIdx(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, splitCodes, stride, col.values, false, rowIndexes, rowCount, true);
+          secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, totalCells));
+          ranFusedAvg = true;
+        } else {
+          sCountIdx(primary[firstCountIndex], groupIds, splitCodes, stride, rowIndexes, rowCount, true);
+        }
+      } else {
+        sCountIdx(primary[firstCountIndex], groupIds, splitCodes, stride, rowIndexes, rowCount, true);
       }
     }
 
@@ -1913,194 +2745,121 @@
       acc = primary[m];
 
       if (op === OP_COUNT) {
+        if (m === firstCountIndex && (ranFused || canShareCount)) continue;
         if (canShareCount) {
-          if (m === firstCountIndex) continue;
-          acc.set(primary[firstCountIndex].subarray(0, slotCount));
-        } else if (add) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
-          }
+          acc.set(primary[firstCountIndex].subarray(0, totalCells));
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            acc[groupIds[idx] * stride + splitCodes[idx]] -= 1;
-          }
+          sCountIdx(acc, groupIds, splitCodes, stride, rowIndexes, rowCount, add);
         }
         continue;
       }
 
-      col = getNumericColumn(fields[m]);
-      vals = col.values;
-      hasNaN = col.hasNaN;
+      if ((ranFused && m === fusedSumIndex) || (ranFusedAvg && m === fusedAvgIndex)) continue;
+
+      srcIdx = isReset ? primarySumSourceIdx[m] : -1;
+      denomIdx = isReset ? denomSumSourceIdx[m] : -1;
+      if (pendingAcc && (srcIdx === pendingIdx || denomIdx === pendingIdx)) {
+        sSumIdx(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
+        pendingAcc = null;
+        pendingCol = null;
+        pendingIdx = -1;
+      }
 
       if (op === OP_SUM) {
-        if (add) {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              acc[groupIds[idx] * stride + splitCodes[idx]] += vals[idx];
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] += v;
-            }
-          }
+        if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, totalCells));
         } else {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              acc[groupIds[idx] * stride + splitCodes[idx]] -= vals[idx];
-            }
+          col = getNumericColumn(fields[m]);
+          if (pendingAcc) {
+            sRatioIdx(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, add);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
           } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] -= v;
-            }
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
           }
         }
       } else if (op === OP_AVG) {
         acc2 = secondary[m];
-        if (add) {
-          if (!hasNaN) {
-            if (canShareCount) {
-              for (j = 0; j < rowCount; ++j) {
-                idx = rowIndexes[j];
-                acc[groupIds[idx] * stride + splitCodes[idx]] += vals[idx];
-              }
-              acc2.set(primary[firstCountIndex].subarray(0, slotCount));
-            } else {
-              for (j = 0; j < rowCount; ++j) {
-                idx = rowIndexes[j];
-                cell = groupIds[idx] * stride + splitCodes[idx];
-                acc[cell] += vals[idx];
-                acc2[cell] += 1;
-              }
-            }
+        col = getNumericColumn(fields[m]);
+        if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, totalCells));
+          if (!col.hasNaN && canShareCount) {
+            acc2.set(primary[firstCountIndex].subarray(0, totalCells));
+          } else if (avgCountSourceIdx[m] >= 0) {
+            acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, totalCells));
+          } else if (!col.hasNaN) {
+            sCountIdx(acc2, groupIds, splitCodes, stride, rowIndexes, rowCount, true);
           } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v) {
-                cell = groupIds[idx] * stride + splitCodes[idx];
-                acc[cell] += v;
-                acc2[cell] += 1;
-              }
-            }
+            sValidCountIdx(acc2, groupIds, splitCodes, stride, col.values, rowIndexes, rowCount);
+          }
+        } else if (add && !col.hasNaN && canShareCount) {
+          acc2.set(primary[firstCountIndex].subarray(0, totalCells));
+          if (pendingAcc) {
+            sRatioIdx(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, false, rowIndexes, rowCount, true);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
           }
         } else {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] -= vals[idx];
-              acc2[cell] -= 1;
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v) {
-                cell = groupIds[idx] * stride + splitCodes[idx];
-                acc[cell] -= v;
-                acc2[cell] -= 1;
-              }
-            }
-          }
+          sAvgIdx(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, rowIndexes, rowCount, add);
         }
       } else if (op === OP_AVG_NON_ZERO) {
-        acc2 = secondary[m];
-        if (add) {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v !== 0) {
-                cell = groupIds[idx] * stride + splitCodes[idx];
-                acc[cell] += v;
-                acc2[cell] += 1;
-              }
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v && v !== 0) {
-                cell = groupIds[idx] * stride + splitCodes[idx];
-                acc[cell] += v;
-                acc2[cell] += 1;
-              }
-            }
-          }
-        } else {
-          if (!hasNaN) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v !== 0) {
-                cell = groupIds[idx] * stride + splitCodes[idx];
-                acc[cell] -= v;
-                acc2[cell] -= 1;
-              }
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              v = vals[idx];
-              if (v === v && v !== 0) {
-                cell = groupIds[idx] * stride + splitCodes[idx];
-                acc[cell] -= v;
-                acc2[cell] -= 1;
-              }
-            }
-          }
-        }
+        col = getNumericColumn(fields[m]);
+        sAvgNzIdx(acc, secondary[m], groupIds, splitCodes, stride, col.values, col.hasNaN, rowIndexes, rowCount, add);
       } else if (op === OP_RATIO) {
         acc2 = secondary[m];
-        col2 = getNumericColumn(denominators[m]);
-        vals2 = col2.values;
-        hasNaN2 = col2.hasNaN;
-        if (add) {
-          if (!hasNaN && !hasNaN2) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] += vals[idx];
-              acc2[cell] += vals2[idx];
-            }
+        if (srcIdx >= 0 && denomIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, totalCells));
+          srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+          acc2.set(srcBuf.subarray(0, totalCells));
+        } else if (denomIdx >= 0) {
+          srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+          acc2.set(srcBuf.subarray(0, totalCells));
+          col = getNumericColumn(fields[m]);
+          if (pendingAcc) {
+            sRatioIdx(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, true);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
           } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              v = vals[idx];
-              if (v === v) acc[cell] += v;
-              v2 = vals2[idx];
-              if (v2 === v2) acc2[cell] += v2;
-            }
+            pendingAcc = acc;
+            pendingCol = col;
+            pendingIdx = m;
+          }
+        } else if (srcIdx >= 0) {
+          srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+          acc.set(srcBuf.subarray(0, totalCells));
+          col2 = getNumericColumn(denominators[m]);
+          if (pendingAcc) {
+            sRatioIdx(pendingAcc, acc2, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, true);
+            pendingAcc = null;
+            pendingCol = null;
+            pendingIdx = -1;
+          } else {
+            pendingAcc = acc2;
+            pendingCol = col2;
+            pendingIdx = m;
           }
         } else {
-          if (!hasNaN && !hasNaN2) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] -= vals[idx];
-              acc2[cell] -= vals2[idx];
-            }
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              v = vals[idx];
-              if (v === v) acc[cell] -= v;
-              v2 = vals2[idx];
-              if (v2 === v2) acc2[cell] -= v2;
-            }
-          }
+          col = getNumericColumn(fields[m]);
+          col2 = getNumericColumn(denominators[m]);
+          sRatioIdx(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, add);
         }
       }
+    }
+
+    if (pendingAcc) {
+      sSumIdx(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
     }
   }
 
@@ -2108,10 +2867,15 @@
     var ops = plan.ops;
     var fields = plan.fields;
     var denominators = plan.denominators;
+    var primarySumSourceIdx = plan.primarySumSourceIdx;
+    var primarySumSourceSec = plan.primarySumSourceSec;
+    var denomSumSourceIdx = plan.denomSumSourceIdx;
+    var denomSumSourceSec = plan.denomSumSourceSec;
+    var avgCountSourceIdx = plan.avgCountSourceIdx;
     var primary = buffers.primary;
     var secondary = buffers.secondary;
     var metricCount = plan.count;
-    var m, op, col, col2, vals, vals2, hasNaN, hasNaN2, i, v, v2, s, s2;
+    var m, op, col, col2, vals, hasNaN, i, v, s, s2, srcIdx, denomIdx;
 
     for (m = 0; m < metricCount; ++m) {
       op = ops[m];
@@ -2120,76 +2884,71 @@
         continue;
       }
 
-      col = getNumericColumn(fields[m]);
-      vals = col.values;
-      hasNaN = col.hasNaN;
+      srcIdx = primarySumSourceIdx[m];
       s = 0;
       s2 = 0;
 
       if (op === OP_SUM) {
-        if (!hasNaN) {
-          for (i = 0; i < n; ++i) s += vals[i];
+        if (srcIdx >= 0) {
+          primary[m][0] = primarySumSourceSec[m] ? secondary[srcIdx][0] : primary[srcIdx][0];
         } else {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v === v) s += v;
-          }
+          col = getNumericColumn(fields[m]);
+          primary[m][0] += scSumAll(col.values, col.hasNaN, n);
         }
-        primary[m][0] += s;
       } else if (op === OP_AVG) {
-        if (!hasNaN) {
-          for (i = 0; i < n; ++i) s += vals[i];
-          s2 = n;
+        col = getNumericColumn(fields[m]);
+        if (srcIdx >= 0) {
+          primary[m][0] = primarySumSourceSec[m] ? secondary[srcIdx][0] : primary[srcIdx][0];
+          if (!col.hasNaN) {
+            secondary[m][0] += n;
+          } else if (avgCountSourceIdx[m] >= 0) {
+            secondary[m][0] = secondary[avgCountSourceIdx[m]][0];
+          } else {
+            secondary[m][0] += scValidCountAll(col.values, n);
+          }
+        } else if (!col.hasNaN) {
+          primary[m][0] += scSumAll(col.values, false, n);
+          secondary[m][0] += n;
         } else {
+          vals = col.values;
           for (i = 0; i < n; ++i) {
             v = vals[i];
-            if (v === v) {
-              s += v;
-              s2 += 1;
-            }
+            if (v === v) { s += v; s2 += 1; }
           }
+          primary[m][0] += s;
+          secondary[m][0] += s2;
         }
-        primary[m][0] += s;
-        secondary[m][0] += s2;
       } else if (op === OP_AVG_NON_ZERO) {
+        col = getNumericColumn(fields[m]);
+        vals = col.values;
+        hasNaN = col.hasNaN;
         if (!hasNaN) {
           for (i = 0; i < n; ++i) {
             v = vals[i];
-            if (v !== 0) {
-              s += v;
-              s2 += 1;
-            }
+            if (v !== 0) { s += v; s2 += 1; }
           }
         } else {
           for (i = 0; i < n; ++i) {
             v = vals[i];
-            if (v === v && v !== 0) {
-              s += v;
-              s2 += 1;
-            }
+            if (v === v && v !== 0) { s += v; s2 += 1; }
           }
         }
         primary[m][0] += s;
         secondary[m][0] += s2;
       } else if (op === OP_RATIO) {
-        col2 = getNumericColumn(denominators[m]);
-        vals2 = col2.values;
-        hasNaN2 = col2.hasNaN;
-        if (!hasNaN && !hasNaN2) {
-          for (i = 0; i < n; ++i) {
-            s += vals[i];
-            s2 += vals2[i];
-          }
+        denomIdx = denomSumSourceIdx[m];
+        if (srcIdx >= 0) {
+          primary[m][0] = primarySumSourceSec[m] ? secondary[srcIdx][0] : primary[srcIdx][0];
         } else {
-          for (i = 0; i < n; ++i) {
-            v = vals[i];
-            if (v === v) s += v;
-            v2 = vals2[i];
-            if (v2 === v2) s2 += v2;
-          }
+          col = getNumericColumn(fields[m]);
+          primary[m][0] += scSumAll(col.values, col.hasNaN, n);
         }
-        primary[m][0] += s;
-        secondary[m][0] += s2;
+        if (denomIdx >= 0) {
+          secondary[m][0] = denomSumSourceSec[m] ? secondary[denomIdx][0] : primary[denomIdx][0];
+        } else {
+          col2 = getNumericColumn(denominators[m]);
+          secondary[m][0] += scSumAll(col2.values, col2.hasNaN, n);
+        }
       }
     }
   }
@@ -2200,89 +2959,100 @@
     var ops = plan.ops;
     var fields = plan.fields;
     var denominators = plan.denominators;
+    var primarySumSourceIdx = plan.primarySumSourceIdx;
+    var primarySumSourceSec = plan.primarySumSourceSec;
+    var denomSumSourceIdx = plan.denomSumSourceIdx;
+    var denomSumSourceSec = plan.denomSumSourceSec;
+    var avgCountSourceIdx = plan.avgCountSourceIdx;
     var primary = buffers.primary;
     var secondary = buffers.secondary;
     var metricCount = plan.count;
     var sign = delta > 0 ? 1 : -1;
-    var m, op, col, col2, vals, vals2, hasNaN, hasNaN2, j, idx, v, v2, s, s2;
+    var stepPrimary = new Float64Array(metricCount);
+    var stepSecondary = new Float64Array(metricCount);
+    var m, op, col, col2, vals, hasNaN, j, v, s, s2, srcIdx, denomIdx;
 
     for (m = 0; m < metricCount; ++m) {
       op = ops[m];
       if (op === OP_COUNT) {
+        stepPrimary[m] = rowCount;
         primary[m][0] += sign * rowCount;
         continue;
       }
 
-      col = getNumericColumn(fields[m]);
-      vals = col.values;
-      hasNaN = col.hasNaN;
+      srcIdx = primarySumSourceIdx[m];
       s = 0;
       s2 = 0;
 
       if (op === OP_SUM) {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
+        if (srcIdx >= 0) {
+          s = primarySumSourceSec[m] ? stepSecondary[srcIdx] : stepPrimary[srcIdx];
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            v = vals[rowIndexes[j]];
-            if (v === v) s += v;
-          }
+          col = getNumericColumn(fields[m]);
+          s = scSumIdx(col.values, col.hasNaN, rowIndexes, rowCount);
         }
+        stepPrimary[m] = s;
         primary[m][0] += sign * s;
       } else if (op === OP_AVG) {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
+        col = getNumericColumn(fields[m]);
+        if (srcIdx >= 0) {
+          s = primarySumSourceSec[m] ? stepSecondary[srcIdx] : stepPrimary[srcIdx];
+          if (!col.hasNaN) {
+            s2 = rowCount;
+          } else if (avgCountSourceIdx[m] >= 0) {
+            s2 = stepSecondary[avgCountSourceIdx[m]];
+          } else {
+            s2 = scValidCountIdx(col.values, rowIndexes, rowCount);
+          }
+        } else if (!col.hasNaN) {
+          s = scSumIdx(col.values, false, rowIndexes, rowCount);
           s2 = rowCount;
         } else {
+          vals = col.values;
           for (j = 0; j < rowCount; ++j) {
             v = vals[rowIndexes[j]];
-            if (v === v) {
-              s += v;
-              s2 += 1;
-            }
+            if (v === v) { s += v; s2 += 1; }
           }
         }
+        stepPrimary[m] = s;
+        stepSecondary[m] = s2;
         primary[m][0] += sign * s;
         secondary[m][0] += sign * s2;
       } else if (op === OP_AVG_NON_ZERO) {
+        col = getNumericColumn(fields[m]);
+        vals = col.values;
+        hasNaN = col.hasNaN;
         if (!hasNaN) {
           for (j = 0; j < rowCount; ++j) {
             v = vals[rowIndexes[j]];
-            if (v !== 0) {
-              s += v;
-              s2 += 1;
-            }
+            if (v !== 0) { s += v; s2 += 1; }
           }
         } else {
           for (j = 0; j < rowCount; ++j) {
             v = vals[rowIndexes[j]];
-            if (v === v && v !== 0) {
-              s += v;
-              s2 += 1;
-            }
+            if (v === v && v !== 0) { s += v; s2 += 1; }
           }
         }
+        stepPrimary[m] = s;
+        stepSecondary[m] = s2;
         primary[m][0] += sign * s;
         secondary[m][0] += sign * s2;
       } else if (op === OP_RATIO) {
-        col2 = getNumericColumn(denominators[m]);
-        vals2 = col2.values;
-        hasNaN2 = col2.hasNaN;
-        if (!hasNaN && !hasNaN2) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            s += vals[idx];
-            s2 += vals2[idx];
-          }
+        denomIdx = denomSumSourceIdx[m];
+        if (srcIdx >= 0) {
+          s = primarySumSourceSec[m] ? stepSecondary[srcIdx] : stepPrimary[srcIdx];
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v) s += v;
-            v2 = vals2[idx];
-            if (v2 === v2) s2 += v2;
-          }
+          col = getNumericColumn(fields[m]);
+          s = scSumIdx(col.values, col.hasNaN, rowIndexes, rowCount);
         }
+        if (denomIdx >= 0) {
+          s2 = denomSumSourceSec[m] ? stepSecondary[denomIdx] : stepPrimary[denomIdx];
+        } else {
+          col2 = getNumericColumn(denominators[m]);
+          s2 = scSumIdx(col2.values, col2.hasNaN, rowIndexes, rowCount);
+        }
+        stepPrimary[m] = s;
+        stepSecondary[m] = s2;
         primary[m][0] += sign * s;
         secondary[m][0] += sign * s2;
       }
@@ -4674,6 +5444,12 @@ function isBigIntTypedArray(arr) {
   var tag = typedArrayToString.call(arr);
   return tag === '[object BigInt64Array]' || tag === '[object BigUint64Array]';
 }
+function hasValidNullBitmap(chunk) {
+  if (!chunk || chunk.nullCount === 0) return true;
+  if (!chunk.nullBitmap || typeof chunk.nullBitmap.length !== 'number') return false;
+  var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+  return chunk.nullBitmap.length >= ((chunkOff + chunk.length + 7) >>> 3);
+}
 function extractArrowNumericChunks(sourceColumn, length, mode) {
   if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
     return null;
@@ -4685,11 +5461,14 @@ function extractArrowNumericChunks(sourceColumn, length, mode) {
     return null;
   }
   var chunks = sourceColumn.data;
-  var c, chunk, chunkLen, vals, j, v;
+  var c, chunk, chunkLen, vals, j, v, nullBitmap, chunkOff, bitIdx;
   var total = 0;
   for (c = 0; c < chunks.length; ++c) {
     chunk = chunks[c];
-    if (!chunk || chunk.nullCount !== 0 || !ArrayBuffer.isView(chunk.values)) {
+    if (!chunk || !ArrayBuffer.isView(chunk.values)) {
+      return null;
+    }
+    if (mode === 'raw' ? chunk.nullCount !== 0 : !hasValidNullBitmap(chunk)) {
       return null;
     }
     chunkLen = chunk.length;
@@ -4697,6 +5476,9 @@ function extractArrowNumericChunks(sourceColumn, length, mode) {
       return null;
     }
     if (typeId === 2 && chunk.type && chunk.type.bitWidth > 32 && !isBigIntTypedArray(chunk.values)) {
+      return null;
+    }
+    if (typeId === 3 && chunk.type && chunk.type.precision === 0) {
       return null;
     }
     if (!isStandardNumericTypedArray(chunk.values) && !isBigIntTypedArray(chunk.values)) {
@@ -4722,30 +5504,76 @@ function extractArrowNumericChunks(sourceColumn, length, mode) {
     chunk = chunks[c];
     chunkLen = chunk.length;
     vals = chunk.values;
+    nullBitmap = chunk.nullCount > 0 ? chunk.nullBitmap : null;
+    chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
     if (mode === 'number') {
-      if (isIntegerTypedArray(vals)) {
-        out.set(vals.length === chunkLen ? vals : vals.subarray(0, chunkLen), outOffset);
+      if (!nullBitmap) {
+        if (isIntegerTypedArray(vals)) {
+          out.set(vals.length === chunkLen ? vals : vals.subarray(0, chunkLen), outOffset);
+        } else if (isBigIntTypedArray(vals)) {
+          for (j = 0; j < chunkLen; ++j) {
+            v = Number(vals[j]);
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          }
+        } else {
+          for (j = 0; j < chunkLen; ++j) {
+            v = vals[j];
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          }
+        }
       } else if (isBigIntTypedArray(vals)) {
         for (j = 0; j < chunkLen; ++j) {
-          v = Number(vals[j]);
-          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          bitIdx = chunkOff + j;
+          if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+            out[outOffset + j] = 0;
+          } else {
+            v = Number(vals[j]);
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          }
         }
       } else {
         for (j = 0; j < chunkLen; ++j) {
-          v = vals[j];
-          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          bitIdx = chunkOff + j;
+          if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+            out[outOffset + j] = 0;
+          } else {
+            v = vals[j];
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+          }
         }
       }
     } else if (mode === 'timestampMs') {
-      if (isBigIntTypedArray(vals)) {
+      if (!nullBitmap) {
+        if (isBigIntTypedArray(vals)) {
+          for (j = 0; j < chunkLen; ++j) {
+            v = Number(vals[j]);
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+          }
+        } else {
+          for (j = 0; j < chunkLen; ++j) {
+            v = vals[j];
+            out[outOffset + j] = v < 1e12 ? v * 1000 : v;
+          }
+        }
+      } else if (isBigIntTypedArray(vals)) {
         for (j = 0; j < chunkLen; ++j) {
-          v = Number(vals[j]);
-          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+          bitIdx = chunkOff + j;
+          if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+            out[outOffset + j] = 0;
+          } else {
+            v = Number(vals[j]);
+            out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+          }
         }
       } else {
         for (j = 0; j < chunkLen; ++j) {
-          v = vals[j];
-          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+          bitIdx = chunkOff + j;
+          if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+            out[outOffset + j] = 0;
+          } else {
+            v = vals[j];
+            out[outOffset + j] = v < 1e12 ? v * 1000 : v;
+          }
         }
       }
     }
@@ -4753,24 +5581,23 @@ function extractArrowNumericChunks(sourceColumn, length, mode) {
   }
   return out;
 }
-function extractArrowDictionaryColumn(sourceColumn, length) {
+function copyArrowDictionaryInto(target, targetOffset, sourceColumn, length) {
   if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
-    return null;
+    return false;
   }
   var chunks = sourceColumn.data;
   var c, chunk, total = 0;
   for (c = 0; c < chunks.length; ++c) {
     chunk = chunks[c];
-    if (!chunk || !chunk.dictionary || typeof chunk.dictionary.get !== 'function' || chunk.nullCount !== 0 || !ArrayBuffer.isView(chunk.values) || chunk.values.length < chunk.length) {
-      return null;
+    if (!chunk || !chunk.dictionary || typeof chunk.dictionary.get !== 'function' || !hasValidNullBitmap(chunk) || !ArrayBuffer.isView(chunk.values) || chunk.values.length < chunk.length) {
+      return false;
     }
     total += chunk.length;
   }
   if (total !== length) {
-    return null;
+    return false;
   }
-  var out = new Array(length);
-  var outOffset = 0;
+  var outOffset = targetOffset;
   for (c = 0; c < chunks.length; ++c) {
     chunk = chunks[c];
     var dict = chunk.dictionary;
@@ -4782,12 +5609,24 @@ function extractArrowDictionaryColumn(sourceColumn, length) {
     }
     var indices = chunk.values;
     var chunkLen = chunk.length;
-    for (var j = 0; j < chunkLen; ++j) {
-      out[outOffset + j] = dictVals[indices[j]];
+    var nullBitmap = chunk.nullCount > 0 ? chunk.nullBitmap : null;
+    var j;
+    if (!nullBitmap) {
+      for (j = 0; j < chunkLen; ++j) {
+        target[outOffset + j] = dictVals[indices[j]];
+      }
+    } else {
+      var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+      for (j = 0; j < chunkLen; ++j) {
+        var bitIdx = chunkOff + j;
+        target[outOffset + j] = (nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))
+          ? dictVals[indices[j]]
+          : null;
+      }
     }
     outOffset += chunkLen;
   }
-  return out;
+  return true;
 }
 function resolveColumnAccessor(column) {
   if (column == null) return null;
@@ -4801,15 +5640,26 @@ function getValueByKind(column, index, kind) {
   if (kind === 'at') return column.at(index);
   return column[index];
 }
-function allocateMergedColumn(column, length) {
-  if (ArrayBuffer.isView(column) && typeof column.constructor === 'function' && typeof column.BYTES_PER_ELEMENT === 'number') {
-    return new column.constructor(length);
+function allocateMergedColumnForBatches(batches, field, length) {
+  var first = batches[0].columns[field];
+  if (!ArrayBuffer.isView(first) || typeof first.constructor !== 'function' || typeof first.BYTES_PER_ELEMENT !== 'number') {
+    return new Array(length);
   }
-  return new Array(length);
+  var firstTag = typedArrayToString.call(first);
+  for (var b = 1; b < batches.length; ++b) {
+    var col = batches[b].columns[field];
+    if (!ArrayBuffer.isView(col) || typedArrayToString.call(col) !== firstTag) {
+      return new Array(length);
+    }
+  }
+  return new first.constructor(length);
 }
 function copyColumnValues(target, targetOffset, source, length) {
-  if (ArrayBuffer.isView(target) && ArrayBuffer.isView(source) && source.constructor === target.constructor && typeof source.length === 'number') {
-    target.set(source, targetOffset);
+  if (ArrayBuffer.isView(target) && ArrayBuffer.isView(source) && typedArrayToString.call(source) === typedArrayToString.call(target) && typeof source.length === 'number') {
+    target.set(source.length === length ? source : source.subarray(0, length), targetOffset);
+    return;
+  }
+  if (copyArrowDictionaryInto(target, targetOffset, source, length)) {
     return;
   }
   var sourceKind = resolveColumnAccessor(source);
@@ -4834,7 +5684,8 @@ function mergeProjectedBatches(batches) {
   }
 
   for (var fieldIndex = 0; fieldIndex < fields.length; ++fieldIndex) {
-    columns[fields[fieldIndex]] = allocateMergedColumn(batches[0].columns[fields[fieldIndex]], totalLength);
+    var mergeField = fields[fieldIndex];
+    columns[mergeField] = allocateMergedColumnForBatches(batches, mergeField, totalLength);
   }
 
   var offset = 0;
@@ -5031,8 +5882,7 @@ function projectBatch(batch, projection) {
       values.fill(1);
       columns[outputName] = values;
     } else {
-      var fastRaw = extractArrowNumericChunks(sourceColumn, length, 'raw')
-        || extractArrowDictionaryColumn(sourceColumn, length);
+      var fastRaw = extractArrowNumericChunks(sourceColumn, length, 'raw');
       columns[outputName] = fastRaw || sourceColumn;
     }
   }
@@ -6098,6 +6948,67 @@ self.onmessage = async function(event) {
       return tag === '[object Float64Array]' || tag === '[object Float32Array]';
     }
 
+    function hasValidArrowNullBitmap(chunk) {
+      if (!chunk || chunk.nullCount === 0) return true;
+      if (!chunk.nullBitmap || typeof chunk.nullBitmap.length !== 'number') return false;
+      var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+      return chunk.nullBitmap.length >= ((chunkOff + chunk.length + 7) >>> 3);
+    }
+
+    function resolveArrowDictionaryChunks(col) {
+      if (!col || !Array.isArray(col.data) || !col.data.length) return null;
+      var chunks = col.data;
+      var total = 0;
+      for (var c = 0; c < chunks.length; ++c) {
+        var chunk = chunks[c];
+        if (
+          !chunk
+          || !chunk.dictionary
+          || typeof chunk.dictionary.get !== 'function'
+          || typeof chunk.dictionary.length !== 'number'
+          || !isGuaranteedFiniteTypedArray(chunk.values)
+          || chunk.values.length < chunk.length
+          || !hasValidArrowNullBitmap(chunk)
+        ) {
+          return null;
+        }
+        total += chunk.length;
+      }
+      if (typeof col.length === 'number' && total !== col.length) return null;
+      return chunks;
+    }
+
+    function resolveArrowNumericChunks(col) {
+      if (!col || !Array.isArray(col.data) || !col.data.length) return null;
+      var colType = col.type || col.data[0].type;
+      if (!colType) return null;
+      var typeId = colType.typeId;
+      if (typeId === 2) {
+        if (!(colType.bitWidth > 0 && colType.bitWidth <= 32)) return null;
+      } else if (typeId === 3) {
+        if (!(colType.precision >= 1)) return null;
+      } else {
+        return null;
+      }
+      var chunks = col.data;
+      var total = 0;
+      for (var c = 0; c < chunks.length; ++c) {
+        var chunk = chunks[c];
+        if (
+          !chunk
+          || chunk.dictionary
+          || !(isGuaranteedFiniteTypedArray(chunk.values) || isFloatTypedArray(chunk.values))
+          || chunk.values.length < chunk.length
+          || !hasValidArrowNullBitmap(chunk)
+        ) {
+          return null;
+        }
+        total += chunk.length;
+      }
+      if (typeof col.length === 'number' && total !== col.length) return null;
+      return chunks;
+    }
+
     function isPureNumericColumnSource(field) {
       if (!n || !columnarBatches.length) return false;
       var expectedStart = 0;
@@ -6106,8 +7017,17 @@ self.onmessage = async function(event) {
         if (batch.start !== expectedStart) return false;
         expectedStart = batch.end;
         var col = batch.columns[field];
-        if (!(isFloatTypedArray(col) || isGuaranteedFiniteTypedArray(col))) {
+        if (isFloatTypedArray(col) || isGuaranteedFiniteTypedArray(col)) {
+          continue;
+        }
+        var arrowChunks = resolveArrowNumericChunks(col);
+        if (!arrowChunks) {
           return false;
+        }
+        for (var c = 0; c < arrowChunks.length; ++c) {
+          if (arrowChunks[c].nullCount !== 0) {
+            return false;
+          }
         }
       }
       return expectedStart === n;
@@ -6209,8 +7129,34 @@ self.onmessage = async function(event) {
     function getNumericColumn(field) {
       var entry = numericColumns[field];
       if (!entry) {
+        if (n > 0 && columnarBatches.length === 1 && columnarBatches[0].start === 0 && columnarBatches[0].end === n) {
+          var onlyCol = columnarBatches[0].columns[field];
+          var directF64 = null;
+          if (ArrayBuffer.isView(onlyCol) && objToString.call(onlyCol) === '[object Float64Array]') {
+            directF64 = onlyCol;
+          } else {
+            var onlyArrow = resolveArrowNumericChunks(onlyCol);
+            if (onlyArrow && onlyArrow.length === 1 && onlyArrow[0].nullCount === 0 && objToString.call(onlyArrow[0].values) === '[object Float64Array]') {
+              directF64 = onlyArrow[0].values;
+            }
+          }
+          if (directF64 && directF64.length >= n) {
+            var nonFiniteFound = false;
+            for (var fi = 0; fi < n; ++fi) {
+              if (directF64[fi] - directF64[fi] !== 0) {
+                nonFiniteFound = true;
+                break;
+              }
+            }
+            if (!nonFiniteFound) {
+              entry = { values: directF64, hasNaN: false, length: n, shared: true };
+              numericColumns[field] = entry;
+              return entry;
+            }
+          }
+        }
         var initCap = n < 64 ? 64 : n;
-        entry = { values: new Float64Array(initCap), hasNaN: false, length: 0 };
+        entry = { values: new Float64Array(initCap), hasNaN: false, length: 0, shared: false };
         numericColumns[field] = entry;
       }
       if (entry.length >= n) {
@@ -6218,7 +7164,7 @@ self.onmessage = async function(event) {
       }
 
       var values = entry.values;
-      if (values.length < n) {
+      if (entry.shared || values.length < n) {
         var nextCap = values.length || 64;
         while (nextCap < n) nextCap <<= 1;
         var nextValues = new Float64Array(nextCap);
@@ -6226,6 +7172,7 @@ self.onmessage = async function(event) {
           nextValues.set(values.subarray(0, entry.length));
         }
         values = entry.values = nextValues;
+        entry.shared = false;
       }
 
       var cursor = entry.length;
@@ -6258,7 +7205,7 @@ self.onmessage = async function(event) {
         } else if (isFloatTypedArray(col)) {
           for (i = localStart; i < localEnd; ++i) {
             v = col[i];
-            if (v === v && v !== Infinity && v !== -Infinity) {
+            if (v - v === 0) {
               values[segStart + i - localStart] = v;
             } else {
               values[segStart + i - localStart] = NaN;
@@ -6268,28 +7215,7 @@ self.onmessage = async function(event) {
         } else if (Array.isArray(col)) {
           for (i = localStart; i < localEnd; ++i) {
             raw = col[i];
-            if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
-              values[segStart + i - localStart] = raw;
-            } else {
-              values[segStart + i - localStart] = NaN;
-              entry.hasNaN = true;
-            }
-          }
-        } else if (batch.accessors && batch.accessors[field]) {
-          accessor = batch.accessors[field];
-          for (i = localStart; i < localEnd; ++i) {
-            raw = accessor(i);
-            if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
-              values[segStart + i - localStart] = raw;
-            } else {
-              values[segStart + i - localStart] = NaN;
-              entry.hasNaN = true;
-            }
-          }
-        } else if (col != null) {
-          for (i = localStart; i < localEnd; ++i) {
-            raw = getColumnValue(col, i);
-            if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+            if (typeof raw === 'number' && raw - raw === 0) {
               values[segStart + i - localStart] = raw;
             } else {
               values[segStart + i - localStart] = NaN;
@@ -6297,10 +7223,84 @@ self.onmessage = async function(event) {
             }
           }
         } else {
-          for (i = segStart; i < segEnd; ++i) {
-            values[i] = NaN;
+          var arrowNumChunks = resolveArrowNumericChunks(col);
+          if (arrowNumChunks) {
+            var chunkStart = 0;
+            for (var cIdx = 0; cIdx < arrowNumChunks.length; ++cIdx) {
+              var numChunk = arrowNumChunks[cIdx];
+              var chunkEnd = chunkStart + numChunk.length;
+              if (chunkEnd <= localStart) {
+                chunkStart = chunkEnd;
+                continue;
+              }
+              if (chunkStart >= localEnd) break;
+              var subStart = localStart > chunkStart ? localStart - chunkStart : 0;
+              var subEnd = localEnd < chunkEnd ? localEnd - chunkStart : numChunk.length;
+              var dstBase = segStart + (chunkStart + subStart - localStart);
+              var chunkVals = numChunk.values;
+              if (numChunk.nullCount === 0) {
+                if (isGuaranteedFiniteTypedArray(chunkVals)) {
+                  values.set(chunkVals.subarray(subStart, subEnd), dstBase);
+                } else {
+                  for (i = subStart; i < subEnd; ++i) {
+                    v = chunkVals[i];
+                    if (v - v === 0) {
+                      values[dstBase + i - subStart] = v;
+                    } else {
+                      values[dstBase + i - subStart] = NaN;
+                      entry.hasNaN = true;
+                    }
+                  }
+                }
+              } else {
+                var numNullBitmap = numChunk.nullBitmap;
+                var numChunkOff = typeof numChunk.offset === 'number' ? numChunk.offset : 0;
+                var isIntChunk = isGuaranteedFiniteTypedArray(chunkVals);
+                for (i = subStart; i < subEnd; ++i) {
+                  var numBitIdx = numChunkOff + i;
+                  if (!(numNullBitmap[numBitIdx >>> 3] & (1 << (numBitIdx & 7)))) {
+                    values[dstBase + i - subStart] = NaN;
+                    entry.hasNaN = true;
+                  } else {
+                    v = chunkVals[i];
+                    if (isIntChunk || v - v === 0) {
+                      values[dstBase + i - subStart] = v;
+                    } else {
+                      values[dstBase + i - subStart] = NaN;
+                      entry.hasNaN = true;
+                    }
+                  }
+                }
+              }
+              chunkStart = chunkEnd;
+            }
+          } else if (batch.accessors && batch.accessors[field]) {
+            accessor = batch.accessors[field];
+            for (i = localStart; i < localEnd; ++i) {
+              raw = accessor(i);
+              if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+                values[segStart + i - localStart] = raw;
+              } else {
+                values[segStart + i - localStart] = NaN;
+                entry.hasNaN = true;
+              }
+            }
+          } else if (col != null) {
+            for (i = localStart; i < localEnd; ++i) {
+              raw = getColumnValue(col, i);
+              if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+                values[segStart + i - localStart] = raw;
+              } else {
+                values[segStart + i - localStart] = NaN;
+                entry.hasNaN = true;
+              }
+            }
+          } else {
+            for (i = segStart; i < segEnd; ++i) {
+              values[i] = NaN;
+            }
+            entry.hasNaN = true;
           }
-          entry.hasNaN = true;
         }
 
         cursor = segEnd;
@@ -6389,18 +7389,69 @@ self.onmessage = async function(event) {
           for (i = localStart; i < localEnd; ++i) {
             codes[segStart + i - localStart] = encodeSplitValue(entry, col[i]);
           }
-        } else if (batch.accessors && batch.accessors[field]) {
-          accessor = batch.accessors[field];
-          for (i = localStart; i < localEnd; ++i) {
-            codes[segStart + i - localStart] = encodeSplitValue(entry, accessor(i));
-          }
-        } else if (col != null) {
-          for (i = localStart; i < localEnd; ++i) {
-            codes[segStart + i - localStart] = encodeSplitValue(entry, getColumnValue(col, i));
-          }
         } else {
-          var unknownCode = encodeSplitValue(entry, undefined);
-          codes.fill(unknownCode, segStart, segEnd);
+          var splitDictChunks = resolveArrowDictionaryChunks(col);
+          if (splitDictChunks) {
+            var sChunkStart = 0;
+            for (var scIdx = 0; scIdx < splitDictChunks.length; ++scIdx) {
+              var sChunk = splitDictChunks[scIdx];
+              var sChunkEnd = sChunkStart + sChunk.length;
+              if (sChunkEnd <= localStart) {
+                sChunkStart = sChunkEnd;
+                continue;
+              }
+              if (sChunkStart >= localEnd) break;
+              var sSubStart = localStart > sChunkStart ? localStart - sChunkStart : 0;
+              var sSubEnd = localEnd < sChunkEnd ? localEnd - sChunkStart : sChunk.length;
+              var sDstBase = segStart + (sChunkStart + sSubStart - localStart);
+              var sDict = sChunk.dictionary;
+              var sDictToCode = new Int32Array(sDict.length);
+              sDictToCode.fill(-1);
+              var sIndices = sChunk.values;
+              var sDIdx, sCode;
+              if (sChunk.nullCount === 0) {
+                for (i = sSubStart; i < sSubEnd; ++i) {
+                  sDIdx = sIndices[i];
+                  sCode = sDictToCode[sDIdx];
+                  if (sCode < 0) {
+                    sCode = sDictToCode[sDIdx] = encodeSplitValue(entry, sDict.get(sDIdx));
+                  }
+                  codes[sDstBase + i - sSubStart] = sCode;
+                }
+              } else {
+                var sNullBitmap = sChunk.nullBitmap;
+                var sChunkOff = typeof sChunk.offset === 'number' ? sChunk.offset : 0;
+                var sNullCode = -1;
+                for (i = sSubStart; i < sSubEnd; ++i) {
+                  var sBitIdx = sChunkOff + i;
+                  if (!(sNullBitmap[sBitIdx >>> 3] & (1 << (sBitIdx & 7)))) {
+                    if (sNullCode < 0) sNullCode = encodeSplitValue(entry, null);
+                    codes[sDstBase + i - sSubStart] = sNullCode;
+                  } else {
+                    sDIdx = sIndices[i];
+                    sCode = sDictToCode[sDIdx];
+                    if (sCode < 0) {
+                      sCode = sDictToCode[sDIdx] = encodeSplitValue(entry, sDict.get(sDIdx));
+                    }
+                    codes[sDstBase + i - sSubStart] = sCode;
+                  }
+                }
+              }
+              sChunkStart = sChunkEnd;
+            }
+          } else if (batch.accessors && batch.accessors[field]) {
+            accessor = batch.accessors[field];
+            for (i = localStart; i < localEnd; ++i) {
+              codes[segStart + i - localStart] = encodeSplitValue(entry, accessor(i));
+            }
+          } else if (col != null) {
+            for (i = localStart; i < localEnd; ++i) {
+              codes[segStart + i - localStart] = encodeSplitValue(entry, getColumnValue(col, i));
+            }
+          } else {
+            var unknownCode = encodeSplitValue(entry, undefined);
+            codes.fill(unknownCode, segStart, segEnd);
+          }
         }
 
         cursor = segEnd;
@@ -6494,7 +7545,26 @@ self.onmessage = async function(event) {
       }
     }
 
-    function notifyFilterListeners(filterOne, filterOffset, added, removed) {
+    // Returns:
+    //   0 = no active filter listener outside (dimOne, dimOffset)
+    //   1 = at least one other listener exists, and ALL are built-in resettable groups
+    //   2 = at least one other listener requires exact added/removed delta arrays
+    function inspectOtherFilterListeners(dimOne, dimOffset) {
+      var hasResettable = false;
+      for (var i = 0; i < filterListeners.length; ++i) {
+        var l = filterListeners[i];
+        if (l === cr_null) continue;
+        if (l._xfilterDimOne === dimOne && l._xfilterDimOffset === dimOffset) continue;
+        if (l._xfilterResettable === true) {
+          hasResettable = true;
+        } else {
+          return 2;
+        }
+      }
+      return hasResettable ? 1 : 0;
+    }
+
+    function notifyFilterListeners(filterOne, filterOffset, added, removed, forceReset) {
       activeRowsDirty = true;
       if (transientFilterDepth > 0) {
         return;
@@ -6505,7 +7575,16 @@ self.onmessage = async function(event) {
         return;
       }
 
-      filterListeners.forEach(function(l) { l(filterOne, filterOffset, added, removed); });
+      var li;
+      if (forceReset) {
+        for (li = 0; li < filterListeners.length; ++li) {
+          filterListeners[li](filterOne, filterOffset, added, removed, false, true);
+        }
+      } else {
+        for (li = 0; li < filterListeners.length; ++li) {
+          filterListeners[li](filterOne, filterOffset, added, removed);
+        }
+      }
       triggerOnChange('filtered');
     }
 
@@ -6705,12 +7784,14 @@ self.onmessage = async function(event) {
 
         var directColumn = batch.columns[field];
         var isDirectIndexable = Array.isArray(directColumn) || ArrayBuffer.isView(directColumn);
-        if (!isDirectIndexable && (!batch.accessors || !batch.accessors[field])) {
+        var arrowDictChunks = !isDirectIndexable ? resolveArrowDictionaryChunks(directColumn) : null;
+        if (!isDirectIndexable && !arrowDictChunks && (!batch.accessors || !batch.accessors[field])) {
           return null;
         }
 
         return {
           accessor: batch.accessors ? batch.accessors[field] : null,
+          arrowDictChunks: arrowDictChunks,
           column: isDirectIndexable ? directColumn : null,
           offset: start - batch.start
         };
@@ -6935,36 +8016,115 @@ self.onmessage = async function(event) {
             codeCounts = new Uint32Array(64),
             hasUnorderable = false,
             isPureNumeric = true,
+            isPureString = true,
             i,
             valueToEncode,
             code;
 
-        for (i = 0; i < length; ++i) {
-          valueToEncode = source ? source[offset + i] : accessor(offset + i);
-          if (!isLazyEncodedValue(valueToEncode)) {
-            return null;
-          }
-          code = valueToCode.get(valueToEncode);
-          if (code === undefined) {
-            code = codeToValue.length;
-            valueToCode.set(valueToEncode, code);
-            codeToValue.push(valueToEncode);
-            if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
-              hasUnorderable = true;
-              isPureNumeric = false;
-            } else if (typeof valueToEncode !== 'number') {
-              isPureNumeric = false;
+        if (source) {
+          if (offset === 0) {
+            for (i = 0; i < length; ++i) {
+              valueToEncode = source[i];
+              code = valueToCode.get(valueToEncode);
+              if (code === undefined) {
+                if (!isLazyEncodedValue(valueToEncode)) {
+                  return null;
+                }
+                code = codeToValue.length;
+                valueToCode.set(valueToEncode, code);
+                codeToValue.push(valueToEncode);
+                if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                  hasUnorderable = true;
+                  isPureNumeric = false;
+                  isPureString = false;
+                } else if (typeof valueToEncode === 'number') {
+                  isPureString = false;
+                } else if (typeof valueToEncode === 'string') {
+                  isPureNumeric = false;
+                } else {
+                  isPureNumeric = false;
+                  isPureString = false;
+                }
+                if (code >= codeCounts.length) {
+                  var nextCountCap0 = codeCounts.length << 1;
+                  while (nextCountCap0 <= code) nextCountCap0 <<= 1;
+                  var nextCounts0 = new Uint32Array(nextCountCap0);
+                  nextCounts0.set(codeCounts);
+                  codeCounts = nextCounts0;
+                }
+              }
+              codes[i] = code;
+              ++codeCounts[code];
             }
-            if (code >= codeCounts.length) {
-              var nextCountCap = codeCounts.length << 1;
-              while (nextCountCap <= code) nextCountCap <<= 1;
-              var nextCounts = new Uint32Array(nextCountCap);
-              nextCounts.set(codeCounts);
-              codeCounts = nextCounts;
+          } else {
+            for (i = 0; i < length; ++i) {
+              valueToEncode = source[offset + i];
+              code = valueToCode.get(valueToEncode);
+              if (code === undefined) {
+                if (!isLazyEncodedValue(valueToEncode)) {
+                  return null;
+                }
+                code = codeToValue.length;
+                valueToCode.set(valueToEncode, code);
+                codeToValue.push(valueToEncode);
+                if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                  hasUnorderable = true;
+                  isPureNumeric = false;
+                  isPureString = false;
+                } else if (typeof valueToEncode === 'number') {
+                  isPureString = false;
+                } else if (typeof valueToEncode === 'string') {
+                  isPureNumeric = false;
+                } else {
+                  isPureNumeric = false;
+                  isPureString = false;
+                }
+                if (code >= codeCounts.length) {
+                  var nextCountCap1 = codeCounts.length << 1;
+                  while (nextCountCap1 <= code) nextCountCap1 <<= 1;
+                  var nextCounts1 = new Uint32Array(nextCountCap1);
+                  nextCounts1.set(codeCounts);
+                  codeCounts = nextCounts1;
+                }
+              }
+              codes[i] = code;
+              ++codeCounts[code];
             }
           }
-          codes[i] = code;
-          ++codeCounts[code];
+        } else {
+          for (i = 0; i < length; ++i) {
+            valueToEncode = accessor(offset + i);
+            code = valueToCode.get(valueToEncode);
+            if (code === undefined) {
+              if (!isLazyEncodedValue(valueToEncode)) {
+                return null;
+              }
+              code = codeToValue.length;
+              valueToCode.set(valueToEncode, code);
+              codeToValue.push(valueToEncode);
+              if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                hasUnorderable = true;
+                isPureNumeric = false;
+                isPureString = false;
+              } else if (typeof valueToEncode === 'number') {
+                isPureString = false;
+              } else if (typeof valueToEncode === 'string') {
+                isPureNumeric = false;
+              } else {
+                isPureNumeric = false;
+                isPureString = false;
+              }
+              if (code >= codeCounts.length) {
+                var nextCountCap2 = codeCounts.length << 1;
+                while (nextCountCap2 <= code) nextCountCap2 <<= 1;
+                var nextCounts2 = new Uint32Array(nextCountCap2);
+                nextCounts2.set(codeCounts);
+                codeCounts = nextCounts2;
+              }
+            }
+            codes[i] = code;
+            ++codeCounts[code];
+          }
         }
 
         var marksCap = codeToValue.length < 64 ? 64 : codeToValue.length;
@@ -6978,6 +8138,178 @@ self.onmessage = async function(event) {
           hasActiveFilterMask: false,
           hasUnorderable: hasUnorderable,
           isPureNumeric: isPureNumeric,
+          isPureString: isPureString,
+          lastSelectedCount: -1,
+          selectionMarkVersion: 1,
+          selectionMarks: new Uint32Array(marksCap),
+          valueToCode: valueToCode,
+          version: 1
+        };
+      }
+
+      function createLazyEncodedStateFromArrowDict(chunks, startOffset, length) {
+        if (!accessorPath || iterable) {
+          return null;
+        }
+        runtimeController.canUseWasmScan();
+
+        var codesCapacity = length < 64 ? 64 : length,
+            codes = new Uint32Array(codesCapacity),
+            valueToCode = new Map(),
+            codeToValue = [undefined],
+            codeCounts = new Uint32Array(64),
+            hasUnorderable = false,
+            isPureNumeric = true,
+            isPureString = true,
+            localEnd = startOffset + length,
+            chunkStart = 0,
+            outIdx = 0,
+            nullCode = -1,
+            c,
+            j,
+            dIdx,
+            code,
+            val;
+
+        for (c = 0; c < chunks.length && outIdx < length; ++c) {
+          var chunk = chunks[c];
+          var chunkEnd = chunkStart + chunk.length;
+          if (chunkEnd <= startOffset) {
+            chunkStart = chunkEnd;
+            continue;
+          }
+          if (chunkStart >= localEnd) break;
+          var subStart = startOffset > chunkStart ? startOffset - chunkStart : 0;
+          var subEnd = localEnd < chunkEnd ? localEnd - chunkStart : chunk.length;
+          var dict = chunk.dictionary;
+          var dictLen = dict.length;
+          var dictToCode = new Int32Array(dictLen);
+          dictToCode.fill(-1);
+          var indices = chunk.values;
+
+          if (chunk.nullCount === 0) {
+            for (j = subStart; j < subEnd; ++j) {
+              dIdx = indices[j];
+              code = dictToCode[dIdx];
+              if (!(code >= 0)) {
+                if (dIdx < 0 || dIdx >= dictLen) return null;
+                val = dict.get(dIdx);
+                code = valueToCode.get(val);
+                if (code === undefined) {
+                  if (!isLazyEncodedValue(val)) return null;
+                  code = codeToValue.length;
+                  valueToCode.set(val, code);
+                  codeToValue.push(val);
+                  if (val === undefined || !(val >= val)) {
+                    hasUnorderable = true;
+                    isPureNumeric = false;
+                    isPureString = false;
+                  } else if (typeof val === 'number') {
+                    isPureString = false;
+                  } else if (typeof val === 'string') {
+                    isPureNumeric = false;
+                  } else {
+                    isPureNumeric = false;
+                    isPureString = false;
+                  }
+                  if (code >= codeCounts.length) {
+                    var nextCapA = codeCounts.length << 1;
+                    while (nextCapA <= code) nextCapA <<= 1;
+                    var nextCountsA = new Uint32Array(nextCapA);
+                    nextCountsA.set(codeCounts);
+                    codeCounts = nextCountsA;
+                  }
+                }
+                dictToCode[dIdx] = code;
+              }
+              codes[outIdx++] = code;
+              ++codeCounts[code];
+            }
+          } else {
+            var nullBitmap = chunk.nullBitmap;
+            var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+            for (j = subStart; j < subEnd; ++j) {
+              var bitIdx = chunkOff + j;
+              if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+                if (nullCode < 0) {
+                  code = valueToCode.get(null);
+                  if (code === undefined) {
+                    code = codeToValue.length;
+                    valueToCode.set(null, code);
+                    codeToValue.push(null);
+                    isPureNumeric = false;
+                    isPureString = false;
+                    if (code >= codeCounts.length) {
+                      var nextCapN = codeCounts.length << 1;
+                      while (nextCapN <= code) nextCapN <<= 1;
+                      var nextCountsN = new Uint32Array(nextCapN);
+                      nextCountsN.set(codeCounts);
+                      codeCounts = nextCountsN;
+                    }
+                  }
+                  nullCode = code;
+                }
+                codes[outIdx++] = nullCode;
+                ++codeCounts[nullCode];
+              } else {
+                dIdx = indices[j];
+                code = dictToCode[dIdx];
+                if (!(code >= 0)) {
+                  if (dIdx < 0 || dIdx >= dictLen) return null;
+                  val = dict.get(dIdx);
+                  code = valueToCode.get(val);
+                  if (code === undefined) {
+                    if (!isLazyEncodedValue(val)) return null;
+                    code = codeToValue.length;
+                    valueToCode.set(val, code);
+                    codeToValue.push(val);
+                    if (val === undefined || !(val >= val)) {
+                      hasUnorderable = true;
+                      isPureNumeric = false;
+                      isPureString = false;
+                    } else if (typeof val === 'number') {
+                      isPureString = false;
+                    } else if (typeof val === 'string') {
+                      isPureNumeric = false;
+                    } else {
+                      isPureNumeric = false;
+                      isPureString = false;
+                    }
+                    if (code >= codeCounts.length) {
+                      var nextCapB = codeCounts.length << 1;
+                      while (nextCapB <= code) nextCapB <<= 1;
+                      var nextCountsB = new Uint32Array(nextCapB);
+                      nextCountsB.set(codeCounts);
+                      codeCounts = nextCountsB;
+                    }
+                  }
+                  dictToCode[dIdx] = code;
+                }
+                codes[outIdx++] = code;
+                ++codeCounts[code];
+              }
+            }
+          }
+          chunkStart = chunkEnd;
+        }
+
+        if (outIdx !== length) {
+          return null;
+        }
+
+        var marksCap = codeToValue.length < 64 ? 64 : codeToValue.length;
+        return {
+          codeCounts: codeCounts,
+          codeRank: null,
+          codeRankVersion: -1,
+          codesLength: length,
+          codeToValue: codeToValue,
+          codes: codes,
+          hasActiveFilterMask: false,
+          hasUnorderable: hasUnorderable,
+          isPureNumeric: isPureNumeric,
+          isPureString: isPureString,
+          lastSelectedCount: -1,
           selectionMarkVersion: 1,
           selectionMarks: new Uint32Array(marksCap),
           valueToCode: valueToCode,
@@ -7026,6 +8358,7 @@ self.onmessage = async function(event) {
             appendedCodes = new Uint32Array(length),
             hasUnorderable = lazyEncodedState.hasUnorderable,
             isPureNumeric = lazyEncodedState.isPureNumeric,
+            isPureString = lazyEncodedState.isPureString,
             i,
             valueToEncode,
             code;
@@ -7039,33 +8372,270 @@ self.onmessage = async function(event) {
           lazyEncodedState.codes = codes;
         }
 
-        for (i = 0; i < length; ++i) {
-          valueToEncode = source ? source[offset + i] : accessor(offset + i);
-          if (!isLazyEncodedValue(valueToEncode)) {
-            return null;
-          }
-          code = valueToCode.get(valueToEncode);
-          if (code === undefined) {
-            code = codeToValue.length;
-            valueToCode.set(valueToEncode, code);
-            codeToValue.push(valueToEncode);
-            if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
-              hasUnorderable = true;
-              isPureNumeric = false;
-            } else if (typeof valueToEncode !== 'number') {
-              isPureNumeric = false;
+        if (source) {
+          if (offset === 0) {
+            for (i = 0; i < length; ++i) {
+              valueToEncode = source[i];
+              code = valueToCode.get(valueToEncode);
+              if (code === undefined) {
+                if (!isLazyEncodedValue(valueToEncode)) {
+                  return null;
+                }
+                code = codeToValue.length;
+                valueToCode.set(valueToEncode, code);
+                codeToValue.push(valueToEncode);
+                if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                  hasUnorderable = true;
+                  isPureNumeric = false;
+                  isPureString = false;
+                } else if (typeof valueToEncode === 'number') {
+                  isPureString = false;
+                } else if (typeof valueToEncode === 'string') {
+                  isPureNumeric = false;
+                } else {
+                  isPureNumeric = false;
+                  isPureString = false;
+                }
+                if (code >= codeCounts.length) {
+                  codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+                }
+              }
+              appendedCodes[i] = code;
+              codes[existingLength + i] = code;
+              ++codeCounts[code];
             }
-            if (code >= codeCounts.length) {
-              codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+          } else {
+            for (i = 0; i < length; ++i) {
+              valueToEncode = source[offset + i];
+              code = valueToCode.get(valueToEncode);
+              if (code === undefined) {
+                if (!isLazyEncodedValue(valueToEncode)) {
+                  return null;
+                }
+                code = codeToValue.length;
+                valueToCode.set(valueToEncode, code);
+                codeToValue.push(valueToEncode);
+                if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                  hasUnorderable = true;
+                  isPureNumeric = false;
+                  isPureString = false;
+                } else if (typeof valueToEncode === 'number') {
+                  isPureString = false;
+                } else if (typeof valueToEncode === 'string') {
+                  isPureNumeric = false;
+                } else {
+                  isPureNumeric = false;
+                  isPureString = false;
+                }
+                if (code >= codeCounts.length) {
+                  codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+                }
+              }
+              appendedCodes[i] = code;
+              codes[existingLength + i] = code;
+              ++codeCounts[code];
             }
           }
-          appendedCodes[i] = code;
-          codes[existingLength + i] = code;
-          ++codeCounts[code];
+        } else {
+          for (i = 0; i < length; ++i) {
+            valueToEncode = accessor(offset + i);
+            code = valueToCode.get(valueToEncode);
+            if (code === undefined) {
+              if (!isLazyEncodedValue(valueToEncode)) {
+                return null;
+              }
+              code = codeToValue.length;
+              valueToCode.set(valueToEncode, code);
+              codeToValue.push(valueToEncode);
+              if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+                hasUnorderable = true;
+                isPureNumeric = false;
+                isPureString = false;
+              } else if (typeof valueToEncode === 'number') {
+                isPureString = false;
+              } else if (typeof valueToEncode === 'string') {
+                isPureNumeric = false;
+              } else {
+                isPureNumeric = false;
+                isPureString = false;
+              }
+              if (code >= codeCounts.length) {
+                codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+              }
+            }
+            appendedCodes[i] = code;
+            codes[existingLength + i] = code;
+            ++codeCounts[code];
+          }
         }
 
         lazyEncodedState.hasUnorderable = hasUnorderable;
         lazyEncodedState.isPureNumeric = isPureNumeric;
+        lazyEncodedState.isPureString = isPureString;
+        lazyEncodedState.codesLength = newLength;
+        lazyEncodedState.version += 1;
+        lazyEncodedState.codeRank = null;
+        ensureLazySelectionMarksSize(codeToValue.length);
+        return appendedCodes;
+      }
+
+      function appendLazyEncodedValuesFromArrowDict(chunks, startOffset, length) {
+        if (!lazyEncodedState) {
+          return null;
+        }
+
+        var existingLength = lazyEncodedState.codesLength,
+            newLength = existingLength + length,
+            codes = lazyEncodedState.codes,
+            codeCounts = lazyEncodedState.codeCounts,
+            valueToCode = lazyEncodedState.valueToCode,
+            codeToValue = lazyEncodedState.codeToValue,
+            appendedCodes = new Uint32Array(length),
+            hasUnorderable = lazyEncodedState.hasUnorderable,
+            isPureNumeric = lazyEncodedState.isPureNumeric,
+            isPureString = lazyEncodedState.isPureString,
+            localEnd = startOffset + length,
+            chunkStart = 0,
+            outIdx = 0,
+            nullCode = -1,
+            c,
+            j,
+            dIdx,
+            code,
+            val;
+
+        if (newLength > codes.length) {
+          var nextCapacity = codes.length || 64;
+          while (nextCapacity < newLength) nextCapacity <<= 1;
+          var nextCodes = new Uint32Array(nextCapacity);
+          nextCodes.set(codes.subarray(0, existingLength));
+          codes = nextCodes;
+          lazyEncodedState.codes = codes;
+        }
+
+        for (c = 0; c < chunks.length && outIdx < length; ++c) {
+          var chunk = chunks[c];
+          var chunkEnd = chunkStart + chunk.length;
+          if (chunkEnd <= startOffset) {
+            chunkStart = chunkEnd;
+            continue;
+          }
+          if (chunkStart >= localEnd) break;
+          var subStart = startOffset > chunkStart ? startOffset - chunkStart : 0;
+          var subEnd = localEnd < chunkEnd ? localEnd - chunkStart : chunk.length;
+          var dict = chunk.dictionary;
+          var dictLen = dict.length;
+          var dictToCode = new Int32Array(dictLen);
+          dictToCode.fill(-1);
+          var indices = chunk.values;
+
+          if (chunk.nullCount === 0) {
+            for (j = subStart; j < subEnd; ++j) {
+              dIdx = indices[j];
+              code = dictToCode[dIdx];
+              if (!(code >= 0)) {
+                if (dIdx < 0 || dIdx >= dictLen) return null;
+                val = dict.get(dIdx);
+                code = valueToCode.get(val);
+                if (code === undefined) {
+                  if (!isLazyEncodedValue(val)) return null;
+                  code = codeToValue.length;
+                  valueToCode.set(val, code);
+                  codeToValue.push(val);
+                  if (val === undefined || !(val >= val)) {
+                    hasUnorderable = true;
+                    isPureNumeric = false;
+                    isPureString = false;
+                  } else if (typeof val === 'number') {
+                    isPureString = false;
+                  } else if (typeof val === 'string') {
+                    isPureNumeric = false;
+                  } else {
+                    isPureNumeric = false;
+                    isPureString = false;
+                  }
+                  if (code >= codeCounts.length) {
+                    codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+                  }
+                }
+                dictToCode[dIdx] = code;
+              }
+              appendedCodes[outIdx] = code;
+              codes[existingLength + outIdx] = code;
+              ++outIdx;
+              ++codeCounts[code];
+            }
+          } else {
+            var nullBitmap = chunk.nullBitmap;
+            var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+            for (j = subStart; j < subEnd; ++j) {
+              var bitIdx = chunkOff + j;
+              if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+                if (nullCode < 0) {
+                  code = valueToCode.get(null);
+                  if (code === undefined) {
+                    code = codeToValue.length;
+                    valueToCode.set(null, code);
+                    codeToValue.push(null);
+                    isPureNumeric = false;
+                    isPureString = false;
+                    if (code >= codeCounts.length) {
+                      codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+                    }
+                  }
+                  nullCode = code;
+                }
+                appendedCodes[outIdx] = nullCode;
+                codes[existingLength + outIdx] = nullCode;
+                ++outIdx;
+                ++codeCounts[nullCode];
+              } else {
+                dIdx = indices[j];
+                code = dictToCode[dIdx];
+                if (!(code >= 0)) {
+                  if (dIdx < 0 || dIdx >= dictLen) return null;
+                  val = dict.get(dIdx);
+                  code = valueToCode.get(val);
+                  if (code === undefined) {
+                    if (!isLazyEncodedValue(val)) return null;
+                    code = codeToValue.length;
+                    valueToCode.set(val, code);
+                    codeToValue.push(val);
+                    if (val === undefined || !(val >= val)) {
+                      hasUnorderable = true;
+                      isPureNumeric = false;
+                      isPureString = false;
+                    } else if (typeof val === 'number') {
+                      isPureString = false;
+                    } else if (typeof val === 'string') {
+                      isPureNumeric = false;
+                    } else {
+                      isPureNumeric = false;
+                      isPureString = false;
+                    }
+                    if (code >= codeCounts.length) {
+                      codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+                    }
+                  }
+                  dictToCode[dIdx] = code;
+                }
+                appendedCodes[outIdx] = code;
+                codes[existingLength + outIdx] = code;
+                ++outIdx;
+                ++codeCounts[code];
+              }
+            }
+          }
+          chunkStart = chunkEnd;
+        }
+
+        if (outIdx !== length) {
+          return null;
+        }
+
+        lazyEncodedState.hasUnorderable = hasUnorderable;
+        lazyEncodedState.isPureNumeric = isPureNumeric;
+        lazyEncodedState.isPureString = isPureString;
         lazyEncodedState.codesLength = newLength;
         lazyEncodedState.version += 1;
         lazyEncodedState.codeRank = null;
@@ -7082,9 +8652,9 @@ self.onmessage = async function(event) {
         return codeCounts;
       }
 
-      function lazyCodesSelectAllRows(targetCodes) {
+      function countLazySelectedRows(targetCodes) {
         if (!lazyEncodedState || !targetCodes || !targetCodes.length) {
-          return false;
+          return 0;
         }
 
         var codeCounts = lazyEncodedState.codeCounts,
@@ -7092,7 +8662,7 @@ self.onmessage = async function(event) {
         for (var codeIndex = 0; codeIndex < targetCodes.length; ++codeIndex) {
           selectedCount += codeCounts[targetCodes[codeIndex]] || 0;
         }
-        return selectedCount === n;
+        return selectedCount;
       }
 
       function nextLazyMarkVersion() {
@@ -7140,10 +8710,16 @@ self.onmessage = async function(event) {
         }
 
         var f = filters[offset],
-            needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+            otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+              ? inspectOtherFilterListeners(one, offset)
+              : 0,
+            prevSelected = lazyEncodedState.lastSelectedCount,
+            useForceReset = otherMode === 1 && prevSelected >= 0 && (n - prevSelected) > (n >>> 2),
+            needDeltas = otherMode > 0 && !useForceReset,
             i;
 
         lazyEncodedState.hasActiveFilterMask = false;
+        lazyEncodedState.lastSelectedCount = -1;
 
         if (!needDeltas) {
           for (i = 0; i < n; ++i) {
@@ -7151,7 +8727,7 @@ self.onmessage = async function(event) {
               f[i] &= zero;
             }
           }
-          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
           return dimension;
         }
 
@@ -7186,15 +8762,28 @@ self.onmessage = async function(event) {
         lo0 = 0;
         hi0 = 0;
 
-        if (n === 0 || lazyCodesSelectAllRows(targetCodes)) {
+        if (n === 0) {
+          return applyLazyClearFilter();
+        }
+        var selectedCount = countLazySelectedRows(targetCodes);
+        if (selectedCount === n) {
           return applyLazyClearFilter();
         }
 
         var hadMask = lazyEncodedState.hasActiveFilterMask,
+            prevSelected = lazyEncodedState.lastSelectedCount,
             codes = lazyEncodedState.codes,
             f = filters[offset],
             targetCount = targetCodes.length,
-            needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+            otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+              ? inspectOtherFilterListeners(one, offset)
+              : 0,
+            useForceReset = otherMode === 1 && (
+              !hadMask
+                ? (n - selectedCount) > (n >>> 2)
+                : (prevSelected >= 0 && Math.abs(selectedCount - prevSelected) > (n >>> 2))
+            ),
+            needDeltas = otherMode > 0 && !useForceReset,
             markVersion = 0,
             selectionMarks = null,
             t0 = 0,
@@ -7211,6 +8800,7 @@ self.onmessage = async function(event) {
         }
 
         lazyEncodedState.hasActiveFilterMask = true;
+        lazyEncodedState.lastSelectedCount = selectedCount;
 
         if (!needDeltas) {
           if (targetCount === 0) {
@@ -7240,7 +8830,7 @@ self.onmessage = async function(event) {
               }
             }
           }
-          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
           return dimension;
         }
 
@@ -7445,6 +9035,7 @@ self.onmessage = async function(event) {
         if (maskedAny) {
           lazyEncodedState.hasActiveFilterMask = true;
         }
+        lazyEncodedState.lastSelectedCount = -1;
       }
 
       function compactLazyEncodedState(reIndex) {
@@ -7480,14 +9071,21 @@ self.onmessage = async function(event) {
         var codeCounts = buildCodeCounts(nextCodes, nextLength, codeToValue.length);
         var hasUnorderable = false;
         var isPureNumeric = true;
+        var isPureString = true;
         for (var c = 1; c < codeToValue.length; ++c) {
           if (codeCounts[c] > 0) {
             var v = codeToValue[c];
             if (v === undefined || !(v >= v)) {
               hasUnorderable = true;
               isPureNumeric = false;
-            } else if (typeof v !== 'number') {
+              isPureString = false;
+            } else if (typeof v === 'number') {
+              isPureString = false;
+            } else if (typeof v === 'string') {
               isPureNumeric = false;
+            } else {
+              isPureNumeric = false;
+              isPureString = false;
             }
           }
         }
@@ -7498,6 +9096,8 @@ self.onmessage = async function(event) {
         lazyEncodedState.hasActiveFilterMask = hasActiveMask;
         lazyEncodedState.hasUnorderable = hasUnorderable;
         lazyEncodedState.isPureNumeric = isPureNumeric;
+        lazyEncodedState.isPureString = isPureString;
+        lazyEncodedState.lastSelectedCount = -1;
         lazyEncodedState.version += 1;
         lazyEncodedState.codeRank = null;
         lo0 = 0;
@@ -7517,15 +9117,29 @@ self.onmessage = async function(event) {
             activeCodes.push(c);
           }
         }
-        activeCodes.sort(function(a, b) {
-          var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
-          return order || a - b;
-        });
+        var isFastOrder = lazyEncodedState.isPureNumeric || lazyEncodedState.isPureString;
+        if (isFastOrder) {
+          activeCodes.sort(function(a, b) {
+            var va = codeToValue[a], vb = codeToValue[b];
+            return va < vb ? -1 : va > vb ? 1 : a - b;
+          });
+        } else {
+          activeCodes.sort(function(a, b) {
+            var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
+            return order || a - b;
+          });
+        }
         var rankArr = new Uint32Array(codeToValue.length);
         var currentRank = 0;
         for (var i = 0; i < activeCodes.length; ++i) {
-          if (i > 0 && compareNaturalOrder(codeToValue[activeCodes[i - 1]], codeToValue[activeCodes[i]]) !== 0) {
-            ++currentRank;
+          if (i > 0) {
+            if (isFastOrder) {
+              if (codeToValue[activeCodes[i - 1]] !== codeToValue[activeCodes[i]]) {
+                ++currentRank;
+              }
+            } else if (compareNaturalOrder(codeToValue[activeCodes[i - 1]], codeToValue[activeCodes[i]]) !== 0) {
+              ++currentRank;
+            }
           }
           rankArr[activeCodes[i]] = currentRank;
         }
@@ -7562,14 +9176,19 @@ self.onmessage = async function(event) {
           return dimension;
         }
         var f = filters[offset],
-            needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+            otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+              ? inspectOtherFilterListeners(one, offset)
+              : 0,
+            useForceReset = otherMode === 1 && rawNumericState.lastMaskedCount > (n >>> 2),
+            needDeltas = otherMode > 0 && !useForceReset,
             i;
         rawNumericState.hasActiveFilterMask = false;
+        rawNumericState.lastMaskedCount = -1;
         if (!needDeltas) {
           for (i = 0; i < n; ++i) {
             if (f[i] & one) f[i] &= zero;
           }
-          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
           return dimension;
         }
         var useScratch = !deltaBufInUse,
@@ -7605,8 +9224,12 @@ self.onmessage = async function(event) {
         var hadMask = rawNumericState.hasActiveFilterMask,
             vals = rawNumericState.values,
             f = filters[offset],
-            needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
-            anyMasked = false,
+            otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+              ? inspectOtherFilterListeners(one, offset)
+              : 0,
+            useForceReset = otherMode === 1 && !hadMask && kind === 0 && n > (n >>> 2),
+            needDeltas = otherMode > 0 && !useForceReset,
+            maskedCount = 0,
             i,
             v,
             match;
@@ -7615,48 +9238,49 @@ self.onmessage = async function(event) {
         if (!needDeltas) {
           if (kind === 0) {
             for (i = 0; i < n; ++i) f[i] |= one;
-            anyMasked = true;
+            maskedCount = n;
           } else if (kind === 1) {
             if (!hadMask) {
               for (i = 0; i < n; ++i) {
-                if (vals[i] !== argA) { f[i] |= one; anyMasked = true; }
+                if (vals[i] !== argA) { f[i] |= one; ++maskedCount; }
               }
             } else {
               for (i = 0; i < n; ++i) {
                 if (vals[i] === argA) f[i] &= zero;
-                else { f[i] |= one; anyMasked = true; }
+                else { f[i] |= one; ++maskedCount; }
               }
             }
           } else if (kind === 2) {
             if (!hadMask) {
               for (i = 0; i < n; ++i) {
                 v = vals[i];
-                if (!(v >= argA && v < argB)) { f[i] |= one; anyMasked = true; }
+                if (!(v >= argA && v < argB)) { f[i] |= one; ++maskedCount; }
               }
             } else {
               for (i = 0; i < n; ++i) {
                 v = vals[i];
                 if (v >= argA && v < argB) f[i] &= zero;
-                else { f[i] |= one; anyMasked = true; }
+                else { f[i] |= one; ++maskedCount; }
               }
             }
           } else {
             if (!hadMask) {
               for (i = 0; i < n; ++i) {
-                if (!argA.has(vals[i])) { f[i] |= one; anyMasked = true; }
+                if (!argA.has(vals[i])) { f[i] |= one; ++maskedCount; }
               }
             } else {
               for (i = 0; i < n; ++i) {
                 if (argA.has(vals[i])) f[i] &= zero;
-                else { f[i] |= one; anyMasked = true; }
+                else { f[i] |= one; ++maskedCount; }
               }
             }
           }
-          rawNumericState.hasActiveFilterMask = anyMasked;
-          if (!hadMask && !anyMasked) {
+          rawNumericState.hasActiveFilterMask = maskedCount > 0;
+          rawNumericState.lastMaskedCount = maskedCount;
+          if (!hadMask && maskedCount === 0) {
             return dimension;
           }
-          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
           return dimension;
         }
 
@@ -7664,7 +9288,10 @@ self.onmessage = async function(event) {
             added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
             removed = useScratch ? (deltaRemovedBuf = ensureUint32Capacity(deltaRemovedBuf, n)) : [],
             addedCount = 0,
-            removedCount = 0;
+            removedCount = 0,
+            canBail = otherMode === 1,
+            bailLimit = n >>> 2,
+            bailed = false;
         if (useScratch) deltaBufInUse = true;
 
         for (i = 0; i < n; ++i) {
@@ -7683,19 +9310,59 @@ self.onmessage = async function(event) {
               f[i] &= zero;
               if (useScratch) added[addedCount++] = i;
               else added.push(i);
+              if (canBail && addedCount + removedCount > bailLimit) {
+                bailed = true;
+                ++i;
+                break;
+              }
             }
           } else {
-            anyMasked = true;
+            ++maskedCount;
             if (!hadMask || !(f[i] & one)) {
               f[i] |= one;
               if (useScratch) removed[removedCount++] = i;
               else removed.push(i);
+              if (canBail && addedCount + removedCount > bailLimit) {
+                bailed = true;
+                ++i;
+                break;
+              }
             }
           }
         }
 
-        rawNumericState.hasActiveFilterMask = anyMasked;
-        if (!hadMask && !anyMasked) {
+        if (bailed) {
+          if (kind === 0) {
+            for (; i < n; ++i) { f[i] |= one; ++maskedCount; }
+          } else if (kind === 1) {
+            if (!hadMask) {
+              for (; i < n; ++i) { if (vals[i] !== argA) { f[i] |= one; ++maskedCount; } }
+            } else {
+              for (; i < n; ++i) { if (vals[i] === argA) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
+            }
+          } else if (kind === 2) {
+            if (!hadMask) {
+              for (; i < n; ++i) { v = vals[i]; if (!(v >= argA && v < argB)) { f[i] |= one; ++maskedCount; } }
+            } else {
+              for (; i < n; ++i) { v = vals[i]; if (v >= argA && v < argB) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
+            }
+          } else {
+            if (!hadMask) {
+              for (; i < n; ++i) { if (!argA.has(vals[i])) { f[i] |= one; ++maskedCount; } }
+            } else {
+              for (; i < n; ++i) { if (argA.has(vals[i])) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
+            }
+          }
+          rawNumericState.hasActiveFilterMask = maskedCount > 0;
+          rawNumericState.lastMaskedCount = maskedCount;
+          if (useScratch) deltaBufInUse = false;
+          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, true);
+          return dimension;
+        }
+
+        rawNumericState.hasActiveFilterMask = maskedCount > 0;
+        rawNumericState.lastMaskedCount = maskedCount;
+        if (!hadMask && maskedCount === 0) {
           if (useScratch) deltaBufInUse = false;
           return dimension;
         }
@@ -7750,6 +9417,7 @@ self.onmessage = async function(event) {
         if (maskedAny) {
           rawNumericState.hasActiveFilterMask = true;
         }
+        rawNumericState.lastMaskedCount = -1;
       }
 
       function materializeLazyEncodedState() {
@@ -8051,6 +9719,7 @@ self.onmessage = async function(event) {
                 rawNumericState = {
                   field: accessorPath,
                   hasActiveFilterMask: false,
+                  lastMaskedCount: -1,
                   values: initNumCol.values,
                   version: 1
                 };
@@ -8062,7 +9731,9 @@ self.onmessage = async function(event) {
               }
             }
             lazyEncodedState = columnAccessorSegment
-              ? createLazyEncodedStateFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+              ? (columnAccessorSegment.arrowDictChunks
+                ? createLazyEncodedStateFromArrowDict(columnAccessorSegment.arrowDictChunks, columnAccessorSegment.offset, n1)
+                : createLazyEncodedStateFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1))
               : createLazyEncodedStateFromSource(ensureSourceValues(), null, 0, n1);
             if (lazyEncodedState) {
               applyLazyFilterToRange(0, n1);
@@ -8087,7 +9758,9 @@ self.onmessage = async function(event) {
             upgradeRawNumericToLazy(n0);
             if (lazyEncodedState) {
               var upgradedAppendedCodes = columnAccessorSegment
-                ? appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+                ? (columnAccessorSegment.arrowDictChunks
+                  ? appendLazyEncodedValuesFromArrowDict(columnAccessorSegment.arrowDictChunks, columnAccessorSegment.offset, n1)
+                  : appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1))
                 : appendLazyEncodedValuesFromSource(ensureSourceValues(), null, 0, n1);
               if (upgradedAppendedCodes) {
                 applyLazyFilterToRange(n0, n1);
@@ -8099,8 +9772,51 @@ self.onmessage = async function(event) {
             }
             materializeLazyEncodedState();
           } else if (lazyEncodedState && !values) {
+            if (
+              !n0
+              && n1 > 0
+              && lazyEncodedState.codesLength === 0
+              && !refilterFunction
+              && (!filterValuePresent || filterMode === 'all' || filterMode === 'in' || typeof filterValue === 'number' || (Array.isArray(filterValue) && typeof filterValue[0] === 'number' && typeof filterValue[1] === 'number'))
+              && isPureNumericColumnSource(accessorPath)
+            ) {
+              var canPromoteGroups = true;
+              for (var pgi = 0; pgi < dimensionGroups.length; ++pgi) {
+                if (!dimensionGroups[pgi]._canPromoteToRawNumeric) {
+                  canPromoteGroups = false;
+                  break;
+                }
+              }
+              if (canPromoteGroups) {
+                var promotedNumCol = getNumericColumn(accessorPath);
+                if (!promotedNumCol.hasNaN) {
+                  rawNumericState = {
+                    field: accessorPath,
+                    hasActiveFilterMask: false,
+                    lastMaskedCount: -1,
+                    values: promotedNumCol.values,
+                    version: 1
+                  };
+                  lazyEncodedState = null;
+                  lazyFilterTargetCodes = null;
+                  lazyFilterTargetCodesVersion = 0;
+                  for (var pgi2 = 0; pgi2 < dimensionGroups.length; ++pgi2) {
+                    if (typeof dimensionGroups[pgi2]._onRawNumericPromote === 'function') {
+                      dimensionGroups[pgi2]._onRawNumericPromote();
+                    }
+                  }
+                  applyRawNumericFilterToRange(0, n1);
+                  lastAppendedCodes = null;
+                  lo0 = 0;
+                  hi0 = 0;
+                  return;
+                }
+              }
+            }
             var appendedCodes = columnAccessorSegment
-              ? appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+              ? (columnAccessorSegment.arrowDictChunks
+                ? appendLazyEncodedValuesFromArrowDict(columnAccessorSegment.arrowDictChunks, columnAccessorSegment.offset, n1)
+                : appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1))
               : appendLazyEncodedValuesFromSource(ensureSourceValues(), null, 0, n1);
             if (appendedCodes) {
               applyLazyFilterToRange(n0, n1);
@@ -9331,7 +11047,9 @@ self.onmessage = async function(event) {
           size: size,
           dispose: dispose,
           remove: dispose, // for backwards-compatibility
+          _canPromoteToRawNumeric: !!(groupAll || lazyBucketMode),
           _onDimensionMaterialize: onDimensionMaterialize,
+          _onRawNumericPromote: onRawNumericPromote,
           _onRawNumericUpgrade: onRawNumericUpgrade,
           _readColumnar: readColumnar
         };
@@ -9422,6 +11140,16 @@ self.onmessage = async function(event) {
           return countBuf;
         }
 
+        function syncUpdateListenerMeta() {
+          var canReset = !iterable && reduceMode !== null;
+          updateMany._xfilterDimOne = one;
+          updateMany._xfilterDimOffset = offset;
+          updateMany._xfilterResettable = canReset;
+          updateOne._xfilterDimOne = one;
+          updateOne._xfilterDimOffset = offset;
+          updateOne._xfilterResettable = canReset;
+        }
+
         function ensureLazyOrder() {
           if (!lazyIdentityMode || !lazyEncodedState) {
             return;
@@ -9434,15 +11162,30 @@ self.onmessage = async function(event) {
               sorted = [],
               c;
 
-          for (c = 1; c < codeToValue.length; ++c) {
-            if (codeCounts[c] > 0 && isNaturallyOrderable(codeToValue[c])) {
-              sorted.push(c);
+          if (!lazyEncodedState.hasUnorderable) {
+            for (c = 1; c < codeToValue.length; ++c) {
+              if (codeCounts[c] > 0) {
+                sorted.push(c);
+              }
+            }
+          } else {
+            for (c = 1; c < codeToValue.length; ++c) {
+              if (codeCounts[c] > 0 && isNaturallyOrderable(codeToValue[c])) {
+                sorted.push(c);
+              }
             }
           }
-          sorted.sort(function(a, b) {
-            var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
-            return order || a - b;
-          });
+          if (lazyEncodedState.isPureNumeric || lazyEncodedState.isPureString) {
+            sorted.sort(function(a, b) {
+              var va = codeToValue[a], vb = codeToValue[b];
+              return va < vb ? -1 : va > vb ? 1 : a - b;
+            });
+          } else {
+            sorted.sort(function(a, b) {
+              var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
+              return order || a - b;
+            });
+          }
 
           lazySortedCodes = sorted;
           k = sorted.length;
@@ -9489,12 +11232,15 @@ self.onmessage = async function(event) {
               c,
               bk;
 
-          // Fast incremental extend when only new rows arrived and no new bucket key appeared.
+          // Fast incremental extend when only new rows arrived and no new or reappearing bucket key appeared.
           if (bucketKeyToSlot && bucketCodeToSlot && bucketCodeCount <= codeLen && bucketIndexedLength <= n && bucketOrderVersion > 0 && bucketIndexedLength > 0) {
             var canExtend = true;
             var newCodeToSlot = bucketCodeToSlot;
             if (newCodeToSlot.length < codeLen) {
-              var nextMap = new Uint32Array(codeLen);
+              var nextMapCap = newCodeToSlot.length || 64;
+              while (nextMapCap < codeLen) nextMapCap <<= 1;
+              var nextMap = new Uint32Array(nextMapCap);
+              nextMap.fill(0xffffffff);
               nextMap.set(bucketCodeToSlot);
               newCodeToSlot = nextMap;
             }
@@ -9513,17 +11259,27 @@ self.onmessage = async function(event) {
               newCodeToSlot[c] = existingSlot;
             }
             if (canExtend && groupIndex) {
-              bucketCodeToSlot = newCodeToSlot;
-              bucketCodeCount = codeLen;
               if (groupIndex.length < n) {
-                groupIndex = xfilterArray.arrayLengthen(groupIndex, n);
+                var nextGroupCap = groupIndex.length || 64;
+                while (nextGroupCap < n) nextGroupCap <<= 1;
+                groupIndex = xfilterArray.arrayLengthen(groupIndex, nextGroupCap);
               }
+              var allMapped = true;
               for (i = bucketIndexedLength; i < n; ++i) {
-                groupIndex[i] = bucketCodeToSlot[codes[i]];
+                var mappedSlot = newCodeToSlot[codes[i]];
+                if (mappedSlot === 0xffffffff) {
+                  allMapped = false;
+                  break;
+                }
+                groupIndex[i] = mappedSlot;
               }
-              bucketIndexedLength = n;
-              bucketOrderVersion = lazyEncodedState.version;
-              return;
+              if (allMapped) {
+                bucketCodeToSlot = newCodeToSlot;
+                bucketCodeCount = codeLen;
+                bucketIndexedLength = n;
+                bucketOrderVersion = lazyEncodedState.version;
+                return;
+              }
             }
           }
 
@@ -9553,6 +11309,7 @@ self.onmessage = async function(event) {
           }
 
           var codeToSlot = new Uint32Array(codeLen);
+          codeToSlot.fill(0xffffffff);
           var sentinel = uniqueKeys.length;
           for (c = 1; c < codeLen; ++c) {
             if (!codeCounts[c]) continue;
@@ -9613,7 +11370,8 @@ self.onmessage = async function(event) {
           }
 
           if (!groupIndex || groupIndex.length < n) {
-            var nextCap = n < 64 ? 64 : n;
+            var nextCap = (groupIndex && groupIndex.length) ? groupIndex.length : 64;
+            while (nextCap < n) nextCap <<= 1;
             if (groupIndex && groupIndex.length > 0 && start > 0) {
               var grown = new Uint32Array(nextCap);
               grown.set(groupIndex.subarray(0, start));
@@ -9710,6 +11468,32 @@ self.onmessage = async function(event) {
           valuesSynced = false;
         }
 
+        function onRawNumericPromote() {
+          if (groupAll) {
+            return;
+          }
+          lazyBucketMode = false;
+          bucketKeys = null;
+          bucketKeyToSlot = null;
+          bucketCodeToSlot = null;
+          bucketOrderVersion = -1;
+          bucketCodeCount = 0;
+          bucketIndexedLength = 0;
+          hasInvalidBucket = false;
+          rawBucketMode = true;
+          rawBucketKeys = null;
+          rawBucketMap = null;
+          rawBucketSortedOrder = null;
+          rawBucketSlotToGroup = null;
+          rawBucketIndexedLength = 0;
+          rawBucketVersion = -1;
+          groupIndex = null;
+          groups = null;
+          sparseLayoutVersionReset();
+          resetNeeded = true;
+          valuesSynced = false;
+        }
+
         function onRawNumericUpgrade() {
           if (!rawBucketMode) {
             return;
@@ -9766,9 +11550,7 @@ self.onmessage = async function(event) {
           }
 
           var splitCodes = splitCol.codes,
-              pairIds = (sparsePairGroupIds && sparsePairGroupIds.length >= n)
-                ? sparsePairGroupIds
-                : new Uint32Array(n < 64 ? 64 : n),
+              pairIds = sparsePairGroupIds,
               head = new Int32Array(primarySlots),
               cap = primarySlots < 256 ? 256 : primarySlots,
               nextPair = new Int32Array(cap),
@@ -9780,6 +11562,12 @@ self.onmessage = async function(event) {
               sc,
               pairKey,
               pid;
+
+          if (!pairIds || pairIds.length < n) {
+            var nextPairCap = (pairIds && pairIds.length) ? pairIds.length : 64;
+            while (nextPairCap < n) nextPairCap <<= 1;
+            pairIds = new Uint32Array(nextPairCap);
+          }
 
           head.fill(-1);
 
@@ -10333,7 +12121,7 @@ self.onmessage = async function(event) {
         }
 
         // Reduces the specified selected or deselected records.
-        function updateMany(filterOne, filterOffset, added, removed, notFilter) {
+        function updateMany(filterOne, filterOffset, added, removed, notFilter, forceReset) {
           if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
 
           var i,
@@ -10372,7 +12160,7 @@ self.onmessage = async function(event) {
           }
 
           if (reduceMode !== null) {
-            if (notFilter || added.length + removed.length > (n >>> 2)) {
+            if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
               resetNeeded = true;
               valuesSynced = false;
               return;
@@ -10498,7 +12286,7 @@ self.onmessage = async function(event) {
         }
 
         // Reduces the specified selected or deselected records (cardinality 1).
-        function updateOne(filterOne, filterOffset, added, removed, notFilter) {
+        function updateOne(filterOne, filterOffset, added, removed, notFilter, forceReset) {
           if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
 
           var i,
@@ -10507,7 +12295,7 @@ self.onmessage = async function(event) {
               g;
 
           if (reduceMode !== null) {
-            if (notFilter || added.length + removed.length > (n >>> 2)) {
+            if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
               resetNeeded = true;
               valuesSynced = false;
               return;
@@ -10963,6 +12751,7 @@ self.onmessage = async function(event) {
           if (reduceMetricSpec && !iterable) {
             reduceMode = reduceSplitField ? 'splitMetricSpec' : 'metricSpec';
           }
+          syncUpdateListenerMeta();
           resetNeeded = true;
           valuesSynced = false;
           return group;
@@ -10972,6 +12761,7 @@ self.onmessage = async function(event) {
         function reduceCount() {
           reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
           reduceMode = 'count';
+          syncUpdateListenerMeta();
           return group;
         }
 
@@ -11036,7 +12826,7 @@ self.onmessage = async function(event) {
 
       // Removes this dimension and associated groups and event listeners.
       function dispose() {
-        dimensionGroups.forEach(function(group) { group.dispose(); });
+        dimensionGroups.slice().forEach(function(group) { group.dispose(); });
         var i = dataListeners.indexOf(preAdd);
         if (i >= 0) dataListeners.splice(i, 1);
         i = dataListeners.indexOf(postAdd);
@@ -11081,6 +12871,9 @@ self.onmessage = async function(event) {
       // The group listens to the crossfilter for when any dimension changes, so
       // that it can update the reduce value. It must also listen to the parent
       // dimension for when data is added.
+      update._xfilterDimOne = -1;
+      update._xfilterDimOffset = -1;
+      update._xfilterResettable = false;
       filterListeners.push(update);
       dataListeners.push(add);
 
@@ -11135,7 +12928,7 @@ self.onmessage = async function(event) {
       }
 
       // Reduces the specified selected or deselected records.
-      function update(filterOne, filterOffset, added, removed, notFilter) {
+      function update(filterOne, filterOffset, added, removed, notFilter, forceReset) {
         var i,
             k,
             len;
@@ -11143,7 +12936,7 @@ self.onmessage = async function(event) {
         if (resetNeeded) return;
 
         if (reduceMode !== null) {
-          if (notFilter || added.length + removed.length > (n >>> 2)) {
+          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
             resetNeeded = true;
             valueSynced = false;
             return;
@@ -11248,6 +13041,7 @@ self.onmessage = async function(event) {
         metricPlan = reduceMetricSpec ? compileMetricPlan(reduceMetricSpec) : null;
         metricBuffers = null;
         reduceMode = reduceMetricSpec ? 'metricSpec' : null;
+        update._xfilterResettable = reduceMode !== null;
         resetNeeded = true;
         valueSynced = false;
         return group;
@@ -11257,6 +13051,7 @@ self.onmessage = async function(event) {
       function reduceCount() {
         reduce(xfilterReduce.reduceIncrement, xfilterReduce.reduceDecrement, cr_zero);
         reduceMode = 'count';
+        update._xfilterResettable = true;
         return group;
       }
 
@@ -11357,15 +13152,21 @@ self.onmessage = async function(event) {
       if (!columnarBatches.length) return null;
       var expectedStart = 0;
       var ctor = null;
-      var b, batch, col;
+      var firstTag = null;
+      var b, batch, col, tag;
       for (b = 0; b < columnarBatches.length; ++b) {
         batch = columnarBatches[b];
         if (batch.start !== expectedStart) return null;
         expectedStart = batch.end;
         col = batch.columns[field];
         if (!ArrayBuffer.isView(col) || typeof col.BYTES_PER_ELEMENT !== 'number') return null;
-        if (ctor === null) ctor = col.constructor;
-        else if (col.constructor !== ctor) return null;
+        tag = objToString.call(col);
+        if (ctor === null) {
+          ctor = col.constructor;
+          firstTag = tag;
+        } else if (tag !== firstTag) {
+          return null;
+        }
       }
       return expectedStart === n ? ctor : null;
     }
@@ -11376,7 +13177,8 @@ self.onmessage = async function(event) {
       var rowCount = rowIndexes ? rowIndexes.length : 0;
       var fieldIndex;
       var rowIndex;
-      var singleFullBatch = columnarBatches.length === 1
+      var batchCount = columnarBatches.length;
+      var singleFullBatch = batchCount === 1
         && columnarBatches[0].start === 0
         && columnarBatches[0].end === n
         ? columnarBatches[0]
@@ -11388,6 +13190,17 @@ self.onmessage = async function(event) {
           fields: [],
           length: rowCount
         };
+      }
+
+      var batchStarts = null;
+      var batchEnds = null;
+      if (batchCount > 0 && !singleFullBatch) {
+        batchStarts = new Uint32Array(batchCount);
+        batchEnds = new Uint32Array(batchCount);
+        for (var bi0 = 0; bi0 < batchCount; ++bi0) {
+          batchStarts[bi0] = columnarBatches[bi0].start;
+          batchEnds[bi0] = columnarBatches[bi0].end;
+        }
       }
 
       for (fieldIndex = 0; fieldIndex < selectedFields.length; ++fieldIndex) {
@@ -11402,23 +13215,97 @@ self.onmessage = async function(event) {
             for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
               out[rowIndex] = srcCol[rowIndexes[rowIndex]];
             }
-          } else if (srcAcc) {
-            for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
-              out[rowIndex] = srcAcc(rowIndexes[rowIndex]);
-            }
           } else {
-            for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
-              out[rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+            var srcDictChunks = rowCount > 32 ? resolveArrowDictionaryChunks(srcCol) : null;
+            if (srcDictChunks && srcDictChunks.length === 1 && srcDictChunks[0].dictionary.length <= rowCount * 2) {
+              var dChunk = srcDictChunks[0];
+              var dDict = dChunk.dictionary;
+              var dLen = dDict.length;
+              var dVals = new Array(dLen);
+              for (var d = 0; d < dLen; ++d) dVals[d] = dDict.get(d);
+              var dIndices = dChunk.values;
+              if (dChunk.nullCount === 0) {
+                for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+                  out[rowIndex] = dVals[dIndices[rowIndexes[rowIndex]]];
+                }
+              } else {
+                var dNull = dChunk.nullBitmap;
+                var dOff = typeof dChunk.offset === 'number' ? dChunk.offset : 0;
+                for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+                  var dri = rowIndexes[rowIndex];
+                  var dBitIdx = dOff + dri;
+                  out[rowIndex] = (dNull[dBitIdx >>> 3] & (1 << (dBitIdx & 7))) ? dVals[dIndices[dri]] : null;
+                }
+              }
+            } else if (srcAcc) {
+              for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+                out[rowIndex] = srcAcc(rowIndexes[rowIndex]);
+              }
+            } else {
+              for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+                out[rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+              }
             }
           }
-        } else if (!columnarBatches.length) {
+        } else if (!batchCount) {
           for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
             var row = data[rowIndexes[rowIndex]];
             out[rowIndex] = row ? row[field] : undefined;
           }
         } else {
-          for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
-            out[rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+          var cachedNum = typedCtor ? numericColumns[field] : null;
+          if (cachedNum && cachedNum.length === n && !cachedNum.hasNaN && (isGuaranteedFiniteTypedArray(out) || isFloatTypedArray(out))) {
+            var cachedVals = cachedNum.values;
+            for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+              out[rowIndex] = cachedVals[rowIndexes[rowIndex]];
+            }
+          } else {
+            var batchDirect = new Array(batchCount);
+            var batchAcc = new Array(batchCount);
+            for (var bi = 0; bi < batchCount; ++bi) {
+              var bCol = columnarBatches[bi].columns[field];
+              if (ArrayBuffer.isView(bCol) || Array.isArray(bCol)) {
+                batchDirect[bi] = bCol;
+                batchAcc[bi] = null;
+              } else {
+                batchDirect[bi] = null;
+                batchAcc[bi] = (columnarBatches[bi].accessors && columnarBatches[bi].accessors[field]) || null;
+              }
+            }
+            var lastStart = -1;
+            var lastEnd = -1;
+            var lastDirect = null;
+            var lastAcc = null;
+            for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+              var ri = rowIndexes[rowIndex];
+              if (ri < lastStart || ri >= lastEnd) {
+                var bLo = 0, bHi = batchCount, found = -1;
+                while (bLo < bHi) {
+                  var bMid = (bLo + bHi) >>> 1;
+                  if (ri < batchStarts[bMid]) bHi = bMid;
+                  else if (ri >= batchEnds[bMid]) bLo = bMid + 1;
+                  else { found = bMid; break; }
+                }
+                if (found >= 0) {
+                  lastStart = batchStarts[found];
+                  lastEnd = batchEnds[found];
+                  lastDirect = batchDirect[found];
+                  lastAcc = batchAcc[found];
+                } else {
+                  lastStart = -1;
+                  lastEnd = -1;
+                  lastDirect = null;
+                  lastAcc = null;
+                }
+              }
+              if (lastDirect) {
+                out[rowIndex] = lastDirect[ri - lastStart];
+              } else if (lastAcc) {
+                out[rowIndex] = lastAcc(ri - lastStart);
+              } else {
+                out[rowIndex] = getFieldValue(ri, field);
+              }
+            }
           }
         }
 
@@ -11477,7 +13364,7 @@ self.onmessage = async function(event) {
         : 0x100000000;
   }
 
-  const version = "3.1.0";
+  const version = "3.1.1";
 
   crossfilter.version = version;
 

@@ -11,14 +11,29 @@ export function compileMetricPlan(metricSpec) {
   var fields = new Array(count);
   var denominators = new Array(count);
   var hidden = new Uint8Array(count);
+  var primarySumSourceIdx = new Int32Array(count);
+  var primarySumSourceSec = new Uint8Array(count);
+  var denomSumSourceIdx = new Int32Array(count);
+  var denomSumSourceSec = new Uint8Array(count);
+  var avgCountSourceIdx = new Int32Array(count);
+  var sumSourceByField = Object.create(null);
+  var avgSourceByField = Object.create(null);
   var firstCountIndex = -1;
-  var i, metric, op;
+  var fusedSumIndex = -1;
+  var firstAvgIndex = -1;
+  var i, metric, op, field, denom, src;
+
+  primarySumSourceIdx.fill(-1);
+  denomSumSourceIdx.fill(-1);
+  avgCountSourceIdx.fill(-1);
 
   for (i = 0; i < count; ++i) {
     metric = metricSpec[i];
     ids[i] = metric.id;
-    fields[i] = metric.field || null;
-    denominators[i] = metric.denominator || null;
+    field = metric.field || null;
+    denom = metric.denominator || null;
+    fields[i] = field;
+    denominators[i] = denom;
     hidden[i] = metric.hidden ? 1 : 0;
     switch (metric.op) {
       case 'count':
@@ -27,15 +42,58 @@ export function compileMetricPlan(metricSpec) {
         break;
       case 'sum':
         op = OP_SUM;
+        if (field) {
+          src = sumSourceByField[field];
+          if (src) {
+            primarySumSourceIdx[i] = src.idx;
+            primarySumSourceSec[i] = src.sec;
+          } else {
+            sumSourceByField[field] = { idx: i, sec: 0 };
+            if (fusedSumIndex < 0) fusedSumIndex = i;
+          }
+        }
         break;
       case 'avg':
         op = OP_AVG;
+        if (field) {
+          src = sumSourceByField[field];
+          if (src) {
+            primarySumSourceIdx[i] = src.idx;
+            primarySumSourceSec[i] = src.sec;
+          } else {
+            sumSourceByField[field] = { idx: i, sec: 0 };
+            if (firstAvgIndex < 0) firstAvgIndex = i;
+          }
+          if (avgSourceByField[field] !== undefined) {
+            avgCountSourceIdx[i] = avgSourceByField[field];
+          } else {
+            avgSourceByField[field] = i;
+          }
+        }
         break;
       case 'avgNonZero':
         op = OP_AVG_NON_ZERO;
         break;
       case 'ratio':
         op = OP_RATIO;
+        if (field) {
+          src = sumSourceByField[field];
+          if (src) {
+            primarySumSourceIdx[i] = src.idx;
+            primarySumSourceSec[i] = src.sec;
+          } else {
+            sumSourceByField[field] = { idx: i, sec: 0 };
+          }
+        }
+        if (denom) {
+          src = sumSourceByField[denom];
+          if (src && src.idx < i) {
+            denomSumSourceIdx[i] = src.idx;
+            denomSumSourceSec[i] = src.sec;
+          } else if (!src) {
+            sumSourceByField[denom] = { idx: i, sec: 1 };
+          }
+        }
         break;
       default:
         op = OP_COUNT;
@@ -44,13 +102,20 @@ export function compileMetricPlan(metricSpec) {
   }
 
   return {
+    avgCountSourceIdx: avgCountSourceIdx,
     count: count,
+    denomSumSourceIdx: denomSumSourceIdx,
+    denomSumSourceSec: denomSumSourceSec,
     denominators: denominators,
     fields: fields,
     firstCountIndex: firstCountIndex,
+    fusedAvgIndex: firstCountIndex >= 0 && fusedSumIndex < 0 ? firstAvgIndex : -1,
+    fusedSumIndex: firstCountIndex >= 0 ? fusedSumIndex : -1,
     hidden: hidden,
     ids: ids,
     ops: ops,
+    primarySumSourceIdx: primarySumSourceIdx,
+    primarySumSourceSec: primarySumSourceSec,
     spec: metricSpec
   };
 }
@@ -114,22 +179,747 @@ export function zeroMetricBuffers(buffers, slotCount) {
   }
 }
 
+// ============================================================================
+// Grouped-All leaf kernels (small functions for immediate V8 JIT compilation)
+// ============================================================================
+
+function gCountAll(acc, groupIds, n) {
+  for (var i = 0; i < n; ++i) acc[groupIds[i]] += 1;
+}
+
+function gCountSumAll(cntAcc, sumAcc, groupIds, vals, hasNaN, n) {
+  var i, g, v;
+  if (!hasNaN) {
+    for (i = 0; i < n; ++i) {
+      g = groupIds[i];
+      cntAcc[g] += 1;
+      sumAcc[g] += vals[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      g = groupIds[i];
+      cntAcc[g] += 1;
+      v = vals[i];
+      if (v === v) sumAcc[g] += v;
+    }
+  }
+}
+
+function gSumAll(acc, groupIds, vals, hasNaN, n) {
+  var i, v;
+  if (!hasNaN) {
+    for (i = 0; i < n; ++i) acc[groupIds[i]] += vals[i];
+  } else {
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v) acc[groupIds[i]] += v;
+    }
+  }
+}
+
+function gValidCountAll(acc, groupIds, vals, n) {
+  var i, v;
+  for (i = 0; i < n; ++i) {
+    v = vals[i];
+    if (v === v) acc[groupIds[i]] += 1;
+  }
+}
+
+function gAvgAll(acc, acc2, groupIds, vals, hasNaN, n) {
+  var i, g, v;
+  if (!hasNaN) {
+    for (i = 0; i < n; ++i) {
+      g = groupIds[i];
+      acc[g] += vals[i];
+      acc2[g] += 1;
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v) {
+        g = groupIds[i];
+        acc[g] += v;
+        acc2[g] += 1;
+      }
+    }
+  }
+}
+
+function gAvgNzAll(acc, acc2, groupIds, vals, hasNaN, n) {
+  var i, g, v;
+  if (!hasNaN) {
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v !== 0) {
+        g = groupIds[i];
+        acc[g] += v;
+        acc2[g] += 1;
+      }
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v && v !== 0) {
+        g = groupIds[i];
+        acc[g] += v;
+        acc2[g] += 1;
+      }
+    }
+  }
+}
+
+function gRatioAll(acc, acc2, groupIds, vals, hasNaN, vals2, hasNaN2, n) {
+  var i, g, v, v2;
+  if (!hasNaN && !hasNaN2) {
+    for (i = 0; i < n; ++i) {
+      g = groupIds[i];
+      acc[g] += vals[i];
+      acc2[g] += vals2[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      g = groupIds[i];
+      v = vals[i];
+      if (v === v) acc[g] += v;
+      v2 = vals2[i];
+      if (v2 === v2) acc2[g] += v2;
+    }
+  }
+}
+
+// ============================================================================
+// Grouped-Indexed leaf kernels
+// ============================================================================
+
+function gCountIdx(acc, groupIds, rowIndexes, rowCount, add) {
+  var j;
+  if (add) {
+    for (j = 0; j < rowCount; ++j) acc[groupIds[rowIndexes[j]]] += 1;
+  } else {
+    for (j = 0; j < rowCount; ++j) acc[groupIds[rowIndexes[j]]] -= 1;
+  }
+}
+
+function gCountSumIdx(cntAcc, sumAcc, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
+  var j, idx, g, v;
+  if (add) {
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        cntAcc[g] += 1;
+        sumAcc[g] += vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        cntAcc[g] += 1;
+        v = vals[idx];
+        if (v === v) sumAcc[g] += v;
+      }
+    }
+  } else if (!hasNaN) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      g = groupIds[idx];
+      cntAcc[g] -= 1;
+      sumAcc[g] -= vals[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      g = groupIds[idx];
+      cntAcc[g] -= 1;
+      v = vals[idx];
+      if (v === v) sumAcc[g] -= v;
+    }
+  }
+}
+
+function gSumIdx(acc, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
+  var j, idx, v;
+  if (add) {
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        acc[groupIds[idx]] += vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) acc[groupIds[idx]] += v;
+      }
+    }
+  } else if (!hasNaN) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      acc[groupIds[idx]] -= vals[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v === v) acc[groupIds[idx]] -= v;
+    }
+  }
+}
+
+function gValidCountIdx(acc, groupIds, vals, rowIndexes, rowCount) {
+  var j, idx, v;
+  for (j = 0; j < rowCount; ++j) {
+    idx = rowIndexes[j];
+    v = vals[idx];
+    if (v === v) acc[groupIds[idx]] += 1;
+  }
+}
+
+function gAvgIdx(acc, acc2, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
+  var j, idx, g, v;
+  if (add) {
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        acc[g] += vals[idx];
+        acc2[g] += 1;
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) {
+          g = groupIds[idx];
+          acc[g] += v;
+          acc2[g] += 1;
+        }
+      }
+    }
+  } else if (!hasNaN) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      g = groupIds[idx];
+      acc[g] -= vals[idx];
+      acc2[g] -= 1;
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v === v) {
+        g = groupIds[idx];
+        acc[g] -= v;
+        acc2[g] -= 1;
+      }
+    }
+  }
+}
+
+function gAvgNzIdx(acc, acc2, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
+  var j, idx, g, v;
+  if (add) {
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v !== 0) {
+          g = groupIds[idx];
+          acc[g] += v;
+          acc2[g] += 1;
+        }
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v && v !== 0) {
+          g = groupIds[idx];
+          acc[g] += v;
+          acc2[g] += 1;
+        }
+      }
+    }
+  } else if (!hasNaN) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v !== 0) {
+        g = groupIds[idx];
+        acc[g] -= v;
+        acc2[g] -= 1;
+      }
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v === v && v !== 0) {
+        g = groupIds[idx];
+        acc[g] -= v;
+        acc2[g] -= 1;
+      }
+    }
+  }
+}
+
+function gRatioIdx(acc, acc2, groupIds, vals, hasNaN, vals2, hasNaN2, rowIndexes, rowCount, add) {
+  var j, idx, g, v, v2;
+  if (add) {
+    if (!hasNaN && !hasNaN2) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        acc[g] += vals[idx];
+        acc2[g] += vals2[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        g = groupIds[idx];
+        v = vals[idx];
+        if (v === v) acc[g] += v;
+        v2 = vals2[idx];
+        if (v2 === v2) acc2[g] += v2;
+      }
+    }
+  } else if (!hasNaN && !hasNaN2) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      g = groupIds[idx];
+      acc[g] -= vals[idx];
+      acc2[g] -= vals2[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      g = groupIds[idx];
+      v = vals[idx];
+      if (v === v) acc[g] -= v;
+      v2 = vals2[idx];
+      if (v2 === v2) acc2[g] -= v2;
+    }
+  }
+}
+
+// ============================================================================
+// Split-Dense-All leaf kernels
+// ============================================================================
+
+function sCountAll(acc, groupIds, splitCodes, stride, n) {
+  for (var i = 0; i < n; ++i) acc[groupIds[i] * stride + splitCodes[i]] += 1;
+}
+
+function sCountSumAll(cntAcc, sumAcc, groupIds, splitCodes, stride, vals, hasNaN, n) {
+  var i, cell, v;
+  if (!hasNaN) {
+    for (i = 0; i < n; ++i) {
+      cell = groupIds[i] * stride + splitCodes[i];
+      cntAcc[cell] += 1;
+      sumAcc[cell] += vals[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      cell = groupIds[i] * stride + splitCodes[i];
+      cntAcc[cell] += 1;
+      v = vals[i];
+      if (v === v) sumAcc[cell] += v;
+    }
+  }
+}
+
+function sSumAll(acc, groupIds, splitCodes, stride, vals, hasNaN, n) {
+  var i, v;
+  if (!hasNaN) {
+    for (i = 0; i < n; ++i) acc[groupIds[i] * stride + splitCodes[i]] += vals[i];
+  } else {
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v) acc[groupIds[i] * stride + splitCodes[i]] += v;
+    }
+  }
+}
+
+function sValidCountAll(acc, groupIds, splitCodes, stride, vals, n) {
+  var i, v;
+  for (i = 0; i < n; ++i) {
+    v = vals[i];
+    if (v === v) acc[groupIds[i] * stride + splitCodes[i]] += 1;
+  }
+}
+
+function sAvgAll(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, n) {
+  var i, cell, v;
+  if (!hasNaN) {
+    for (i = 0; i < n; ++i) {
+      cell = groupIds[i] * stride + splitCodes[i];
+      acc[cell] += vals[i];
+      acc2[cell] += 1;
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v) {
+        cell = groupIds[i] * stride + splitCodes[i];
+        acc[cell] += v;
+        acc2[cell] += 1;
+      }
+    }
+  }
+}
+
+function sAvgNzAll(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, n) {
+  var i, cell, v;
+  if (!hasNaN) {
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v !== 0) {
+        cell = groupIds[i] * stride + splitCodes[i];
+        acc[cell] += v;
+        acc2[cell] += 1;
+      }
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v && v !== 0) {
+        cell = groupIds[i] * stride + splitCodes[i];
+        acc[cell] += v;
+        acc2[cell] += 1;
+      }
+    }
+  }
+}
+
+function sRatioAll(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, vals2, hasNaN2, n) {
+  var i, cell, v, v2;
+  if (!hasNaN && !hasNaN2) {
+    for (i = 0; i < n; ++i) {
+      cell = groupIds[i] * stride + splitCodes[i];
+      acc[cell] += vals[i];
+      acc2[cell] += vals2[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      cell = groupIds[i] * stride + splitCodes[i];
+      v = vals[i];
+      if (v === v) acc[cell] += v;
+      v2 = vals2[i];
+      if (v2 === v2) acc2[cell] += v2;
+    }
+  }
+}
+
+// ============================================================================
+// Split-Dense-Indexed leaf kernels
+// ============================================================================
+
+function sCountIdx(acc, groupIds, splitCodes, stride, rowIndexes, rowCount, add) {
+  var j, idx;
+  if (add) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      acc[groupIds[idx] * stride + splitCodes[idx]] -= 1;
+    }
+  }
+}
+
+function sCountSumIdx(cntAcc, sumAcc, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
+  var j, idx, cell, v;
+  if (add) {
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        cntAcc[cell] += 1;
+        sumAcc[cell] += vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        cntAcc[cell] += 1;
+        v = vals[idx];
+        if (v === v) sumAcc[cell] += v;
+      }
+    }
+  } else if (!hasNaN) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      cell = groupIds[idx] * stride + splitCodes[idx];
+      cntAcc[cell] -= 1;
+      sumAcc[cell] -= vals[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      cell = groupIds[idx] * stride + splitCodes[idx];
+      cntAcc[cell] -= 1;
+      v = vals[idx];
+      if (v === v) sumAcc[cell] -= v;
+    }
+  }
+}
+
+function sSumIdx(acc, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
+  var j, idx, v;
+  if (add) {
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        acc[groupIds[idx] * stride + splitCodes[idx]] += vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] += v;
+      }
+    }
+  } else if (!hasNaN) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      acc[groupIds[idx] * stride + splitCodes[idx]] -= vals[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] -= v;
+    }
+  }
+}
+
+function sValidCountIdx(acc, groupIds, splitCodes, stride, vals, rowIndexes, rowCount) {
+  var j, idx, v;
+  for (j = 0; j < rowCount; ++j) {
+    idx = rowIndexes[j];
+    v = vals[idx];
+    if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
+  }
+}
+
+function sAvgIdx(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
+  var j, idx, cell, v;
+  if (add) {
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        acc[cell] += vals[idx];
+        acc2[cell] += 1;
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) {
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          acc[cell] += v;
+          acc2[cell] += 1;
+        }
+      }
+    }
+  } else if (!hasNaN) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      cell = groupIds[idx] * stride + splitCodes[idx];
+      acc[cell] -= vals[idx];
+      acc2[cell] -= 1;
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v === v) {
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        acc[cell] -= v;
+        acc2[cell] -= 1;
+      }
+    }
+  }
+}
+
+function sAvgNzIdx(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
+  var j, idx, cell, v;
+  if (add) {
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v !== 0) {
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          acc[cell] += v;
+          acc2[cell] += 1;
+        }
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v && v !== 0) {
+          cell = groupIds[idx] * stride + splitCodes[idx];
+          acc[cell] += v;
+          acc2[cell] += 1;
+        }
+      }
+    }
+  } else if (!hasNaN) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v !== 0) {
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        acc[cell] -= v;
+        acc2[cell] -= 1;
+      }
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      v = vals[idx];
+      if (v === v && v !== 0) {
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        acc[cell] -= v;
+        acc2[cell] -= 1;
+      }
+    }
+  }
+}
+
+function sRatioIdx(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, vals2, hasNaN2, rowIndexes, rowCount, add) {
+  var j, idx, cell, v, v2;
+  if (add) {
+    if (!hasNaN && !hasNaN2) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        acc[cell] += vals[idx];
+        acc2[cell] += vals2[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        cell = groupIds[idx] * stride + splitCodes[idx];
+        v = vals[idx];
+        if (v === v) acc[cell] += v;
+        v2 = vals2[idx];
+        if (v2 === v2) acc2[cell] += v2;
+      }
+    }
+  } else if (!hasNaN && !hasNaN2) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      cell = groupIds[idx] * stride + splitCodes[idx];
+      acc[cell] -= vals[idx];
+      acc2[cell] -= vals2[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      cell = groupIds[idx] * stride + splitCodes[idx];
+      v = vals[idx];
+      if (v === v) acc[cell] -= v;
+      v2 = vals2[idx];
+      if (v2 === v2) acc2[cell] -= v2;
+    }
+  }
+}
+
+// ============================================================================
+// Scalar leaf kernels
+// ============================================================================
+
+function scSumAll(vals, hasNaN, n) {
+  var s = 0, i, v;
+  if (!hasNaN) {
+    for (i = 0; i < n; ++i) s += vals[i];
+  } else {
+    for (i = 0; i < n; ++i) {
+      v = vals[i];
+      if (v === v) s += v;
+    }
+  }
+  return s;
+}
+
+function scValidCountAll(vals, n) {
+  var c = 0, i, v;
+  for (i = 0; i < n; ++i) {
+    v = vals[i];
+    if (v === v) c += 1;
+  }
+  return c;
+}
+
+function scSumIdx(vals, hasNaN, rowIndexes, rowCount) {
+  var s = 0, j, v;
+  if (!hasNaN) {
+    for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      v = vals[rowIndexes[j]];
+      if (v === v) s += v;
+    }
+  }
+  return s;
+}
+
+function scValidCountIdx(vals, rowIndexes, rowCount) {
+  var c = 0, j, v;
+  for (j = 0; j < rowCount; ++j) {
+    v = vals[rowIndexes[j]];
+    if (v === v) c += 1;
+  }
+  return c;
+}
+
+// ============================================================================
+// Orchestrators
+// ============================================================================
+
 export function reduceGroupedAll(buffers, plan, getNumericColumn, groupIds, n, slotCount) {
   var ops = plan.ops;
   var fields = plan.fields;
   var denominators = plan.denominators;
+  var primarySumSourceIdx = plan.primarySumSourceIdx;
+  var primarySumSourceSec = plan.primarySumSourceSec;
+  var denomSumSourceIdx = plan.denomSumSourceIdx;
+  var denomSumSourceSec = plan.denomSumSourceSec;
+  var avgCountSourceIdx = plan.avgCountSourceIdx;
   var primary = buffers.primary;
   var secondary = buffers.secondary;
   var metricCount = plan.count;
   var firstCountIndex = plan.firstCountIndex;
+  var fusedSumIndex = plan.fusedSumIndex;
+  var fusedAvgIndex = plan.fusedAvgIndex;
+  var ranFusedAvg = false;
   var countComputed = false;
-  var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, i, v, v2, g;
+  var pendingAcc = null;
+  var pendingCol = null;
+  var pendingIdx = -1;
+  var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
 
-  // Compute first count metric up front so non-NaN avg metrics can copy counts directly.
   if (firstCountIndex >= 0) {
-    acc = primary[firstCountIndex];
-    for (i = 0; i < n; ++i) {
-      acc[groupIds[i]] += 1;
+    if (fusedSumIndex >= 0) {
+      col = getNumericColumn(fields[fusedSumIndex]);
+      gCountSumAll(primary[firstCountIndex], primary[fusedSumIndex], groupIds, col.values, col.hasNaN, n);
+    } else if (fusedAvgIndex >= 0) {
+      col = getNumericColumn(fields[fusedAvgIndex]);
+      if (!col.hasNaN) {
+        gCountSumAll(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, col.values, false, n);
+        secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, slotCount));
+        ranFusedAvg = true;
+      } else {
+        gCountAll(primary[firstCountIndex], groupIds, n);
+      }
+    } else {
+      gCountAll(primary[firstCountIndex], groupIds, n);
     }
     countComputed = true;
   }
@@ -143,97 +933,117 @@ export function reduceGroupedAll(buffers, plan, getNumericColumn, groupIds, n, s
       if (countComputed) {
         acc.set(primary[firstCountIndex].subarray(0, slotCount));
       } else {
-        for (i = 0; i < n; ++i) {
-          acc[groupIds[i]] += 1;
-        }
+        gCountAll(acc, groupIds, n);
       }
       continue;
     }
 
-    col = getNumericColumn(fields[m]);
-    vals = col.values;
-    hasNaN = col.hasNaN;
+    if (m === fusedSumIndex || (ranFusedAvg && m === fusedAvgIndex)) continue;
+
+    srcIdx = primarySumSourceIdx[m];
+    if (pendingAcc && (srcIdx === pendingIdx || denomSumSourceIdx[m] === pendingIdx)) {
+      gSumAll(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, n);
+      pendingAcc = null;
+      pendingCol = null;
+      pendingIdx = -1;
+    }
 
     if (op === OP_SUM) {
-      if (!hasNaN) {
-        for (i = 0; i < n; ++i) {
-          acc[groupIds[i]] += vals[i];
-        }
+      if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, slotCount));
       } else {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v) {
-            acc[groupIds[i]] += v;
-          }
+        col = getNumericColumn(fields[m]);
+        if (pendingAcc) {
+          gRatioAll(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
         }
       }
     } else if (op === OP_AVG) {
       acc2 = secondary[m];
-      if (!hasNaN) {
-        if (countComputed) {
-          for (i = 0; i < n; ++i) {
-            acc[groupIds[i]] += vals[i];
-          }
+      col = getNumericColumn(fields[m]);
+      if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, slotCount));
+        if (!col.hasNaN && countComputed) {
           acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+        } else if (avgCountSourceIdx[m] >= 0) {
+          acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, slotCount));
+        } else if (!col.hasNaN) {
+          gCountAll(acc2, groupIds, n);
         } else {
-          for (i = 0; i < n; ++i) {
-            g = groupIds[i];
-            acc[g] += vals[i];
-            acc2[g] += 1;
-          }
+          gValidCountAll(acc2, groupIds, col.values, n);
+        }
+      } else if (!col.hasNaN && countComputed) {
+        acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+        if (pendingAcc) {
+          gRatioAll(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, false, n);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
         }
       } else {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v) {
-            g = groupIds[i];
-            acc[g] += v;
-            acc2[g] += 1;
-          }
-        }
+        gAvgAll(acc, acc2, groupIds, col.values, col.hasNaN, n);
       }
     } else if (op === OP_AVG_NON_ZERO) {
-      acc2 = secondary[m];
-      if (!hasNaN) {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v !== 0) {
-            g = groupIds[i];
-            acc[g] += v;
-            acc2[g] += 1;
-          }
-        }
-      } else {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v && v !== 0) {
-            g = groupIds[i];
-            acc[g] += v;
-            acc2[g] += 1;
-          }
-        }
-      }
+      col = getNumericColumn(fields[m]);
+      gAvgNzAll(acc, secondary[m], groupIds, col.values, col.hasNaN, n);
     } else if (op === OP_RATIO) {
       acc2 = secondary[m];
-      col2 = getNumericColumn(denominators[m]);
-      vals2 = col2.values;
-      hasNaN2 = col2.hasNaN;
-      if (!hasNaN && !hasNaN2) {
-        for (i = 0; i < n; ++i) {
-          g = groupIds[i];
-          acc[g] += vals[i];
-          acc2[g] += vals2[i];
+      denomIdx = denomSumSourceIdx[m];
+      if (srcIdx >= 0 && denomIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, slotCount));
+        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+        acc2.set(srcBuf.subarray(0, slotCount));
+      } else if (denomIdx >= 0) {
+        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+        acc2.set(srcBuf.subarray(0, slotCount));
+        col = getNumericColumn(fields[m]);
+        if (pendingAcc) {
+          gRatioAll(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
+        }
+      } else if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, slotCount));
+        col2 = getNumericColumn(denominators[m]);
+        if (pendingAcc) {
+          gRatioAll(pendingAcc, acc2, groupIds, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, n);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc2;
+          pendingCol = col2;
+          pendingIdx = m;
         }
       } else {
-        for (i = 0; i < n; ++i) {
-          g = groupIds[i];
-          v = vals[i];
-          if (v === v) acc[g] += v;
-          v2 = vals2[i];
-          if (v2 === v2) acc2[g] += v2;
-        }
+        col = getNumericColumn(fields[m]);
+        col2 = getNumericColumn(denominators[m]);
+        gRatioAll(acc, acc2, groupIds, col.values, col.hasNaN, col2.values, col2.hasNaN, n);
       }
     }
+  }
+
+  if (pendingAcc) {
+    gSumAll(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, n);
   }
 }
 
@@ -243,18 +1053,43 @@ export function reduceGroupedIndexed(buffers, plan, getNumericColumn, groupIds, 
   var ops = plan.ops;
   var fields = plan.fields;
   var denominators = plan.denominators;
+  var primarySumSourceIdx = plan.primarySumSourceIdx;
+  var primarySumSourceSec = plan.primarySumSourceSec;
+  var denomSumSourceIdx = plan.denomSumSourceIdx;
+  var denomSumSourceSec = plan.denomSumSourceSec;
+  var avgCountSourceIdx = plan.avgCountSourceIdx;
   var primary = buffers.primary;
   var secondary = buffers.secondary;
   var metricCount = plan.count;
   var firstCountIndex = plan.firstCountIndex;
+  var fusedSumIndex = plan.fusedSumIndex;
+  var fusedAvgIndex = plan.fusedAvgIndex;
   var add = delta > 0;
-  var canShareCount = add && slotCount > 0 && firstCountIndex >= 0;
-  var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, j, idx, v, v2, g;
+  var isReset = add && slotCount > 0;
+  var canShareCount = isReset && firstCountIndex >= 0;
+  var ranFused = false;
+  var ranFusedAvg = false;
+  var pendingAcc = null;
+  var pendingCol = null;
+  var pendingIdx = -1;
+  var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
 
-  if (canShareCount) {
-    acc = primary[firstCountIndex];
-    for (j = 0; j < rowCount; ++j) {
-      acc[groupIds[rowIndexes[j]]] += 1;
+  if (firstCountIndex >= 0 && fusedSumIndex >= 0) {
+    col = getNumericColumn(fields[fusedSumIndex]);
+    gCountSumIdx(primary[firstCountIndex], primary[fusedSumIndex], groupIds, col.values, col.hasNaN, rowIndexes, rowCount, add);
+    ranFused = true;
+  } else if (canShareCount) {
+    if (fusedAvgIndex >= 0) {
+      col = getNumericColumn(fields[fusedAvgIndex]);
+      if (!col.hasNaN) {
+        gCountSumIdx(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, col.values, false, rowIndexes, rowCount, true);
+        secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, slotCount));
+        ranFusedAvg = true;
+      } else {
+        gCountIdx(primary[firstCountIndex], groupIds, rowIndexes, rowCount, true);
+      }
+    } else {
+      gCountIdx(primary[firstCountIndex], groupIds, rowIndexes, rowCount, true);
     }
   }
 
@@ -263,210 +1098,161 @@ export function reduceGroupedIndexed(buffers, plan, getNumericColumn, groupIds, 
     acc = primary[m];
 
     if (op === OP_COUNT) {
+      if (m === firstCountIndex && (ranFused || canShareCount)) continue;
       if (canShareCount) {
-        if (m === firstCountIndex) continue;
         acc.set(primary[firstCountIndex].subarray(0, slotCount));
-      } else if (add) {
-        for (j = 0; j < rowCount; ++j) {
-          acc[groupIds[rowIndexes[j]]] += 1;
-        }
       } else {
-        for (j = 0; j < rowCount; ++j) {
-          acc[groupIds[rowIndexes[j]]] -= 1;
-        }
+        gCountIdx(acc, groupIds, rowIndexes, rowCount, add);
       }
       continue;
     }
 
-    col = getNumericColumn(fields[m]);
-    vals = col.values;
-    hasNaN = col.hasNaN;
+    if ((ranFused && m === fusedSumIndex) || (ranFusedAvg && m === fusedAvgIndex)) continue;
+
+    srcIdx = isReset ? primarySumSourceIdx[m] : -1;
+    denomIdx = isReset ? denomSumSourceIdx[m] : -1;
+    if (pendingAcc && (srcIdx === pendingIdx || denomIdx === pendingIdx)) {
+      gSumIdx(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
+      pendingAcc = null;
+      pendingCol = null;
+      pendingIdx = -1;
+    }
 
     if (op === OP_SUM) {
-      if (add) {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            acc[groupIds[idx]] += vals[idx];
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v) acc[groupIds[idx]] += v;
-          }
-        }
+      if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, slotCount));
       } else {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            acc[groupIds[idx]] -= vals[idx];
-          }
+        col = getNumericColumn(fields[m]);
+        if (pendingAcc) {
+          gRatioIdx(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, add);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v) acc[groupIds[idx]] -= v;
-          }
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
         }
       }
     } else if (op === OP_AVG) {
       acc2 = secondary[m];
-      if (add) {
-        if (!hasNaN) {
-          if (canShareCount) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              acc[groupIds[idx]] += vals[idx];
-            }
-            acc2.set(primary[firstCountIndex].subarray(0, slotCount));
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              g = groupIds[idx];
-              acc[g] += vals[idx];
-              acc2[g] += 1;
-            }
-          }
+      col = getNumericColumn(fields[m]);
+      if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, slotCount));
+        if (!col.hasNaN && canShareCount) {
+          acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+        } else if (avgCountSourceIdx[m] >= 0) {
+          acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, slotCount));
+        } else if (!col.hasNaN) {
+          gCountIdx(acc2, groupIds, rowIndexes, rowCount, true);
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v) {
-              g = groupIds[idx];
-              acc[g] += v;
-              acc2[g] += 1;
-            }
-          }
+          gValidCountIdx(acc2, groupIds, col.values, rowIndexes, rowCount);
+        }
+      } else if (add && !col.hasNaN && canShareCount) {
+        acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+        if (pendingAcc) {
+          gRatioIdx(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, false, rowIndexes, rowCount, true);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
         }
       } else {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            g = groupIds[idx];
-            acc[g] -= vals[idx];
-            acc2[g] -= 1;
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v) {
-              g = groupIds[idx];
-              acc[g] -= v;
-              acc2[g] -= 1;
-            }
-          }
-        }
+        gAvgIdx(acc, acc2, groupIds, col.values, col.hasNaN, rowIndexes, rowCount, add);
       }
     } else if (op === OP_AVG_NON_ZERO) {
-      acc2 = secondary[m];
-      if (add) {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v !== 0) {
-              g = groupIds[idx];
-              acc[g] += v;
-              acc2[g] += 1;
-            }
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v && v !== 0) {
-              g = groupIds[idx];
-              acc[g] += v;
-              acc2[g] += 1;
-            }
-          }
-        }
-      } else {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v !== 0) {
-              g = groupIds[idx];
-              acc[g] -= v;
-              acc2[g] -= 1;
-            }
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v && v !== 0) {
-              g = groupIds[idx];
-              acc[g] -= v;
-              acc2[g] -= 1;
-            }
-          }
-        }
-      }
+      col = getNumericColumn(fields[m]);
+      gAvgNzIdx(acc, secondary[m], groupIds, col.values, col.hasNaN, rowIndexes, rowCount, add);
     } else if (op === OP_RATIO) {
       acc2 = secondary[m];
-      col2 = getNumericColumn(denominators[m]);
-      vals2 = col2.values;
-      hasNaN2 = col2.hasNaN;
-      if (add) {
-        if (!hasNaN && !hasNaN2) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            g = groupIds[idx];
-            acc[g] += vals[idx];
-            acc2[g] += vals2[idx];
-          }
+      if (srcIdx >= 0 && denomIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, slotCount));
+        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+        acc2.set(srcBuf.subarray(0, slotCount));
+      } else if (denomIdx >= 0) {
+        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+        acc2.set(srcBuf.subarray(0, slotCount));
+        col = getNumericColumn(fields[m]);
+        if (pendingAcc) {
+          gRatioIdx(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, true);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            g = groupIds[idx];
-            v = vals[idx];
-            if (v === v) acc[g] += v;
-            v2 = vals2[idx];
-            if (v2 === v2) acc2[g] += v2;
-          }
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
+        }
+      } else if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, slotCount));
+        col2 = getNumericColumn(denominators[m]);
+        if (pendingAcc) {
+          gRatioIdx(pendingAcc, acc2, groupIds, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, true);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc2;
+          pendingCol = col2;
+          pendingIdx = m;
         }
       } else {
-        if (!hasNaN && !hasNaN2) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            g = groupIds[idx];
-            acc[g] -= vals[idx];
-            acc2[g] -= vals2[idx];
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            g = groupIds[idx];
-            v = vals[idx];
-            if (v === v) acc[g] -= v;
-            v2 = vals2[idx];
-            if (v2 === v2) acc2[g] -= v2;
-          }
-        }
+        col = getNumericColumn(fields[m]);
+        col2 = getNumericColumn(denominators[m]);
+        gRatioIdx(acc, acc2, groupIds, col.values, col.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, add);
       }
     }
   }
+
+  if (pendingAcc) {
+    gSumIdx(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
+  }
 }
 
-export function reduceSplitDenseAll(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, n, slotCount) {
+export function reduceSplitDenseAll(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, n, totalCells) {
   var ops = plan.ops;
   var fields = plan.fields;
   var denominators = plan.denominators;
+  var primarySumSourceIdx = plan.primarySumSourceIdx;
+  var primarySumSourceSec = plan.primarySumSourceSec;
+  var denomSumSourceIdx = plan.denomSumSourceIdx;
+  var denomSumSourceSec = plan.denomSumSourceSec;
+  var avgCountSourceIdx = plan.avgCountSourceIdx;
   var primary = buffers.primary;
   var secondary = buffers.secondary;
   var metricCount = plan.count;
   var firstCountIndex = plan.firstCountIndex;
+  var fusedSumIndex = plan.fusedSumIndex;
+  var fusedAvgIndex = plan.fusedAvgIndex;
+  var ranFusedAvg = false;
   var countComputed = false;
-  var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, i, v, v2, cell;
+  var pendingAcc = null;
+  var pendingCol = null;
+  var pendingIdx = -1;
+  var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
 
   if (firstCountIndex >= 0) {
-    acc = primary[firstCountIndex];
-    for (i = 0; i < n; ++i) {
-      acc[groupIds[i] * stride + splitCodes[i]] += 1;
+    if (fusedSumIndex >= 0) {
+      col = getNumericColumn(fields[fusedSumIndex]);
+      sCountSumAll(primary[firstCountIndex], primary[fusedSumIndex], groupIds, splitCodes, stride, col.values, col.hasNaN, n);
+    } else if (fusedAvgIndex >= 0) {
+      col = getNumericColumn(fields[fusedAvgIndex]);
+      if (!col.hasNaN) {
+        sCountSumAll(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, splitCodes, stride, col.values, false, n);
+        secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, totalCells));
+        ranFusedAvg = true;
+      } else {
+        sCountAll(primary[firstCountIndex], groupIds, splitCodes, stride, n);
+      }
+    } else {
+      sCountAll(primary[firstCountIndex], groupIds, splitCodes, stride, n);
     }
     countComputed = true;
   }
@@ -478,121 +1264,165 @@ export function reduceSplitDenseAll(buffers, plan, getNumericColumn, groupIds, s
     if (op === OP_COUNT) {
       if (m === firstCountIndex) continue;
       if (countComputed) {
-        acc.set(primary[firstCountIndex].subarray(0, slotCount));
+        acc.set(primary[firstCountIndex].subarray(0, totalCells));
       } else {
-        for (i = 0; i < n; ++i) {
-          acc[groupIds[i] * stride + splitCodes[i]] += 1;
-        }
+        sCountAll(acc, groupIds, splitCodes, stride, n);
       }
       continue;
     }
 
-    col = getNumericColumn(fields[m]);
-    vals = col.values;
-    hasNaN = col.hasNaN;
+    if (m === fusedSumIndex || (ranFusedAvg && m === fusedAvgIndex)) continue;
+
+    srcIdx = primarySumSourceIdx[m];
+    if (pendingAcc && (srcIdx === pendingIdx || denomSumSourceIdx[m] === pendingIdx)) {
+      sSumAll(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, n);
+      pendingAcc = null;
+      pendingCol = null;
+      pendingIdx = -1;
+    }
 
     if (op === OP_SUM) {
-      if (!hasNaN) {
-        for (i = 0; i < n; ++i) {
-          acc[groupIds[i] * stride + splitCodes[i]] += vals[i];
-        }
+      if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, totalCells));
       } else {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v) {
-            acc[groupIds[i] * stride + splitCodes[i]] += v;
-          }
+        col = getNumericColumn(fields[m]);
+        if (pendingAcc) {
+          sRatioAll(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
         }
       }
     } else if (op === OP_AVG) {
       acc2 = secondary[m];
-      if (!hasNaN) {
-        if (countComputed) {
-          for (i = 0; i < n; ++i) {
-            acc[groupIds[i] * stride + splitCodes[i]] += vals[i];
-          }
-          acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+      col = getNumericColumn(fields[m]);
+      if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, totalCells));
+        if (!col.hasNaN && countComputed) {
+          acc2.set(primary[firstCountIndex].subarray(0, totalCells));
+        } else if (avgCountSourceIdx[m] >= 0) {
+          acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, totalCells));
+        } else if (!col.hasNaN) {
+          sCountAll(acc2, groupIds, splitCodes, stride, n);
         } else {
-          for (i = 0; i < n; ++i) {
-            cell = groupIds[i] * stride + splitCodes[i];
-            acc[cell] += vals[i];
-            acc2[cell] += 1;
-          }
+          sValidCountAll(acc2, groupIds, splitCodes, stride, col.values, n);
+        }
+      } else if (!col.hasNaN && countComputed) {
+        acc2.set(primary[firstCountIndex].subarray(0, totalCells));
+        if (pendingAcc) {
+          sRatioAll(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, false, n);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
         }
       } else {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v) {
-            cell = groupIds[i] * stride + splitCodes[i];
-            acc[cell] += v;
-            acc2[cell] += 1;
-          }
-        }
+        sAvgAll(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, n);
       }
     } else if (op === OP_AVG_NON_ZERO) {
-      acc2 = secondary[m];
-      if (!hasNaN) {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v !== 0) {
-            cell = groupIds[i] * stride + splitCodes[i];
-            acc[cell] += v;
-            acc2[cell] += 1;
-          }
-        }
-      } else {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v && v !== 0) {
-            cell = groupIds[i] * stride + splitCodes[i];
-            acc[cell] += v;
-            acc2[cell] += 1;
-          }
-        }
-      }
+      col = getNumericColumn(fields[m]);
+      sAvgNzAll(acc, secondary[m], groupIds, splitCodes, stride, col.values, col.hasNaN, n);
     } else if (op === OP_RATIO) {
       acc2 = secondary[m];
-      col2 = getNumericColumn(denominators[m]);
-      vals2 = col2.values;
-      hasNaN2 = col2.hasNaN;
-      if (!hasNaN && !hasNaN2) {
-        for (i = 0; i < n; ++i) {
-          cell = groupIds[i] * stride + splitCodes[i];
-          acc[cell] += vals[i];
-          acc2[cell] += vals2[i];
+      denomIdx = denomSumSourceIdx[m];
+      if (srcIdx >= 0 && denomIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, totalCells));
+        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+        acc2.set(srcBuf.subarray(0, totalCells));
+      } else if (denomIdx >= 0) {
+        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+        acc2.set(srcBuf.subarray(0, totalCells));
+        col = getNumericColumn(fields[m]);
+        if (pendingAcc) {
+          sRatioAll(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
+        }
+      } else if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, totalCells));
+        col2 = getNumericColumn(denominators[m]);
+        if (pendingAcc) {
+          sRatioAll(pendingAcc, acc2, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, n);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc2;
+          pendingCol = col2;
+          pendingIdx = m;
         }
       } else {
-        for (i = 0; i < n; ++i) {
-          cell = groupIds[i] * stride + splitCodes[i];
-          v = vals[i];
-          if (v === v) acc[cell] += v;
-          v2 = vals2[i];
-          if (v2 === v2) acc2[cell] += v2;
-        }
+        col = getNumericColumn(fields[m]);
+        col2 = getNumericColumn(denominators[m]);
+        sRatioAll(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, col2.values, col2.hasNaN, n);
       }
     }
   }
+
+  if (pendingAcc) {
+    sSumAll(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, n);
+  }
 }
 
-export function reduceSplitDenseIndexed(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, rowIndexes, rowCount, delta, slotCount) {
+export function reduceSplitDenseIndexed(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, rowIndexes, rowCount, delta, totalCells) {
   if (!rowCount) return;
 
   var ops = plan.ops;
   var fields = plan.fields;
   var denominators = plan.denominators;
+  var primarySumSourceIdx = plan.primarySumSourceIdx;
+  var primarySumSourceSec = plan.primarySumSourceSec;
+  var denomSumSourceIdx = plan.denomSumSourceIdx;
+  var denomSumSourceSec = plan.denomSumSourceSec;
+  var avgCountSourceIdx = plan.avgCountSourceIdx;
   var primary = buffers.primary;
   var secondary = buffers.secondary;
   var metricCount = plan.count;
   var firstCountIndex = plan.firstCountIndex;
+  var fusedSumIndex = plan.fusedSumIndex;
+  var fusedAvgIndex = plan.fusedAvgIndex;
   var add = delta > 0;
-  var canShareCount = add && slotCount > 0 && firstCountIndex >= 0;
-  var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, j, idx, v, v2, cell;
+  var isReset = add && totalCells > 0;
+  var canShareCount = isReset && firstCountIndex >= 0;
+  var ranFused = false;
+  var ranFusedAvg = false;
+  var pendingAcc = null;
+  var pendingCol = null;
+  var pendingIdx = -1;
+  var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
 
-  if (canShareCount) {
-    acc = primary[firstCountIndex];
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
+  if (firstCountIndex >= 0 && fusedSumIndex >= 0) {
+    col = getNumericColumn(fields[fusedSumIndex]);
+    sCountSumIdx(primary[firstCountIndex], primary[fusedSumIndex], groupIds, splitCodes, stride, col.values, col.hasNaN, rowIndexes, rowCount, add);
+    ranFused = true;
+  } else if (canShareCount) {
+    if (fusedAvgIndex >= 0) {
+      col = getNumericColumn(fields[fusedAvgIndex]);
+      if (!col.hasNaN) {
+        sCountSumIdx(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, splitCodes, stride, col.values, false, rowIndexes, rowCount, true);
+        secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, totalCells));
+        ranFusedAvg = true;
+      } else {
+        sCountIdx(primary[firstCountIndex], groupIds, splitCodes, stride, rowIndexes, rowCount, true);
+      }
+    } else {
+      sCountIdx(primary[firstCountIndex], groupIds, splitCodes, stride, rowIndexes, rowCount, true);
     }
   }
 
@@ -601,194 +1431,121 @@ export function reduceSplitDenseIndexed(buffers, plan, getNumericColumn, groupId
     acc = primary[m];
 
     if (op === OP_COUNT) {
+      if (m === firstCountIndex && (ranFused || canShareCount)) continue;
       if (canShareCount) {
-        if (m === firstCountIndex) continue;
-        acc.set(primary[firstCountIndex].subarray(0, slotCount));
-      } else if (add) {
-        for (j = 0; j < rowCount; ++j) {
-          idx = rowIndexes[j];
-          acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
-        }
+        acc.set(primary[firstCountIndex].subarray(0, totalCells));
       } else {
-        for (j = 0; j < rowCount; ++j) {
-          idx = rowIndexes[j];
-          acc[groupIds[idx] * stride + splitCodes[idx]] -= 1;
-        }
+        sCountIdx(acc, groupIds, splitCodes, stride, rowIndexes, rowCount, add);
       }
       continue;
     }
 
-    col = getNumericColumn(fields[m]);
-    vals = col.values;
-    hasNaN = col.hasNaN;
+    if ((ranFused && m === fusedSumIndex) || (ranFusedAvg && m === fusedAvgIndex)) continue;
+
+    srcIdx = isReset ? primarySumSourceIdx[m] : -1;
+    denomIdx = isReset ? denomSumSourceIdx[m] : -1;
+    if (pendingAcc && (srcIdx === pendingIdx || denomIdx === pendingIdx)) {
+      sSumIdx(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
+      pendingAcc = null;
+      pendingCol = null;
+      pendingIdx = -1;
+    }
 
     if (op === OP_SUM) {
-      if (add) {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            acc[groupIds[idx] * stride + splitCodes[idx]] += vals[idx];
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] += v;
-          }
-        }
+      if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, totalCells));
       } else {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            acc[groupIds[idx] * stride + splitCodes[idx]] -= vals[idx];
-          }
+        col = getNumericColumn(fields[m]);
+        if (pendingAcc) {
+          sRatioIdx(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, add);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] -= v;
-          }
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
         }
       }
     } else if (op === OP_AVG) {
       acc2 = secondary[m];
-      if (add) {
-        if (!hasNaN) {
-          if (canShareCount) {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              acc[groupIds[idx] * stride + splitCodes[idx]] += vals[idx];
-            }
-            acc2.set(primary[firstCountIndex].subarray(0, slotCount));
-          } else {
-            for (j = 0; j < rowCount; ++j) {
-              idx = rowIndexes[j];
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] += vals[idx];
-              acc2[cell] += 1;
-            }
-          }
+      col = getNumericColumn(fields[m]);
+      if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, totalCells));
+        if (!col.hasNaN && canShareCount) {
+          acc2.set(primary[firstCountIndex].subarray(0, totalCells));
+        } else if (avgCountSourceIdx[m] >= 0) {
+          acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, totalCells));
+        } else if (!col.hasNaN) {
+          sCountIdx(acc2, groupIds, splitCodes, stride, rowIndexes, rowCount, true);
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v) {
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] += v;
-              acc2[cell] += 1;
-            }
-          }
+          sValidCountIdx(acc2, groupIds, splitCodes, stride, col.values, rowIndexes, rowCount);
+        }
+      } else if (add && !col.hasNaN && canShareCount) {
+        acc2.set(primary[firstCountIndex].subarray(0, totalCells));
+        if (pendingAcc) {
+          sRatioIdx(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, false, rowIndexes, rowCount, true);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
         }
       } else {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            cell = groupIds[idx] * stride + splitCodes[idx];
-            acc[cell] -= vals[idx];
-            acc2[cell] -= 1;
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v) {
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] -= v;
-              acc2[cell] -= 1;
-            }
-          }
-        }
+        sAvgIdx(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, rowIndexes, rowCount, add);
       }
     } else if (op === OP_AVG_NON_ZERO) {
-      acc2 = secondary[m];
-      if (add) {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v !== 0) {
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] += v;
-              acc2[cell] += 1;
-            }
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v && v !== 0) {
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] += v;
-              acc2[cell] += 1;
-            }
-          }
-        }
-      } else {
-        if (!hasNaN) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v !== 0) {
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] -= v;
-              acc2[cell] -= 1;
-            }
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            v = vals[idx];
-            if (v === v && v !== 0) {
-              cell = groupIds[idx] * stride + splitCodes[idx];
-              acc[cell] -= v;
-              acc2[cell] -= 1;
-            }
-          }
-        }
-      }
+      col = getNumericColumn(fields[m]);
+      sAvgNzIdx(acc, secondary[m], groupIds, splitCodes, stride, col.values, col.hasNaN, rowIndexes, rowCount, add);
     } else if (op === OP_RATIO) {
       acc2 = secondary[m];
-      col2 = getNumericColumn(denominators[m]);
-      vals2 = col2.values;
-      hasNaN2 = col2.hasNaN;
-      if (add) {
-        if (!hasNaN && !hasNaN2) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            cell = groupIds[idx] * stride + splitCodes[idx];
-            acc[cell] += vals[idx];
-            acc2[cell] += vals2[idx];
-          }
+      if (srcIdx >= 0 && denomIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, totalCells));
+        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+        acc2.set(srcBuf.subarray(0, totalCells));
+      } else if (denomIdx >= 0) {
+        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
+        acc2.set(srcBuf.subarray(0, totalCells));
+        col = getNumericColumn(fields[m]);
+        if (pendingAcc) {
+          sRatioIdx(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, true);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
         } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            cell = groupIds[idx] * stride + splitCodes[idx];
-            v = vals[idx];
-            if (v === v) acc[cell] += v;
-            v2 = vals2[idx];
-            if (v2 === v2) acc2[cell] += v2;
-          }
+          pendingAcc = acc;
+          pendingCol = col;
+          pendingIdx = m;
+        }
+      } else if (srcIdx >= 0) {
+        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
+        acc.set(srcBuf.subarray(0, totalCells));
+        col2 = getNumericColumn(denominators[m]);
+        if (pendingAcc) {
+          sRatioIdx(pendingAcc, acc2, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, true);
+          pendingAcc = null;
+          pendingCol = null;
+          pendingIdx = -1;
+        } else {
+          pendingAcc = acc2;
+          pendingCol = col2;
+          pendingIdx = m;
         }
       } else {
-        if (!hasNaN && !hasNaN2) {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            cell = groupIds[idx] * stride + splitCodes[idx];
-            acc[cell] -= vals[idx];
-            acc2[cell] -= vals2[idx];
-          }
-        } else {
-          for (j = 0; j < rowCount; ++j) {
-            idx = rowIndexes[j];
-            cell = groupIds[idx] * stride + splitCodes[idx];
-            v = vals[idx];
-            if (v === v) acc[cell] -= v;
-            v2 = vals2[idx];
-            if (v2 === v2) acc2[cell] -= v2;
-          }
-        }
+        col = getNumericColumn(fields[m]);
+        col2 = getNumericColumn(denominators[m]);
+        sRatioIdx(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, add);
       }
     }
+  }
+
+  if (pendingAcc) {
+    sSumIdx(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
   }
 }
 
@@ -796,10 +1553,15 @@ export function reduceScalarAll(buffers, plan, getNumericColumn, n) {
   var ops = plan.ops;
   var fields = plan.fields;
   var denominators = plan.denominators;
+  var primarySumSourceIdx = plan.primarySumSourceIdx;
+  var primarySumSourceSec = plan.primarySumSourceSec;
+  var denomSumSourceIdx = plan.denomSumSourceIdx;
+  var denomSumSourceSec = plan.denomSumSourceSec;
+  var avgCountSourceIdx = plan.avgCountSourceIdx;
   var primary = buffers.primary;
   var secondary = buffers.secondary;
   var metricCount = plan.count;
-  var m, op, col, col2, vals, vals2, hasNaN, hasNaN2, i, v, v2, s, s2;
+  var m, op, col, col2, vals, hasNaN, i, v, s, s2, srcIdx, denomIdx;
 
   for (m = 0; m < metricCount; ++m) {
     op = ops[m];
@@ -808,76 +1570,71 @@ export function reduceScalarAll(buffers, plan, getNumericColumn, n) {
       continue;
     }
 
-    col = getNumericColumn(fields[m]);
-    vals = col.values;
-    hasNaN = col.hasNaN;
+    srcIdx = primarySumSourceIdx[m];
     s = 0;
     s2 = 0;
 
     if (op === OP_SUM) {
-      if (!hasNaN) {
-        for (i = 0; i < n; ++i) s += vals[i];
+      if (srcIdx >= 0) {
+        primary[m][0] = primarySumSourceSec[m] ? secondary[srcIdx][0] : primary[srcIdx][0];
       } else {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v) s += v;
-        }
+        col = getNumericColumn(fields[m]);
+        primary[m][0] += scSumAll(col.values, col.hasNaN, n);
       }
-      primary[m][0] += s;
     } else if (op === OP_AVG) {
-      if (!hasNaN) {
-        for (i = 0; i < n; ++i) s += vals[i];
-        s2 = n;
+      col = getNumericColumn(fields[m]);
+      if (srcIdx >= 0) {
+        primary[m][0] = primarySumSourceSec[m] ? secondary[srcIdx][0] : primary[srcIdx][0];
+        if (!col.hasNaN) {
+          secondary[m][0] += n;
+        } else if (avgCountSourceIdx[m] >= 0) {
+          secondary[m][0] = secondary[avgCountSourceIdx[m]][0];
+        } else {
+          secondary[m][0] += scValidCountAll(col.values, n);
+        }
+      } else if (!col.hasNaN) {
+        primary[m][0] += scSumAll(col.values, false, n);
+        secondary[m][0] += n;
       } else {
+        vals = col.values;
         for (i = 0; i < n; ++i) {
           v = vals[i];
-          if (v === v) {
-            s += v;
-            s2 += 1;
-          }
+          if (v === v) { s += v; s2 += 1; }
         }
+        primary[m][0] += s;
+        secondary[m][0] += s2;
       }
-      primary[m][0] += s;
-      secondary[m][0] += s2;
     } else if (op === OP_AVG_NON_ZERO) {
+      col = getNumericColumn(fields[m]);
+      vals = col.values;
+      hasNaN = col.hasNaN;
       if (!hasNaN) {
         for (i = 0; i < n; ++i) {
           v = vals[i];
-          if (v !== 0) {
-            s += v;
-            s2 += 1;
-          }
+          if (v !== 0) { s += v; s2 += 1; }
         }
       } else {
         for (i = 0; i < n; ++i) {
           v = vals[i];
-          if (v === v && v !== 0) {
-            s += v;
-            s2 += 1;
-          }
+          if (v === v && v !== 0) { s += v; s2 += 1; }
         }
       }
       primary[m][0] += s;
       secondary[m][0] += s2;
     } else if (op === OP_RATIO) {
-      col2 = getNumericColumn(denominators[m]);
-      vals2 = col2.values;
-      hasNaN2 = col2.hasNaN;
-      if (!hasNaN && !hasNaN2) {
-        for (i = 0; i < n; ++i) {
-          s += vals[i];
-          s2 += vals2[i];
-        }
+      denomIdx = denomSumSourceIdx[m];
+      if (srcIdx >= 0) {
+        primary[m][0] = primarySumSourceSec[m] ? secondary[srcIdx][0] : primary[srcIdx][0];
       } else {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v) s += v;
-          v2 = vals2[i];
-          if (v2 === v2) s2 += v2;
-        }
+        col = getNumericColumn(fields[m]);
+        primary[m][0] += scSumAll(col.values, col.hasNaN, n);
       }
-      primary[m][0] += s;
-      secondary[m][0] += s2;
+      if (denomIdx >= 0) {
+        secondary[m][0] = denomSumSourceSec[m] ? secondary[denomIdx][0] : primary[denomIdx][0];
+      } else {
+        col2 = getNumericColumn(denominators[m]);
+        secondary[m][0] += scSumAll(col2.values, col2.hasNaN, n);
+      }
     }
   }
 }
@@ -888,89 +1645,100 @@ export function reduceScalarIndexed(buffers, plan, getNumericColumn, rowIndexes,
   var ops = plan.ops;
   var fields = plan.fields;
   var denominators = plan.denominators;
+  var primarySumSourceIdx = plan.primarySumSourceIdx;
+  var primarySumSourceSec = plan.primarySumSourceSec;
+  var denomSumSourceIdx = plan.denomSumSourceIdx;
+  var denomSumSourceSec = plan.denomSumSourceSec;
+  var avgCountSourceIdx = plan.avgCountSourceIdx;
   var primary = buffers.primary;
   var secondary = buffers.secondary;
   var metricCount = plan.count;
   var sign = delta > 0 ? 1 : -1;
-  var m, op, col, col2, vals, vals2, hasNaN, hasNaN2, j, idx, v, v2, s, s2;
+  var stepPrimary = new Float64Array(metricCount);
+  var stepSecondary = new Float64Array(metricCount);
+  var m, op, col, col2, vals, hasNaN, j, v, s, s2, srcIdx, denomIdx;
 
   for (m = 0; m < metricCount; ++m) {
     op = ops[m];
     if (op === OP_COUNT) {
+      stepPrimary[m] = rowCount;
       primary[m][0] += sign * rowCount;
       continue;
     }
 
-    col = getNumericColumn(fields[m]);
-    vals = col.values;
-    hasNaN = col.hasNaN;
+    srcIdx = primarySumSourceIdx[m];
     s = 0;
     s2 = 0;
 
     if (op === OP_SUM) {
-      if (!hasNaN) {
-        for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
+      if (srcIdx >= 0) {
+        s = primarySumSourceSec[m] ? stepSecondary[srcIdx] : stepPrimary[srcIdx];
       } else {
-        for (j = 0; j < rowCount; ++j) {
-          v = vals[rowIndexes[j]];
-          if (v === v) s += v;
-        }
+        col = getNumericColumn(fields[m]);
+        s = scSumIdx(col.values, col.hasNaN, rowIndexes, rowCount);
       }
+      stepPrimary[m] = s;
       primary[m][0] += sign * s;
     } else if (op === OP_AVG) {
-      if (!hasNaN) {
-        for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
+      col = getNumericColumn(fields[m]);
+      if (srcIdx >= 0) {
+        s = primarySumSourceSec[m] ? stepSecondary[srcIdx] : stepPrimary[srcIdx];
+        if (!col.hasNaN) {
+          s2 = rowCount;
+        } else if (avgCountSourceIdx[m] >= 0) {
+          s2 = stepSecondary[avgCountSourceIdx[m]];
+        } else {
+          s2 = scValidCountIdx(col.values, rowIndexes, rowCount);
+        }
+      } else if (!col.hasNaN) {
+        s = scSumIdx(col.values, false, rowIndexes, rowCount);
         s2 = rowCount;
       } else {
+        vals = col.values;
         for (j = 0; j < rowCount; ++j) {
           v = vals[rowIndexes[j]];
-          if (v === v) {
-            s += v;
-            s2 += 1;
-          }
+          if (v === v) { s += v; s2 += 1; }
         }
       }
+      stepPrimary[m] = s;
+      stepSecondary[m] = s2;
       primary[m][0] += sign * s;
       secondary[m][0] += sign * s2;
     } else if (op === OP_AVG_NON_ZERO) {
+      col = getNumericColumn(fields[m]);
+      vals = col.values;
+      hasNaN = col.hasNaN;
       if (!hasNaN) {
         for (j = 0; j < rowCount; ++j) {
           v = vals[rowIndexes[j]];
-          if (v !== 0) {
-            s += v;
-            s2 += 1;
-          }
+          if (v !== 0) { s += v; s2 += 1; }
         }
       } else {
         for (j = 0; j < rowCount; ++j) {
           v = vals[rowIndexes[j]];
-          if (v === v && v !== 0) {
-            s += v;
-            s2 += 1;
-          }
+          if (v === v && v !== 0) { s += v; s2 += 1; }
         }
       }
+      stepPrimary[m] = s;
+      stepSecondary[m] = s2;
       primary[m][0] += sign * s;
       secondary[m][0] += sign * s2;
     } else if (op === OP_RATIO) {
-      col2 = getNumericColumn(denominators[m]);
-      vals2 = col2.values;
-      hasNaN2 = col2.hasNaN;
-      if (!hasNaN && !hasNaN2) {
-        for (j = 0; j < rowCount; ++j) {
-          idx = rowIndexes[j];
-          s += vals[idx];
-          s2 += vals2[idx];
-        }
+      denomIdx = denomSumSourceIdx[m];
+      if (srcIdx >= 0) {
+        s = primarySumSourceSec[m] ? stepSecondary[srcIdx] : stepPrimary[srcIdx];
       } else {
-        for (j = 0; j < rowCount; ++j) {
-          idx = rowIndexes[j];
-          v = vals[idx];
-          if (v === v) s += v;
-          v2 = vals2[idx];
-          if (v2 === v2) s2 += v2;
-        }
+        col = getNumericColumn(fields[m]);
+        s = scSumIdx(col.values, col.hasNaN, rowIndexes, rowCount);
       }
+      if (denomIdx >= 0) {
+        s2 = denomSumSourceSec[m] ? stepSecondary[denomIdx] : stepPrimary[denomIdx];
+      } else {
+        col2 = getNumericColumn(denominators[m]);
+        s2 = scSumIdx(col2.values, col2.hasNaN, rowIndexes, rowCount);
+      }
+      stepPrimary[m] = s;
+      stepSecondary[m] = s2;
       primary[m][0] += sign * s;
       secondary[m][0] += sign * s2;
     }

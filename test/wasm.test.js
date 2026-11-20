@@ -143,6 +143,30 @@ describe("wasm runtime", () => {
     expect(r2).toEqual([2, 3]);
     expect(r3).toEqual([4]);
   });
+
+  it("clears marks accurately when maxTargetCode shrinks and grows back at the same markPtr", () => {
+    var ctrl = createWasmRuntimeController({ wasm: true });
+    var jsCtrl = createWasmRuntimeController({ wasm: false });
+    var codesLarge = new Uint32Array(2000);
+    var codesSmall = new Uint32Array(2000);
+    for (var i = 0; i < 2000; ++i) {
+      codesLarge[i] = i % 500;
+      codesSmall[i] = i % 10;
+    }
+    var targetsLarge = [1, 2, 3, 4, 450];
+    var targetsSmall = [0, 1, 2, 3, 4];
+
+    // Call 1: large maxTargetCode (499)
+    expect(Array.from(ctrl.findEncodedMatches(codesLarge, targetsLarge)))
+      .toEqual(Array.from(jsCtrl.findEncodedMatches(codesLarge, targetsLarge)));
+    // Call 2: same codes.length and targetCodes.length => SAME markPtr, smaller maxTargetCode (9)
+    // outPtr overwrites the upper region of Call 1's marks with match indices!
+    expect(Array.from(ctrl.findEncodedMatches(codesSmall, targetsSmall)))
+      .toEqual(Array.from(jsCtrl.findEncodedMatches(codesSmall, targetsSmall)));
+    // Call 3: back to large maxTargetCode (499) at the SAME markPtr — must re-zero stale bytes!
+    expect(Array.from(ctrl.findEncodedMatches(codesLarge, targetsLarge)))
+      .toEqual(Array.from(jsCtrl.findEncodedMatches(codesLarge, targetsLarge)));
+  });
 });
 
 describe("denseLookupMatches (JS fallback)", () => {
