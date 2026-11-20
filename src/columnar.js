@@ -128,7 +128,7 @@ export function materializeColumnarRow(batch, index) {
 function createDefaultRowFactory(fields, accessors) {
   var fieldCount = fields.length;
 
-  return function(index) {
+  var factory = function(index) {
     var row = {},
         fieldIndex = 0;
 
@@ -145,6 +145,8 @@ function createDefaultRowFactory(fields, accessors) {
 
     return row;
   };
+  factory._xfilterDefaultRowFactory = true;
+  return factory;
 }
 
 export function rowsFromColumns(columns, options) {

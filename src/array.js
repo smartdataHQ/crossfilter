@@ -46,20 +46,27 @@ function arrayWidenUntyped(array, width) {
 
 // An arbitrarily-wide array of bitmasks
 function bitarray(n) {
+  var cap = n < 64 ? 64 : n;
   this.length = n;
+  this.capacity = cap;
   this.subarrays = 1;
   this.width = 8;
   this.masks = {
     0: 0
   }
 
-  this[0] = array8(n);
+  this[0] = array8(cap);
 }
 
 bitarray.prototype.lengthen = function(n) {
-  var i, len;
-  for (i = 0, len = this.subarrays; i < len; ++i) {
-    this[i] = arrayLengthen(this[i], n);
+  if (n > this.capacity) {
+    var nextCap = this.capacity || 64;
+    while (nextCap < n) nextCap <<= 1;
+    var i, len;
+    for (i = 0, len = this.subarrays; i < len; ++i) {
+      this[i] = arrayLengthen(this[i], nextCap);
+    }
+    this.capacity = nextCap;
   }
   this.length = n;
 };
@@ -93,7 +100,7 @@ bitarray.prototype.add = function() {
   }
 
   // add a new subarray
-  this[this.subarrays] = array8(this.length);
+  this[this.subarrays] = array8(this.capacity);
   this.masks[this.subarrays] = 1;
   this.width += 8;
   return {
@@ -114,8 +121,12 @@ bitarray.prototype.copy = function(dest, src) {
 bitarray.prototype.truncate = function(n) {
   var i, len;
   for (i = 0, len = this.subarrays; i < len; ++i) {
-    for (var j = this.length - 1; j >= n; j--) {
-      this[i][j] = 0;
+    if (typeof this[i].fill === "function") {
+      this[i].fill(0, n, this.length);
+    } else {
+      for (var j = this.length - 1; j >= n; j--) {
+        this[i][j] = 0;
+      }
     }
   }
   this.length = n;

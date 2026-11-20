@@ -1662,3 +1662,492 @@ describe("v3.1.1 systematic correctness fixes and performance fast paths", () =>
     cf.dispose && cf.dispose();
   });
 });
+
+describe("v3.1.2 items 1-11 and splitField sort parity", () => {
+  it("bonus fix: columnar splitField sorting by avg or ratio matches non-columnar metricStateValue order", () => {
+    const records = [
+      { cat: "A", ch: "web", rev: 10, cost: 2 },
+      { cat: "A", ch: "app", rev: 20, cost: 4 },
+      { cat: "B", ch: "web", rev: 100, cost: 50 },
+      { cat: "B", ch: "app", rev: 200, cost: 100 },
+      { cat: "C", ch: "web", rev: 50, cost: 10 },
+    ];
+    const metrics = [
+      { id: "avgRev", op: "avg", field: "rev" },
+      { id: "ratioCR", op: "ratio", field: "cost", denominator: "rev" },
+    ];
+    const rtCol = crossfilter.createDashboardRuntime({
+      columns: {
+        cat: records.map((r) => r.cat),
+        ch: records.map((r) => r.ch),
+        rev: Float64Array.from(records.map((r) => r.rev)),
+        cost: Float64Array.from(records.map((r) => r.cost)),
+      },
+      dimensions: ["cat", "ch"],
+      groups: [{ id: "g", field: "cat", splitField: "ch", metrics }],
+    });
+    const rtObj = crossfilter.createDashboardRuntime({
+      records,
+      dimensions: ["cat", "ch"],
+      groups: [{ id: "g", field: "cat", splitField: "ch", metrics }],
+    });
+    // avgRev sums across splits: B=300, C=50, A=30 -> desc order MUST be B, C, A (not A, B, C!)
+    const byAvg = rtCol.groups({ groups: { g: { sort: "desc", sortMetric: "avgRev" } } }).g;
+    const byAvgObj = rtObj.groups({ groups: { g: { sort: "desc", sortMetric: "avgRev" } } }).g;
+    expect(byAvg.entries.map((e) => e.key)).toEqual(["B", "C", "A"]);
+    expect(byAvg.entries).toEqual(byAvgObj.entries);
+    // ratioCR num sums across splits: B=150, C=10, A=6 -> desc order MUST be B, C, A!
+    const byRatio = rtCol.groups({ groups: { g: { sort: "desc", sortMetric: "ratioCR" } } }).g;
+    const byRatioObj = rtObj.groups({ groups: { g: { sort: "desc", sortMetric: "ratioCR" } } }).g;
+    expect(byRatio.entries.map((e) => e.key)).toEqual(["B", "C", "A"]);
+    expect(byRatio.entries).toEqual(byRatioObj.entries);
+    // asc order: A, C, B
+    const byAvgAsc = rtCol.groups({ groups: { g: { sort: "asc", sortMetric: "avgRev" } } }).g;
+    const byAvgAscObj = rtObj.groups({ groups: { g: { sort: "asc", sortMetric: "avgRev" } } }).g;
+    expect(byAvgAsc.entries.map((e) => e.key)).toEqual(["A", "C", "B"]);
+    expect(byAvgAsc.entries).toEqual(byAvgAscObj.entries);
+    rtCol.dispose();
+    rtObj.dispose();
+  });
+
+  it("item 1: non-columnar rt.rows({ limit, offset }) materializes only requested page rows", () => {
+    const n = 400;
+    let extraReads = 0;
+    const extraCol = {
+      length: n,
+      get(i) {
+        extraReads += 1;
+        return `extra_${i}`;
+      },
+    };
+    const rt = crossfilter.createDashboardRuntime({
+      columns: {
+        cat: Array.from({ length: n }, (_, i) => `c${i % 4}`),
+        val: Float64Array.from({ length: n }, (_, i) => i * 10),
+        extra: extraCol,
+      },
+      columnarOptions: { fields: ["cat", "val", "extra"], length: n },
+      dimensions: ["cat"],
+    });
+
+    // Projected page without sortBy: should NEVER touch `extra` at all!
+    const proj = rt.rows({ limit: 5, offset: 10, fields: ["cat", "val"] });
+    expect(proj.length).toBe(5);
+    expect(proj[0]).toEqual({ cat: "c2", val: 100 });
+    expect(extraReads).toBe(0);
+
+    // Full-record page without sortBy: should touch ONLY the 5 page rows, not all 400!
+    const full = rt.rows({ limit: 5, offset: 20 });
+    expect(full.length).toBe(5);
+    expect(full[0]).toEqual({ cat: "c0", val: 200, extra: "extra_20" });
+    expect(extraReads).toBe(5);
+
+    // Under filter: touches only the 3 filtered page rows
+    rt.updateFilters({ cat: { type: "exact", value: "c1" } });
+    extraReads = 0;
+    const flt = rt.rows({ limit: 3, offset: 2 });
+    expect(flt.map((r) => r.val)).toEqual([90, 130, 170]);
+    expect(extraReads).toBe(3);
+    rt.dispose();
+  });
+
+  it("item 2: Arrow Utf8 (ASCII + Unicode), Timestamp (Sec/Ms/Us/Ns), Date (Day/Ms), and Bool fast paths with nulls & slices", async () => {
+    const n = 70;
+    const uAscii = Array.from({ length: n }, (_, i) => (i % 7 === 0 ? null : `cat_${i % 5}`));
+    const uUni = Array.from({ length: n }, (_, i) => (i % 6 === 0 ? null : (i % 2 === 0 ? `café_${i % 3}` : `🚀_${i % 3}`)));
+    const baseMs = Date.UTC(2025, 0, 1);
+    const tsSecVals = Array.from({ length: n }, (_, i) => (i % 8 === 0 ? null : baseMs + i * 60000));
+    const tsMsVals = Array.from({ length: n }, (_, i) => baseMs + (i % 10) * 86400000);
+    const tsUsVals = Array.from({ length: n }, (_, i) => (i % 9 === 0 ? null : baseMs + i * 1000 + 0.5));
+    const tsNsVals = Array.from({ length: n }, (_, i) => (i % 10 === 0 ? null : baseMs + i * 1000));
+    const dtDayVals = Array.from({ length: n }, (_, i) => (i % 5 === 0 ? null : new Date(baseMs + i * 86400000)));
+    const dtMsVals = Array.from({ length: n }, (_, i) => (i % 5 === 0 ? null : new Date(baseMs + i * 86400000)));
+    const boolVals = Array.from({ length: n }, (_, i) => (i % 7 === 0 ? null : (i % 2 === 0)));
+
+    const tbl = Arrow.tableFromArrays({
+      uAscii: Arrow.vectorFromArray(uAscii, new Arrow.Utf8()),
+      uUni: Arrow.vectorFromArray(uUni, new Arrow.Utf8()),
+      tsSec: Arrow.vectorFromArray(tsSecVals, new Arrow.TimestampSecond()),
+      tsMs: Arrow.vectorFromArray(tsMsVals, new Arrow.TimestampMillisecond()),
+      tsUs: Arrow.vectorFromArray(tsUsVals, new Arrow.TimestampMicrosecond()),
+      tsNs: Arrow.vectorFromArray(tsNsVals, new Arrow.TimestampNanosecond()),
+      dtDay: Arrow.vectorFromArray(dtDayVals, new Arrow.DateDay()),
+      dtMs: Arrow.vectorFromArray(dtMsVals, new Arrow.DateMillisecond()),
+      flag: Arrow.vectorFromArray(boolVals, new Arrow.Bool()),
+      rev: Float64Array.from({ length: n }, (_, i) => i + 1),
+    });
+
+    // Non-byte-aligned slice(7, 57) = 50 rows through fromArrowTable
+    const sl = tbl.slice(7, 57);
+    const rt = crossfilter.createDashboardRuntime({
+      table: sl,
+      dimensions: ["uAscii", "uUni", "tsMs"],
+      kpis: [{ id: "rows", op: "count" }, { id: "rev", op: "sum", field: "rev" }],
+      groups: [
+        { id: "byAscii", field: "uAscii", splitField: "uUni", metrics: [{ id: "rows", op: "count" }, { id: "rev", op: "sum", field: "rev" }] },
+        { id: "byDay", field: "tsMs", bucket: { type: "timeBucket", granularity: "day" }, metrics: [{ id: "rows", op: "count" }] },
+      ],
+    });
+    const snap = rt.snapshot();
+    expect(snap.kpis.rows).toBe(50);
+    expect(snap.groups.byDay.reduce((s, e) => s + e.value.rows, 0)).toBe(50);
+    const taken = rt.rows({ columnar: true, fields: ["uAscii", "uUni"], limit: 50 });
+    expect(taken.columns.uAscii).toEqual(uAscii.slice(7, 57));
+    expect(taken.columns.uUni).toEqual(uUni.slice(7, 57));
+    rt.dispose();
+
+    // Stream two batches through real streaming worker with timestampMs, boolean, and Utf8 mergeProjectedBatches!
+    const b0 = Arrow.tableFromArrays({
+      uAscii: Arrow.vectorFromArray(["x", "y", null, "z"], new Arrow.Utf8()),
+      uUni: Arrow.vectorFromArray(["café", "🚀", "plain", null], new Arrow.Utf8()),
+      tsSec: Arrow.vectorFromArray([baseMs, null, baseMs + 60000, baseMs + 120000], new Arrow.TimestampSecond()),
+      tsUs: Arrow.vectorFromArray([baseMs + 0.5, baseMs + 1.25, null, baseMs + 2], new Arrow.TimestampMicrosecond()),
+      dtDay: Arrow.vectorFromArray([new Date(baseMs), null, new Date(baseMs + 86400000), new Date(baseMs + 172800000)], new Arrow.DateDay()),
+      flag: Arrow.vectorFromArray([true, false, null, true], new Arrow.Bool()),
+    });
+    const b1 = Arrow.tableFromArrays({
+      uAscii: Arrow.vectorFromArray(["a", "b", "c", "d"], new Arrow.Utf8()),
+      uUni: Arrow.vectorFromArray(["ü", "x", "y", "z"], new Arrow.Utf8()),
+      tsSec: Arrow.vectorFromArray([baseMs + 180000, baseMs + 240000, baseMs + 300000, null], new Arrow.TimestampSecond()),
+      tsUs: Arrow.vectorFromArray([baseMs + 3, baseMs + 4, baseMs + 5, baseMs + 6], new Arrow.TimestampMicrosecond()),
+      dtDay: Arrow.vectorFromArray([new Date(baseMs), new Date(baseMs), new Date(baseMs), new Date(baseMs)], new Arrow.DateDay()),
+      flag: Arrow.vectorFromArray([false, null, true, false], new Arrow.Bool()),
+    });
+    const ipc = Arrow.tableToIPC(new Arrow.Table([...b0.batches, ...b1.batches]), "stream");
+
+    const workerSrc = readFileSync(new URL("../src/dashboard-stream-worker.js", import.meta.url), "utf8");
+    const m = workerSrc.match(/function createWorkerSource\(crossfilterUrl, arrowUrl\)\s*\{\s*return `([\s\S]*?)`;\s*\}/);
+    const cfBundle = readFileSync(new URL("../crossfilter.js", import.meta.url), "utf8");
+    const resolved = m[1].replace("${JSON.stringify(crossfilterUrl)}", JSON.stringify("cf.js")).replace("${JSON.stringify(arrowUrl)}", JSON.stringify("arrow.js"));
+    const responses = new Map();
+    let resolveReady;
+    const readyPromise = new Promise((r) => { resolveReady = r; });
+    const sandbox = {
+      console, setTimeout, clearTimeout, URL, TextDecoder, TextEncoder, AbortController,
+      ReadableStream, Response, Uint8Array, Int32Array, Float64Array, Float32Array, BigInt64Array, Map, Set, Promise,
+      fetch: async () => new Response(ipc, { status: 200 }),
+      importScripts: () => { sandbox.Arrow = Arrow; runInNewContext(cfBundle, sandbox); },
+      postMessage: (msg) => {
+        if (msg.id && responses.has(msg.id)) {
+          const { resolve, reject } = responses.get(msg.id);
+          responses.delete(msg.id);
+          if (msg.ok) resolve(msg.payload);
+          else reject(new Error(msg.error?.message || "worker error"));
+        } else if (msg.eventType === "ready") {
+          resolveReady(msg.payload);
+        }
+      },
+    };
+    sandbox.self = sandbox;
+    runInNewContext(resolved, sandbox);
+    const call = (type, payload) => new Promise((resolve, reject) => {
+      const id = `m_${Math.random()}`;
+      responses.set(id, { resolve, reject });
+      sandbox.onmessage({ data: { id, type, payload } });
+    });
+
+    await call("initStreaming", {
+      batchCoalesceRows: 100,
+      sources: [{
+        id: "base",
+        role: "base",
+        dataUrl: "https://example.test/arrow-types.arrow",
+        projection: {
+          fields: ["uAscii", "uUni", "tsSec", "tsUs", "dtDay", "flag"],
+          transforms: { tsSec: "timestampMs", tsUs: "timestampMs", dtDay: "timestampMs", flag: "boolean" },
+        },
+      }],
+      dimensions: ["uAscii", "flag"],
+      kpis: [{ id: "rows", op: "count" }],
+      groups: [{ id: "byFlag", field: "flag", metrics: [{ id: "rows", op: "count" }] }],
+    });
+    await readyPromise;
+
+    const q = await call("query", { request: { snapshot: true, rows: { columnar: true, fields: ["uAscii", "uUni", "tsSec", "tsUs", "dtDay", "flag"], limit: 10 } } });
+    expect(q.rows.columns.uAscii).toEqual(["x", "y", null, "z", "a", "b", "c", "d"]);
+    expect(q.rows.columns.uUni).toEqual(["café", "🚀", "plain", null, "ü", "x", "y", "z"]);
+    expect(Array.from(q.rows.columns.tsSec)).toEqual([baseMs, 0, baseMs + 60000, baseMs + 120000, baseMs + 180000, baseMs + 240000, baseMs + 300000, 0]);
+    expect(Array.from(q.rows.columns.tsUs)).toEqual([baseMs + 0.5, baseMs + 1.25, 0, baseMs + 2, baseMs + 3, baseMs + 4, baseMs + 5, baseMs + 6]);
+    expect(Array.from(q.rows.columns.dtDay)).toEqual([baseMs, 0, baseMs + 86400000, baseMs + 172800000, baseMs, baseMs, baseMs, baseMs]);
+    expect(q.rows.columns.flag).toEqual(["true", "false", null, "true", "false", null, "true", "false"]);
+  });
+
+  it("item 3: streaming worker multi-source lookup joins fast-path Arrow Dictionary keys and multi-key lookups", async () => {
+    const dType0 = new Arrow.Dictionary(new Arrow.Utf8(), new Arrow.Int32(), 0);
+    const dType1 = new Arrow.Dictionary(new Arrow.Utf8(), new Arrow.Int32(), 1);
+    const baseTbl = Arrow.tableFromArrays({
+      storeId: Arrow.vectorFromArray(["s1", "s2", null, "s1", "s3"], dType0),
+      region: Arrow.vectorFromArray(["north", "south", "north", "south", "north"], dType1),
+      rev: new Float64Array([10, 20, 30, 40, 50]),
+    });
+    const storeLookup = Arrow.tableFromArrays({
+      storeId: Arrow.vectorFromArray(["s1", "s2", "s3"], dType0),
+      storeName: Arrow.vectorFromArray(["Alpha", "Beta", "Gamma"], new Arrow.Utf8()),
+      tier: new Float64Array([1, 2, 3]),
+    });
+    const compLookup = Arrow.tableFromArrays({
+      storeId: Arrow.vectorFromArray(["s1", "s1", "s2"], new Arrow.Utf8()),
+      region: Arrow.vectorFromArray(["north", "south", "south"], new Arrow.Utf8()),
+      bonus: new Float64Array([5, 7, 9]),
+    });
+
+    const urls = {
+      "https://example.test/base.arrow": Arrow.tableToIPC(baseTbl, "stream"),
+      "https://example.test/stores.arrow": Arrow.tableToIPC(storeLookup, "stream"),
+      "https://example.test/comp.arrow": Arrow.tableToIPC(compLookup, "stream"),
+    };
+
+    const workerSrc = readFileSync(new URL("../src/dashboard-stream-worker.js", import.meta.url), "utf8");
+    const m = workerSrc.match(/function createWorkerSource\(crossfilterUrl, arrowUrl\)\s*\{\s*return `([\s\S]*?)`;\s*\}/);
+    const cfBundle = readFileSync(new URL("../crossfilter.js", import.meta.url), "utf8");
+    const resolved = m[1].replace("${JSON.stringify(crossfilterUrl)}", JSON.stringify("cf.js")).replace("${JSON.stringify(arrowUrl)}", JSON.stringify("arrow.js"));
+    const responses = new Map();
+    let resolveReady;
+    const readyPromise = new Promise((r) => { resolveReady = r; });
+    const sandbox = {
+      console, setTimeout, clearTimeout, URL, TextDecoder, TextEncoder, AbortController,
+      ReadableStream, Response, Uint8Array, Int32Array, Float64Array, Float32Array, BigInt64Array, Map, Set, Promise,
+      fetch: async (url) => new Response(urls[url], { status: 200 }),
+      importScripts: () => { sandbox.Arrow = Arrow; runInNewContext(cfBundle, sandbox); },
+      postMessage: (msg) => {
+        if (msg.id && responses.has(msg.id)) {
+          const { resolve, reject } = responses.get(msg.id);
+          responses.delete(msg.id);
+          if (msg.ok) resolve(msg.payload);
+          else reject(new Error(msg.error?.message || "worker error"));
+        } else if (msg.eventType === "ready") {
+          resolveReady(msg.payload);
+        }
+      },
+    };
+    sandbox.self = sandbox;
+    runInNewContext(resolved, sandbox);
+    const call = (type, payload) => new Promise((resolve, reject) => {
+      const id = `m_${Math.random()}`;
+      responses.set(id, { resolve, reject });
+      sandbox.onmessage({ data: { id, type, payload } });
+    });
+
+    await call("initStreaming", {
+      sources: [
+        { id: "base", role: "base", dataUrl: "https://example.test/base.arrow" },
+        { id: "stores", role: "lookup", dataUrl: "https://example.test/stores.arrow", lookup: { keyFields: ["storeId"], valueFields: ["storeName", "tier"] } },
+        { id: "comp", role: "lookup", dataUrl: "https://example.test/comp.arrow", lookup: { keyFields: ["storeId", "region"], valueFields: ["bonus"] } },
+      ],
+      dimensions: ["storeName"],
+      kpis: [{ id: "rev", op: "sum", field: "rev" }, { id: "bonus", op: "sum", field: "bonus" }],
+      groups: [{ id: "byStore", field: "storeName", metrics: [{ id: "rev", op: "sum", field: "rev" }] }],
+    });
+    await readyPromise;
+
+    const q = await call("query", { request: { snapshot: true, rows: { columnar: true, fields: ["storeName", "tier", "bonus"], limit: 10 } } });
+    expect(q.snapshot.kpis).toEqual({ rev: 150, bonus: 21 });
+    expect(q.rows.columns.storeName).toEqual(["Alpha", "Beta", undefined, "Alpha", "Gamma"]);
+    expect(Array.from(q.rows.columns.tier).map((v) => (Number.isNaN(v) ? null : v))).toEqual([1, 2, null, 1, 3]);
+    expect(Array.from(q.rows.columns.bonus).map((v) => (Number.isNaN(v) ? null : v))).toEqual([5, 9, null, 7, null]);
+  });
+
+  it("item 4: cf.remove() and rt.removeFiltered() compact columns in place without materializing rows and preserve rawNumericState/rawBucketMode", () => {
+    const day0 = Date.UTC(2025, 0, 1);
+    const n = 40;
+    const rt = crossfilter.createDashboardRuntime({
+      columns: {
+        cat: Array.from({ length: n }, (_, i) => (i % 2 === 0 ? "even" : "odd")),
+        ts: Float64Array.from({ length: n }, (_, i) => day0 + (i % 4) * 86400000),
+        rev: Float64Array.from({ length: n }, (_, i) => i + 1),
+      },
+      dimensions: ["cat", "ts", "rev"],
+      kpis: [{ id: "rows", op: "count" }, { id: "rev", op: "sum", field: "rev" }],
+      groups: [
+        { id: "byCat", field: "cat", metrics: [{ id: "rows", op: "count" }, { id: "rev", op: "sum", field: "rev" }] },
+        { id: "byDay", field: "ts", bucket: { type: "timeBucket", granularity: "day" }, metrics: [{ id: "rows", op: "count" }, { id: "rev", op: "sum", field: "rev" }] },
+      ],
+    });
+
+    // Remove "even" rows ("included")
+    rt.updateFilters({ cat: { type: "exact", value: "even" } });
+    rt.removeFiltered("included");
+    rt.updateFilters({});
+
+    const snap1 = rt.snapshot();
+    expect(snap1.kpis.rows).toBe(20);
+    // Odd rows: 2, 4, ..., 40 -> sum = 2 * (20*21/2) = 420
+    expect(snap1.kpis.rev).toBe(420);
+    expect(snap1.groups.byDay.reduce((s, e) => s + e.value.rev, 0)).toBe(420);
+    expect(rt.bounds({ fields: ["rev"] }).rev).toEqual({ min: 2, max: 40 });
+    // Columnar output stays typed Float64Array after remove!
+    const colPage = rt.rows({ columnar: true, fields: ["rev"], limit: 5 });
+    expect(colPage.columns.rev).toBeInstanceOf(Float64Array);
+
+    // Keep only rev >= 20 via removeFiltered("excluded")
+    rt.updateFilters({ rev: { type: "range", range: [20, 100] } });
+    rt.removeFiltered("excluded");
+    rt.updateFilters({});
+    const snap2 = rt.snapshot();
+    expect(snap2.kpis.rows).toBe(11); // 20,22,...,40
+    expect(snap2.kpis.rev).toBe(330);
+
+    // Subsequent append continues working seamlessly in columnar mode
+    rt.appendColumns({ cat: ["odd"], ts: new Float64Array([day0]), rev: new Float64Array([100]) });
+    expect(rt.snapshot().kpis).toEqual({ rows: 12, rev: 430 });
+    rt.dispose();
+
+    // User row-predicate cf.remove((d) => ...) still works identically!
+    const cfPred = crossfilter.fromColumns({ k: ["a", "b", "c"], v: new Float64Array([1, 2, 3]) });
+    cfPred.remove((d) => d.k === "b");
+    expect(cfPred.all().map((r) => r.k)).toEqual(["a", "c"]);
+  });
+
+  it("item 5 & item 8: shared lazyEncodedState for splitColumns and incremental ensureSparseSplitLayout across streamed appends", () => {
+    // 1. Shared dim+splitField with null, "", strings, and streamed append adding new split values
+    const rtShared = crossfilter.createDashboardRuntime({
+      columns: {
+        cat: ["A", "B", "A", "B"],
+        ch: ["web", null, "", "app"],
+        rev: new Float64Array([10, 20, 30, 40]),
+      },
+      dimensions: ["cat", "ch"],
+      groups: [{ id: "g", field: "cat", splitField: "ch", metrics: [{ id: "rev", op: "sum", field: "rev" }] }],
+    });
+    expect(rtShared.snapshot().groups.g.find((e) => e.key === "A").value).toEqual({ web: { rev: 10 }, __unknown__: { rev: 30 } });
+    rtShared.appendColumns({
+      cat: ["A", "B"],
+      ch: ["retail", "web"],
+      rev: new Float64Array([5, 15]),
+    });
+    expect(rtShared.snapshot().groups.g.find((e) => e.key === "A").value).toEqual({ web: { rev: 10 }, __unknown__: { rev: 30 }, retail: { rev: 5 } });
+    expect(rtShared.snapshot().groups.g.find((e) => e.key === "B").value).toEqual({ __unknown__: { rev: 20 }, app: { rev: 40 }, web: { rev: 15 } });
+    rtShared.dispose();
+
+    // 2. Sparse split layout (> 262,144 cells: 2000 primary x 150 split = 300,000) across 3 streamed batches!
+    const makeSparseBatch = (offset, count, splitMod) => ({
+      sku: Array.from({ length: count }, (_, i) => `sku_${(offset + i) % 2000}`),
+      tag: Array.from({ length: count }, (_, i) => `tag_${(offset + i) % splitMod}`),
+      rev: Float64Array.from({ length: count }, () => 1),
+    });
+    const rtSparse = crossfilter.createDashboardRuntime({
+      columns: makeSparseBatch(0, 2000, 150),
+      dimensions: ["sku"],
+      groups: [{ id: "sp", field: "sku", splitField: "tag", metrics: [{ id: "rev", op: "sum", field: "rev" }] }],
+    });
+    expect(rtSparse.snapshot().groups.sp.length).toBe(2000);
+    // Batch 2: same stride (150) -> exercises incremental sparse extension!
+    rtSparse.appendColumns(makeSparseBatch(2000, 500, 150));
+    let total = 0;
+    for (const e of rtSparse.snapshot().groups.sp) {
+      for (const k of Object.keys(e.value)) total += e.value[k].rev;
+    }
+    expect(total).toBe(2500);
+    // Batch 3: new split tag (`tag_150` -> stride changes 150 -> 151) -> clean rebuild!
+    rtSparse.appendColumns({ sku: ["sku_0"], tag: ["tag_150"], rev: new Float64Array([7]) });
+    const sku0 = rtSparse.snapshot().groups.sp.find((e) => e.key === "sku_0");
+    expect(sku0.value.tag_150).toEqual({ rev: 7 });
+    rtSparse.dispose();
+  });
+
+  it("item 6 & item 7: Intl.Collator tie-break parity, heap reuse across growing limits, and bitarray geometric growth across 35 dims & 40 batches", () => {
+    // 1. Heap reuse across growing limit (3 -> 25 -> 2) & Intl.Collator tie-break
+    const keys = Array.from({ length: 40 }, (_, i) => `k_${String(i).padStart(2, "0")}`);
+    const rtHeap = crossfilter.createDashboardRuntime({
+      columns: { k: keys, v: Float64Array.from({ length: 40 }, (_, i) => i % 5) },
+      dimensions: ["k"],
+      groups: [{ id: "g", field: "k", metrics: [{ id: "v", op: "sum", field: "v" }] }],
+    });
+    for (const lim of [3, 25, 2, 15]) {
+      const res = rtHeap.groups({ groups: { g: { limit: lim, sort: "desc", sortMetric: "v" } } }).g;
+      expect(res.entries.length).toBe(lim);
+      // Top 8 keys have v=4, broken alphabetically by Collator: k_04, k_09, k_14, ...
+      expect(res.entries[0].key).toBe("k_04");
+      expect(res.entries[1].key).toBe("k_09");
+    }
+    rtHeap.dispose();
+
+    // 2. bitarray geometric growth across 40 small batches + 35 dims (2 bitarray subarrays!) + remove + re-add
+    const cf = crossfilter();
+    const dims = Array.from({ length: 35 }, (_, d) => cf.dimension(`d${d}`));
+    for (let b = 0; b < 40; ++b) {
+      const cols = {};
+      for (let d = 0; d < 35; ++d) {
+        cols[`d${d}`] = Int32Array.from({ length: 20 }, (_, i) => (b * 20 + i + d) % 5);
+      }
+      cf.add(crossfilter.rowsFromColumns(cols));
+    }
+    expect(cf.size()).toBe(800);
+    dims[0].filterExact(0);
+    dims[34].filterExact(4);
+    const matched = cf.allFilteredIndexes();
+    expect(matched.length).toBe(160);
+    cf.remove();
+    expect(cf.size()).toBe(640);
+    dims[0].filterAll();
+    dims[34].filterAll();
+    expect(cf.allFilteredIndexes().length).toBe(640);
+  });
+
+  it("item 9, item 10, & item 11: lazyTopBottomIndex +/-Infinity, classic JS-object Date/number/string sortRange, and multi-batch Arrow Dict+Utf8 takeColumns", () => {
+    // Item 9: lazyTopBottomIndex both heap (<rowCount) and sort (>=rowCount) with +/-Infinity + filtered/unfiltered
+    const vals = [Infinity, 5, -Infinity, 10, 5, Infinity, -Infinity, 0, 20, -10];
+    const flags = ["a", "a", "b", "a", "b", "b", "a", "a", "b", "a"];
+    const cf9 = crossfilter.fromColumns({ x: vals, f: flags });
+    const dX = cf9.dimension("x");
+    const dF = cf9.dimension("f");
+    expect(dX.topIndex(3).map((i) => vals[i])).toEqual([Infinity, Infinity, 20]);
+    expect(dX.bottomIndex(3).map((i) => vals[i])).toEqual([-Infinity, -Infinity, -10]);
+    expect(dX.topIndex(20).map((i) => vals[i])).toEqual([Infinity, Infinity, 20, 10, 5, 5, 0, -10, -Infinity, -Infinity]);
+    dF.filterExact("a");
+    expect(dX.topIndex(3).map((i) => vals[i])).toEqual([Infinity, 10, 5]);
+    expect(dX.bottomIndex(3).map((i) => vals[i])).toEqual([-Infinity, -10, 0]);
+
+    // Item 10: classic JS objects with Date (valid & Invalid Date), number, string, and mixed-type sortRange
+    const base = Date.UTC(2025, 0, 1);
+    const objs = [
+      { dt: new Date(base + 3000), num: 30, str: "c", mix: "z" },
+      { dt: new Date(base + 1000), num: 10, str: "a", mix: 1 },
+      { dt: new Date(base + 2000), num: 20, str: "b", mix: null },
+    ];
+    const cfObj = crossfilter(objs);
+    const dDt = cfObj.dimension((d) => d.dt);
+    const dNum = cfObj.dimension((d) => d.num * 2);
+    const dStr = cfObj.dimension((d) => d.str + "!");
+    const dMix = cfObj.dimension((d) => d.mix);
+    expect(dDt.bottom(3).map((r) => r.num)).toEqual([10, 20, 30]);
+    expect(dNum.top(3).map((r) => r.num)).toEqual([30, 20, 10]);
+    expect(dStr.bottom(3).map((r) => r.str)).toEqual(["a", "b", "c"]);
+    expect(dMix.bottom(3).map((r) => r.mix)).toEqual([null, 1, "z"]);
+    // Invalid Date fallback must not break
+    const cfBadDt = crossfilter([{ dt: new Date(NaN), id: 1 }, { dt: new Date(base), id: 2 }]);
+    expect(cfBadDt.dimension((d) => d.dt).top(2).length).toBe(2);
+
+    // Item 11: multi-batch Arrow Dictionary + Arrow Utf8 (ASCII & Unicode) takeColumns (>32 rows, sliced offsets, nulls)
+    const dType = new Arrow.Dictionary(new Arrow.Utf8(), new Arrow.Int32());
+    const expectedDict = [];
+    const expectedAscii = [];
+    const expectedUni = [];
+    const cfMb = crossfilter();
+    for (let b = 0; b < 4; ++b) {
+      const rawDict = Array.from({ length: 30 }, (_, i) => (i % 5 === 0 ? null : `d_${b}_${i % 4}`));
+      const rawAscii = Array.from({ length: 30 }, (_, i) => (i % 7 === 0 ? null : `a_${b}_${i}`));
+      const rawUni = Array.from({ length: 30 }, (_, i) => (i % 6 === 0 ? null : `é_${b}_${i}`));
+      const tbl = Arrow.tableFromArrays({
+        dict: Arrow.vectorFromArray(rawDict, dType),
+        ascii: Arrow.vectorFromArray(rawAscii, new Arrow.Utf8()),
+        uni: Arrow.vectorFromArray(rawUni, new Arrow.Utf8()),
+      }).slice(3, 28); // 25 rows per batch, non-byte-aligned offset 3!
+      cfMb.add(crossfilter.rowsFromArrowTable(tbl));
+      expectedDict.push(...rawDict.slice(3, 28));
+      expectedAscii.push(...rawAscii.slice(3, 28));
+      expectedUni.push(...rawUni.slice(3, 28));
+    }
+    const orders = [
+      Array.from({ length: 100 }, (_, i) => i),
+      Array.from({ length: 100 }, (_, i) => 99 - i),
+      Array.from({ length: 60 }, (_, i) => (i * 17) % 100),
+    ];
+    for (const idxs of orders) {
+      const out = cfMb.takeColumns(idxs, ["dict", "ascii", "uni"]);
+      expect(out.columns.dict).toEqual(idxs.map((i) => expectedDict[i]));
+      expect(out.columns.ascii).toEqual(idxs.map((i) => expectedAscii[i]));
+      expect(out.columns.uni).toEqual(idxs.map((i) => expectedUni[i]));
+    }
+  });
+});

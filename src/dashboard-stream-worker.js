@@ -168,11 +168,201 @@ function isBigIntTypedArray(arr) {
   var tag = typedArrayToString.call(arr);
   return tag === '[object BigInt64Array]' || tag === '[object BigUint64Array]';
 }
+var utf8FatalDecoder = typeof TextDecoder === 'function' ? new TextDecoder('utf-8', { fatal: true }) : null;
+var utf8Decoder = typeof TextDecoder === 'function' ? new TextDecoder('utf-8') : null;
 function hasValidNullBitmap(chunk) {
   if (!chunk || chunk.nullCount === 0) return true;
   if (!chunk.nullBitmap || typeof chunk.nullBitmap.length !== 'number') return false;
   var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
   return chunk.nullBitmap.length >= ((chunkOff + chunk.length + 7) >>> 3);
+}
+function extractArrowTemporalChunks(sourceColumn, length, mode) {
+  if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
+    return null;
+  }
+  var colType = sourceColumn.type || sourceColumn.data[0].type;
+  var typeId = colType && typeof colType.typeId === 'number' ? colType.typeId : -1;
+  if (typeId !== 8 && typeId !== 10) {
+    return null;
+  }
+  var unit = colType && typeof colType.unit === 'number' ? colType.unit : -1;
+  var scaleMul = 1;
+  var scaleDiv = 1;
+  if (typeId === 8) {
+    if (unit === 0) scaleMul = 86400000;
+    else if (unit !== 1) return null;
+  } else {
+    if (unit === 0) scaleMul = 1000;
+    else if (unit === 1) scaleMul = 1;
+    else if (unit === 2) scaleDiv = 1000;
+    else if (unit === 3) scaleDiv = 1000000;
+    else return null;
+  }
+  var chunks = sourceColumn.data;
+  var c, chunk, chunkLen, vals, j, v, nullBitmap, chunkOff, bitIdx;
+  var total = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    if (!chunk || !ArrayBuffer.isView(chunk.values)) return null;
+    if (mode === 'raw' ? chunk.nullCount !== 0 : !hasValidNullBitmap(chunk)) return null;
+    chunkLen = chunk.length;
+    if (chunk.values.length < chunkLen) return null;
+    if (typeId === 8 && unit === 0) {
+      if (!isIntegerTypedArray(chunk.values)) return null;
+    } else if (!isBigIntTypedArray(chunk.values) && !isStandardNumericTypedArray(chunk.values)) {
+      return null;
+    }
+    total += chunkLen;
+  }
+  if (total !== length) return null;
+
+  var out = new Float64Array(length);
+  var outOffset = 0;
+  var isTsMode = mode === 'timestampMs';
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    chunkLen = chunk.length;
+    vals = chunk.values;
+    nullBitmap = chunk.nullCount > 0 ? chunk.nullBitmap : null;
+    chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+    var isBig = isBigIntTypedArray(vals);
+    if (!nullBitmap) {
+      for (j = 0; j < chunkLen; ++j) {
+        v = isBig ? Number(vals[j]) : vals[j];
+        if (scaleMul !== 1) v *= scaleMul;
+        else if (scaleDiv !== 1) v /= scaleDiv;
+        out[outOffset + j] = isTsMode ? (v < 1e12 ? v * 1000 : v) : v;
+      }
+    } else {
+      for (j = 0; j < chunkLen; ++j) {
+        bitIdx = chunkOff + j;
+        if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+          out[outOffset + j] = 0;
+        } else {
+          v = isBig ? Number(vals[j]) : vals[j];
+          if (scaleMul !== 1) v *= scaleMul;
+          else if (scaleDiv !== 1) v /= scaleDiv;
+          out[outOffset + j] = isTsMode ? (v < 1e12 ? v * 1000 : v) : v;
+        }
+      }
+    }
+    outOffset += chunkLen;
+  }
+  return out;
+}
+function extractArrowBoolColumn(sourceColumn, length) {
+  if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
+    return null;
+  }
+  var colType = sourceColumn.type || sourceColumn.data[0].type;
+  if (!colType || colType.typeId !== 6) {
+    return null;
+  }
+  var chunks = sourceColumn.data;
+  var c, chunk, chunkLen, chunkOff, total = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    if (!chunk || !ArrayBuffer.isView(chunk.values) || !hasValidNullBitmap(chunk)) return null;
+    chunkLen = chunk.length;
+    chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+    if (chunk.values.length < ((chunkOff + chunkLen + 7) >>> 3)) return null;
+    total += chunkLen;
+  }
+  if (total !== length) return null;
+
+  var out = new Array(length);
+  var outOffset = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    chunkLen = chunk.length;
+    chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+    var vals = chunk.values;
+    var nullBitmap = chunk.nullCount > 0 ? chunk.nullBitmap : null;
+    var j, bitIdx;
+    if (!nullBitmap) {
+      for (j = 0; j < chunkLen; ++j) {
+        bitIdx = chunkOff + j;
+        out[outOffset + j] = (vals[bitIdx >>> 3] & (1 << (bitIdx & 7))) ? 'true' : 'false';
+      }
+    } else {
+      for (j = 0; j < chunkLen; ++j) {
+        bitIdx = chunkOff + j;
+        if (!(nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))) {
+          out[outOffset + j] = null;
+        } else {
+          out[outOffset + j] = (vals[bitIdx >>> 3] & (1 << (bitIdx & 7))) ? 'true' : 'false';
+        }
+      }
+    }
+    outOffset += chunkLen;
+  }
+  return out;
+}
+function copyArrowUtf8Into(target, targetOffset, sourceColumn, length) {
+  if (!utf8Decoder || !sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
+    return false;
+  }
+  var colType = sourceColumn.type || sourceColumn.data[0].type;
+  if (!colType || colType.typeId !== 5) {
+    return false;
+  }
+  var chunks = sourceColumn.data;
+  var c, chunk, total = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    if (!chunk || !ArrayBuffer.isView(chunk.values) || !ArrayBuffer.isView(chunk.valueOffsets) || chunk.valueOffsets.length <= chunk.length || !hasValidNullBitmap(chunk)) {
+      return false;
+    }
+    total += chunk.length;
+  }
+  if (total !== length) return false;
+  var outOffset = targetOffset;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    var chunkLen = chunk.length;
+    var vo = chunk.valueOffsets;
+    var bytes = chunk.values;
+    var base = vo[0];
+    var end = vo[chunkLen];
+    var byteLen = end - base;
+    var nullBitmap = chunk.nullCount > 0 ? chunk.nullBitmap : null;
+    var chunkOff = typeof chunk.offset === 'number' ? chunk.offset : 0;
+    var asciiStr = null;
+    if (utf8FatalDecoder && byteLen >= 0) {
+      try {
+        var decoded = utf8FatalDecoder.decode(bytes.subarray(base, end));
+        if (decoded.length === byteLen) asciiStr = decoded;
+      } catch (_) {}
+    }
+    var j, bitIdx;
+    if (asciiStr !== null) {
+      if (!nullBitmap) {
+        for (j = 0; j < chunkLen; ++j) {
+          target[outOffset + j] = asciiStr.slice(vo[j] - base, vo[j + 1] - base);
+        }
+      } else {
+        for (j = 0; j < chunkLen; ++j) {
+          bitIdx = chunkOff + j;
+          target[outOffset + j] = (nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))
+            ? asciiStr.slice(vo[j] - base, vo[j + 1] - base)
+            : null;
+        }
+      }
+    } else if (!nullBitmap) {
+      for (j = 0; j < chunkLen; ++j) {
+        target[outOffset + j] = utf8Decoder.decode(bytes.subarray(vo[j], vo[j + 1]));
+      }
+    } else {
+      for (j = 0; j < chunkLen; ++j) {
+        bitIdx = chunkOff + j;
+        target[outOffset + j] = (nullBitmap[bitIdx >>> 3] & (1 << (bitIdx & 7)))
+          ? utf8Decoder.decode(bytes.subarray(vo[j], vo[j + 1]))
+          : null;
+      }
+    }
+    outOffset += chunkLen;
+  }
+  return true;
 }
 function extractArrowNumericChunks(sourceColumn, length, mode) {
   if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
@@ -181,6 +371,9 @@ function extractArrowNumericChunks(sourceColumn, length, mode) {
   var typeId = sourceColumn.type && typeof sourceColumn.type.typeId === 'number'
     ? sourceColumn.type.typeId
     : (sourceColumn.data[0].type && sourceColumn.data[0].type.typeId);
+  if (typeId === 8 || typeId === 10) {
+    return extractArrowTemporalChunks(sourceColumn, length, mode);
+  }
   if (typeId !== 2 && typeId !== 3) {
     return null;
   }
@@ -384,6 +577,9 @@ function copyColumnValues(target, targetOffset, source, length) {
     return;
   }
   if (copyArrowDictionaryInto(target, targetOffset, source, length)) {
+    return;
+  }
+  if (copyArrowUtf8Into(target, targetOffset, source, length)) {
     return;
   }
   var sourceKind = resolveColumnAccessor(source);
@@ -596,11 +792,16 @@ function projectBatch(batch, projection) {
         columns[outputName] = values;
       }
     } else if (transform === 'boolean') {
-      values = new Array(length);
-      for (rowIndex = 0; rowIndex < length; ++rowIndex) {
-        values[rowIndex] = normalizeBooleanValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+      var fastBool = extractArrowBoolColumn(sourceColumn, length);
+      if (fastBool) {
+        columns[outputName] = fastBool;
+      } else {
+        values = new Array(length);
+        for (rowIndex = 0; rowIndex < length; ++rowIndex) {
+          values[rowIndex] = normalizeBooleanValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+        }
+        columns[outputName] = values;
       }
-      columns[outputName] = values;
     } else if (transform === 'constantOne') {
       values = new Float64Array(length);
       values.fill(1);
@@ -994,35 +1195,63 @@ async function loadProjectedBatchesFromSource(source) {
     sourceId: source.id
   };
 }
+function resolveArrowDictForLookup(column, length) {
+  if (!column || !Array.isArray(column.data) || !column.data.length) return null;
+  var chunks = column.data;
+  var total = 0;
+  for (var c = 0; c < chunks.length; ++c) {
+    var ch = chunks[c];
+    if (!ch || !ch.dictionary || typeof ch.dictionary.get !== 'function' || !ArrayBuffer.isView(ch.values) || ch.values.length < ch.length || !hasValidNullBitmap(ch)) {
+      return null;
+    }
+    total += ch.length;
+  }
+  return total === length ? chunks : null;
+}
 async function buildLookupIndexFromSource(source) {
   var arrow = self.Arrow;
   var RecordBatchReader = getRecordBatchReader(arrow);
   var sourceProgress = progress.sources[source.id];
   var reader = await RecordBatchReader.from(await getSourceInput(source));
   var index = new Map();
+  var keyFields = source.lookup.keyFields;
+  var singleKey = keyFields.length === 1;
   var valueFields = source.lookup.valueFields.slice();
-  var valueKinds = new Array(valueFields.length);
+  var valueCount = valueFields.length;
+  var valueKinds = new Array(valueCount);
 
   for await (var batch of reader) {
     reserveInput('rows', batch.numRows);
     var projected = projectBatch(batch, source.projection);
-    var keyKinds = new Array(source.lookup.keyFields.length);
-    for (var ki = 0; ki < source.lookup.keyFields.length; ++ki) {
-      keyKinds[ki] = resolveColumnAccessor(projected.columns[source.lookup.keyFields[ki]]);
+    var keyKinds = new Array(keyFields.length);
+    var keyCols = new Array(keyFields.length);
+    for (var ki = 0; ki < keyFields.length; ++ki) {
+      keyCols[ki] = projected.columns[keyFields[ki]];
+      keyKinds[ki] = resolveColumnAccessor(keyCols[ki]);
     }
-    var valKinds = new Array(valueFields.length);
-    for (var vi = 0; vi < valueFields.length; ++vi) {
-      valKinds[vi] = resolveColumnAccessor(projected.columns[valueFields[vi]]);
+    var valKinds = new Array(valueCount);
+    var valCols = new Array(valueCount);
+    for (var vi = 0; vi < valueCount; ++vi) {
+      valCols[vi] = projected.columns[valueFields[vi]];
+      valKinds[vi] = resolveColumnAccessor(valCols[vi]);
     }
 
+    var singleKeyCol = singleKey ? keyCols[0] : null;
+    var singleKeyKind = singleKey ? keyKinds[0] : null;
     for (var rowIndex = 0; rowIndex < projected.length; ++rowIndex) {
-      var key = buildLookupKeyResolved(projected.columns, source.lookup.keyFields, keyKinds, rowIndex);
+      var key;
+      if (singleKey) {
+        var rawK = singleKeyCol == null ? undefined : getValueByKind(singleKeyCol, rowIndex, singleKeyKind);
+        key = rawK == null ? '' : (typeof rawK === 'string' ? rawK : String(rawK));
+      } else {
+        key = buildLookupKeyResolved(projected.columns, keyFields, keyKinds, rowIndex);
+      }
       if (index.has(key)) {
         continue;
       }
-      var values = new Array(valueFields.length);
-      for (var valueIndex = 0; valueIndex < valueFields.length; ++valueIndex) {
-        var valCol = projected.columns[valueFields[valueIndex]];
+      var values = new Array(valueCount);
+      for (var valueIndex = 0; valueIndex < valueCount; ++valueIndex) {
+        var valCol = valCols[valueIndex];
         var fieldValue = valCol == null ? undefined : getValueByKind(valCol, rowIndex, valKinds[valueIndex]);
         values[valueIndex] = fieldValue;
         if (valueKinds[valueIndex] !== 'generic' && typeof fieldValue === 'number' && Number.isFinite(fieldValue)) {
@@ -1045,7 +1274,7 @@ async function buildLookupIndexFromSource(source) {
   return {
     id: source.id,
     index: index,
-    keyFields: source.lookup.keyFields.slice(),
+    keyFields: keyFields.slice(),
     valueFields: valueFields,
     valueKinds: valueKinds.map(function(kind) {
       return kind === 'number' ? 'number' : 'generic';
@@ -1066,33 +1295,89 @@ function applyLookupIndexes(baseBatches, lookupResults) {
 
     for (var lookupIndex = 0; lookupIndex < lookupResults.length; ++lookupIndex) {
       var lookup = lookupResults[lookupIndex];
-      var columnsByField = {};
+      var valueCount = lookup.valueFields.length;
+      var targetCols = new Array(valueCount);
 
-      for (var valueFieldIndex = 0; valueFieldIndex < lookup.valueFields.length; ++valueFieldIndex) {
+      for (var valueFieldIndex = 0; valueFieldIndex < valueCount; ++valueFieldIndex) {
         var valueField = lookup.valueFields[valueFieldIndex];
-        columnsByField[valueField] = allocateLookupColumn(batch.length, lookup.valueKinds[valueFieldIndex]);
+        targetCols[valueFieldIndex] = allocateLookupColumn(batch.length, lookup.valueKinds[valueFieldIndex]);
         if (batch.fields.indexOf(valueField) < 0) {
           batch.fields.push(valueField);
         }
       }
 
-      var lookupKeyKinds = new Array(lookup.keyFields.length);
-      for (var ki = 0; ki < lookup.keyFields.length; ++ki) {
-        lookupKeyKinds[ki] = resolveColumnAccessor(batch.columns[lookup.keyFields[ki]]);
+      var lookupIndexMap = lookup.index;
+      var singleKey = lookup.keyFields.length === 1;
+      var keyCol0 = singleKey ? batch.columns[lookup.keyFields[0]] : null;
+      var dictChunks = singleKey ? resolveArrowDictForLookup(keyCol0, batch.length) : null;
+      var rowIndex, fieldIndex, values;
+
+      if (dictChunks) {
+        var nullHit = lookupIndexMap.get('');
+        var outRow = 0;
+        for (var ci = 0; ci < dictChunks.length; ++ci) {
+          var ch = dictChunks[ci];
+          var dict = ch.dictionary;
+          var dictLen = dict.length;
+          var dictHits = new Array(dictLen);
+          for (var di = 0; di < dictLen; ++di) {
+            var dk = dict.get(di);
+            dictHits[di] = lookupIndexMap.get(dk == null ? '' : (typeof dk === 'string' ? dk : String(dk)));
+          }
+          var indices = ch.values;
+          var chLen = ch.length;
+          var nullBitmap = ch.nullCount > 0 ? ch.nullBitmap : null;
+          var chOff = typeof ch.offset === 'number' ? ch.offset : 0;
+          if (!nullBitmap) {
+            for (var j = 0; j < chLen; ++j) {
+              values = dictHits[indices[j]];
+              if (values) {
+                for (fieldIndex = 0; fieldIndex < valueCount; ++fieldIndex) {
+                  targetCols[fieldIndex][outRow] = values[fieldIndex];
+                }
+              }
+              ++outRow;
+            }
+          } else {
+            for (var j2 = 0; j2 < chLen; ++j2) {
+              var bIdx = chOff + j2;
+              values = (nullBitmap[bIdx >>> 3] & (1 << (bIdx & 7))) ? dictHits[indices[j2]] : nullHit;
+              if (values) {
+                for (fieldIndex = 0; fieldIndex < valueCount; ++fieldIndex) {
+                  targetCols[fieldIndex][outRow] = values[fieldIndex];
+                }
+              }
+              ++outRow;
+            }
+          }
+        }
+      } else if (singleKey) {
+        var keyKind0 = resolveColumnAccessor(keyCol0);
+        for (rowIndex = 0; rowIndex < batch.length; ++rowIndex) {
+          var rawKey = keyCol0 == null ? undefined : getValueByKind(keyCol0, rowIndex, keyKind0);
+          var keyStr = rawKey == null ? '' : (typeof rawKey === 'string' ? rawKey : String(rawKey));
+          values = lookupIndexMap.get(keyStr);
+          if (!values) continue;
+          for (fieldIndex = 0; fieldIndex < valueCount; ++fieldIndex) {
+            targetCols[fieldIndex][rowIndex] = values[fieldIndex];
+          }
+        }
+      } else {
+        var lookupKeyKinds = new Array(lookup.keyFields.length);
+        for (var ki = 0; ki < lookup.keyFields.length; ++ki) {
+          lookupKeyKinds[ki] = resolveColumnAccessor(batch.columns[lookup.keyFields[ki]]);
+        }
+        for (rowIndex = 0; rowIndex < batch.length; ++rowIndex) {
+          values = lookupIndexMap.get(buildLookupKeyResolved(batch.columns, lookup.keyFields, lookupKeyKinds, rowIndex));
+          if (!values) continue;
+          for (fieldIndex = 0; fieldIndex < valueCount; ++fieldIndex) {
+            targetCols[fieldIndex][rowIndex] = values[fieldIndex];
+          }
+        }
       }
 
-      for (var rowIndex = 0; rowIndex < batch.length; ++rowIndex) {
-        var values = lookup.index.get(buildLookupKeyResolved(batch.columns, lookup.keyFields, lookupKeyKinds, rowIndex));
-        if (!values) {
-          continue;
-        }
-        for (var fieldIndex = 0; fieldIndex < lookup.valueFields.length; ++fieldIndex) {
-          columnsByField[lookup.valueFields[fieldIndex]][rowIndex] = values[fieldIndex];
-        }
-      }
-
-      for (fieldIndex = 0; fieldIndex < lookup.valueFields.length; ++fieldIndex) {
-        batch.columns[lookup.valueFields[fieldIndex]] = columnsByField[lookup.valueFields[fieldIndex]];
+      for (fieldIndex = 0; fieldIndex < valueCount; ++fieldIndex) {
+        batch.columns[lookup.valueFields[fieldIndex]] = targetCols[fieldIndex];
       }
     }
   }

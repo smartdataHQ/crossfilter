@@ -573,11 +573,17 @@ function metricHasVisibleValue(metric, value) {
   return comparable != null && comparable > 0;
 }
 
+var groupKeyCollator = typeof Intl !== "undefined" && typeof Intl.Collator === "function"
+  ? new Intl.Collator()
+  : null;
+
 function compareGroupKeys(left, right) {
   if (left === right) {
     return 0;
   }
-  return String(left).localeCompare(String(right));
+  var leftText = String(left);
+  var rightText = String(right);
+  return groupKeyCollator ? groupKeyCollator.compare(leftText, rightText) : leftText.localeCompare(rightText);
 }
 
 function insertSortedEntry(entries, entry, compare, maxSize) {
@@ -676,6 +682,9 @@ function createGroupRuntime(dimension, spec, index) {
   var visibleMetricIndex = 0;
   var defaultSortMetric = null;
   var orderedMetricId = null;
+  var queryHeapVal = null;
+  var queryHeapSlot = null;
+  var queryHeapKey = null;
 
   group.reduce(reducer.add, reducer.remove, reducer.initial);
 
@@ -910,11 +919,11 @@ function createGroupRuntime(dimension, spec, index) {
     var sortPrim = (buffers && sortIdx >= 0) ? buffers.primary[sortIdx] : null;
     var sortSec = (buffers && sortIdx >= 0) ? buffers.secondary[sortIdx] : null;
     var sortOp = sortIdx >= 0 ? plan.ops[sortIdx] : OP_COUNT;
-    var splitSortNumeric = sortOp === OP_COUNT || sortOp === OP_SUM;
+    var modeCode = mode === "flat" ? 0 : (mode === "splitDense" ? 1 : 2);
 
     function isSlotVisible(slot) {
       if (!buffers) return false;
-      if (mode === "flat") {
+      if (modeCode === 0) {
         if (visOp === OP_COUNT || visOp === OP_SUM) {
           return visPrim[slot] > 0;
         }
@@ -927,7 +936,7 @@ function createGroupRuntime(dimension, spec, index) {
         return false;
       }
       var sum = 0;
-      if (mode === "splitDense") {
+      if (modeCode === 1) {
         var base = slot * stride;
         for (var sc = 0; sc < stride; ++sc) {
           sum += visPrim[base + sc];
@@ -942,7 +951,7 @@ function createGroupRuntime(dimension, spec, index) {
 
     function readSortComparable(slot) {
       if (!sortPrim) return 0;
-      if (mode === "flat") {
+      if (modeCode === 0) {
         if (sortOp === OP_COUNT || sortOp === OP_SUM) {
           return sortPrim[slot];
         }
@@ -956,11 +965,8 @@ function createGroupRuntime(dimension, spec, index) {
         }
         return 0;
       }
-      if (!splitSortNumeric) {
-        return 0;
-      }
       var sum = 0;
-      if (mode === "splitDense") {
+      if (modeCode === 1) {
         var base = slot * stride;
         for (var sc = 0; sc < stride; ++sc) {
           sum += sortPrim[base + sc];
@@ -976,9 +982,16 @@ function createGroupRuntime(dimension, spec, index) {
     var total = 0;
     var forcedItems = includeKeySet ? [] : null;
     var matchedItems = useHeap ? null : [];
-    var heapVal = useHeap ? new Float64Array(limitWindow) : null;
-    var heapSlot = useHeap ? new Uint32Array(limitWindow) : null;
-    var heapKey = useHeap ? new Array(limitWindow) : null;
+    if (useHeap && (!queryHeapVal || queryHeapVal.length < limitWindow)) {
+      var nextHeapCap = queryHeapVal && queryHeapVal.length ? queryHeapVal.length : 32;
+      while (nextHeapCap < limitWindow) nextHeapCap <<= 1;
+      queryHeapVal = new Float64Array(nextHeapCap);
+      queryHeapSlot = new Uint32Array(nextHeapCap);
+      queryHeapKey = new Array(nextHeapCap);
+    }
+    var heapVal = useHeap ? queryHeapVal : null;
+    var heapSlot = useHeap ? queryHeapSlot : null;
+    var heapKey = useHeap ? queryHeapKey : null;
     var heapSize = 0;
     var canBreakNatural = isNatural && limitWindow != null && !normalized.includeTotals && !includeKeySet;
 
@@ -1277,6 +1290,9 @@ function createGroupRuntime(dimension, spec, index) {
 
   return {
     dispose: function() {
+      queryHeapVal = null;
+      queryHeapSlot = null;
+      queryHeapKey = null;
       group.dispose();
     },
     id: spec.id || "group_" + index,
@@ -1555,6 +1571,9 @@ export function createDashboardRuntime(crossfilter, options) {
       rows = normalized.direction === "bottom"
         ? dimension.bottom(normalized.limit, normalized.offset)
         : dimension.top(normalized.limit, normalized.offset);
+    } else if (typeof cf._filteredIndexesSlice === "function" && typeof cf._materializeRowsByIndex === "function") {
+      var pageIndexes = cf._filteredIndexesSlice(normalized.offset, normalized.limit);
+      return cf._materializeRowsByIndex(pageIndexes, normalized.fields);
     } else {
       var allRows = typeof cf.allFiltered === "function" ? cf.allFiltered() : cf.all();
       rows = allRows.slice(normalized.offset, normalized.offset + normalized.limit);
@@ -1714,9 +1733,11 @@ export function createDashboardRuntime(crossfilter, options) {
 
   function removeFiltered(selection) {
     if (selection === "excluded") {
-      cf.remove(function(_, index) {
+      var isExcluded = function(_, index) {
         return typeof cf.isElementFiltered === "function" ? !cf.isElementFiltered(index) : false;
-      });
+      };
+      isExcluded._xfilterIndexOnly = true;
+      cf.remove(isExcluded);
     } else {
       cf.remove();
     }
