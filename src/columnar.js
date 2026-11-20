@@ -14,6 +14,9 @@ export function getColumnAccessor(column) {
   if (column == null) {
     return function() { return undefined; };
   }
+  if (Array.isArray(column) || ArrayBuffer.isView(column)) {
+    return function(index) { return column[index]; };
+  }
   if (typeof column.get === "function") {
     return function(index) { return column.get(index); };
   }
@@ -26,6 +29,9 @@ export function getColumnAccessor(column) {
 export function getColumnValue(column, index) {
   if (column == null) {
     return undefined;
+  }
+  if (Array.isArray(column) || ArrayBuffer.isView(column)) {
+    return column[index];
   }
   if (typeof column.get === "function") {
     return column.get(index);

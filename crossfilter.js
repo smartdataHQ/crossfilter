@@ -1,4 +1,4 @@
-// https://github.com/smartdataHQ/crossfilter v3.0.3 Copyright 2026 Mike Bostock
+// https://github.com/smartdataHQ/crossfilter v3.1.0 Copyright 2026 Mike Bostock
 (function (global, factory) {
   typeof exports === 'object' && typeof module !== 'undefined' ? module.exports = factory() :
   typeof define === 'function' && define.amd ? define(factory) :
@@ -585,6 +585,9 @@
     if (column == null) {
       return function() { return undefined; };
     }
+    if (Array.isArray(column) || ArrayBuffer.isView(column)) {
+      return function(index) { return column[index]; };
+    }
     if (typeof column.get === "function") {
       return function(index) { return column.get(index); };
     }
@@ -597,6 +600,9 @@
   function getColumnValue(column, index) {
     if (column == null) {
       return undefined;
+    }
+    if (Array.isArray(column) || ArrayBuffer.isView(column)) {
+      return column[index];
     }
     if (typeof column.get === "function") {
       return column.get(index);
@@ -1010,6 +1016,9 @@
       cachedTargets: null,
       cachedTargetsLength: 0,
       cachedTargetsOffset: 0,
+      lastMarkPtr: -1,
+      lastMarkMax: -1,
+      marksDirty: false,
       filterInU32: instance.exports.filterInU32,
       markFilterInU32: instance.exports.markFilterInU32,
       memory: instance.exports.memory,
@@ -1034,6 +1043,7 @@
         this.cachedTargets = null;
         this.cachedTargetsLength = 0;
         this.cachedTargetsOffset = 0;
+        this.marksDirty = true;
 
         return this.memory.buffer;
       },
@@ -1064,6 +1074,7 @@
 
         this.syncCodes(buffer, codes);
         this.syncTargets(buffer, targetCodes, dataBytes);
+        this.marksDirty = true;
 
         var count = this.filterInU32(0, codes.length, dataBytes, targetCodes.length, outPtr);
         // SAFETY: returned view is only valid until next matchSmall/matchMarked call
@@ -1081,8 +1092,12 @@
         this.syncCodes(buffer, codes);
         this.syncTargets(buffer, targetCodes, dataBytes);
 
-        // Zero marks region — it may contain stale data from prior matchSmall output
-        new Uint32Array(buffer, markPtr, maxTargetCode + 1).fill(0);
+        if (this.marksDirty || this.lastMarkPtr !== markPtr || maxTargetCode > this.lastMarkMax) {
+          new Uint32Array(buffer, markPtr, maxTargetCode + 1).fill(0);
+          this.marksDirty = false;
+          this.lastMarkPtr = markPtr;
+          this.lastMarkMax = maxTargetCode;
+        }
 
         var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
         // SAFETY: returned view is only valid until next matchSmall/matchMarked call
@@ -1147,7 +1162,7 @@
     return state.scratch;
   }
 
-  function denseLookupMatches(codes, targetCodes, state) {
+  function denseLookupMatches(codes, targetCodes, state, maxCodeHint) {
     var matches = ensureScratchCapacity(state, codes.length);
     var count = 0;
     var i;
@@ -1169,7 +1184,11 @@
       }
     }
 
-    ensureDenseLookupCapacity(state, maxTargetCode + 1);
+    var requiredMarks = maxTargetCode + 1;
+    if (typeof maxCodeHint === 'number' && maxCodeHint + 1 > requiredMarks && (maxCodeHint + 1) * 4 <= MAX_WASM_MARK_BYTES) {
+      requiredMarks = maxCodeHint + 1;
+    }
+    ensureDenseLookupCapacity(state, requiredMarks);
     if (state.version === 0xffffffff) {
       state.marks.fill(0);
       state.version = 1;
@@ -1177,13 +1196,15 @@
 
     var version = state.version++;
     var marks = state.marks;
+    var marksLen = marks.length;
 
     for (i = 0; i < targetCodes.length; ++i) {
       marks[targetCodes[i]] = version;
     }
 
     for (i = 0; i < codes.length; ++i) {
-      if (marks[codes[i]] === version) {
+      var code = codes[i];
+      if (code < marksLen && marks[code] === version) {
         matches[count++] = i;
       }
     }
@@ -1226,7 +1247,7 @@
       return !!getSharedRuntime(enabled);
     }
 
-    function findMatches(codes, targetCodes) {
+    function findMatches(codes, targetCodes, maxCodeHint) {
       if (!targetCodes.length) {
         return new Uint32Array(0);
       }
@@ -1249,7 +1270,12 @@
       }
 
       if (runtime) {
-        maxTargetCode = Math.max(maxCodeValue(targetCodes), maxCodeValue(codes));
+        if (targetCodes.length === 1 && (runtime.cachedCodes !== codes || runtime.cachedCodesLength !== codes.length)) {
+          return denseLookupMatches(codes, targetCodes, denseLookupState, maxCodeHint);
+        }
+        maxTargetCode = typeof maxCodeHint === 'number' && maxCodeHint >= 0
+          ? Math.max(maxCodeValue(targetCodes), maxCodeHint)
+          : Math.max(maxCodeValue(targetCodes), maxCodeValue(codes));
         if ((maxTargetCode + 1) * 4 <= MAX_WASM_MARK_BYTES) {
           try {
             return runtime.matchMarked(codes, targetCodes, maxTargetCode);
@@ -1260,7 +1286,7 @@
         }
       }
 
-      return denseLookupMatches(codes, targetCodes, denseLookupState);
+      return denseLookupMatches(codes, targetCodes, denseLookupState, maxCodeHint);
     }
 
     return {
@@ -1282,6 +1308,1066 @@
 
   function getWasmRuntimeInfo() {
     return defaultRuntimeController.runtimeInfo();
+  }
+
+  var OP_COUNT = 0;
+  var OP_SUM = 1;
+  var OP_AVG = 2;
+  var OP_AVG_NON_ZERO = 3;
+  var OP_RATIO = 4;
+
+  function compileMetricPlan(metricSpec) {
+    var count = metricSpec.length;
+    var ops = new Uint8Array(count);
+    var ids = new Array(count);
+    var fields = new Array(count);
+    var denominators = new Array(count);
+    var hidden = new Uint8Array(count);
+    var firstCountIndex = -1;
+    var i, metric, op;
+
+    for (i = 0; i < count; ++i) {
+      metric = metricSpec[i];
+      ids[i] = metric.id;
+      fields[i] = metric.field || null;
+      denominators[i] = metric.denominator || null;
+      hidden[i] = metric.hidden ? 1 : 0;
+      switch (metric.op) {
+        case 'count':
+          op = OP_COUNT;
+          if (firstCountIndex < 0) firstCountIndex = i;
+          break;
+        case 'sum':
+          op = OP_SUM;
+          break;
+        case 'avg':
+          op = OP_AVG;
+          break;
+        case 'avgNonZero':
+          op = OP_AVG_NON_ZERO;
+          break;
+        case 'ratio':
+          op = OP_RATIO;
+          break;
+        default:
+          op = OP_COUNT;
+      }
+      ops[i] = op;
+    }
+
+    return {
+      count: count,
+      denominators: denominators,
+      fields: fields,
+      firstCountIndex: firstCountIndex,
+      hidden: hidden,
+      ids: ids,
+      ops: ops,
+      spec: metricSpec
+    };
+  }
+
+  function ensureMetricBuffers(buffers, plan, required, preserve) {
+    var count = plan.count;
+    var ops = plan.ops;
+    var i, nextCap, nextPrimary, nextSecondary, copyLen;
+
+    if (buffers && buffers.capacity >= required) {
+      return buffers;
+    }
+
+    if (buffers && buffers.capacity > 0) {
+      nextCap = buffers.capacity;
+      while (nextCap < required) {
+        nextCap = nextCap < 65536 ? nextCap * 2 : required;
+      }
+    } else {
+      nextCap = required < 64 ? 64 : required;
+    }
+
+    var primary = new Array(count);
+    var secondary = new Array(count);
+    copyLen = preserve && buffers ? buffers.capacity : 0;
+
+    for (i = 0; i < count; ++i) {
+      nextPrimary = new Float64Array(nextCap);
+      if (copyLen > 0) {
+        nextPrimary.set(buffers.primary[i].subarray(0, copyLen));
+      }
+      primary[i] = nextPrimary;
+
+      if (ops[i] === OP_AVG || ops[i] === OP_AVG_NON_ZERO || ops[i] === OP_RATIO) {
+        nextSecondary = new Float64Array(nextCap);
+        if (copyLen > 0) {
+          nextSecondary.set(buffers.secondary[i].subarray(0, copyLen));
+        }
+        secondary[i] = nextSecondary;
+      } else {
+        secondary[i] = null;
+      }
+    }
+
+    return {
+      capacity: nextCap,
+      primary: primary,
+      secondary: secondary
+    };
+  }
+
+  function zeroMetricBuffers(buffers, slotCount) {
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var i;
+    for (i = 0; i < primary.length; ++i) {
+      primary[i].fill(0, 0, slotCount);
+      if (secondary[i]) {
+        secondary[i].fill(0, 0, slotCount);
+      }
+    }
+  }
+
+  function reduceGroupedAll(buffers, plan, getNumericColumn, groupIds, n, slotCount) {
+    var ops = plan.ops;
+    var fields = plan.fields;
+    var denominators = plan.denominators;
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var metricCount = plan.count;
+    var firstCountIndex = plan.firstCountIndex;
+    var countComputed = false;
+    var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, i, v, v2, g;
+
+    // Compute first count metric up front so non-NaN avg metrics can copy counts directly.
+    if (firstCountIndex >= 0) {
+      acc = primary[firstCountIndex];
+      for (i = 0; i < n; ++i) {
+        acc[groupIds[i]] += 1;
+      }
+      countComputed = true;
+    }
+
+    for (m = 0; m < metricCount; ++m) {
+      op = ops[m];
+      acc = primary[m];
+
+      if (op === OP_COUNT) {
+        if (m === firstCountIndex) continue;
+        if (countComputed) {
+          acc.set(primary[firstCountIndex].subarray(0, slotCount));
+        } else {
+          for (i = 0; i < n; ++i) {
+            acc[groupIds[i]] += 1;
+          }
+        }
+        continue;
+      }
+
+      col = getNumericColumn(fields[m]);
+      vals = col.values;
+      hasNaN = col.hasNaN;
+
+      if (op === OP_SUM) {
+        if (!hasNaN) {
+          for (i = 0; i < n; ++i) {
+            acc[groupIds[i]] += vals[i];
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v) {
+              acc[groupIds[i]] += v;
+            }
+          }
+        }
+      } else if (op === OP_AVG) {
+        acc2 = secondary[m];
+        if (!hasNaN) {
+          if (countComputed) {
+            for (i = 0; i < n; ++i) {
+              acc[groupIds[i]] += vals[i];
+            }
+            acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+          } else {
+            for (i = 0; i < n; ++i) {
+              g = groupIds[i];
+              acc[g] += vals[i];
+              acc2[g] += 1;
+            }
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v) {
+              g = groupIds[i];
+              acc[g] += v;
+              acc2[g] += 1;
+            }
+          }
+        }
+      } else if (op === OP_AVG_NON_ZERO) {
+        acc2 = secondary[m];
+        if (!hasNaN) {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v !== 0) {
+              g = groupIds[i];
+              acc[g] += v;
+              acc2[g] += 1;
+            }
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v && v !== 0) {
+              g = groupIds[i];
+              acc[g] += v;
+              acc2[g] += 1;
+            }
+          }
+        }
+      } else if (op === OP_RATIO) {
+        acc2 = secondary[m];
+        col2 = getNumericColumn(denominators[m]);
+        vals2 = col2.values;
+        hasNaN2 = col2.hasNaN;
+        if (!hasNaN && !hasNaN2) {
+          for (i = 0; i < n; ++i) {
+            g = groupIds[i];
+            acc[g] += vals[i];
+            acc2[g] += vals2[i];
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            g = groupIds[i];
+            v = vals[i];
+            if (v === v) acc[g] += v;
+            v2 = vals2[i];
+            if (v2 === v2) acc2[g] += v2;
+          }
+        }
+      }
+    }
+  }
+
+  function reduceGroupedIndexed(buffers, plan, getNumericColumn, groupIds, rowIndexes, rowCount, delta, slotCount) {
+    if (!rowCount) return;
+
+    var ops = plan.ops;
+    var fields = plan.fields;
+    var denominators = plan.denominators;
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var metricCount = plan.count;
+    var firstCountIndex = plan.firstCountIndex;
+    var add = delta > 0;
+    var canShareCount = add && slotCount > 0 && firstCountIndex >= 0;
+    var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, j, idx, v, v2, g;
+
+    if (canShareCount) {
+      acc = primary[firstCountIndex];
+      for (j = 0; j < rowCount; ++j) {
+        acc[groupIds[rowIndexes[j]]] += 1;
+      }
+    }
+
+    for (m = 0; m < metricCount; ++m) {
+      op = ops[m];
+      acc = primary[m];
+
+      if (op === OP_COUNT) {
+        if (canShareCount) {
+          if (m === firstCountIndex) continue;
+          acc.set(primary[firstCountIndex].subarray(0, slotCount));
+        } else if (add) {
+          for (j = 0; j < rowCount; ++j) {
+            acc[groupIds[rowIndexes[j]]] += 1;
+          }
+        } else {
+          for (j = 0; j < rowCount; ++j) {
+            acc[groupIds[rowIndexes[j]]] -= 1;
+          }
+        }
+        continue;
+      }
+
+      col = getNumericColumn(fields[m]);
+      vals = col.values;
+      hasNaN = col.hasNaN;
+
+      if (op === OP_SUM) {
+        if (add) {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              acc[groupIds[idx]] += vals[idx];
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v) acc[groupIds[idx]] += v;
+            }
+          }
+        } else {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              acc[groupIds[idx]] -= vals[idx];
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v) acc[groupIds[idx]] -= v;
+            }
+          }
+        }
+      } else if (op === OP_AVG) {
+        acc2 = secondary[m];
+        if (add) {
+          if (!hasNaN) {
+            if (canShareCount) {
+              for (j = 0; j < rowCount; ++j) {
+                idx = rowIndexes[j];
+                acc[groupIds[idx]] += vals[idx];
+              }
+              acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+            } else {
+              for (j = 0; j < rowCount; ++j) {
+                idx = rowIndexes[j];
+                g = groupIds[idx];
+                acc[g] += vals[idx];
+                acc2[g] += 1;
+              }
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v) {
+                g = groupIds[idx];
+                acc[g] += v;
+                acc2[g] += 1;
+              }
+            }
+          }
+        } else {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              g = groupIds[idx];
+              acc[g] -= vals[idx];
+              acc2[g] -= 1;
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v) {
+                g = groupIds[idx];
+                acc[g] -= v;
+                acc2[g] -= 1;
+              }
+            }
+          }
+        }
+      } else if (op === OP_AVG_NON_ZERO) {
+        acc2 = secondary[m];
+        if (add) {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v !== 0) {
+                g = groupIds[idx];
+                acc[g] += v;
+                acc2[g] += 1;
+              }
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v && v !== 0) {
+                g = groupIds[idx];
+                acc[g] += v;
+                acc2[g] += 1;
+              }
+            }
+          }
+        } else {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v !== 0) {
+                g = groupIds[idx];
+                acc[g] -= v;
+                acc2[g] -= 1;
+              }
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v && v !== 0) {
+                g = groupIds[idx];
+                acc[g] -= v;
+                acc2[g] -= 1;
+              }
+            }
+          }
+        }
+      } else if (op === OP_RATIO) {
+        acc2 = secondary[m];
+        col2 = getNumericColumn(denominators[m]);
+        vals2 = col2.values;
+        hasNaN2 = col2.hasNaN;
+        if (add) {
+          if (!hasNaN && !hasNaN2) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              g = groupIds[idx];
+              acc[g] += vals[idx];
+              acc2[g] += vals2[idx];
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              g = groupIds[idx];
+              v = vals[idx];
+              if (v === v) acc[g] += v;
+              v2 = vals2[idx];
+              if (v2 === v2) acc2[g] += v2;
+            }
+          }
+        } else {
+          if (!hasNaN && !hasNaN2) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              g = groupIds[idx];
+              acc[g] -= vals[idx];
+              acc2[g] -= vals2[idx];
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              g = groupIds[idx];
+              v = vals[idx];
+              if (v === v) acc[g] -= v;
+              v2 = vals2[idx];
+              if (v2 === v2) acc2[g] -= v2;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  function reduceSplitDenseAll(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, n, slotCount) {
+    var ops = plan.ops;
+    var fields = plan.fields;
+    var denominators = plan.denominators;
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var metricCount = plan.count;
+    var firstCountIndex = plan.firstCountIndex;
+    var countComputed = false;
+    var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, i, v, v2, cell;
+
+    if (firstCountIndex >= 0) {
+      acc = primary[firstCountIndex];
+      for (i = 0; i < n; ++i) {
+        acc[groupIds[i] * stride + splitCodes[i]] += 1;
+      }
+      countComputed = true;
+    }
+
+    for (m = 0; m < metricCount; ++m) {
+      op = ops[m];
+      acc = primary[m];
+
+      if (op === OP_COUNT) {
+        if (m === firstCountIndex) continue;
+        if (countComputed) {
+          acc.set(primary[firstCountIndex].subarray(0, slotCount));
+        } else {
+          for (i = 0; i < n; ++i) {
+            acc[groupIds[i] * stride + splitCodes[i]] += 1;
+          }
+        }
+        continue;
+      }
+
+      col = getNumericColumn(fields[m]);
+      vals = col.values;
+      hasNaN = col.hasNaN;
+
+      if (op === OP_SUM) {
+        if (!hasNaN) {
+          for (i = 0; i < n; ++i) {
+            acc[groupIds[i] * stride + splitCodes[i]] += vals[i];
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v) {
+              acc[groupIds[i] * stride + splitCodes[i]] += v;
+            }
+          }
+        }
+      } else if (op === OP_AVG) {
+        acc2 = secondary[m];
+        if (!hasNaN) {
+          if (countComputed) {
+            for (i = 0; i < n; ++i) {
+              acc[groupIds[i] * stride + splitCodes[i]] += vals[i];
+            }
+            acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+          } else {
+            for (i = 0; i < n; ++i) {
+              cell = groupIds[i] * stride + splitCodes[i];
+              acc[cell] += vals[i];
+              acc2[cell] += 1;
+            }
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v) {
+              cell = groupIds[i] * stride + splitCodes[i];
+              acc[cell] += v;
+              acc2[cell] += 1;
+            }
+          }
+        }
+      } else if (op === OP_AVG_NON_ZERO) {
+        acc2 = secondary[m];
+        if (!hasNaN) {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v !== 0) {
+              cell = groupIds[i] * stride + splitCodes[i];
+              acc[cell] += v;
+              acc2[cell] += 1;
+            }
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v && v !== 0) {
+              cell = groupIds[i] * stride + splitCodes[i];
+              acc[cell] += v;
+              acc2[cell] += 1;
+            }
+          }
+        }
+      } else if (op === OP_RATIO) {
+        acc2 = secondary[m];
+        col2 = getNumericColumn(denominators[m]);
+        vals2 = col2.values;
+        hasNaN2 = col2.hasNaN;
+        if (!hasNaN && !hasNaN2) {
+          for (i = 0; i < n; ++i) {
+            cell = groupIds[i] * stride + splitCodes[i];
+            acc[cell] += vals[i];
+            acc2[cell] += vals2[i];
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            cell = groupIds[i] * stride + splitCodes[i];
+            v = vals[i];
+            if (v === v) acc[cell] += v;
+            v2 = vals2[i];
+            if (v2 === v2) acc2[cell] += v2;
+          }
+        }
+      }
+    }
+  }
+
+  function reduceSplitDenseIndexed(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, rowIndexes, rowCount, delta, slotCount) {
+    if (!rowCount) return;
+
+    var ops = plan.ops;
+    var fields = plan.fields;
+    var denominators = plan.denominators;
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var metricCount = plan.count;
+    var firstCountIndex = plan.firstCountIndex;
+    var add = delta > 0;
+    var canShareCount = add && slotCount > 0 && firstCountIndex >= 0;
+    var m, op, acc, acc2, col, col2, vals, vals2, hasNaN, hasNaN2, j, idx, v, v2, cell;
+
+    if (canShareCount) {
+      acc = primary[firstCountIndex];
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
+      }
+    }
+
+    for (m = 0; m < metricCount; ++m) {
+      op = ops[m];
+      acc = primary[m];
+
+      if (op === OP_COUNT) {
+        if (canShareCount) {
+          if (m === firstCountIndex) continue;
+          acc.set(primary[firstCountIndex].subarray(0, slotCount));
+        } else if (add) {
+          for (j = 0; j < rowCount; ++j) {
+            idx = rowIndexes[j];
+            acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
+          }
+        } else {
+          for (j = 0; j < rowCount; ++j) {
+            idx = rowIndexes[j];
+            acc[groupIds[idx] * stride + splitCodes[idx]] -= 1;
+          }
+        }
+        continue;
+      }
+
+      col = getNumericColumn(fields[m]);
+      vals = col.values;
+      hasNaN = col.hasNaN;
+
+      if (op === OP_SUM) {
+        if (add) {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              acc[groupIds[idx] * stride + splitCodes[idx]] += vals[idx];
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] += v;
+            }
+          }
+        } else {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              acc[groupIds[idx] * stride + splitCodes[idx]] -= vals[idx];
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] -= v;
+            }
+          }
+        }
+      } else if (op === OP_AVG) {
+        acc2 = secondary[m];
+        if (add) {
+          if (!hasNaN) {
+            if (canShareCount) {
+              for (j = 0; j < rowCount; ++j) {
+                idx = rowIndexes[j];
+                acc[groupIds[idx] * stride + splitCodes[idx]] += vals[idx];
+              }
+              acc2.set(primary[firstCountIndex].subarray(0, slotCount));
+            } else {
+              for (j = 0; j < rowCount; ++j) {
+                idx = rowIndexes[j];
+                cell = groupIds[idx] * stride + splitCodes[idx];
+                acc[cell] += vals[idx];
+                acc2[cell] += 1;
+              }
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v) {
+                cell = groupIds[idx] * stride + splitCodes[idx];
+                acc[cell] += v;
+                acc2[cell] += 1;
+              }
+            }
+          }
+        } else {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              cell = groupIds[idx] * stride + splitCodes[idx];
+              acc[cell] -= vals[idx];
+              acc2[cell] -= 1;
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v) {
+                cell = groupIds[idx] * stride + splitCodes[idx];
+                acc[cell] -= v;
+                acc2[cell] -= 1;
+              }
+            }
+          }
+        }
+      } else if (op === OP_AVG_NON_ZERO) {
+        acc2 = secondary[m];
+        if (add) {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v !== 0) {
+                cell = groupIds[idx] * stride + splitCodes[idx];
+                acc[cell] += v;
+                acc2[cell] += 1;
+              }
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v && v !== 0) {
+                cell = groupIds[idx] * stride + splitCodes[idx];
+                acc[cell] += v;
+                acc2[cell] += 1;
+              }
+            }
+          }
+        } else {
+          if (!hasNaN) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v !== 0) {
+                cell = groupIds[idx] * stride + splitCodes[idx];
+                acc[cell] -= v;
+                acc2[cell] -= 1;
+              }
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              v = vals[idx];
+              if (v === v && v !== 0) {
+                cell = groupIds[idx] * stride + splitCodes[idx];
+                acc[cell] -= v;
+                acc2[cell] -= 1;
+              }
+            }
+          }
+        }
+      } else if (op === OP_RATIO) {
+        acc2 = secondary[m];
+        col2 = getNumericColumn(denominators[m]);
+        vals2 = col2.values;
+        hasNaN2 = col2.hasNaN;
+        if (add) {
+          if (!hasNaN && !hasNaN2) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              cell = groupIds[idx] * stride + splitCodes[idx];
+              acc[cell] += vals[idx];
+              acc2[cell] += vals2[idx];
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              cell = groupIds[idx] * stride + splitCodes[idx];
+              v = vals[idx];
+              if (v === v) acc[cell] += v;
+              v2 = vals2[idx];
+              if (v2 === v2) acc2[cell] += v2;
+            }
+          }
+        } else {
+          if (!hasNaN && !hasNaN2) {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              cell = groupIds[idx] * stride + splitCodes[idx];
+              acc[cell] -= vals[idx];
+              acc2[cell] -= vals2[idx];
+            }
+          } else {
+            for (j = 0; j < rowCount; ++j) {
+              idx = rowIndexes[j];
+              cell = groupIds[idx] * stride + splitCodes[idx];
+              v = vals[idx];
+              if (v === v) acc[cell] -= v;
+              v2 = vals2[idx];
+              if (v2 === v2) acc2[cell] -= v2;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  function reduceScalarAll(buffers, plan, getNumericColumn, n) {
+    var ops = plan.ops;
+    var fields = plan.fields;
+    var denominators = plan.denominators;
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var metricCount = plan.count;
+    var m, op, col, col2, vals, vals2, hasNaN, hasNaN2, i, v, v2, s, s2;
+
+    for (m = 0; m < metricCount; ++m) {
+      op = ops[m];
+      if (op === OP_COUNT) {
+        primary[m][0] += n;
+        continue;
+      }
+
+      col = getNumericColumn(fields[m]);
+      vals = col.values;
+      hasNaN = col.hasNaN;
+      s = 0;
+      s2 = 0;
+
+      if (op === OP_SUM) {
+        if (!hasNaN) {
+          for (i = 0; i < n; ++i) s += vals[i];
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v) s += v;
+          }
+        }
+        primary[m][0] += s;
+      } else if (op === OP_AVG) {
+        if (!hasNaN) {
+          for (i = 0; i < n; ++i) s += vals[i];
+          s2 = n;
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v) {
+              s += v;
+              s2 += 1;
+            }
+          }
+        }
+        primary[m][0] += s;
+        secondary[m][0] += s2;
+      } else if (op === OP_AVG_NON_ZERO) {
+        if (!hasNaN) {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v !== 0) {
+              s += v;
+              s2 += 1;
+            }
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v && v !== 0) {
+              s += v;
+              s2 += 1;
+            }
+          }
+        }
+        primary[m][0] += s;
+        secondary[m][0] += s2;
+      } else if (op === OP_RATIO) {
+        col2 = getNumericColumn(denominators[m]);
+        vals2 = col2.values;
+        hasNaN2 = col2.hasNaN;
+        if (!hasNaN && !hasNaN2) {
+          for (i = 0; i < n; ++i) {
+            s += vals[i];
+            s2 += vals2[i];
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            v = vals[i];
+            if (v === v) s += v;
+            v2 = vals2[i];
+            if (v2 === v2) s2 += v2;
+          }
+        }
+        primary[m][0] += s;
+        secondary[m][0] += s2;
+      }
+    }
+  }
+
+  function reduceScalarIndexed(buffers, plan, getNumericColumn, rowIndexes, rowCount, delta) {
+    if (!rowCount) return;
+
+    var ops = plan.ops;
+    var fields = plan.fields;
+    var denominators = plan.denominators;
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var metricCount = plan.count;
+    var sign = delta > 0 ? 1 : -1;
+    var m, op, col, col2, vals, vals2, hasNaN, hasNaN2, j, idx, v, v2, s, s2;
+
+    for (m = 0; m < metricCount; ++m) {
+      op = ops[m];
+      if (op === OP_COUNT) {
+        primary[m][0] += sign * rowCount;
+        continue;
+      }
+
+      col = getNumericColumn(fields[m]);
+      vals = col.values;
+      hasNaN = col.hasNaN;
+      s = 0;
+      s2 = 0;
+
+      if (op === OP_SUM) {
+        if (!hasNaN) {
+          for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
+        } else {
+          for (j = 0; j < rowCount; ++j) {
+            v = vals[rowIndexes[j]];
+            if (v === v) s += v;
+          }
+        }
+        primary[m][0] += sign * s;
+      } else if (op === OP_AVG) {
+        if (!hasNaN) {
+          for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
+          s2 = rowCount;
+        } else {
+          for (j = 0; j < rowCount; ++j) {
+            v = vals[rowIndexes[j]];
+            if (v === v) {
+              s += v;
+              s2 += 1;
+            }
+          }
+        }
+        primary[m][0] += sign * s;
+        secondary[m][0] += sign * s2;
+      } else if (op === OP_AVG_NON_ZERO) {
+        if (!hasNaN) {
+          for (j = 0; j < rowCount; ++j) {
+            v = vals[rowIndexes[j]];
+            if (v !== 0) {
+              s += v;
+              s2 += 1;
+            }
+          }
+        } else {
+          for (j = 0; j < rowCount; ++j) {
+            v = vals[rowIndexes[j]];
+            if (v === v && v !== 0) {
+              s += v;
+              s2 += 1;
+            }
+          }
+        }
+        primary[m][0] += sign * s;
+        secondary[m][0] += sign * s2;
+      } else if (op === OP_RATIO) {
+        col2 = getNumericColumn(denominators[m]);
+        vals2 = col2.values;
+        hasNaN2 = col2.hasNaN;
+        if (!hasNaN && !hasNaN2) {
+          for (j = 0; j < rowCount; ++j) {
+            idx = rowIndexes[j];
+            s += vals[idx];
+            s2 += vals2[idx];
+          }
+        } else {
+          for (j = 0; j < rowCount; ++j) {
+            idx = rowIndexes[j];
+            v = vals[idx];
+            if (v === v) s += v;
+            v2 = vals2[idx];
+            if (v2 === v2) s2 += v2;
+          }
+        }
+        primary[m][0] += sign * s;
+        secondary[m][0] += sign * s2;
+      }
+    }
+  }
+
+  function writeMetricSlotToState(state, plan, buffers, slot) {
+    var ops = plan.ops;
+    var ids = plan.ids;
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var m, op, id, sub;
+
+    for (m = 0; m < plan.count; ++m) {
+      op = ops[m];
+      id = ids[m];
+      if (op === OP_AVG || op === OP_AVG_NON_ZERO) {
+        sub = state[id];
+        if (!sub) {
+          state[id] = { count: secondary[m][slot], sum: primary[m][slot] };
+        } else {
+          sub.sum = primary[m][slot];
+          sub.count = secondary[m][slot];
+        }
+      } else if (op === OP_RATIO) {
+        sub = state[id];
+        if (!sub) {
+          state[id] = { den: secondary[m][slot], num: primary[m][slot] };
+        } else {
+          sub.num = primary[m][slot];
+          sub.den = secondary[m][slot];
+        }
+      } else {
+        state[id] = primary[m][slot];
+      }
+    }
+    if (state.__version !== undefined) {
+      state.__version += 1;
+    }
+  }
+
+  function finalizeMetricSlot(plan, buffers, slot) {
+    var ops = plan.ops;
+    var ids = plan.ids;
+    var hidden = plan.hidden;
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var result = {};
+    var m, op, denom;
+
+    for (m = 0; m < plan.count; ++m) {
+      if (hidden[m]) continue;
+      op = ops[m];
+      if (op === OP_AVG || op === OP_AVG_NON_ZERO) {
+        denom = secondary[m][slot];
+        result[ids[m]] = denom ? primary[m][slot] / denom : null;
+      } else if (op === OP_RATIO) {
+        denom = secondary[m][slot];
+        result[ids[m]] = denom !== 0 ? primary[m][slot] / denom : null;
+      } else {
+        result[ids[m]] = primary[m][slot];
+      }
+    }
+    return result;
+  }
+
+  function slotHasAnyActivity(plan, buffers, slot) {
+    var ops = plan.ops;
+    var primary = buffers.primary;
+    var secondary = buffers.secondary;
+    var m, op;
+
+    for (m = 0; m < plan.count; ++m) {
+      op = ops[m];
+      if (op === OP_COUNT) {
+        if (primary[m][slot] > 0) return true;
+      } else if (op === OP_AVG || op === OP_AVG_NON_ZERO) {
+        if (secondary[m][slot] > 0) return true;
+      } else if (op === OP_RATIO) {
+        if (primary[m][slot] !== 0 || secondary[m][slot] !== 0) return true;
+      } else {
+        if (primary[m][slot] !== 0) return true;
+      }
+    }
+    return false;
   }
 
   function isFiniteNumber(value) {
@@ -1333,17 +2419,20 @@
     return normalized;
   }
 
+  var reusableMonthDate = new Date(0);
+
   function normalizeTimeBucketValue(value) {
+    if (typeof value === "number") {
+      return value === value && value !== Infinity && value !== -Infinity ? value : null;
+    }
+
     if (value == null) {
       return null;
     }
 
     if (value instanceof Date) {
-      return value.getTime();
-    }
-
-    if (typeof value === "number") {
-      return Number.isFinite(value) ? value : null;
+      var time = value.getTime();
+      return time === time ? time : null;
     }
 
     var numeric = Number(value);
@@ -1361,20 +2450,25 @@
       return null;
     }
 
-    if (granularity === "month") {
-      var monthDate = new Date(numeric);
-      return Date.UTC(monthDate.getUTCFullYear(), monthDate.getUTCMonth(), 1);
+    if (granularity === "day") {
+      return Math.floor(numeric / 86400000) * 86400000;
+    }
+
+    if (granularity === "hour") {
+      return Math.floor(numeric / 3600000) * 3600000;
+    }
+
+    if (granularity === "minute") {
+      return Math.floor(numeric / 60000) * 60000;
     }
 
     if (granularity === "week") {
-      var weekDate = new Date(numeric);
-      var day = weekDate.getUTCDay();
-      var monday = new Date(Date.UTC(
-        weekDate.getUTCFullYear(),
-        weekDate.getUTCMonth(),
-        weekDate.getUTCDate() - ((day + 6) % 7)
-      ));
-      return monday.getTime();
+      return Math.floor((numeric + 259200000) / 604800000) * 604800000 - 259200000;
+    }
+
+    if (granularity === "month") {
+      reusableMonthDate.setTime(numeric);
+      return Date.UTC(reusableMonthDate.getUTCFullYear(), reusableMonthDate.getUTCMonth(), 1);
     }
 
     var step = TIME_BUCKET_MS[granularity];
@@ -1395,9 +2489,24 @@
     }
 
     var granularity = spec.bucket.granularity || "day";
-    return function(value) {
+    var accessor = function(value) {
       return bucketTimestampValue(value, granularity);
     };
+    accessor._xfilterPureMonotonic = true;
+    if (granularity === "day") {
+      accessor._xfilterTimeStep = 86400000;
+      accessor._xfilterTimeOffset = 0;
+    } else if (granularity === "hour") {
+      accessor._xfilterTimeStep = 3600000;
+      accessor._xfilterTimeOffset = 0;
+    } else if (granularity === "minute") {
+      accessor._xfilterTimeStep = 60000;
+      accessor._xfilterTimeOffset = 0;
+    } else if (granularity === "week") {
+      accessor._xfilterTimeStep = 604800000;
+      accessor._xfilterTimeOffset = 259200000;
+    }
+    return accessor;
   }
 
   function buildMetricReducer(metrics, splitField) {
@@ -1405,6 +2514,7 @@
       return {
         field: metric.field || null,
         denominator: metric.denominator || null,
+        hidden: !!metric.hidden,
         id: metric.id,
         op: metric.op
       };
@@ -1591,8 +2701,12 @@
         return result;
       };
 
-      // Do NOT attach _xfilterMetricSpec — the metricSpec fast path in
-      // crossfilter core bypasses custom reducers, which we need for split.
+      splitAdd._xfilterMetricSpec = metricSpec;
+      splitRemove._xfilterMetricSpec = metricSpec;
+      splitInitial._xfilterMetricSpec = metricSpec;
+      splitAdd._xfilterSplitField = splitField;
+      splitRemove._xfilterSplitField = splitField;
+      splitInitial._xfilterSplitField = splitField;
 
       return { add: splitAdd, finalize: splitFinalize, initial: splitInitial, remove: splitRemove };
     }
@@ -1659,19 +2773,6 @@
       finalize: finalize,
       initial: initial,
       remove: remove
-    };
-  }
-
-  function getNativeSumMetric(metrics) {
-    return metrics && metrics.length === 1 && metrics[0].op === "sum"
-      ? metrics[0]
-      : null;
-  }
-
-  function createNativeSumAccessor(metric) {
-    return function(row) {
-      var value = row[metric.field];
-      return isFiniteNumber(value) ? value : 0;
     };
   }
 
@@ -1754,6 +2855,21 @@
       }
     }
 
+    return true;
+  }
+
+  function sameFilterState(left, right) {
+    var field;
+    for (field in left) {
+      if (!sameFilter(left[field], right[field])) {
+        return false;
+      }
+    }
+    for (field in right) {
+      if (!(field in left) && right[field] != null) {
+        return false;
+      }
+    }
     return true;
   }
 
@@ -1844,25 +2960,64 @@
   }
 
   function createKpiRuntime(cf, metrics) {
-    var nativeSumMetric = getNativeSumMetric(metrics);
-    var reducer = nativeSumMetric ? null : buildMetricReducer(metrics);
-    var group = nativeSumMetric && typeof cf.groupAll === "function"
-      ? cf.groupAll().reduceSum(createNativeSumAccessor(nativeSumMetric))
-      : cf.groupAll().reduce(reducer.add, reducer.remove, reducer.initial);
+    var reducer = buildMetricReducer(metrics);
+    var group = cf.groupAll().reduce(reducer.add, reducer.remove, reducer.initial);
 
     return {
       dispose: function() {
         group.dispose();
       },
       read: function() {
-        if (nativeSumMetric) {
-          var result = {};
-          result[nativeSumMetric.id] = group.value();
-          return result;
+        if (typeof group._readScalar === "function") {
+          var fast = group._readScalar();
+          if (fast) {
+            return fast;
+          }
         }
         return reducer.finalize(group.value());
       }
     };
+  }
+
+  function finalizeColumnarSlot(view, slot) {
+    if (view.mode === "flat") {
+      return finalizeMetricSlot(view.plan, view.buffers, slot);
+    }
+
+    var result = {};
+    var splitKeys = view.splitKeys;
+    var plan = view.plan;
+    var buffers = view.buffers;
+
+    if (view.mode === "splitDense") {
+      var stride = view.splitStride;
+      var base = slot * stride;
+      for (var sc = 0; sc < stride; ++sc) {
+        var cell = base + sc;
+        if (slotHasAnyActivity(plan, buffers, cell)) {
+          result[splitKeys[sc]] = finalizeMetricSlot(plan, buffers, cell);
+        }
+      }
+      return result;
+    }
+
+    var activePairs = [];
+    for (var pid = view.headBySlot[slot]; pid !== -1; pid = view.nextPair[pid]) {
+      if (slotHasAnyActivity(plan, buffers, pid)) {
+        activePairs.push(pid);
+      }
+    }
+    if (activePairs.length > 1) {
+      var pairSplitCode = view.pairSplitCode;
+      activePairs.sort(function(a, b) {
+        return pairSplitCode[a] - pairSplitCode[b];
+      });
+    }
+    for (var pi = 0; pi < activePairs.length; ++pi) {
+      var pairId = activePairs[pi];
+      result[splitKeys[view.pairSplitCode[pairId]]] = finalizeMetricSlot(plan, buffers, pairId);
+    }
+    return result;
   }
 
   function createGroupRuntime(dimension, spec, index) {
@@ -1873,39 +3028,37 @@
       metrics = metrics.concat([{ field: undefined, id: "__rows", op: "count", denominator: null, hidden: true }]);
     }
     var metricsById = {};
+    var metricIndexById = {};
     var metricIndex;
     var splitField = spec.splitField || null;
-    var nativeSumMetric = splitField ? null : getNativeSumMetric(metrics);
-    var reducer = nativeSumMetric ? null : buildMetricReducer(metrics, splitField);
+    var reducer = buildMetricReducer(metrics, splitField);
     var groupAccessor = resolveGroupAccessor(spec);
     var group = groupAccessor ? dimension.group(groupAccessor) : dimension.group();
     var visibleMetric = null;
+    var visibleMetricIndex = 0;
     var defaultSortMetric = null;
     var orderedMetricId = null;
-    if (nativeSumMetric && typeof group.reduceSum === "function") {
-      group.reduceSum(createNativeSumAccessor(nativeSumMetric));
-    } else {
-      group.reduce(reducer.add, reducer.remove, reducer.initial);
-    }
+
+    group.reduce(reducer.add, reducer.remove, reducer.initial);
 
     for (metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
       metricsById[metrics[metricIndex].id] = metrics[metricIndex];
+      metricIndexById[metrics[metricIndex].id] = metricIndex;
       if (!visibleMetric && metrics[metricIndex].op === "count") {
         visibleMetric = metrics[metricIndex];
+        visibleMetricIndex = metricIndex;
       }
     }
 
     if (!visibleMetric) {
       visibleMetric = metrics[0] || null;
+      visibleMetricIndex = 0;
     }
     defaultSortMetric = metricsById[spec.sortMetric] || metricsById.rows || metrics[0] || null;
 
     function metricStateValue(value, metric) {
       if (!metric) {
         return 0;
-      }
-      if (nativeSumMetric) {
-        return metric.id === nativeSumMetric.id ? value : 0;
       }
       if (splitField) {
         // Sum the metric across all split buckets for comparability
@@ -1932,24 +3085,49 @@
       return entry ? metricStateValue(entry.value, metric) : 0;
     }
 
-    function finalizeEntryValue(value) {
-      if (!nativeSumMetric) {
-        return reducer.finalize(value);
-      }
-
-      var result = {};
-      result[nativeSumMetric.id] = value;
-      return result;
-    }
-
     function finalizeEntry(entry) {
       return {
         key: entry.key,
-        value: finalizeEntryValue(entry.value)
+        value: reducer.finalize(entry.value)
       };
     }
 
+    function readAllColumnar(view) {
+      var count = view.count;
+      var out = new Array(count);
+      var slotOf = view.slotOf;
+      var codeToValue = view.codeToValue;
+      var keys = view.keys;
+      var groupsRef = view.groups;
+      var i, slot, key;
+
+      for (i = 0; i < count; ++i) {
+        if (slotOf) {
+          slot = slotOf[i];
+          key = codeToValue[slot];
+        } else if (keys) {
+          slot = i;
+          key = keys[i];
+        } else {
+          slot = i;
+          key = groupsRef[i].key;
+        }
+        out[i] = {
+          key: key,
+          value: finalizeColumnarSlot(view, slot)
+        };
+      }
+
+      return out;
+    }
+
     function readAll() {
+      if (typeof group._readColumnar === "function") {
+        var view = group._readColumnar();
+        if (view) {
+          return readAllColumnar(view);
+        }
+      }
       return group.all().map(finalizeEntry);
     }
 
@@ -2062,6 +3240,289 @@
       };
     }
 
+    function readQueryColumnar(view, normalized, sortMetric) {
+      var count = view.count;
+      var mode = view.mode;
+      var plan = view.plan;
+      var buffers = view.buffers;
+      var slotOf = view.slotOf;
+      var codeToValue = view.codeToValue;
+      var keys = view.keys;
+      var groupsRef = view.groups;
+      var stride = view.splitStride || 0;
+      var headBySlot = view.headBySlot;
+      var nextPair = view.nextPair;
+
+      var includeKeySet = normalized.includeKeys ? new Set(normalized.includeKeys) : null;
+      var keySet = normalized.keys ? new Set(normalized.keys) : null;
+      var visibleOnly = normalized.visibleOnly;
+      var nonEmptyKeys = normalized.nonEmptyKeys;
+      var searchTerm = normalized.search;
+      var sortDir = normalized.sort;
+      var isAsc = sortDir === "asc";
+      var isNatural = sortDir === "natural" || !sortMetric;
+      var limitWindow = normalized.limit == null ? null : normalized.offset + normalized.limit;
+      var useHeap = !isNatural && limitWindow != null && limitWindow > 0 && limitWindow < count;
+
+      var visPrim = buffers ? buffers.primary[visibleMetricIndex] : null;
+      var visSec = buffers ? buffers.secondary[visibleMetricIndex] : null;
+      var visOp = plan.ops[visibleMetricIndex];
+
+      var sortIdx = sortMetric ? metricIndexById[sortMetric.id] : -1;
+      var sortPrim = (buffers && sortIdx >= 0) ? buffers.primary[sortIdx] : null;
+      var sortSec = (buffers && sortIdx >= 0) ? buffers.secondary[sortIdx] : null;
+      var sortOp = sortIdx >= 0 ? plan.ops[sortIdx] : OP_COUNT;
+      var splitSortNumeric = sortOp === OP_COUNT || sortOp === OP_SUM;
+
+      function isSlotVisible(slot) {
+        if (!buffers) return false;
+        if (mode === "flat") {
+          if (visOp === OP_COUNT || visOp === OP_SUM) {
+            return visPrim[slot] > 0;
+          }
+          if (visOp === OP_AVG || visOp === OP_AVG_NON_ZERO) {
+            return visSec[slot] > 0 && (visPrim[slot] / visSec[slot]) > 0;
+          }
+          if (visOp === OP_RATIO) {
+            return visSec[slot] !== 0 && (visPrim[slot] / visSec[slot]) > 0;
+          }
+          return false;
+        }
+        var sum = 0;
+        if (mode === "splitDense") {
+          var base = slot * stride;
+          for (var sc = 0; sc < stride; ++sc) {
+            sum += visPrim[base + sc];
+          }
+          return sum > 0;
+        }
+        for (var pid = headBySlot[slot]; pid !== -1; pid = nextPair[pid]) {
+          sum += visPrim[pid];
+        }
+        return sum > 0;
+      }
+
+      function readSortComparable(slot) {
+        if (!sortPrim) return 0;
+        if (mode === "flat") {
+          if (sortOp === OP_COUNT || sortOp === OP_SUM) {
+            return sortPrim[slot];
+          }
+          if (sortOp === OP_AVG || sortOp === OP_AVG_NON_ZERO) {
+            var c = sortSec[slot];
+            return c ? sortPrim[slot] / c : 0;
+          }
+          if (sortOp === OP_RATIO) {
+            var d = sortSec[slot];
+            return d !== 0 ? sortPrim[slot] / d : 0;
+          }
+          return 0;
+        }
+        if (!splitSortNumeric) {
+          return 0;
+        }
+        var sum = 0;
+        if (mode === "splitDense") {
+          var base = slot * stride;
+          for (var sc = 0; sc < stride; ++sc) {
+            sum += sortPrim[base + sc];
+          }
+          return sum;
+        }
+        for (var pid = headBySlot[slot]; pid !== -1; pid = nextPair[pid]) {
+          sum += sortPrim[pid];
+        }
+        return sum;
+      }
+
+      var total = 0;
+      var forcedItems = includeKeySet ? [] : null;
+      var matchedItems = useHeap ? null : [];
+      var heapVal = useHeap ? new Float64Array(limitWindow) : null;
+      var heapSlot = useHeap ? new Uint32Array(limitWindow) : null;
+      var heapKey = useHeap ? new Array(limitWindow) : null;
+      var heapSize = 0;
+      var canBreakNatural = isNatural && limitWindow != null && !normalized.includeTotals && !includeKeySet;
+
+      function isHeapWorse(valA, keyA, valB, keyB) {
+        var diff = valA - valB;
+        if (!Number.isFinite(diff) || diff === 0) {
+          return compareGroupKeys(keyA, keyB) > 0;
+        }
+        return isAsc ? diff > 0 : diff < 0;
+      }
+
+      var i, slot, key, visible, matchesKey, val, pos, parent, left, right, child;
+      for (i = 0; i < count; ++i) {
+        if (slotOf) {
+          slot = slotOf[i];
+          key = codeToValue[slot];
+        } else if (keys) {
+          slot = i;
+          key = keys[i];
+        } else {
+          slot = i;
+          key = groupsRef[i].key;
+        }
+
+        var forceInclude = includeKeySet !== null && includeKeySet.has(key);
+
+        visible = !visibleOnly || isSlotVisible(slot);
+        if (visible) {
+          matchesKey = true;
+          if (nonEmptyKeys && (key == null || key === "")) {
+            matchesKey = false;
+          } else if (keySet && !keySet.has(key)) {
+            matchesKey = false;
+          } else if (searchTerm && String(key).toLowerCase().indexOf(searchTerm) < 0) {
+            matchesKey = false;
+          }
+        } else {
+          matchesKey = false;
+        }
+
+        if (matchesKey) {
+          total += 1;
+          if (limitWindow === 0) ; else if (useHeap) {
+            val = readSortComparable(slot);
+            if (heapSize < limitWindow) {
+              pos = heapSize++;
+              while (pos > 0) {
+                parent = (pos - 1) >>> 1;
+                if (isHeapWorse(val, key, heapVal[parent], heapKey[parent])) {
+                  heapVal[pos] = heapVal[parent];
+                  heapSlot[pos] = heapSlot[parent];
+                  heapKey[pos] = heapKey[parent];
+                  pos = parent;
+                } else {
+                  break;
+                }
+              }
+              heapVal[pos] = val;
+              heapSlot[pos] = slot;
+              heapKey[pos] = key;
+            } else {
+              var rootVal = heapVal[0];
+              var better = isAsc
+                ? (val < rootVal || (val === rootVal && compareGroupKeys(key, heapKey[0]) < 0))
+                : (val > rootVal || (val === rootVal && compareGroupKeys(key, heapKey[0]) < 0));
+              if (better) {
+                pos = 0;
+                while ((left = (pos << 1) + 1) < heapSize) {
+                  child = left;
+                  right = left + 1;
+                  if (right < heapSize && isHeapWorse(heapVal[right], heapKey[right], heapVal[left], heapKey[left])) {
+                    child = right;
+                  }
+                  if (isHeapWorse(heapVal[child], heapKey[child], val, key)) {
+                    heapVal[pos] = heapVal[child];
+                    heapSlot[pos] = heapSlot[child];
+                    heapKey[pos] = heapKey[child];
+                    pos = child;
+                  } else {
+                    break;
+                  }
+                }
+                heapVal[pos] = val;
+                heapSlot[pos] = slot;
+                heapKey[pos] = key;
+              }
+            }
+          } else if (isNatural) {
+            if (limitWindow == null || (total > normalized.offset && matchedItems.length < normalized.limit)) {
+              matchedItems.push({ key: key, slot: slot, val: 0 });
+              if (canBreakNatural && matchedItems.length >= normalized.limit) {
+                break;
+              }
+            }
+          } else {
+            matchedItems.push({ key: key, slot: slot, val: readSortComparable(slot) });
+          }
+        }
+
+        if (forceInclude) {
+          forcedItems.push({
+            key: key,
+            slot: slot,
+            val: isNatural ? 0 : readSortComparable(slot)
+          });
+        }
+      }
+
+      var compareItems = function(leftItem, rightItem) {
+        var diff = leftItem.val - rightItem.val;
+        if (!Number.isFinite(diff) || diff === 0) {
+          return compareGroupKeys(leftItem.key, rightItem.key);
+        }
+        return isAsc ? diff : -diff;
+      };
+
+      var pagedItems;
+      if (useHeap) {
+        var extracted = new Array(heapSize);
+        for (i = 0; i < heapSize; ++i) {
+          extracted[i] = { key: heapKey[i], slot: heapSlot[i], val: heapVal[i] };
+        }
+        extracted.sort(compareItems);
+        pagedItems = normalized.offset > 0
+          ? extracted.slice(normalized.offset, normalized.offset + normalized.limit)
+          : (extracted.length > normalized.limit ? extracted.slice(0, normalized.limit) : extracted);
+      } else if (isNatural) {
+        pagedItems = limitWindow != null
+          ? matchedItems
+          : (normalized.offset > 0 ? matchedItems.slice(normalized.offset) : matchedItems);
+      } else {
+        matchedItems.sort(compareItems);
+        pagedItems = normalized.limit == null
+          ? matchedItems.slice(normalized.offset)
+          : matchedItems.slice(normalized.offset, normalized.offset + normalized.limit);
+      }
+
+      var finalItems = pagedItems;
+      if (forcedItems && forcedItems.length) {
+        if (!isNatural) {
+          forcedItems.sort(compareItems);
+        }
+        var seenKeys = new Set();
+        var merged = [];
+        for (i = 0; i < pagedItems.length; ++i) {
+          merged.push(pagedItems[i]);
+          seenKeys.add(pagedItems[i].key);
+        }
+        for (i = 0; i < forcedItems.length; ++i) {
+          if (seenKeys.has(forcedItems[i].key)) continue;
+          merged.push(forcedItems[i]);
+          seenKeys.add(forcedItems[i].key);
+        }
+        if (!isNatural) {
+          merged.sort(compareItems);
+        }
+        finalItems = merged;
+      }
+
+      var entries = new Array(finalItems.length);
+      for (i = 0; i < finalItems.length; ++i) {
+        entries[i] = {
+          key: finalItems[i].key,
+          value: finalizeColumnarSlot(view, finalItems[i].slot)
+        };
+      }
+
+      var result = {
+        entries: entries,
+        limit: normalized.limit,
+        offset: normalized.offset,
+        sort: normalized.sort,
+        sortMetric: sortMetric ? sortMetric.id : null
+      };
+
+      if (normalized.includeTotals) {
+        result.total = total;
+      }
+
+      return result;
+    }
+
     function readQuery(query) {
       var normalized = normalizeGroupQuery(query);
       var allEntries;
@@ -2078,6 +3539,13 @@
 
       if (!normalized) {
         return readAll();
+      }
+
+      if (typeof group._readColumnar === "function") {
+        var view = group._readColumnar();
+        if (view) {
+          return readQueryColumnar(view, normalized, sortMetric);
+        }
       }
 
       if (canUseTopQuery(normalized, sortMetric)) {
@@ -2306,7 +3774,7 @@
     var currentFilters = {};
     var groupRuntimes = {};
     var kpiRuntime = createKpiRuntime(cf, normalizeMetrics(options.kpis, "kpi"));
-    var rowCountGroup = cf.groupAll().reduceCount();
+    var rowCountGroup = typeof cf._filteredCount === "function" ? null : cf.groupAll().reduceCount();
 
     for (var fieldIndex = 0; fieldIndex < dimensionFields.length; ++fieldIndex) {
       dimensions[dimensionFields[fieldIndex]] = cf.dimension(dimensionFields[fieldIndex]);
@@ -2409,6 +3877,9 @@
     }
 
     function readRowCount() {
+      if (typeof cf._filteredCount === "function") {
+        return cf._filteredCount();
+      }
       return rowCountGroup.value();
     }
 
@@ -2428,6 +3899,8 @@
             : typeof columnDimension.topIndex === "function"
               ? columnDimension.topIndex(normalized.limit, normalized.offset)
               : null;
+        } else if (typeof cf._filteredIndexesSlice === "function") {
+          rowIndexes = cf._filteredIndexesSlice(normalized.offset, normalized.limit);
         } else if (typeof cf.allFilteredIndexes === "function") {
           rowIndexes = cf.allFilteredIndexes().slice(normalized.offset, normalized.offset + normalized.limit);
         }
@@ -2458,6 +3931,13 @@
       for (fieldIndex = 0; fieldIndex < normalized.fields.length; ++fieldIndex) {
         var field = normalized.fields[fieldIndex];
         var dimension = ensureDimension(dimensions, dimensionFields, cf, field);
+        if (typeof dimension._bounds === "function") {
+          var fastBounds = dimension._bounds();
+          if (fastBounds) {
+            bounds[field] = fastBounds;
+            continue;
+          }
+        }
         var lowerIndexes = typeof dimension.bottomIndex === "function" ? dimension.bottomIndex(1) : null;
         var upperIndexes = typeof dimension.topIndex === "function" ? dimension.topIndex(1) : null;
         var minValue = null;
@@ -2503,17 +3983,7 @@
       return rowSets;
     }
 
-    function queryRuntime(request) {
-      request = request || {};
-
-      var savedFilters = null;
-      if (request.isolatedFilters) {
-        savedFilters = shallowCopy(currentFilters);
-        updateFilters(request.isolatedFilters);
-      } else if (request.filters) {
-        updateFilters(request.filters);
-      }
-
+    function executeQueryReads(request) {
       var response = {
         rows: request.rows ? readRows(request.rows) : [],
         snapshot: request.snapshot === false ? null : readSnapshot(request.snapshot)
@@ -2535,11 +4005,47 @@
         response.rowSets = readRowSets(request.rowSets);
       }
 
-      if (savedFilters) {
-        updateFilters(savedFilters);
+      return response;
+    }
+
+    function queryRuntime(request) {
+      request = request || {};
+
+      if (request.isolatedFilters) {
+        var normalizedIsolated = normalizeFilterState(request.isolatedFilters);
+        for (var isolatedField in normalizedIsolated) {
+          if (!dimensions[isolatedField]) {
+            throw new Error("Unknown dashboard filter dimension: " + isolatedField);
+          }
+        }
+        if (sameFilterState(currentFilters, normalizedIsolated)) {
+          return executeQueryReads(request);
+        }
+        var savedFilters = shallowCopy(currentFilters);
+        var needsGroupState = request.snapshot !== false || !!request.groups;
+        if (!needsGroupState && typeof cf._withTransientFilters === "function") {
+          return cf._withTransientFilters(function() {
+            updateFilters(normalizedIsolated);
+            try {
+              return executeQueryReads(request);
+            } finally {
+              updateFilters(savedFilters);
+            }
+          });
+        }
+        updateFilters(normalizedIsolated);
+        try {
+          return executeQueryReads(request);
+        } finally {
+          updateFilters(savedFilters);
+        }
       }
 
-      return response;
+      if (request.filters) {
+        updateFilters(request.filters);
+      }
+
+      return executeQueryReads(request);
     }
 
     function queryGroups(request) {
@@ -2597,7 +4103,7 @@
           groupRuntimes[groupId].dispose();
         }
         kpiRuntime.dispose();
-        rowCountGroup.dispose();
+        if (rowCountGroup) rowCountGroup.dispose();
         for (var dimensionIndex = 0; dimensionIndex < dimensionFields.length; ++dimensionIndex) {
           dimensions[dimensionFields[dimensionIndex]].dispose();
         }
@@ -3135,9 +4641,153 @@ function getColumn(table, name, index) {
 }
 function getValue(column, index) {
   if (column == null) return undefined;
+  if (ArrayBuffer.isView(column) || Array.isArray(column)) return column[index];
   if (typeof column.get === 'function') return column.get(index);
   if (typeof column.at === 'function') return column.at(index);
   return column[index];
+}
+var typedArrayToString = Object.prototype.toString;
+function isStandardNumericTypedArray(arr) {
+  if (!ArrayBuffer.isView(arr)) return false;
+  var tag = typedArrayToString.call(arr);
+  return tag === '[object Float64Array]'
+    || tag === '[object Float32Array]'
+    || tag === '[object Int32Array]'
+    || tag === '[object Uint32Array]'
+    || tag === '[object Int16Array]'
+    || tag === '[object Uint16Array]'
+    || tag === '[object Int8Array]'
+    || tag === '[object Uint8Array]';
+}
+function isIntegerTypedArray(arr) {
+  if (!ArrayBuffer.isView(arr)) return false;
+  var tag = typedArrayToString.call(arr);
+  return tag === '[object Int32Array]'
+    || tag === '[object Uint32Array]'
+    || tag === '[object Int16Array]'
+    || tag === '[object Uint16Array]'
+    || tag === '[object Int8Array]'
+    || tag === '[object Uint8Array]';
+}
+function isBigIntTypedArray(arr) {
+  if (!ArrayBuffer.isView(arr)) return false;
+  var tag = typedArrayToString.call(arr);
+  return tag === '[object BigInt64Array]' || tag === '[object BigUint64Array]';
+}
+function extractArrowNumericChunks(sourceColumn, length, mode) {
+  if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
+    return null;
+  }
+  var typeId = sourceColumn.type && typeof sourceColumn.type.typeId === 'number'
+    ? sourceColumn.type.typeId
+    : (sourceColumn.data[0].type && sourceColumn.data[0].type.typeId);
+  if (typeId !== 2 && typeId !== 3) {
+    return null;
+  }
+  var chunks = sourceColumn.data;
+  var c, chunk, chunkLen, vals, j, v;
+  var total = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    if (!chunk || chunk.nullCount !== 0 || !ArrayBuffer.isView(chunk.values)) {
+      return null;
+    }
+    chunkLen = chunk.length;
+    if (chunk.values.length < chunkLen) {
+      return null;
+    }
+    if (typeId === 2 && chunk.type && chunk.type.bitWidth > 32 && !isBigIntTypedArray(chunk.values)) {
+      return null;
+    }
+    if (!isStandardNumericTypedArray(chunk.values) && !isBigIntTypedArray(chunk.values)) {
+      return null;
+    }
+    total += chunkLen;
+  }
+  if (total !== length) {
+    return null;
+  }
+
+  if (mode === 'raw') {
+    if (chunks.length === 1 && isStandardNumericTypedArray(chunks[0].values)) {
+      vals = chunks[0].values;
+      return vals.length === length ? vals : vals.subarray(0, length);
+    }
+    return null;
+  }
+
+  var out = new Float64Array(length);
+  var outOffset = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    chunkLen = chunk.length;
+    vals = chunk.values;
+    if (mode === 'number') {
+      if (isIntegerTypedArray(vals)) {
+        out.set(vals.length === chunkLen ? vals : vals.subarray(0, chunkLen), outOffset);
+      } else if (isBigIntTypedArray(vals)) {
+        for (j = 0; j < chunkLen; ++j) {
+          v = Number(vals[j]);
+          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+        }
+      } else {
+        for (j = 0; j < chunkLen; ++j) {
+          v = vals[j];
+          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+        }
+      }
+    } else if (mode === 'timestampMs') {
+      if (isBigIntTypedArray(vals)) {
+        for (j = 0; j < chunkLen; ++j) {
+          v = Number(vals[j]);
+          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+        }
+      } else {
+        for (j = 0; j < chunkLen; ++j) {
+          v = vals[j];
+          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+        }
+      }
+    }
+    outOffset += chunkLen;
+  }
+  return out;
+}
+function extractArrowDictionaryColumn(sourceColumn, length) {
+  if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
+    return null;
+  }
+  var chunks = sourceColumn.data;
+  var c, chunk, total = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    if (!chunk || !chunk.dictionary || typeof chunk.dictionary.get !== 'function' || chunk.nullCount !== 0 || !ArrayBuffer.isView(chunk.values) || chunk.values.length < chunk.length) {
+      return null;
+    }
+    total += chunk.length;
+  }
+  if (total !== length) {
+    return null;
+  }
+  var out = new Array(length);
+  var outOffset = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    var dict = chunk.dictionary;
+    var dictLen = dict.length;
+    var dictVals = new Array(dictLen);
+    var d;
+    for (d = 0; d < dictLen; ++d) {
+      dictVals[d] = dict.get(d);
+    }
+    var indices = chunk.values;
+    var chunkLen = chunk.length;
+    for (var j = 0; j < chunkLen; ++j) {
+      out[outOffset + j] = dictVals[indices[j]];
+    }
+    outOffset += chunkLen;
+  }
+  return out;
 }
 function resolveColumnAccessor(column) {
   if (column == null) return null;
@@ -3349,17 +4999,27 @@ function projectBatch(batch, projection) {
     var sourceKind = resolveColumnAccessor(sourceColumn);
 
     if (transform === 'timestampMs') {
-      var values = new Float64Array(length);
-      for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
-        values[rowIndex] = normalizeTimestampValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+      var fastTs = extractArrowNumericChunks(sourceColumn, length, 'timestampMs');
+      if (fastTs) {
+        columns[outputName] = fastTs;
+      } else {
+        var values = new Float64Array(length);
+        for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
+          values[rowIndex] = normalizeTimestampValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+        }
+        columns[outputName] = values;
       }
-      columns[outputName] = values;
     } else if (transform === 'number') {
-      values = new Float64Array(length);
-      for (rowIndex = 0; rowIndex < length; ++rowIndex) {
-        values[rowIndex] = normalizeNumericValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+      var fastNum = extractArrowNumericChunks(sourceColumn, length, 'number');
+      if (fastNum) {
+        columns[outputName] = fastNum;
+      } else {
+        values = new Float64Array(length);
+        for (rowIndex = 0; rowIndex < length; ++rowIndex) {
+          values[rowIndex] = normalizeNumericValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+        }
+        columns[outputName] = values;
       }
-      columns[outputName] = values;
     } else if (transform === 'boolean') {
       values = new Array(length);
       for (rowIndex = 0; rowIndex < length; ++rowIndex) {
@@ -3371,7 +5031,9 @@ function projectBatch(batch, projection) {
       values.fill(1);
       columns[outputName] = values;
     } else {
-      columns[outputName] = sourceColumn;
+      var fastRaw = extractArrowNumericChunks(sourceColumn, length, 'raw')
+        || extractArrowDictionaryColumn(sourceColumn, length);
+      columns[outputName] = fastRaw || sourceColumn;
     }
   }
 
@@ -4319,6 +5981,7 @@ self.onmessage = async function(event) {
 
   // constants
   var REMOVED_INDEX = -1;
+  var EMPTY_ARRAY = [];
 
   crossfilter.heap = h$1;
   crossfilter.heapselect = h;
@@ -4375,7 +6038,10 @@ self.onmessage = async function(event) {
       isElementFiltered: isElementFiltered,
       takeColumns: takeColumns,
       configureRuntime: runtimeController.configureRuntime,
-      runtimeInfo: runtimeController.runtimeInfo
+      runtimeInfo: runtimeController.runtimeInfo,
+      _filteredCount: filteredCount,
+      _filteredIndexesSlice: filteredIndexesSlice,
+      _withTransientFilters: withTransientFilters
     };
 
     var data = [], // the records
@@ -4387,12 +6053,366 @@ self.onmessage = async function(event) {
         resetListeners = [],
         callbacks = [],
         columnarBatches = [],
+        numericColumns = Object.create(null),
+        splitColumns = Object.create(null),
+        activeRowsDirty = true,
+        activeRowsBuf = new Uint32Array(0),
+        activeRowsLength = 0,
+        dimActiveRowsBuf = new Uint32Array(0),
+        deltaAddedBuf = new Uint32Array(0),
+        deltaRemovedBuf = new Uint32Array(0),
+        deltaWorkBuf = new Uint32Array(0),
+        deltaBufInUse = false,
         activeDimensionFilterCount = 0,
         batchedFilterDepth = 0,
         batchedFilterEventPending = false,
-        batchedFilterResetPending = false;
+        batchedFilterResetPending = false,
+        transientFilterDepth = 0;
 
     filters = new xfilterArray.bitarray(0);
+
+    function ensureUint32Capacity(buf, required) {
+      if (buf.length >= required) return buf;
+      var nextSize = buf.length || 256;
+      while (nextSize < required) nextSize <<= 1;
+      return new Uint32Array(nextSize);
+    }
+
+    var objToString = Object.prototype.toString;
+
+    function isGuaranteedFiniteTypedArray(col) {
+      if (!ArrayBuffer.isView(col)) return false;
+      var tag = objToString.call(col);
+      return tag === '[object Int32Array]'
+        || tag === '[object Uint32Array]'
+        || tag === '[object Int16Array]'
+        || tag === '[object Uint16Array]'
+        || tag === '[object Int8Array]'
+        || tag === '[object Uint8Array]'
+        || tag === '[object Uint8ClampedArray]';
+    }
+
+    function isFloatTypedArray(col) {
+      if (!ArrayBuffer.isView(col)) return false;
+      var tag = objToString.call(col);
+      return tag === '[object Float64Array]' || tag === '[object Float32Array]';
+    }
+
+    function isPureNumericColumnSource(field) {
+      if (!n || !columnarBatches.length) return false;
+      var expectedStart = 0;
+      for (var b = 0; b < columnarBatches.length; ++b) {
+        var batch = columnarBatches[b];
+        if (batch.start !== expectedStart) return false;
+        expectedStart = batch.end;
+        var col = batch.columns[field];
+        if (!(isFloatTypedArray(col) || isGuaranteedFiniteTypedArray(col))) {
+          return false;
+        }
+      }
+      return expectedStart === n;
+    }
+
+    function getActiveRows() {
+      if (!activeDimensionFilterCount) {
+        return null;
+      }
+      if (activeRowsDirty) {
+        activeRowsBuf = ensureUint32Capacity(activeRowsBuf, n);
+        var count = 0,
+            i;
+        if (filters.subarrays === 1) {
+          var f0 = filters[0];
+          for (i = 0; i < n; ++i) {
+            if (!f0[i]) activeRowsBuf[count++] = i;
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            if (filters.zero(i)) activeRowsBuf[count++] = i;
+          }
+        }
+        activeRowsLength = count;
+        activeRowsDirty = false;
+      }
+      return { indices: activeRowsBuf, length: activeRowsLength };
+    }
+
+    function filteredCount() {
+      if (!activeDimensionFilterCount) {
+        return n;
+      }
+      return getActiveRows().length;
+    }
+
+    function filteredIndexesSlice(startOffset, limitCount) {
+      var start = startOffset && startOffset > 0 ? startOffset : 0;
+      var limit = limitCount == null ? n : limitCount;
+      var end, len, out, i;
+      if (limit <= 0) {
+        return [];
+      }
+      if (!activeDimensionFilterCount) {
+        if (start >= n) return [];
+        end = Math.min(n, start + limit);
+        len = end - start;
+        out = new Array(len);
+        for (i = 0; i < len; ++i) out[i] = start + i;
+        return out;
+      }
+      var active = getActiveRows();
+      if (start >= active.length) return [];
+      end = Math.min(active.length, start + limit);
+      len = end - start;
+      out = new Array(len);
+      var indices = active.indices;
+      for (i = 0; i < len; ++i) out[i] = indices[start + i];
+      return out;
+    }
+
+    function collectZeroExceptRows(dimOffset, dimZero) {
+      dimActiveRowsBuf = ensureUint32Capacity(dimActiveRowsBuf, n);
+      var count = 0,
+          i;
+      if (filters.subarrays === 1) {
+        var f0 = filters[0];
+        if (dimOffset === 0) {
+          for (i = 0; i < n; ++i) {
+            if (!(f0[i] & dimZero)) dimActiveRowsBuf[count++] = i;
+          }
+        } else {
+          for (i = 0; i < n; ++i) {
+            if (!f0[i]) dimActiveRowsBuf[count++] = i;
+          }
+        }
+      } else {
+        for (i = 0; i < n; ++i) {
+          if (filters.zeroExcept(i, dimOffset, dimZero)) dimActiveRowsBuf[count++] = i;
+        }
+      }
+      return { indices: dimActiveRowsBuf, length: count };
+    }
+
+    function fillNumericFromRows(dest, entry, field, start, end) {
+      var i, row, raw;
+      for (i = start; i < end; ++i) {
+        row = getRecord(i);
+        raw = row ? row[field] : undefined;
+        if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+          dest[i] = raw;
+        } else {
+          dest[i] = NaN;
+          entry.hasNaN = true;
+        }
+      }
+    }
+
+    function getNumericColumn(field) {
+      var entry = numericColumns[field];
+      if (!entry) {
+        var initCap = n < 64 ? 64 : n;
+        entry = { values: new Float64Array(initCap), hasNaN: false, length: 0 };
+        numericColumns[field] = entry;
+      }
+      if (entry.length >= n) {
+        return entry;
+      }
+
+      var values = entry.values;
+      if (values.length < n) {
+        var nextCap = values.length || 64;
+        while (nextCap < n) nextCap <<= 1;
+        var nextValues = new Float64Array(nextCap);
+        if (entry.length > 0) {
+          nextValues.set(values.subarray(0, entry.length));
+        }
+        values = entry.values = nextValues;
+      }
+
+      var cursor = entry.length;
+      if (!columnarBatches.length) {
+        fillNumericFromRows(values, entry, field, cursor, n);
+        entry.length = n;
+        return entry;
+      }
+
+      var batchIndex, batch, segStart, segEnd, localStart, localEnd, col, accessor, i, v, raw;
+      for (batchIndex = 0; batchIndex < columnarBatches.length && cursor < n; ++batchIndex) {
+        batch = columnarBatches[batchIndex];
+        if (batch.end <= cursor) continue;
+        if (batch.start >= n) break;
+        if (cursor < batch.start) {
+          var gapEnd = Math.min(batch.start, n);
+          fillNumericFromRows(values, entry, field, cursor, gapEnd);
+          cursor = gapEnd;
+          if (cursor >= n) break;
+        }
+
+        segStart = Math.max(cursor, batch.start);
+        segEnd = Math.min(batch.end, n);
+        localStart = segStart - batch.start;
+        localEnd = segEnd - batch.start;
+        col = batch.columns[field];
+
+        if (col != null && isGuaranteedFiniteTypedArray(col)) {
+          values.set(col.subarray(localStart, localEnd), segStart);
+        } else if (isFloatTypedArray(col)) {
+          for (i = localStart; i < localEnd; ++i) {
+            v = col[i];
+            if (v === v && v !== Infinity && v !== -Infinity) {
+              values[segStart + i - localStart] = v;
+            } else {
+              values[segStart + i - localStart] = NaN;
+              entry.hasNaN = true;
+            }
+          }
+        } else if (Array.isArray(col)) {
+          for (i = localStart; i < localEnd; ++i) {
+            raw = col[i];
+            if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+              values[segStart + i - localStart] = raw;
+            } else {
+              values[segStart + i - localStart] = NaN;
+              entry.hasNaN = true;
+            }
+          }
+        } else if (batch.accessors && batch.accessors[field]) {
+          accessor = batch.accessors[field];
+          for (i = localStart; i < localEnd; ++i) {
+            raw = accessor(i);
+            if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+              values[segStart + i - localStart] = raw;
+            } else {
+              values[segStart + i - localStart] = NaN;
+              entry.hasNaN = true;
+            }
+          }
+        } else if (col != null) {
+          for (i = localStart; i < localEnd; ++i) {
+            raw = getColumnValue(col, i);
+            if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
+              values[segStart + i - localStart] = raw;
+            } else {
+              values[segStart + i - localStart] = NaN;
+              entry.hasNaN = true;
+            }
+          }
+        } else {
+          for (i = segStart; i < segEnd; ++i) {
+            values[i] = NaN;
+          }
+          entry.hasNaN = true;
+        }
+
+        cursor = segEnd;
+      }
+
+      if (cursor < n) {
+        fillNumericFromRows(values, entry, field, cursor, n);
+      }
+
+      entry.length = n;
+      return entry;
+    }
+
+    function encodeSplitValue(entry, raw) {
+      var key = (raw == null || raw === '') ? '__unknown__' : (typeof raw === 'string' ? raw : String(raw));
+      var code = entry.valueToCode.get(key);
+      if (code === undefined) {
+        code = entry.codeToKey.length;
+        entry.valueToCode.set(key, code);
+        entry.codeToKey.push(key);
+      }
+      return code;
+    }
+
+    function fillSplitFromRows(dest, entry, field, start, end) {
+      var i, row;
+      for (i = start; i < end; ++i) {
+        row = getRecord(i);
+        dest[i] = encodeSplitValue(entry, row ? row[field] : undefined);
+      }
+    }
+
+    function getSplitColumn(field) {
+      var entry = splitColumns[field];
+      if (!entry) {
+        var initCap = n < 64 ? 64 : n;
+        entry = {
+          codes: new Uint32Array(initCap),
+          codeToKey: [],
+          length: 0,
+          valueToCode: new Map()
+        };
+        splitColumns[field] = entry;
+      }
+      if (entry.length >= n) {
+        return entry;
+      }
+
+      var codes = entry.codes;
+      if (codes.length < n) {
+        var nextCap = codes.length || 64;
+        while (nextCap < n) nextCap <<= 1;
+        var nextCodes = new Uint32Array(nextCap);
+        if (entry.length > 0) {
+          nextCodes.set(codes.subarray(0, entry.length));
+        }
+        codes = entry.codes = nextCodes;
+      }
+
+      var cursor = entry.length;
+      if (!columnarBatches.length) {
+        fillSplitFromRows(codes, entry, field, cursor, n);
+        entry.length = n;
+        return entry;
+      }
+
+      var batchIndex, batch, segStart, segEnd, localStart, localEnd, col, accessor, i;
+      for (batchIndex = 0; batchIndex < columnarBatches.length && cursor < n; ++batchIndex) {
+        batch = columnarBatches[batchIndex];
+        if (batch.end <= cursor) continue;
+        if (batch.start >= n) break;
+        if (cursor < batch.start) {
+          var gapEnd = Math.min(batch.start, n);
+          fillSplitFromRows(codes, entry, field, cursor, gapEnd);
+          cursor = gapEnd;
+          if (cursor >= n) break;
+        }
+
+        segStart = Math.max(cursor, batch.start);
+        segEnd = Math.min(batch.end, n);
+        localStart = segStart - batch.start;
+        localEnd = segEnd - batch.start;
+        col = batch.columns[field];
+
+        if (Array.isArray(col) || ArrayBuffer.isView(col)) {
+          for (i = localStart; i < localEnd; ++i) {
+            codes[segStart + i - localStart] = encodeSplitValue(entry, col[i]);
+          }
+        } else if (batch.accessors && batch.accessors[field]) {
+          accessor = batch.accessors[field];
+          for (i = localStart; i < localEnd; ++i) {
+            codes[segStart + i - localStart] = encodeSplitValue(entry, accessor(i));
+          }
+        } else if (col != null) {
+          for (i = localStart; i < localEnd; ++i) {
+            codes[segStart + i - localStart] = encodeSplitValue(entry, getColumnValue(col, i));
+          }
+        } else {
+          var unknownCode = encodeSplitValue(entry, undefined);
+          codes.fill(unknownCode, segStart, segEnd);
+        }
+
+        cursor = segEnd;
+      }
+
+      if (cursor < n) {
+        fillSplitFromRows(codes, entry, field, cursor, n);
+      }
+
+      entry.length = n;
+      return entry;
+    }
 
     function appendData(newData) {
       var offset = data.length;
@@ -4475,6 +6495,10 @@ self.onmessage = async function(event) {
     }
 
     function notifyFilterListeners(filterOne, filterOffset, added, removed) {
+      activeRowsDirty = true;
+      if (transientFilterDepth > 0) {
+        return;
+      }
       if (batchedFilterDepth > 0) {
         batchedFilterEventPending = true;
         markFilterListenersDirty();
@@ -4503,6 +6527,16 @@ self.onmessage = async function(event) {
         if (!batchedFilterDepth) {
           flushBatchedFilterEvents();
         }
+      }
+    }
+
+    function withTransientFilters(callback) {
+      transientFilterDepth += 1;
+      try {
+        return callback();
+      } finally {
+        transientFilterDepth -= 1;
+        activeRowsDirty = true;
       }
     }
 
@@ -4554,66 +6588,19 @@ self.onmessage = async function(event) {
       return row ? row[field] : undefined;
     }
 
-    function isFiniteMetricNumber(value) {
-      return typeof value === 'number' && Number.isFinite(value);
-    }
-
     function resolveReduceMetricSpec(add, remove, initial) {
       var metricSpec = add && add._xfilterMetricSpec;
       if (!metricSpec || metricSpec !== (remove && remove._xfilterMetricSpec) || metricSpec !== (initial && initial._xfilterMetricSpec)) {
         return null;
       }
-      return metricSpec;
-    }
-
-    function applyReduceMetricSpec(state, metricSpec, rowIndex, delta) {
-      if (!state) {
-        return state;
+      var splitField = add._xfilterSplitField || null;
+      if (splitField && (splitField !== remove._xfilterSplitField || splitField !== initial._xfilterSplitField)) {
+        return null;
       }
-
-      for (var metricIndex = 0; metricIndex < metricSpec.length; ++metricIndex) {
-        var metric = metricSpec[metricIndex];
-        var value;
-
-        switch (metric.op) {
-          case 'count':
-            state[metric.id] += delta;
-            break;
-          case 'sum':
-            value = getFieldValue(rowIndex, metric.field);
-            if (isFiniteMetricNumber(value)) {
-              state[metric.id] += delta * value;
-            }
-            break;
-          case 'avg':
-            value = getFieldValue(rowIndex, metric.field);
-            if (isFiniteMetricNumber(value)) {
-              state[metric.id].sum += delta * value;
-              state[metric.id].count += delta;
-            }
-            break;
-          case 'avgNonZero':
-            value = getFieldValue(rowIndex, metric.field);
-            if (isFiniteMetricNumber(value) && value !== 0) {
-              state[metric.id].sum += delta * value;
-              state[metric.id].count += delta;
-            }
-            break;
-          case 'ratio':
-            value = getFieldValue(rowIndex, metric.field);
-            if (isFiniteMetricNumber(value)) {
-              state[metric.id].num += delta * value;
-            }
-            value = getFieldValue(rowIndex, metric.denominator);
-            if (isFiniteMetricNumber(value)) {
-              state[metric.id].den += delta * value;
-            }
-            break;
-        }
-      }
-
-      state.__version += 1;
-      return state;
+      return {
+        metrics: metricSpec,
+        splitField: splitField
+      };
     }
 
     function materializeAllRecords() {
@@ -4716,12 +6703,15 @@ self.onmessage = async function(event) {
           return null;
         }
 
-        if (!batch.accessors || !batch.accessors[field]) {
+        var directColumn = batch.columns[field];
+        var isDirectIndexable = Array.isArray(directColumn) || ArrayBuffer.isView(directColumn);
+        if (!isDirectIndexable && (!batch.accessors || !batch.accessors[field])) {
           return null;
         }
 
         return {
-          accessor: batch.accessors[field],
+          accessor: batch.accessors ? batch.accessors[field] : null,
+          column: isDirectIndexable ? directColumn : null,
           offset: start - batch.start
         };
       }
@@ -4742,6 +6732,7 @@ self.onmessage = async function(event) {
         appendData(newData);
         rememberColumnarBatch(newData, n0, n1);
         filters.lengthen(n += n1);
+        activeRowsDirty = true;
         dataListeners.forEach(function(l) { l(newData, n0, n1); });
         triggerOnChange('dataAdded');
       }
@@ -4787,6 +6778,9 @@ self.onmessage = async function(event) {
       data.length = n = index4;
       filters.truncate(index4);
       columnarBatches = [];
+      numericColumns = Object.create(null);
+      splitColumns = Object.create(null);
+      activeRowsDirty = true;
       triggerOnChange('dataRemoved');
     }
 
@@ -4842,7 +6836,8 @@ self.onmessage = async function(event) {
         dispose: dispose,
         remove: dispose, // for backwards-compatibility
         accessor: value,
-        id: function() { return id; }
+        id: function() { return id; },
+        _bounds: readDimensionBounds
       };
 
       var one, // lowest unset bit as mask, e.g., 00001000
@@ -4873,6 +6868,7 @@ self.onmessage = async function(event) {
           lazyFilterTargetCodes = null,
           lazyFilterTargetCodesVersion = 0,
           lazyEncodedState = null,
+          rawNumericState = null,
           indexListeners = [], // when data is added
           dimensionGroups = [],
           lo0 = 0,
@@ -4925,81 +6921,67 @@ self.onmessage = async function(event) {
       // When in doubt, materialize. The materialized path is always correct.
       // ==========================================================================
 
-      function createLazyEncodedState(sourceValues) {
-        if (!accessorPath || iterable || !runtimeController.canUseWasmScan()) {
+      function createLazyEncodedStateFromSource(source, accessor, offset, length) {
+        if (!accessorPath || iterable) {
           return null;
         }
-
-        var codesCapacity = sourceValues.length < 64 ? 64 : sourceValues.length,
-            codes = new Uint32Array(codesCapacity),
-            valueToCode = new Map(),
-            codeToValue = [undefined],
-            i,
-            valueToEncode,
-            code;
-
-        for (i = 0; i < sourceValues.length; ++i) {
-          valueToEncode = sourceValues[i];
-          if (!isLazyEncodedValue(valueToEncode)) {
-            return null;
-          }
-          if (!valueToCode.has(valueToEncode)) {
-            code = codeToValue.length;
-            valueToCode.set(valueToEncode, code);
-            codeToValue.push(valueToEncode);
-          }
-          codes[i] = valueToCode.get(valueToEncode);
-        }
-
-        return {
-          codeCounts: buildCodeCounts(codes, codeToValue.length),
-          codesLength: sourceValues.length,
-          codeToValue: codeToValue,
-          codes: codes,
-          matchIndices: null,
-          selected: null,
-          selectionMarkVersion: 1,
-          selectionMarks: new Uint32Array(codeToValue.length),
-          valueToCode: valueToCode
-        };
-      }
-
-      function createLazyEncodedStateFromAccessor(accessor, offset, length) {
-        if (!accessorPath || iterable || !runtimeController.canUseWasmScan()) {
-          return null;
-        }
+        // Warm WASM runtime if enabled so runtimeInfo().active stays consistent.
+        runtimeController.canUseWasmScan();
 
         var codesCapacity = length < 64 ? 64 : length,
             codes = new Uint32Array(codesCapacity),
             valueToCode = new Map(),
             codeToValue = [undefined],
+            codeCounts = new Uint32Array(64),
+            hasUnorderable = false,
+            isPureNumeric = true,
             i,
             valueToEncode,
             code;
 
         for (i = 0; i < length; ++i) {
-          valueToEncode = accessor(offset + i);
+          valueToEncode = source ? source[offset + i] : accessor(offset + i);
           if (!isLazyEncodedValue(valueToEncode)) {
             return null;
           }
-          if (!valueToCode.has(valueToEncode)) {
+          code = valueToCode.get(valueToEncode);
+          if (code === undefined) {
             code = codeToValue.length;
             valueToCode.set(valueToEncode, code);
             codeToValue.push(valueToEncode);
+            if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+              hasUnorderable = true;
+              isPureNumeric = false;
+            } else if (typeof valueToEncode !== 'number') {
+              isPureNumeric = false;
+            }
+            if (code >= codeCounts.length) {
+              var nextCountCap = codeCounts.length << 1;
+              while (nextCountCap <= code) nextCountCap <<= 1;
+              var nextCounts = new Uint32Array(nextCountCap);
+              nextCounts.set(codeCounts);
+              codeCounts = nextCounts;
+            }
           }
-          codes[i] = valueToCode.get(valueToEncode);
+          codes[i] = code;
+          ++codeCounts[code];
         }
 
+        var marksCap = codeToValue.length < 64 ? 64 : codeToValue.length;
         return {
-          codeCounts: buildCodeCounts(codes, codeToValue.length),
+          codeCounts: codeCounts,
+          codeRank: null,
+          codeRankVersion: -1,
           codesLength: length,
           codeToValue: codeToValue,
           codes: codes,
-          matchIndices: null,
-          selected: null,
+          hasActiveFilterMask: false,
+          hasUnorderable: hasUnorderable,
+          isPureNumeric: isPureNumeric,
           selectionMarkVersion: 1,
-          selectionMarks: new Uint32Array(codeToValue.length),
-          valueToCode: valueToCode
+          selectionMarks: new Uint32Array(marksCap),
+          valueToCode: valueToCode,
+          version: 1
         };
       }
 
@@ -5008,7 +6990,9 @@ self.onmessage = async function(event) {
           return;
         }
 
-        var nextMarks = new Uint32Array(size);
+        var nextCap = lazyEncodedState.selectionMarks.length || 64;
+        while (nextCap < size) nextCap <<= 1;
+        var nextMarks = new Uint32Array(nextCap);
         nextMarks.set(lazyEncodedState.selectionMarks);
         lazyEncodedState.selectionMarks = nextMarks;
       }
@@ -5019,61 +7003,16 @@ self.onmessage = async function(event) {
           : lazyEncodedState.codes.subarray(0, lazyEncodedState.codesLength);
       }
 
-      function growLazyCodeCounts(codeCounts, code) {
-        var nextCounts = new Uint32Array(lazyEncodedState.codeToValue.length);
+      function growLazyCodeCounts(codeCounts, minLength) {
+        var nextCap = codeCounts.length || 64;
+        while (nextCap < minLength) nextCap <<= 1;
+        var nextCounts = new Uint32Array(nextCap);
         nextCounts.set(codeCounts);
         lazyEncodedState.codeCounts = nextCounts;
         return nextCounts;
       }
 
-      function appendLazyEncodedValues(sourceValues) {
-        if (!lazyEncodedState) {
-          return null;
-        }
-
-        var existingLength = lazyEncodedState.codesLength,
-            newLength = existingLength + sourceValues.length,
-            codes = lazyEncodedState.codes,
-            codeCounts = lazyEncodedState.codeCounts,
-            appendedCodes = new Uint32Array(sourceValues.length),
-            i,
-            valueToEncode,
-            code;
-
-        if (newLength > codes.length) {
-          var nextCapacity = codes.length;
-          while (nextCapacity < newLength) nextCapacity *= 2;
-          var nextCodes = new Uint32Array(nextCapacity);
-          nextCodes.set(codes.subarray(0, existingLength));
-          codes = nextCodes;
-          lazyEncodedState.codes = codes;
-        }
-
-        for (i = 0; i < sourceValues.length; ++i) {
-          valueToEncode = sourceValues[i];
-          if (!isLazyEncodedValue(valueToEncode)) {
-            return null;
-          }
-          if (!lazyEncodedState.valueToCode.has(valueToEncode)) {
-            code = lazyEncodedState.codeToValue.length;
-            lazyEncodedState.valueToCode.set(valueToEncode, code);
-            lazyEncodedState.codeToValue.push(valueToEncode);
-          }
-          code = lazyEncodedState.valueToCode.get(valueToEncode);
-          appendedCodes[i] = code;
-          codes[existingLength + i] = code;
-          if (code >= codeCounts.length) {
-            codeCounts = growLazyCodeCounts(codeCounts);
-          }
-          ++codeCounts[code];
-        }
-
-        lazyEncodedState.codesLength = newLength;
-        ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
-        return appendedCodes;
-      }
-
-      function appendLazyEncodedValuesFromAccessor(accessor, offset, length) {
+      function appendLazyEncodedValuesFromSource(source, accessor, offset, length) {
         if (!lazyEncodedState) {
           return null;
         }
@@ -5082,14 +7021,18 @@ self.onmessage = async function(event) {
             newLength = existingLength + length,
             codes = lazyEncodedState.codes,
             codeCounts = lazyEncodedState.codeCounts,
+            valueToCode = lazyEncodedState.valueToCode,
+            codeToValue = lazyEncodedState.codeToValue,
             appendedCodes = new Uint32Array(length),
+            hasUnorderable = lazyEncodedState.hasUnorderable,
+            isPureNumeric = lazyEncodedState.isPureNumeric,
             i,
             valueToEncode,
             code;
 
         if (newLength > codes.length) {
-          var nextCapacity = codes.length;
-          while (nextCapacity < newLength) nextCapacity *= 2;
+          var nextCapacity = codes.length || 64;
+          while (nextCapacity < newLength) nextCapacity <<= 1;
           var nextCodes = new Uint32Array(nextCapacity);
           nextCodes.set(codes.subarray(0, existingLength));
           codes = nextCodes;
@@ -5097,32 +7040,43 @@ self.onmessage = async function(event) {
         }
 
         for (i = 0; i < length; ++i) {
-          valueToEncode = accessor(offset + i);
+          valueToEncode = source ? source[offset + i] : accessor(offset + i);
           if (!isLazyEncodedValue(valueToEncode)) {
             return null;
           }
-          if (!lazyEncodedState.valueToCode.has(valueToEncode)) {
-            code = lazyEncodedState.codeToValue.length;
-            lazyEncodedState.valueToCode.set(valueToEncode, code);
-            lazyEncodedState.codeToValue.push(valueToEncode);
+          code = valueToCode.get(valueToEncode);
+          if (code === undefined) {
+            code = codeToValue.length;
+            valueToCode.set(valueToEncode, code);
+            codeToValue.push(valueToEncode);
+            if (valueToEncode === undefined || !(valueToEncode >= valueToEncode)) {
+              hasUnorderable = true;
+              isPureNumeric = false;
+            } else if (typeof valueToEncode !== 'number') {
+              isPureNumeric = false;
+            }
+            if (code >= codeCounts.length) {
+              codeCounts = growLazyCodeCounts(codeCounts, code + 1);
+            }
           }
-          code = lazyEncodedState.valueToCode.get(valueToEncode);
           appendedCodes[i] = code;
           codes[existingLength + i] = code;
-          if (code >= codeCounts.length) {
-            codeCounts = growLazyCodeCounts(codeCounts);
-          }
           ++codeCounts[code];
         }
 
+        lazyEncodedState.hasUnorderable = hasUnorderable;
+        lazyEncodedState.isPureNumeric = isPureNumeric;
         lazyEncodedState.codesLength = newLength;
-        ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
+        lazyEncodedState.version += 1;
+        lazyEncodedState.codeRank = null;
+        ensureLazySelectionMarksSize(codeToValue.length);
         return appendedCodes;
       }
 
-      function buildCodeCounts(codes, size) {
-        var codeCounts = new Uint32Array(size);
-        for (var codeIndex = 0; codeIndex < codes.length; ++codeIndex) {
+      function buildCodeCounts(codes, length, size) {
+        var cap = size < 64 ? 64 : size;
+        var codeCounts = new Uint32Array(cap);
+        for (var codeIndex = 0; codeIndex < length; ++codeIndex) {
           ++codeCounts[codes[codeIndex]];
         }
         return codeCounts;
@@ -5133,48 +7087,21 @@ self.onmessage = async function(event) {
           return false;
         }
 
-        var selectedCount = 0;
+        var codeCounts = lazyEncodedState.codeCounts,
+            selectedCount = 0;
         for (var codeIndex = 0; codeIndex < targetCodes.length; ++codeIndex) {
-          selectedCount += lazyEncodedState.codeCounts[targetCodes[codeIndex]] || 0;
+          selectedCount += codeCounts[targetCodes[codeIndex]] || 0;
         }
         return selectedCount === n;
       }
 
-      function normalizeLazySelectionMask(selection) {
-        if (!selection) {
-          return null;
+      function nextLazyMarkVersion() {
+        ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
+        if (lazyEncodedState.selectionMarkVersion === 0xffffffff) {
+          lazyEncodedState.selectionMarks.fill(0);
+          lazyEncodedState.selectionMarkVersion = 1;
         }
-
-        for (var i = 0; i < selection.length; ++i) {
-          if (!selection[i]) {
-            return selection;
-          }
-        }
-
-        return null;
-      }
-
-      function normalizeLazyMatchIndices(matches) {
-        if (!matches || matches.length === n) {
-          return null;
-        }
-        return matches;
-      }
-
-      function createLazySelectionFromMatches(matches) {
-        if (!matches || matches.length === n) {
-          return null;
-        }
-
-        var selection = new Uint8Array(n);
-        for (var i = 0; i < matches.length; ++i) {
-          selection[matches[i]] = 1;
-        }
-        return selection;
-      }
-
-      function ensureLazySelection(currentMatches, currentSelected) {
-        return currentSelected || createLazySelectionFromMatches(currentMatches);
+        return lazyEncodedState.selectionMarkVersion++;
       }
 
       function encodeLazyFilterValues(filterValues) {
@@ -5185,25 +7112,18 @@ self.onmessage = async function(event) {
         var encodedValues = new Uint32Array(filterValues.length),
             count = 0,
             i,
-            markVersion,
-            selectionMarks,
+            markVersion = nextLazyMarkVersion(),
+            selectionMarks = lazyEncodedState.selectionMarks,
+            valueToCode = lazyEncodedState.valueToCode,
             valueToEncode,
             code;
-
-        ensureLazySelectionMarksSize(lazyEncodedState.codeToValue.length);
-        selectionMarks = lazyEncodedState.selectionMarks;
-        if (lazyEncodedState.selectionMarkVersion === 0xffffffff) {
-          selectionMarks.fill(0);
-          lazyEncodedState.selectionMarkVersion = 1;
-        }
-        markVersion = lazyEncodedState.selectionMarkVersion++;
 
         for (i = 0; i < filterValues.length; ++i) {
           valueToEncode = filterValues[i];
           if (!isLazyEncodedValue(valueToEncode)) {
             return null;
           }
-          code = lazyEncodedState.valueToCode.get(valueToEncode);
+          code = valueToCode.get(valueToEncode);
           if (code === undefined || selectionMarks[code] === markVersion) {
             continue;
           }
@@ -5211,136 +7131,248 @@ self.onmessage = async function(event) {
           encodedValues[count++] = code;
         }
 
-        return encodedValues.slice(0, count);
+        return encodedValues.subarray(0, count);
       }
 
-      function applyLazySelectionState(nextMatches) {
-        var shouldNotify = filterListeners.length > 0 || callbacks.length > 0,
-            added = shouldNotify ? [] : null,
-            removed = shouldNotify ? [] : null,
-            currentSelected = lazyEncodedState.selected,
-            currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
-            currentIndex,
-            nextIndex,
-            currentValue,
-            nextValue,
-            i,
-            isSelected,
-            nextSelected,
-            wasSelected;
-
-        nextMatches = normalizeLazyMatchIndices(nextMatches);
-
-        if (!currentMatches && !nextMatches) {
-          lazyEncodedState.selected = null;
-          lazyEncodedState.matchIndices = null;
+      function applyLazyClearFilter() {
+        if (!lazyEncodedState.hasActiveFilterMask) {
           return dimension;
         }
 
-        if (currentMatches && nextMatches) {
-          currentSelected = ensureLazySelection(currentMatches, currentSelected);
-          currentIndex = 0;
-          nextIndex = 0;
+        var f = filters[offset],
+            needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+            i;
 
-          while (currentIndex < currentMatches.length || nextIndex < nextMatches.length) {
-            currentValue = currentIndex < currentMatches.length ? currentMatches[currentIndex] : n;
-            nextValue = nextIndex < nextMatches.length ? nextMatches[nextIndex] : n;
+        lazyEncodedState.hasActiveFilterMask = false;
 
-            if (currentValue === nextValue) {
-              ++currentIndex;
-              ++nextIndex;
-              continue;
+        if (!needDeltas) {
+          for (i = 0; i < n; ++i) {
+            if (f[i] & one) {
+              f[i] &= zero;
             }
-
-            if (currentValue < nextValue) {
-              if (!(filters[offset][currentValue] & one)) {
-                filters[offset][currentValue] |= one;
-              }
-              currentSelected[currentValue] = 0;
-              if (shouldNotify) {
-                removed.push(currentValue);
-              }
-              ++currentIndex;
-              continue;
-            }
-
-            if (filters[offset][nextValue] & one) {
-              filters[offset][nextValue] &= zero;
-            }
-            currentSelected[nextValue] = 1;
-            if (shouldNotify) {
-              added.push(nextValue);
-            }
-            ++nextIndex;
           }
-
-          lazyEncodedState.selected = normalizeLazySelectionMask(currentSelected);
-          lazyEncodedState.matchIndices = nextMatches;
-          if (shouldNotify) {
-            notifyFilterListeners(one, offset, added, removed);
-          }
+          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
           return dimension;
         }
 
-        nextSelected = createLazySelectionFromMatches(nextMatches);
-        currentSelected = ensureLazySelection(currentMatches, currentSelected);
+        var useScratch = !deltaBufInUse,
+            added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
+            addedCount = 0;
 
-        if (!currentSelected && !nextSelected) {
-          lazyEncodedState.selected = null;
-          lazyEncodedState.matchIndices = null;
-          return dimension;
-        }
+        if (useScratch) deltaBufInUse = true;
 
         for (i = 0; i < n; ++i) {
-          wasSelected = currentSelected ? currentSelected[i] === 1 : true;
-          isSelected = nextSelected ? nextSelected[i] === 1 : true;
-          if (wasSelected === isSelected) {
-            continue;
-          }
-          if (isSelected) {
-            if (filters[offset][i] & one) {
-              filters[offset][i] &= zero;
-            }
-            if (shouldNotify) {
-              added.push(i);
-            }
-          } else {
-            if (!(filters[offset][i] & one)) {
-              filters[offset][i] |= one;
-            }
-            if (shouldNotify) {
-              removed.push(i);
-            }
+          if (f[i] & one) {
+            f[i] &= zero;
+            if (useScratch) added[addedCount++] = i;
+            else added.push(i);
           }
         }
 
-        lazyEncodedState.selected = nextSelected;
-        lazyEncodedState.matchIndices = nextMatches;
-        if (shouldNotify) {
-          notifyFilterListeners(one, offset, added, removed);
+        if (useScratch) {
+          try {
+            notifyFilterListeners(one, offset, added.subarray(0, addedCount), EMPTY_ARRAY);
+          } finally {
+            deltaBufInUse = false;
+          }
+        } else {
+          notifyFilterListeners(one, offset, added, EMPTY_ARRAY);
         }
         return dimension;
       }
 
       function applyLazyEncodedFilter(targetCodes, nextMode) {
-        var matches;
-
-        if (lazyCodesSelectAllRows(targetCodes)) {
-          filterMode = nextMode;
-          lo0 = 0;
-          hi0 = 0;
-          return applyLazySelectionState(null);
-        }
-
-        matches = runtimeController.findEncodedMatches(getLazyCodes(), targetCodes);
-        // Copy from possible WASM memory view before it can be invalidated
-        matches = new Uint32Array(matches);
-
         filterMode = nextMode;
         lo0 = 0;
         hi0 = 0;
 
-        return applyLazySelectionState(matches);
+        if (n === 0 || lazyCodesSelectAllRows(targetCodes)) {
+          return applyLazyClearFilter();
+        }
+
+        var hadMask = lazyEncodedState.hasActiveFilterMask,
+            codes = lazyEncodedState.codes,
+            f = filters[offset],
+            targetCount = targetCodes.length,
+            needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+            markVersion = 0,
+            selectionMarks = null,
+            t0 = 0,
+            i;
+
+        if (targetCount === 1) {
+          t0 = targetCodes[0];
+        } else if (targetCount > 1) {
+          markVersion = nextLazyMarkVersion();
+          selectionMarks = lazyEncodedState.selectionMarks;
+          for (i = 0; i < targetCount; ++i) {
+            selectionMarks[targetCodes[i]] = markVersion;
+          }
+        }
+
+        lazyEncodedState.hasActiveFilterMask = true;
+
+        if (!needDeltas) {
+          if (targetCount === 0) {
+            for (i = 0; i < n; ++i) {
+              f[i] |= one;
+            }
+          } else if (targetCount === 1) {
+            if (!hadMask) {
+              for (i = 0; i < n; ++i) {
+                if (codes[i] !== t0) f[i] |= one;
+              }
+            } else {
+              for (i = 0; i < n; ++i) {
+                if (codes[i] === t0) f[i] &= zero;
+                else f[i] |= one;
+              }
+            }
+          } else {
+            if (!hadMask) {
+              for (i = 0; i < n; ++i) {
+                if (selectionMarks[codes[i]] !== markVersion) f[i] |= one;
+              }
+            } else {
+              for (i = 0; i < n; ++i) {
+                if (selectionMarks[codes[i]] === markVersion) f[i] &= zero;
+                else f[i] |= one;
+              }
+            }
+          }
+          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+          return dimension;
+        }
+
+        var useScratch = !deltaBufInUse,
+            added,
+            removed,
+            addedCount = 0,
+            removedCount = 0;
+
+        if (useScratch) {
+          deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n);
+          deltaRemovedBuf = ensureUint32Capacity(deltaRemovedBuf, n);
+          added = deltaAddedBuf;
+          removed = deltaRemovedBuf;
+          deltaBufInUse = true;
+        } else {
+          added = [];
+          removed = [];
+        }
+
+        if (targetCount === 0) {
+          if (!hadMask) {
+            for (i = 0; i < n; ++i) {
+              f[i] |= one;
+              if (useScratch) removed[removedCount++] = i;
+              else removed.push(i);
+            }
+          } else {
+            for (i = 0; i < n; ++i) {
+              if (!(f[i] & one)) {
+                f[i] |= one;
+                if (useScratch) removed[removedCount++] = i;
+                else removed.push(i);
+              }
+            }
+          }
+        } else if (targetCount === 1) {
+          if (!hadMask) {
+            for (i = 0; i < n; ++i) {
+              if (codes[i] !== t0) {
+                f[i] |= one;
+                if (useScratch) removed[removedCount++] = i;
+                else removed.push(i);
+              }
+            }
+          } else {
+            for (i = 0; i < n; ++i) {
+              if (codes[i] === t0) {
+                if (f[i] & one) {
+                  f[i] &= zero;
+                  if (useScratch) added[addedCount++] = i;
+                  else added.push(i);
+                }
+              } else {
+                if (!(f[i] & one)) {
+                  f[i] |= one;
+                  if (useScratch) removed[removedCount++] = i;
+                  else removed.push(i);
+                }
+              }
+            }
+          }
+        } else {
+          if (!hadMask) {
+            for (i = 0; i < n; ++i) {
+              if (selectionMarks[codes[i]] !== markVersion) {
+                f[i] |= one;
+                if (useScratch) removed[removedCount++] = i;
+                else removed.push(i);
+              }
+            }
+          } else {
+            for (i = 0; i < n; ++i) {
+              if (selectionMarks[codes[i]] === markVersion) {
+                if (f[i] & one) {
+                  f[i] &= zero;
+                  if (useScratch) added[addedCount++] = i;
+                  else added.push(i);
+                }
+              } else {
+                if (!(f[i] & one)) {
+                  f[i] |= one;
+                  if (useScratch) removed[removedCount++] = i;
+                  else removed.push(i);
+                }
+              }
+            }
+          }
+        }
+
+        if (useScratch) {
+          try {
+            notifyFilterListeners(
+              one,
+              offset,
+              added.subarray(0, addedCount),
+              removed.subarray(0, removedCount)
+            );
+          } finally {
+            deltaBufInUse = false;
+          }
+        } else {
+          notifyFilterListeners(one, offset, added, removed);
+        }
+        return dimension;
+      }
+
+      function computeLazyRangeCodes(range) {
+        var codeToValue = lazyEncodedState.codeToValue,
+            rangeCodes = [],
+            lo = range[0],
+            hi = range[1],
+            code,
+            v;
+
+        if (lazyEncodedState.isPureNumeric && typeof lo === 'number' && typeof hi === 'number' && lo === lo && hi === hi) {
+          for (code = 1; code < codeToValue.length; ++code) {
+            v = codeToValue[code];
+            if (v >= lo && v < hi) {
+              rangeCodes.push(code);
+            }
+          }
+        } else {
+          for (code = 1; code < codeToValue.length; ++code) {
+            v = codeToValue[code];
+            if (compareNaturalOrder(v, lo) >= 0 && compareNaturalOrder(v, hi) < 0) {
+              rangeCodes.push(code);
+            }
+          }
+        }
+
+        return new Uint32Array(rangeCodes);
       }
 
       function resolveLazyTargetCodes() {
@@ -5353,20 +7385,7 @@ self.onmessage = async function(event) {
           if (currentCodeCount === lazyFilterTargetCodesVersion) {
             return lazyFilterTargetCodes;
           }
-          // New codes appeared — rescan
-          var codeToValue = lazyEncodedState.codeToValue,
-              rangeCodes = [],
-              code,
-              v,
-              range = filterValue;
-
-          for (code = 1; code < codeToValue.length; ++code) {
-            v = codeToValue[code];
-            if (compareNaturalOrder(v, range[0]) >= 0 && compareNaturalOrder(v, range[1]) < 0) {
-              rangeCodes.push(code);
-            }
-          }
-          lazyFilterTargetCodes = new Uint32Array(rangeCodes);
+          lazyFilterTargetCodes = computeLazyRangeCodes(filterValue);
           lazyFilterTargetCodesVersion = currentCodeCount;
           return lazyFilterTargetCodes;
         }
@@ -5378,77 +7397,63 @@ self.onmessage = async function(event) {
         return encodeLazyFilterValues([filterValue]);
       }
 
-      function concatLazyMatchIndices(currentMatches, appendedMatches) {
-        if (!currentMatches || !currentMatches.length) {
-          return appendedMatches;
-        }
-        if (!appendedMatches || !appendedMatches.length) {
-          return currentMatches;
-        }
-
-        var nextMatches = new Uint32Array(currentMatches.length + appendedMatches.length);
-        nextMatches.set(currentMatches);
-        nextMatches.set(appendedMatches, currentMatches.length);
-        return nextMatches;
-      }
-
-      function applyLazyFilterToNewRows(n0, appendedCodes) {
-        var currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
-            currentSelected,
-            nextMatches,
-            nextSelected,
-            matches,
-            i,
-            rowIndex,
-            targetCodes;
-
-        if (!currentMatches) {
+      function applyLazyFilterToRange(startRow, length) {
+        if (!filterValuePresent || filterMode === 'all' || !length) {
           return;
         }
 
-        targetCodes = resolveLazyTargetCodes();
+        var targetCodes = resolveLazyTargetCodes();
         if (!targetCodes) {
           materializeLazyEncodedState();
           return;
         }
 
-        currentSelected = ensureLazySelection(currentMatches, lazyEncodedState.selected);
-        if (currentSelected.length >= n) {
-          // Buffer is already large enough — reuse it directly.
-          nextSelected = currentSelected;
+        var codes = lazyEncodedState.codes,
+            f = filters[offset],
+            targetCount = targetCodes.length,
+            endRow = startRow + length,
+            maskedAny = false,
+            i;
+
+        if (targetCount === 0) {
+          for (i = startRow; i < endRow; ++i) {
+            f[i] |= one;
+          }
+          maskedAny = true;
+        } else if (targetCount === 1) {
+          var t0 = targetCodes[0];
+          for (i = startRow; i < endRow; ++i) {
+            if (codes[i] !== t0) {
+              f[i] |= one;
+              maskedAny = true;
+            }
+          }
         } else {
-          // Must grow — allocate exact size to preserve normalizeLazySelectionMask semantics.
-          nextSelected = new Uint8Array(n);
-          nextSelected.set(currentSelected);
-        }
-        matches = runtimeController.findEncodedMatches(appendedCodes, targetCodes);
-        nextMatches = new Uint32Array(matches.length);
-
-        for (i = 0; i < matches.length; ++i) {
-          rowIndex = n0 + matches[i];
-          nextSelected[rowIndex] = 1;
-          nextMatches[i] = rowIndex;
-        }
-
-        for (rowIndex = n0; rowIndex < n; ++rowIndex) {
-          if (!nextSelected[rowIndex]) {
-            filters[offset][rowIndex] |= one;
+          var markVersion = nextLazyMarkVersion(),
+              selectionMarks = lazyEncodedState.selectionMarks;
+          for (i = 0; i < targetCount; ++i) {
+            selectionMarks[targetCodes[i]] = markVersion;
+          }
+          for (i = startRow; i < endRow; ++i) {
+            if (selectionMarks[codes[i]] !== markVersion) {
+              f[i] |= one;
+              maskedAny = true;
+            }
           }
         }
 
-        lazyEncodedState.matchIndices = normalizeLazyMatchIndices(concatLazyMatchIndices(currentMatches, nextMatches));
-        lazyEncodedState.selected = normalizeLazySelectionMask(nextSelected);
+        if (maskedAny) {
+          lazyEncodedState.hasActiveFilterMask = true;
+        }
       }
 
       function compactLazyEncodedState(reIndex) {
-        var currentMatches = normalizeLazyMatchIndices(lazyEncodedState.matchIndices),
-            nextLength = 0,
+        var nextLength = 0,
             i,
             nextCodes,
-            nextMatchCount = 0,
-            nextMatchIndices = currentMatches ? new Uint32Array(currentMatches.length) : null,
-            nextSelected = lazyEncodedState.selected ? new Uint8Array(reIndex.length) : null,
-            rowIndex;
+            rowIndex,
+            f = filters[offset],
+            hasActiveMask = false;
 
         for (i = 0; i < reIndex.length; ++i) {
           if (reIndex[i] !== REMOVED_INDEX) {
@@ -5458,46 +7463,299 @@ self.onmessage = async function(event) {
 
         var nextCodesCapacity = nextLength < 64 ? 64 : nextLength;
         nextCodes = new Uint32Array(nextCodesCapacity);
-        if (nextSelected) {
-          nextSelected = new Uint8Array(nextLength);
-        }
 
-        var existingCodes = getLazyCodes();
+        var existingCodes = lazyEncodedState.codes;
         for (i = 0, rowIndex = 0; i < reIndex.length; ++i) {
           if (reIndex[i] === REMOVED_INDEX) {
             continue;
           }
           nextCodes[rowIndex] = existingCodes[i];
-          if (nextSelected && lazyEncodedState.selected[i]) {
-            nextSelected[rowIndex] = 1;
+          if (f[i] & one) {
+            hasActiveMask = true;
           }
           ++rowIndex;
         }
 
-        if (nextMatchIndices) {
-          for (i = 0; i < currentMatches.length; ++i) {
-            rowIndex = reIndex[currentMatches[i]];
-            if (rowIndex === REMOVED_INDEX) {
-              continue;
+        var codeToValue = lazyEncodedState.codeToValue;
+        var codeCounts = buildCodeCounts(nextCodes, nextLength, codeToValue.length);
+        var hasUnorderable = false;
+        var isPureNumeric = true;
+        for (var c = 1; c < codeToValue.length; ++c) {
+          if (codeCounts[c] > 0) {
+            var v = codeToValue[c];
+            if (v === undefined || !(v >= v)) {
+              hasUnorderable = true;
+              isPureNumeric = false;
+            } else if (typeof v !== 'number') {
+              isPureNumeric = false;
             }
-            nextMatchIndices[nextMatchCount++] = rowIndex;
           }
-          nextMatchIndices = normalizeLazyMatchIndices(nextMatchIndices.slice(0, nextMatchCount));
         }
 
         lazyEncodedState.codes = nextCodes;
         lazyEncodedState.codesLength = nextLength;
-        lazyEncodedState.codeCounts = buildCodeCounts(
-          nextCodes.subarray(0, nextLength),
-          lazyEncodedState.codeToValue.length
-        );
-        lazyEncodedState.matchIndices = nextMatchIndices;
-        lazyEncodedState.selected = normalizeLazySelectionMask(nextSelected);
+        lazyEncodedState.codeCounts = codeCounts;
+        lazyEncodedState.hasActiveFilterMask = hasActiveMask;
+        lazyEncodedState.hasUnorderable = hasUnorderable;
+        lazyEncodedState.isPureNumeric = isPureNumeric;
+        lazyEncodedState.version += 1;
+        lazyEncodedState.codeRank = null;
         lo0 = 0;
         hi0 = 0;
       }
 
+      function getLazyCodeRank() {
+        if (lazyEncodedState.codeRank && lazyEncodedState.codeRankVersion === lazyEncodedState.version) {
+          return lazyEncodedState.codeRank;
+        }
+        var codeToValue = lazyEncodedState.codeToValue,
+            codeCounts = lazyEncodedState.codeCounts,
+            activeCodes = [],
+            c;
+        for (c = 1; c < codeToValue.length; ++c) {
+          if (codeCounts[c] > 0) {
+            activeCodes.push(c);
+          }
+        }
+        activeCodes.sort(function(a, b) {
+          var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
+          return order || a - b;
+        });
+        var rankArr = new Uint32Array(codeToValue.length);
+        var currentRank = 0;
+        for (var i = 0; i < activeCodes.length; ++i) {
+          if (i > 0 && compareNaturalOrder(codeToValue[activeCodes[i - 1]], codeToValue[activeCodes[i]]) !== 0) {
+            ++currentRank;
+          }
+          rankArr[activeCodes[i]] = currentRank;
+        }
+        lazyEncodedState.codeRank = rankArr;
+        lazyEncodedState.codeRankVersion = lazyEncodedState.version;
+        return rankArr;
+      }
+
+      function upgradeRawNumericToLazy(existingLength) {
+        if (!rawNumericState || lazyEncodedState || values) {
+          return;
+        }
+        var len = existingLength === undefined ? n : existingLength;
+        var rawValues = rawNumericState.values;
+        var hadMask = rawNumericState.hasActiveFilterMask;
+        rawNumericState = null;
+        lazyEncodedState = createLazyEncodedStateFromSource(rawValues, null, 0, len);
+        if (lazyEncodedState) {
+          lazyEncodedState.hasActiveFilterMask = hadMask;
+          if (filterValuePresent && filterMode === 'bounds' && Array.isArray(filterValue)) {
+            lazyFilterTargetCodes = computeLazyRangeCodes(filterValue);
+            lazyFilterTargetCodesVersion = lazyEncodedState.codeToValue.length;
+          }
+        }
+        for (var i = 0; i < dimensionGroups.length; ++i) {
+          if (typeof dimensionGroups[i]._onRawNumericUpgrade === 'function') {
+            dimensionGroups[i]._onRawNumericUpgrade();
+          }
+        }
+      }
+
+      function applyRawNumericClearFilter() {
+        if (!rawNumericState.hasActiveFilterMask) {
+          return dimension;
+        }
+        var f = filters[offset],
+            needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+            i;
+        rawNumericState.hasActiveFilterMask = false;
+        if (!needDeltas) {
+          for (i = 0; i < n; ++i) {
+            if (f[i] & one) f[i] &= zero;
+          }
+          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+          return dimension;
+        }
+        var useScratch = !deltaBufInUse,
+            added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
+            addedCount = 0;
+        if (useScratch) deltaBufInUse = true;
+        for (i = 0; i < n; ++i) {
+          if (f[i] & one) {
+            f[i] &= zero;
+            if (useScratch) added[addedCount++] = i;
+            else added.push(i);
+          }
+        }
+        if (useScratch) {
+          try {
+            notifyFilterListeners(one, offset, added.subarray(0, addedCount), EMPTY_ARRAY);
+          } finally {
+            deltaBufInUse = false;
+          }
+        } else {
+          notifyFilterListeners(one, offset, added, EMPTY_ARRAY);
+        }
+        return dimension;
+      }
+
+      function applyRawNumericPredicate(kind, argA, argB, nextMode) {
+        filterMode = nextMode;
+        lo0 = 0;
+        hi0 = 0;
+        if (n === 0) {
+          return applyRawNumericClearFilter();
+        }
+        var hadMask = rawNumericState.hasActiveFilterMask,
+            vals = rawNumericState.values,
+            f = filters[offset],
+            needDeltas = transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0,
+            anyMasked = false,
+            i,
+            v,
+            match;
+
+        // kind: 0=empty, 1=exact(argA), 2=range(argA, argB), 3=inSet(argA:Set)
+        if (!needDeltas) {
+          if (kind === 0) {
+            for (i = 0; i < n; ++i) f[i] |= one;
+            anyMasked = true;
+          } else if (kind === 1) {
+            if (!hadMask) {
+              for (i = 0; i < n; ++i) {
+                if (vals[i] !== argA) { f[i] |= one; anyMasked = true; }
+              }
+            } else {
+              for (i = 0; i < n; ++i) {
+                if (vals[i] === argA) f[i] &= zero;
+                else { f[i] |= one; anyMasked = true; }
+              }
+            }
+          } else if (kind === 2) {
+            if (!hadMask) {
+              for (i = 0; i < n; ++i) {
+                v = vals[i];
+                if (!(v >= argA && v < argB)) { f[i] |= one; anyMasked = true; }
+              }
+            } else {
+              for (i = 0; i < n; ++i) {
+                v = vals[i];
+                if (v >= argA && v < argB) f[i] &= zero;
+                else { f[i] |= one; anyMasked = true; }
+              }
+            }
+          } else {
+            if (!hadMask) {
+              for (i = 0; i < n; ++i) {
+                if (!argA.has(vals[i])) { f[i] |= one; anyMasked = true; }
+              }
+            } else {
+              for (i = 0; i < n; ++i) {
+                if (argA.has(vals[i])) f[i] &= zero;
+                else { f[i] |= one; anyMasked = true; }
+              }
+            }
+          }
+          rawNumericState.hasActiveFilterMask = anyMasked;
+          if (!hadMask && !anyMasked) {
+            return dimension;
+          }
+          notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY);
+          return dimension;
+        }
+
+        var useScratch = !deltaBufInUse,
+            added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
+            removed = useScratch ? (deltaRemovedBuf = ensureUint32Capacity(deltaRemovedBuf, n)) : [],
+            addedCount = 0,
+            removedCount = 0;
+        if (useScratch) deltaBufInUse = true;
+
+        for (i = 0; i < n; ++i) {
+          if (kind === 0) {
+            match = false;
+          } else if (kind === 1) {
+            match = vals[i] === argA;
+          } else if (kind === 2) {
+            v = vals[i];
+            match = v >= argA && v < argB;
+          } else {
+            match = argA.has(vals[i]);
+          }
+          if (match) {
+            if (hadMask && (f[i] & one)) {
+              f[i] &= zero;
+              if (useScratch) added[addedCount++] = i;
+              else added.push(i);
+            }
+          } else {
+            anyMasked = true;
+            if (!hadMask || !(f[i] & one)) {
+              f[i] |= one;
+              if (useScratch) removed[removedCount++] = i;
+              else removed.push(i);
+            }
+          }
+        }
+
+        rawNumericState.hasActiveFilterMask = anyMasked;
+        if (!hadMask && !anyMasked) {
+          if (useScratch) deltaBufInUse = false;
+          return dimension;
+        }
+        if (useScratch) {
+          try {
+            notifyFilterListeners(one, offset, added.subarray(0, addedCount), removed.subarray(0, removedCount));
+          } finally {
+            deltaBufInUse = false;
+          }
+        } else {
+          notifyFilterListeners(one, offset, added, removed);
+        }
+        return dimension;
+      }
+
+      function applyRawNumericFilterToRange(startRow, length) {
+        if (!filterValuePresent || filterMode === 'all' || !length) {
+          return;
+        }
+        var vals = rawNumericState.values,
+            f = filters[offset],
+            endRow = startRow + length,
+            maskedAny = false,
+            i,
+            v;
+        if (filterMode === 'in') {
+          var inSet = new Set(filterInValues || []);
+          for (i = startRow; i < endRow; ++i) {
+            if (!inSet.has(vals[i])) {
+              f[i] |= one;
+              maskedAny = true;
+            }
+          }
+        } else if (Array.isArray(filterValue)) {
+          var lo = filterValue[0],
+              hi = filterValue[1];
+          for (i = startRow; i < endRow; ++i) {
+            v = vals[i];
+            if (!(v >= lo && v < hi)) {
+              f[i] |= one;
+              maskedAny = true;
+            }
+          }
+        } else {
+          for (i = startRow; i < endRow; ++i) {
+            if (vals[i] !== filterValue) {
+              f[i] |= one;
+              maskedAny = true;
+            }
+          }
+        }
+        if (maskedAny) {
+          rawNumericState.hasActiveFilterMask = true;
+        }
+      }
+
       function materializeLazyEncodedState() {
+        if (rawNumericState && !values) {
+          upgradeRawNumericToLazy(n);
+        }
         if (!lazyEncodedState || values) {
           return;
         }
@@ -5529,22 +7787,17 @@ self.onmessage = async function(event) {
           hi0 = bounds[1];
         }
 
+        for (i = 0; i < dimensionGroups.length; ++i) {
+          if (typeof dimensionGroups[i]._onDimensionMaterialize === 'function') {
+            dimensionGroups[i]._onDimensionMaterialize(lazyCodes);
+          }
+        }
+
         lazyEncodedState = null;
       }
 
       function hasLazyEncodedGroupingSupport() {
-        if (!lazyEncodedState || values || iterable) {
-          return false;
-        }
-
-        for (var code = 1; code < lazyEncodedState.codeToValue.length; ++code) {
-          var encodedValue = lazyEncodedState.codeToValue[code];
-          if (encodedValue === undefined || !(encodedValue >= encodedValue)) {
-            return false;
-          }
-        }
-
-        return true;
+        return !!(lazyEncodedState && !values && !iterable && !lazyEncodedState.hasUnorderable);
       }
 
       function setFilterValuePresent(nextPresent) {
@@ -5769,7 +8022,7 @@ self.onmessage = async function(event) {
       function preAdd(newData, n0, n1) {
         var newIterablesIndexCount,
             sourceValues = null,
-            columnAccessorSegment = accessorPath && !iterable && runtimeController.canUseWasmScan()
+            columnAccessorSegment = accessorPath && !iterable
               ? findSingleColumnAccessorSegment(accessorPath, n0, n1)
               : null,
             useStoredRecords = !accessorPath && newData === data && columnarBatches.length,
@@ -5790,42 +8043,67 @@ self.onmessage = async function(event) {
         }
 
         if (!iterable && accessorPath) {
-          if (!n0 && !values) {
-            lazyEncodedState = columnAccessorSegment
-              ? createLazyEncodedStateFromAccessor(columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
-              : createLazyEncodedState(ensureSourceValues());
-            if (lazyEncodedState) {
-              if (filterValuePresent && filterMode !== 'all') {
-                var initialTargetCodes = resolveLazyTargetCodes();
-                if (initialTargetCodes) {
-                  var initialMatches = initialTargetCodes.length
-                    ? runtimeController.findEncodedMatches(getLazyCodes(), initialTargetCodes)
-                    : new Uint32Array(0);
-                  initialMatches = new Uint32Array(initialMatches);
-                  var initialSelected = new Uint8Array(n1);
-                  for (var mi = 0; mi < initialMatches.length; ++mi) {
-                    initialSelected[initialMatches[mi]] = 1;
-                  }
-                  for (var ri = 0; ri < n1; ++ri) {
-                    if (!initialSelected[ri]) {
-                      filters[offset][ri] |= one;
-                    }
-                  }
-                  lazyEncodedState.matchIndices = normalizeLazyMatchIndices(initialMatches);
-                  lazyEncodedState.selected = normalizeLazySelectionMask(initialSelected);
-                }
+          if (!rawNumericState && !lazyEncodedState && !n0 && !values) {
+            if (n1 > 0 && isPureNumericColumnSource(accessorPath)) {
+              var initNumCol = getNumericColumn(accessorPath);
+              if (!initNumCol.hasNaN) {
+                runtimeController.canUseWasmScan();
+                rawNumericState = {
+                  field: accessorPath,
+                  hasActiveFilterMask: false,
+                  values: initNumCol.values,
+                  version: 1
+                };
+                applyRawNumericFilterToRange(0, n1);
+                lastAppendedCodes = null;
+                lo0 = 0;
+                hi0 = 0;
+                return;
               }
+            }
+            lazyEncodedState = columnAccessorSegment
+              ? createLazyEncodedStateFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+              : createLazyEncodedStateFromSource(ensureSourceValues(), null, 0, n1);
+            if (lazyEncodedState) {
+              applyLazyFilterToRange(0, n1);
               lastAppendedCodes = getLazyCodes();
               lo0 = 0;
               hi0 = 0;
               return;
             }
+          } else if (rawNumericState && !values) {
+            if (isPureNumericColumnSource(accessorPath)) {
+              var nextNumCol = getNumericColumn(accessorPath);
+              if (!nextNumCol.hasNaN) {
+                rawNumericState.values = nextNumCol.values;
+                rawNumericState.version += 1;
+                applyRawNumericFilterToRange(n0, n1);
+                lastAppendedCodes = null;
+                lo0 = 0;
+                hi0 = 0;
+                return;
+              }
+            }
+            upgradeRawNumericToLazy(n0);
+            if (lazyEncodedState) {
+              var upgradedAppendedCodes = columnAccessorSegment
+                ? appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+                : appendLazyEncodedValuesFromSource(ensureSourceValues(), null, 0, n1);
+              if (upgradedAppendedCodes) {
+                applyLazyFilterToRange(n0, n1);
+                lastAppendedCodes = upgradedAppendedCodes;
+                lo0 = 0;
+                hi0 = 0;
+                return;
+              }
+            }
+            materializeLazyEncodedState();
           } else if (lazyEncodedState && !values) {
             var appendedCodes = columnAccessorSegment
-              ? appendLazyEncodedValuesFromAccessor(columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
-              : appendLazyEncodedValues(ensureSourceValues());
+              ? appendLazyEncodedValuesFromSource(columnAccessorSegment.column, columnAccessorSegment.accessor, columnAccessorSegment.offset, n1)
+              : appendLazyEncodedValuesFromSource(ensureSourceValues(), null, 0, n1);
             if (appendedCodes) {
-              applyLazyFilterToNewRows(n0, appendedCodes);
+              applyLazyFilterToRange(n0, n1);
               lastAppendedCodes = appendedCodes;
               lo0 = 0;
               hi0 = 0;
@@ -6027,6 +8305,11 @@ self.onmessage = async function(event) {
       }
 
       function removeData(reIndex) {
+        if (rawNumericState && !values) {
+          upgradeRawNumericToLazy(reIndex.length);
+          compactLazyEncodedState(reIndex);
+          return;
+        }
         if (lazyEncodedState && !values) {
           compactLazyEncodedState(reIndex);
           return;
@@ -6158,6 +8441,20 @@ self.onmessage = async function(event) {
       function filterExact(value) {
         lazyFilterTargetCodes = null;
         lazyFilterTargetCodesVersion = 0;
+        if (rawNumericState && !values) {
+          if (isLazyEncodedValue(value)) {
+            filterValue = value;
+            setFilterValuePresent(true);
+            refilter = xfilterFilter.filterExact(bisect, value);
+            refilterFunction = null;
+            filterInValues = null;
+            if (typeof value === 'number' && value === value) {
+              return applyRawNumericPredicate(1, value, 0, 'bounds');
+            }
+            return applyRawNumericPredicate(0, 0, 0, 'bounds');
+          }
+          materializeLazyEncodedState();
+        }
         if (lazyEncodedState && !values) {
           var exactCodes = encodeLazyFilterValues([value]);
           if (exactCodes) {
@@ -6181,6 +8478,38 @@ self.onmessage = async function(event) {
       function filterIn(valuesToSelect) {
         lazyFilterTargetCodes = null;
         lazyFilterTargetCodesVersion = 0;
+        if (rawNumericState && !values) {
+          var rawExactFilterValues = normalizeExactFilterValues(valuesToSelect),
+              allLazy = true,
+              numSet = new Set(),
+              ri;
+          for (ri = 0; ri < rawExactFilterValues.length; ++ri) {
+            var rv = rawExactFilterValues[ri];
+            if (!isLazyEncodedValue(rv)) {
+              allLazy = false;
+              break;
+            }
+            if (typeof rv === 'number' && rv === rv) {
+              numSet.add(rv);
+            }
+          }
+          if (allLazy) {
+            filterValue = valuesToSelect;
+            setFilterValuePresent(true);
+            refilter = xfilterFilter.filterAll;
+            refilterFunction = null;
+            filterMode = 'in';
+            filterInValues = rawExactFilterValues;
+            if (numSet.size === 0) {
+              return applyRawNumericPredicate(0, 0, 0, 'in');
+            }
+            if (numSet.size === 1) {
+              return applyRawNumericPredicate(1, numSet.values().next().value, 0, 'in');
+            }
+            return applyRawNumericPredicate(3, numSet, 0, 'in');
+          }
+          materializeLazyEncodedState();
+        }
         if (lazyEncodedState && !values) {
           var lazyExactFilterValues = normalizeExactFilterValues(valuesToSelect),
               lazyEncodedValues = encodeLazyFilterValues(lazyExactFilterValues);
@@ -6224,27 +8553,28 @@ self.onmessage = async function(event) {
       // Filters this dimension to select the specified range [lo, hi].
       // The lower bound is inclusive, and the upper bound is exclusive.
       function filterRange(range) {
-        if (lazyEncodedState && !values && hasLazyEncodedGroupingSupport()) {
-          var codeToValue = lazyEncodedState.codeToValue,
-              rangeCodes = [],
-              rangeCode,
-              rangeValue;
-
-          for (rangeCode = 1; rangeCode < codeToValue.length; ++rangeCode) {
-            rangeValue = codeToValue[rangeCode];
-            if (compareNaturalOrder(rangeValue, range[0]) >= 0 && compareNaturalOrder(rangeValue, range[1]) < 0) {
-              rangeCodes.push(rangeCode);
-            }
+        if (rawNumericState && !values) {
+          var rLo = range[0],
+              rHi = range[1];
+          if (typeof rLo === 'number' && typeof rHi === 'number' && rLo === rLo && rHi === rHi) {
+            filterValue = range;
+            setFilterValuePresent(true);
+            refilter = xfilterFilter.filterRange(bisect, range);
+            refilterFunction = null;
+            filterInValues = null;
+            return applyRawNumericPredicate(2, rLo, rHi, 'bounds');
           }
-
+          upgradeRawNumericToLazy(n);
+        }
+        if (lazyEncodedState && !values && hasLazyEncodedGroupingSupport()) {
           filterValue = range;
           setFilterValuePresent(true);
           refilter = xfilterFilter.filterRange(bisect, range);
           refilterFunction = null;
           filterInValues = null;
           filterMode = 'bounds';
-          lazyFilterTargetCodes = new Uint32Array(rangeCodes);
-          lazyFilterTargetCodesVersion = codeToValue.length;
+          lazyFilterTargetCodes = computeLazyRangeCodes(range);
+          lazyFilterTargetCodesVersion = lazyEncodedState.codeToValue.length;
           return applyLazyEncodedFilter(lazyFilterTargetCodes, 'bounds');
         }
 
@@ -6261,13 +8591,23 @@ self.onmessage = async function(event) {
       function filterAll() {
         lazyFilterTargetCodes = null;
         lazyFilterTargetCodesVersion = 0;
+        if (rawNumericState && !values) {
+          filterValue = undefined;
+          setFilterValuePresent(false);
+          refilter = xfilterFilter.filterAll;
+          refilterFunction = null;
+          filterInValues = null;
+          filterMode = 'all';
+          return applyRawNumericClearFilter();
+        }
         if (lazyEncodedState && !values) {
           filterValue = undefined;
           setFilterValuePresent(false);
           refilter = xfilterFilter.filterAll;
           refilterFunction = null;
           filterInValues = null;
-          return applyLazySelectionState(null);
+          filterMode = 'all';
+          return applyLazyClearFilter();
         }
 
         filterValue = undefined;
@@ -6281,7 +8621,7 @@ self.onmessage = async function(event) {
       function filterFunction(f) {
         lazyFilterTargetCodes = null;
         lazyFilterTargetCodesVersion = 0;
-        if (lazyEncodedState && !values) {
+        if ((rawNumericState || lazyEncodedState) && !values) {
           materializeLazyEncodedState();
         }
 
@@ -6402,9 +8742,375 @@ self.onmessage = async function(event) {
         return filterValuePresent;
       }
 
+      function readDimensionBounds() {
+        if (iterable) {
+          return null;
+        }
+
+        if (rawNumericState && !values) {
+          var rVals = rawNumericState.values,
+              rMin,
+              rMax,
+              ri,
+              rv;
+          if (!activeDimensionFilterCount) {
+            if (!n) return { max: null, min: null };
+            rMin = rMax = rVals[0];
+            for (ri = 1; ri < n; ++ri) {
+              rv = rVals[ri];
+              if (rv < rMin) rMin = rv;
+              if (rv > rMax) rMax = rv;
+            }
+            return { max: rMax, min: rMin };
+          }
+          var rActive = getActiveRows(),
+              rLen = rActive.length,
+              rIdx = rActive.indices;
+          if (!rLen) return { max: null, min: null };
+          rMin = rMax = rVals[rIdx[0]];
+          for (ri = 1; ri < rLen; ++ri) {
+            rv = rVals[rIdx[ri]];
+            if (rv < rMin) rMin = rv;
+            if (rv > rMax) rMax = rv;
+          }
+          return { max: rMax, min: rMin };
+        }
+
+        if (lazyEncodedState && !values) {
+          var codeToValue = lazyEncodedState.codeToValue,
+              codeCounts = lazyEncodedState.codeCounts,
+              codes = lazyEncodedState.codes,
+              isPureNum = lazyEncodedState.isPureNumeric,
+              hasAny = false,
+              minVal = null,
+              maxVal = null,
+              c,
+              i,
+              v;
+
+          if (!activeDimensionFilterCount) {
+            if (!n) return { max: null, min: null };
+            if (isPureNum) {
+              for (c = 1; c < codeToValue.length; ++c) {
+                if (!codeCounts[c]) continue;
+                v = codeToValue[c];
+                if (!hasAny) {
+                  minVal = maxVal = v;
+                  hasAny = true;
+                } else {
+                  if (v < minVal) minVal = v;
+                  if (v > maxVal) maxVal = v;
+                }
+              }
+            } else {
+              for (c = 1; c < codeToValue.length; ++c) {
+                if (!codeCounts[c]) continue;
+                v = codeToValue[c];
+                if (!hasAny) {
+                  minVal = maxVal = v;
+                  hasAny = true;
+                } else {
+                  if (compareNaturalOrder(v, minVal) < 0) minVal = v;
+                  if (compareNaturalOrder(v, maxVal) > 0) maxVal = v;
+                }
+              }
+            }
+            return {
+              max: hasAny && maxVal != null ? maxVal : null,
+              min: hasAny && minVal != null ? minVal : null
+            };
+          }
+
+          var active = getActiveRows(),
+              activeLen = active.length,
+              activeIdx = active.indices;
+          if (!activeLen) {
+            return { max: null, min: null };
+          }
+
+          if (isPureNum) {
+            minVal = maxVal = codeToValue[codes[activeIdx[0]]];
+            for (i = 1; i < activeLen; ++i) {
+              v = codeToValue[codes[activeIdx[i]]];
+              if (v < minVal) minVal = v;
+              if (v > maxVal) maxVal = v;
+            }
+            return {
+              max: maxVal != null ? maxVal : null,
+              min: minVal != null ? minVal : null
+            };
+          }
+
+          var markVersion = nextLazyMarkVersion(),
+              marks = lazyEncodedState.selectionMarks;
+          for (i = 0; i < activeLen; ++i) {
+            marks[codes[activeIdx[i]]] = markVersion;
+          }
+          for (c = 1; c < codeToValue.length; ++c) {
+            if (marks[c] !== markVersion) continue;
+            v = codeToValue[c];
+            if (!hasAny) {
+              minVal = maxVal = v;
+              hasAny = true;
+            } else {
+              if (compareNaturalOrder(v, minVal) < 0) minVal = v;
+              if (compareNaturalOrder(v, maxVal) > 0) maxVal = v;
+            }
+          }
+          return {
+            max: hasAny && maxVal != null ? maxVal : null,
+            min: hasAny && minVal != null ? minVal : null
+          };
+        }
+
+        if (!values) {
+          return { max: null, min: null };
+        }
+
+        var loVal = null,
+            hiVal = null,
+            idx;
+        for (idx = lo0; idx < hi0; ++idx) {
+          if (filters.zero(index[idx])) {
+            loVal = values[idx];
+            break;
+          }
+        }
+        if (idx === hi0) {
+          return { max: null, min: null };
+        }
+        for (idx = hi0 - 1; idx >= lo0; --idx) {
+          if (filters.zero(index[idx])) {
+            hiVal = values[idx];
+            break;
+          }
+        }
+        return {
+          max: hiVal == null ? null : hiVal,
+          min: loVal == null ? null : loVal
+        };
+      }
+
+      function lazyTopBottomIndex(k, skipOffset, isTop) {
+        if (k <= 0) {
+          return [];
+        }
+        var isRaw = !!(rawNumericState && !lazyEncodedState);
+        if (!isRaw && lazyEncodedState.hasUnorderable) {
+          return null;
+        }
+
+        var toSkip = skipOffset && skipOffset > 0 ? skipOffset : 0,
+            need = k + toSkip,
+            activeIndices = null,
+            rowCount;
+
+        if (!activeDimensionFilterCount) {
+          rowCount = n;
+        } else {
+          var active = getActiveRows();
+          activeIndices = active.indices;
+          rowCount = active.length;
+        }
+
+        if (rowCount <= toSkip) {
+          return [];
+        }
+
+        if (need > 4096 && rowCount > 4096) {
+          return null;
+        }
+
+        var rawVals = isRaw ? rawNumericState.values : null,
+            codes = isRaw ? null : lazyEncodedState.codes,
+            useNumeric = isRaw || lazyEncodedState.isPureNumeric,
+            keyTable = isRaw ? null : (useNumeric ? lazyEncodedState.codeToValue : getLazyCodeRank()),
+            i,
+            r,
+            v;
+
+        if (need >= rowCount) {
+          var allRows = new Array(rowCount);
+          if (activeIndices) {
+            for (i = 0; i < rowCount; ++i) allRows[i] = activeIndices[i];
+          } else {
+            for (i = 0; i < rowCount; ++i) allRows[i] = i;
+          }
+          if (isRaw) {
+            allRows.sort(isTop
+              ? function(a, b) {
+                  var diff = rawVals[b] - rawVals[a];
+                  return diff || b - a;
+                }
+              : function(a, b) {
+                  var diff = rawVals[a] - rawVals[b];
+                  return diff || a - b;
+                });
+          } else {
+            allRows.sort(isTop
+              ? function(a, b) {
+                  var diff = keyTable[codes[b]] - keyTable[codes[a]];
+                  return diff || b - a;
+                }
+              : function(a, b) {
+                  var diff = keyTable[codes[a]] - keyTable[codes[b]];
+                  return diff || a - b;
+                });
+          }
+          return toSkip > 0 ? allRows.slice(toSkip, toSkip + k) : (allRows.length > k ? allRows.slice(0, k) : allRows);
+        }
+
+        var heapRow = new Uint32Array(need),
+            heapVal = useNumeric ? new Float64Array(need) : new Uint32Array(need),
+            heapSize = 0,
+            pos,
+            parent,
+            left,
+            right,
+            child,
+            pv,
+            pr,
+            cv,
+            cr;
+
+        if (isTop) {
+          // Min-heap of the `need` largest (val, row) pairs; root is smallest.
+          for (i = 0; i < rowCount; ++i) {
+            r = activeIndices ? activeIndices[i] : i;
+            v = isRaw ? rawVals[r] : keyTable[codes[r]];
+            if (heapSize < need) {
+              pos = heapSize++;
+              while (pos > 0) {
+                parent = (pos - 1) >>> 1;
+                pv = heapVal[parent];
+                pr = heapRow[parent];
+                if (v < pv || (v === pv && r < pr)) {
+                  heapVal[pos] = pv;
+                  heapRow[pos] = pr;
+                  pos = parent;
+                } else {
+                  break;
+                }
+              }
+              heapVal[pos] = v;
+              heapRow[pos] = r;
+            } else if (v >= heapVal[0]) {
+              // Rows are visited in ascending order, so r > heapRow[0] on ties.
+              pos = 0;
+              while ((left = (pos << 1) + 1) < heapSize) {
+                child = left;
+                right = left + 1;
+                if (right < heapSize) {
+                  cv = heapVal[right];
+                  cr = heapRow[right];
+                  if (cv < heapVal[left] || (cv === heapVal[left] && cr < heapRow[left])) {
+                    child = right;
+                  }
+                }
+                cv = heapVal[child];
+                cr = heapRow[child];
+                if (cv < v || (cv === v && cr < r)) {
+                  heapVal[pos] = cv;
+                  heapRow[pos] = cr;
+                  pos = child;
+                } else {
+                  break;
+                }
+              }
+              heapVal[pos] = v;
+              heapRow[pos] = r;
+            }
+          }
+        } else {
+          // Max-heap of the `need` smallest (val, row) pairs; root is largest.
+          for (i = 0; i < rowCount; ++i) {
+            r = activeIndices ? activeIndices[i] : i;
+            v = isRaw ? rawVals[r] : keyTable[codes[r]];
+            if (heapSize < need) {
+              pos = heapSize++;
+              while (pos > 0) {
+                parent = (pos - 1) >>> 1;
+                pv = heapVal[parent];
+                pr = heapRow[parent];
+                if (v > pv || (v === pv && r > pr)) {
+                  heapVal[pos] = pv;
+                  heapRow[pos] = pr;
+                  pos = parent;
+                } else {
+                  break;
+                }
+              }
+              heapVal[pos] = v;
+              heapRow[pos] = r;
+            } else if (v < heapVal[0]) {
+              // Rows are visited in ascending order, so ties (v === heapVal[0]) lose.
+              pos = 0;
+              while ((left = (pos << 1) + 1) < heapSize) {
+                child = left;
+                right = left + 1;
+                if (right < heapSize) {
+                  cv = heapVal[right];
+                  cr = heapRow[right];
+                  if (cv > heapVal[left] || (cv === heapVal[left] && cr > heapRow[left])) {
+                    child = right;
+                  }
+                }
+                cv = heapVal[child];
+                cr = heapRow[child];
+                if (cv > v || (cv === v && cr > r)) {
+                  heapVal[pos] = cv;
+                  heapRow[pos] = cr;
+                  pos = child;
+                } else {
+                  break;
+                }
+              }
+              heapVal[pos] = v;
+              heapRow[pos] = r;
+            }
+          }
+        }
+
+        var result = new Array(heapSize);
+        for (i = 0; i < heapSize; ++i) result[i] = heapRow[i];
+        if (isRaw) {
+          result.sort(isTop
+            ? function(a, b) {
+                var diff = rawVals[b] - rawVals[a];
+                return diff || b - a;
+              }
+            : function(a, b) {
+                var diff = rawVals[a] - rawVals[b];
+                return diff || a - b;
+              });
+        } else {
+          result.sort(isTop
+            ? function(a, b) {
+                var diff = keyTable[codes[b]] - keyTable[codes[a]];
+                return diff || b - a;
+              }
+            : function(a, b) {
+                var diff = keyTable[codes[a]] - keyTable[codes[b]];
+                return diff || a - b;
+              });
+        }
+        return toSkip > 0 ? result.slice(toSkip, toSkip + k) : (result.length > k ? result.slice(0, k) : result);
+      }
+
       // Returns the top K selected records based on this dimension's order.
       // Note: observes this dimension's filter, unlike group and groupAll.
       function top(k, top_offset) {
+        if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
+          var lazyRows = lazyTopBottomIndex(k, top_offset, true);
+          if (lazyRows !== null) {
+            var lazyOut = new Array(lazyRows.length);
+            for (var li = 0; li < lazyRows.length; ++li) {
+              lazyOut[li] = getRecord(lazyRows[li]);
+            }
+            return lazyOut;
+          }
+        }
+
         materializeLazyEncodedState();
 
         var array = [],
@@ -6445,6 +9151,13 @@ self.onmessage = async function(event) {
       }
 
       function topIndex(k, top_offset) {
+        if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
+          var lazyRows = lazyTopBottomIndex(k, top_offset, true);
+          if (lazyRows !== null) {
+            return lazyRows;
+          }
+        }
+
         materializeLazyEncodedState();
 
         var array = [],
@@ -6484,6 +9197,17 @@ self.onmessage = async function(event) {
       // Returns the bottom K selected records based on this dimension's order.
       // Note: observes this dimension's filter, unlike group and groupAll.
       function bottom(k, bottom_offset) {
+        if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
+          var lazyRows = lazyTopBottomIndex(k, bottom_offset, false);
+          if (lazyRows !== null) {
+            var lazyOut = new Array(lazyRows.length);
+            for (var li = 0; li < lazyRows.length; ++li) {
+              lazyOut[li] = getRecord(lazyRows[li]);
+            }
+            return lazyOut;
+          }
+        }
+
         materializeLazyEncodedState();
 
         var array = [],
@@ -6527,6 +9251,13 @@ self.onmessage = async function(event) {
       }
 
       function bottomIndex(k, bottom_offset) {
+        if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
+          var lazyRows = lazyTopBottomIndex(k, bottom_offset, false);
+          if (lazyRows !== null) {
+            return lazyRows;
+          }
+        }
+
         materializeLazyEncodedState();
 
         var array = [],
@@ -6570,8 +9301,22 @@ self.onmessage = async function(event) {
       function group(key) {
         if (arguments.length < 1) key = cr_identity;
 
-        var useLazyEncodedGrouping = (key === cr_identity || key === cr_null) && hasLazyEncodedGroupingSupport();
-        if (!useLazyEncodedGrouping) {
+        var groupAll = key === cr_null;
+        var isPureMonotonicKey = !!(key && key._xfilterPureMonotonic === true);
+        var rawBucketMode = !groupAll && isPureMonotonicKey && !!(rawNumericState && !values && !iterable);
+
+        if (rawNumericState && !values && !groupAll && !rawBucketMode) {
+          if (key === cr_identity) {
+            upgradeRawNumericToLazy(n);
+          } else {
+            materializeLazyEncodedState();
+          }
+        }
+
+        var lazyIdentityMode = !rawBucketMode && key === cr_identity && hasLazyEncodedGroupingSupport();
+        var lazyBucketMode = !groupAll && !rawBucketMode && !lazyIdentityMode && isPureMonotonicKey && hasLazyEncodedGroupingSupport();
+
+        if (!groupAll && !rawBucketMode && !lazyIdentityMode && !lazyBucketMode) {
           materializeLazyEncodedState();
         }
 
@@ -6585,7 +9330,10 @@ self.onmessage = async function(event) {
           orderNatural: orderNatural,
           size: size,
           dispose: dispose,
-          remove: dispose // for backwards-compatibility
+          remove: dispose, // for backwards-compatibility
+          _onDimensionMaterialize: onDimensionMaterialize,
+          _onRawNumericUpgrade: onRawNumericUpgrade,
+          _readColumnar: readColumnar
         };
 
         // Ensure that this group will be removed when the dimension is removed.
@@ -6596,21 +9344,54 @@ self.onmessage = async function(event) {
             groupWidth = 8,
             groupCapacity = capacity(groupWidth),
             k = 0, // cardinality
+            lazySortedCodes = null,
+            lazyOrderVersion = -1,
             lazyCodeToGroup = null,
+            bucketKeys = null,
+            bucketKeyToSlot = null,
+            bucketCodeToSlot = null,
+            bucketOrderVersion = -1,
+            bucketCodeCount = 0,
+            bucketIndexedLength = 0,
+            hasInvalidBucket = false,
+            rawBucketKeys = null,
+            rawBucketMap = null,
+            rawBucketSortedOrder = null,
+            rawBucketSlotToGroup = null,
+            rawBucketIndexedLength = 0,
+            rawBucketVersion = -1,
+            rawBucketTimeStep = key && key._xfilterTimeStep ? key._xfilterTimeStep : 0,
+            rawBucketTimeOffset = key && key._xfilterTimeOffset ? key._xfilterTimeOffset : 0,
+            materializedVersion = 0,
             select,
             heap,
             reduceAdd,
             reduceRemove,
             reduceInitial,
             reduceMetricSpec = null,
+            reduceSplitField = null,
+            metricPlan = null,
+            metricBuffers = null,
+            countBuf = null,
+            splitMode = null, // 'dense' | 'sparse'
+            splitActiveStride = 0,
+            sparsePairGroupIds = null,
+            sparseHeadBySlot = null,
+            sparseNextPair = null,
+            sparsePairSplitCode = null,
+            sparsePairCount = 0,
+            sparseN = -1,
+            sparseSplitStride = -1,
+            sparseDimVersion = -1,
             reduceMode = null,
+            valuesSynced = false,
             update = cr_null,
             reset = cr_null,
             resetNeeded = true,
             markResetNeeded = registerResetListener(function() {
               resetNeeded = true;
+              valuesSynced = false;
             }),
-            groupAll = key === cr_null,
             n0old;
 
         // The group listens to the crossfilter for when any dimension changes, so
@@ -6620,138 +9401,687 @@ self.onmessage = async function(event) {
         indexListeners.push(add);
         removeDataListeners.push(removeData);
 
+        function setFilterListener(nextUpdate, nextReset) {
+          var listenerIndex = filterListeners.indexOf(update);
+          update = nextUpdate;
+          reset = nextReset;
+          if (listenerIndex >= 0) {
+            filterListeners[listenerIndex] = update;
+          }
+        }
+
+        function ensureCountBuf(sizeNeeded) {
+          if (countBuf && countBuf.length >= sizeNeeded) {
+            return countBuf;
+          }
+          var nextCap = countBuf && countBuf.length ? countBuf.length : 64;
+          while (nextCap < sizeNeeded) {
+            nextCap = nextCap < 65536 ? nextCap << 1 : sizeNeeded;
+          }
+          countBuf = new Float64Array(nextCap);
+          return countBuf;
+        }
+
+        function ensureLazyOrder() {
+          if (!lazyIdentityMode || !lazyEncodedState) {
+            return;
+          }
+          if (lazyOrderVersion === lazyEncodedState.version) {
+            return;
+          }
+          var codeToValue = lazyEncodedState.codeToValue,
+              codeCounts = lazyEncodedState.codeCounts,
+              sorted = [],
+              c;
+
+          for (c = 1; c < codeToValue.length; ++c) {
+            if (codeCounts[c] > 0 && isNaturallyOrderable(codeToValue[c])) {
+              sorted.push(c);
+            }
+          }
+          sorted.sort(function(a, b) {
+            var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
+            return order || a - b;
+          });
+
+          lazySortedCodes = sorted;
+          k = sorted.length;
+          lazyOrderVersion = lazyEncodedState.version;
+          lazyCodeToGroup = null;
+          groups = null;
+          valuesSynced = false;
+        }
+
+        function ensureLazyIdentityGroups() {
+          ensureLazyOrder();
+          if (groups && groups.length === k && (!lazyIdentityMode || lazyCodeToGroup)) {
+            return;
+          }
+          var codeToValue = lazyEncodedState.codeToValue,
+              len = k,
+              arr = new Array(len),
+              map = new Int32Array(codeToValue.length),
+              i,
+              c;
+          map.fill(-1);
+          for (i = 0; i < len; ++i) {
+            c = lazySortedCodes[i];
+            arr[i] = { key: codeToValue[c], value: undefined };
+            map[c] = i;
+          }
+          groups = arr;
+          lazyCodeToGroup = map;
+        }
+
+        function ensureLazyBucketLayout() {
+          if (!lazyBucketMode || !lazyEncodedState) {
+            return;
+          }
+          if (bucketOrderVersion === lazyEncodedState.version && bucketIndexedLength === n) {
+            return;
+          }
+
+          var codeToValue = lazyEncodedState.codeToValue,
+              codeCounts = lazyEncodedState.codeCounts,
+              codes = lazyEncodedState.codes,
+              codeLen = codeToValue.length,
+              i,
+              c,
+              bk;
+
+          // Fast incremental extend when only new rows arrived and no new bucket key appeared.
+          if (bucketKeyToSlot && bucketCodeToSlot && bucketCodeCount <= codeLen && bucketIndexedLength <= n && bucketOrderVersion > 0 && bucketIndexedLength > 0) {
+            var canExtend = true;
+            var newCodeToSlot = bucketCodeToSlot;
+            if (newCodeToSlot.length < codeLen) {
+              var nextMap = new Uint32Array(codeLen);
+              nextMap.set(bucketCodeToSlot);
+              newCodeToSlot = nextMap;
+            }
+            for (c = bucketCodeCount; c < codeLen; ++c) {
+              if (!codeCounts[c]) continue;
+              bk = key(codeToValue[c]);
+              if (!isNaturallyOrderable(bk)) {
+                canExtend = false;
+                break;
+              }
+              var existingSlot = bucketKeyToSlot.get(bk);
+              if (existingSlot === undefined) {
+                canExtend = false;
+                break;
+              }
+              newCodeToSlot[c] = existingSlot;
+            }
+            if (canExtend && groupIndex) {
+              bucketCodeToSlot = newCodeToSlot;
+              bucketCodeCount = codeLen;
+              if (groupIndex.length < n) {
+                groupIndex = xfilterArray.arrayLengthen(groupIndex, n);
+              }
+              for (i = bucketIndexedLength; i < n; ++i) {
+                groupIndex[i] = bucketCodeToSlot[codes[i]];
+              }
+              bucketIndexedLength = n;
+              bucketOrderVersion = lazyEncodedState.version;
+              return;
+            }
+          }
+
+          var uniqueKeys = [],
+              keySet = new Map(),
+              codeBuckets = new Array(codeLen),
+              invalid = false;
+
+          for (c = 1; c < codeLen; ++c) {
+            if (!codeCounts[c]) continue;
+            bk = key(codeToValue[c]);
+            codeBuckets[c] = bk;
+            if (isNaturallyOrderable(bk)) {
+              if (!keySet.has(bk)) {
+                keySet.set(bk, 1);
+                uniqueKeys.push(bk);
+              }
+            } else {
+              invalid = true;
+            }
+          }
+
+          uniqueKeys.sort(compareNaturalOrder);
+          var slotMap = new Map();
+          for (i = 0; i < uniqueKeys.length; ++i) {
+            slotMap.set(uniqueKeys[i], i);
+          }
+
+          var codeToSlot = new Uint32Array(codeLen);
+          var sentinel = uniqueKeys.length;
+          for (c = 1; c < codeLen; ++c) {
+            if (!codeCounts[c]) continue;
+            bk = codeBuckets[c];
+            if (isNaturallyOrderable(bk)) {
+              codeToSlot[c] = slotMap.get(bk);
+            } else {
+              codeToSlot[c] = sentinel;
+            }
+          }
+
+          bucketKeys = uniqueKeys;
+          bucketKeyToSlot = slotMap;
+          bucketCodeToSlot = codeToSlot;
+          bucketCodeCount = codeLen;
+          hasInvalidBucket = invalid;
+          k = uniqueKeys.length;
+
+          var totalSlots = k + (invalid ? 1 : 0);
+          if (totalSlots > 0 && n > 0) {
+            groupIndex = cr_index(n, totalSlots);
+            for (i = 0; i < n; ++i) {
+              groupIndex[i] = codeToSlot[codes[i]];
+            }
+          } else {
+            groupIndex = null;
+          }
+          bucketIndexedLength = n;
+          bucketOrderVersion = lazyEncodedState.version;
+          groups = null;
+          valuesSynced = false;
+        }
+
+        function ensureRawBucketLayout() {
+          if (!rawBucketMode || !rawNumericState) {
+            return;
+          }
+          if (rawBucketVersion === rawNumericState.version && rawBucketIndexedLength === n) {
+            return;
+          }
+
+          var vals = rawNumericState.values,
+              step = rawBucketTimeStep,
+              timeOff = rawBucketTimeOffset,
+              start = rawBucketIndexedLength,
+              keysArr = rawBucketKeys,
+              bMap = rawBucketMap,
+              orderDirty = !rawBucketSortedOrder,
+              i,
+              bk,
+              rawId;
+
+          if (!keysArr) {
+            keysArr = rawBucketKeys = [];
+            bMap = rawBucketMap = new Map();
+            start = 0;
+            orderDirty = true;
+          }
+
+          if (!groupIndex || groupIndex.length < n) {
+            var nextCap = n < 64 ? 64 : n;
+            if (groupIndex && groupIndex.length > 0 && start > 0) {
+              var grown = new Uint32Array(nextCap);
+              grown.set(groupIndex.subarray(0, start));
+              groupIndex = grown;
+            } else {
+              groupIndex = new Uint32Array(nextCap);
+            }
+          }
+
+          var lastBk = NaN,
+              lastId = -1;
+
+          if (step > 0) {
+            if (timeOff === 0) {
+              for (i = start; i < n; ++i) {
+                bk = Math.floor(vals[i] / step) * step;
+                if (bk === lastBk) {
+                  groupIndex[i] = lastId;
+                  continue;
+                }
+                rawId = bMap.get(bk);
+                if (rawId === undefined) {
+                  rawId = keysArr.length;
+                  keysArr.push(bk);
+                  bMap.set(bk, rawId);
+                  orderDirty = true;
+                }
+                lastBk = bk;
+                lastId = rawId;
+                groupIndex[i] = rawId;
+              }
+            } else {
+              for (i = start; i < n; ++i) {
+                bk = Math.floor((vals[i] + timeOff) / step) * step - timeOff;
+                if (bk === lastBk) {
+                  groupIndex[i] = lastId;
+                  continue;
+                }
+                rawId = bMap.get(bk);
+                if (rawId === undefined) {
+                  rawId = keysArr.length;
+                  keysArr.push(bk);
+                  bMap.set(bk, rawId);
+                  orderDirty = true;
+                }
+                lastBk = bk;
+                lastId = rawId;
+                groupIndex[i] = rawId;
+              }
+            }
+          } else {
+            for (i = start; i < n; ++i) {
+              bk = key(vals[i]);
+              if (!isNaturallyOrderable(bk)) {
+                upgradeRawNumericToLazy(n);
+                ensureLazyBucketLayout();
+                return;
+              }
+              if (bk === lastBk) {
+                groupIndex[i] = lastId;
+                continue;
+              }
+              rawId = bMap.get(bk);
+              if (rawId === undefined) {
+                rawId = keysArr.length;
+                keysArr.push(bk);
+                bMap.set(bk, rawId);
+                orderDirty = true;
+              }
+              lastBk = bk;
+              lastId = rawId;
+              groupIndex[i] = rawId;
+            }
+          }
+
+          if (orderDirty) {
+            var len = keysArr.length;
+            var sorted = new Array(len);
+            for (i = 0; i < len; ++i) sorted[i] = i;
+            sorted.sort(function(a, b) {
+              var order = compareNaturalOrder(keysArr[a], keysArr[b]);
+              return order || a - b;
+            });
+            rawBucketSortedOrder = sorted;
+            var slotToGroup = new Uint32Array(len);
+            for (i = 0; i < len; ++i) slotToGroup[sorted[i]] = i;
+            rawBucketSlotToGroup = slotToGroup;
+            k = len;
+            groups = null;
+          }
+
+          rawBucketIndexedLength = n;
+          rawBucketVersion = rawNumericState.version;
+          valuesSynced = false;
+        }
+
+        function onRawNumericUpgrade() {
+          if (!rawBucketMode) {
+            return;
+          }
+          rawBucketMode = false;
+          rawBucketKeys = null;
+          rawBucketMap = null;
+          rawBucketSortedOrder = null;
+          rawBucketSlotToGroup = null;
+          rawBucketIndexedLength = 0;
+          rawBucketVersion = -1;
+          groupIndex = null;
+          groups = null;
+          lazyBucketMode = !!(lazyEncodedState && !lazyEncodedState.hasUnorderable);
+          bucketOrderVersion = -1;
+          bucketIndexedLength = 0;
+          sparseLayoutVersionReset();
+          resetNeeded = true;
+          valuesSynced = false;
+        }
+
+        function getPrimarySlotArray() {
+          if (lazyIdentityMode) {
+            return lazyEncodedState.codes;
+          }
+          return groupIndex;
+        }
+
+        function getPrimarySlotCount() {
+          if (lazyIdentityMode) {
+            return lazyEncodedState ? lazyEncodedState.codeToValue.length : 0;
+          }
+          if (rawBucketMode) {
+            return rawBucketKeys ? rawBucketKeys.length : 0;
+          }
+          if (lazyBucketMode) {
+            return k + (hasInvalidBucket ? 1 : 0);
+          }
+          return k;
+        }
+
+        function ensureSparseSplitLayout(slotArr, primarySlots, splitCol) {
+          var stride = splitCol.codeToKey.length;
+          var dimVer = rawNumericState
+            ? rawNumericState.version
+            : (lazyEncodedState ? lazyEncodedState.version : materializedVersion);
+          if (
+            sparsePairGroupIds
+            && sparseN === n
+            && sparseSplitStride === stride
+            && sparseDimVersion === dimVer
+          ) {
+            return;
+          }
+
+          var splitCodes = splitCol.codes,
+              pairIds = (sparsePairGroupIds && sparsePairGroupIds.length >= n)
+                ? sparsePairGroupIds
+                : new Uint32Array(n < 64 ? 64 : n),
+              head = new Int32Array(primarySlots),
+              cap = primarySlots < 256 ? 256 : primarySlots,
+              nextPair = new Int32Array(cap),
+              pairSplit = new Uint32Array(cap),
+              pairMap = new Map(),
+              pairCount = 0,
+              i,
+              s,
+              sc,
+              pairKey,
+              pid;
+
+          head.fill(-1);
+
+          for (i = 0; i < n; ++i) {
+            s = slotArr[i];
+            sc = splitCodes[i];
+            pairKey = s * stride + sc;
+            pid = pairMap.get(pairKey);
+            if (pid === undefined) {
+              pid = pairCount++;
+              pairMap.set(pairKey, pid);
+              if (pid >= cap) {
+                cap <<= 1;
+                var grownNext = new Int32Array(cap);
+                grownNext.set(nextPair);
+                nextPair = grownNext;
+                var grownSplit = new Uint32Array(cap);
+                grownSplit.set(pairSplit);
+                pairSplit = grownSplit;
+              }
+              pairSplit[pid] = sc;
+              nextPair[pid] = head[s];
+              head[s] = pid;
+            }
+            pairIds[i] = pid;
+          }
+
+          sparsePairGroupIds = pairIds;
+          sparseHeadBySlot = head;
+          sparseNextPair = nextPair;
+          sparsePairSplitCode = pairSplit;
+          sparsePairCount = pairCount;
+          sparseN = n;
+          sparseSplitStride = stride;
+          sparseDimVersion = dimVer;
+        }
+
+        function syncGroupsFromBuffers() {
+          if (valuesSynced) {
+            return;
+          }
+          if (reduceMode === null) {
+            valuesSynced = true;
+            return;
+          }
+
+          var i, slot, state, splitCol, splitKeys, sc, cell, bucket, pid;
+
+          if (groupAll) {
+            if (!groups || !groups.length) {
+              groups = [{ key: null, value: undefined }];
+            }
+            if (reduceMode === 'count') {
+              groups[0].value = countBuf ? countBuf[0] : 0;
+            } else if (reduceMode === 'metricSpec') {
+              if (!groups[0].value) groups[0].value = reduceInitial();
+              writeMetricSlotToState(groups[0].value, metricPlan, metricBuffers, 0);
+            } else if (reduceMode === 'splitMetricSpec') {
+              splitCol = getSplitColumn(reduceSplitField);
+              splitKeys = splitCol.codeToKey;
+              state = reduceInitial();
+              for (sc = 0; sc < splitActiveStride; ++sc) {
+                if (slotHasAnyActivity(metricPlan, metricBuffers, sc)) {
+                  bucket = {};
+                  writeMetricSlotToState(bucket, metricPlan, metricBuffers, sc);
+                  state[splitKeys[sc]] = bucket;
+                }
+              }
+              state.__version += 1;
+              groups[0].value = state;
+            }
+            valuesSynced = true;
+            return;
+          }
+
+          if (lazyIdentityMode) {
+            ensureLazyIdentityGroups();
+          } else if (rawBucketMode) {
+            if (!groups || groups.length !== k) {
+              groups = new Array(k);
+              for (i = 0; i < k; ++i) {
+                groups[i] = { key: rawBucketKeys[rawBucketSortedOrder[i]], value: undefined };
+              }
+            }
+          } else if (lazyBucketMode) {
+            if (!groups || groups.length !== k) {
+              groups = new Array(k);
+              for (i = 0; i < k; ++i) {
+                groups[i] = { key: bucketKeys[i], value: undefined };
+              }
+            }
+          }
+
+          if (k === 0) {
+            groups = [];
+            valuesSynced = true;
+            return;
+          }
+
+          var slotList = lazyIdentityMode ? lazySortedCodes : (rawBucketMode ? rawBucketSortedOrder : null);
+
+          if (reduceMode === 'count') {
+            for (i = 0; i < k; ++i) {
+              slot = slotList ? slotList[i] : i;
+              groups[i].value = countBuf[slot];
+            }
+          } else if (reduceMode === 'metricSpec') {
+            for (i = 0; i < k; ++i) {
+              slot = slotList ? slotList[i] : i;
+              state = groups[i].value;
+              if (!state) {
+                state = groups[i].value = reduceInitial();
+              }
+              writeMetricSlotToState(state, metricPlan, metricBuffers, slot);
+            }
+          } else if (reduceMode === 'splitMetricSpec') {
+            splitCol = getSplitColumn(reduceSplitField);
+            splitKeys = splitCol.codeToKey;
+            if (splitMode === 'dense') {
+              for (i = 0; i < k; ++i) {
+                slot = slotList ? slotList[i] : i;
+                state = reduceInitial();
+                var base = slot * splitActiveStride;
+                for (sc = 0; sc < splitActiveStride; ++sc) {
+                  cell = base + sc;
+                  if (slotHasAnyActivity(metricPlan, metricBuffers, cell)) {
+                    bucket = {};
+                    writeMetricSlotToState(bucket, metricPlan, metricBuffers, cell);
+                    state[splitKeys[sc]] = bucket;
+                  }
+                }
+                state.__version += 1;
+                groups[i].value = state;
+              }
+            } else {
+              for (i = 0; i < k; ++i) {
+                slot = slotList ? slotList[i] : i;
+                state = reduceInitial();
+                for (pid = sparseHeadBySlot[slot]; pid !== -1; pid = sparseNextPair[pid]) {
+                  if (slotHasAnyActivity(metricPlan, metricBuffers, pid)) {
+                    bucket = {};
+                    writeMetricSlotToState(bucket, metricPlan, metricBuffers, pid);
+                    state[splitKeys[sparsePairSplitCode[pid]]] = bucket;
+                  }
+                }
+                state.__version += 1;
+                groups[i].value = state;
+              }
+            }
+          }
+
+          valuesSynced = true;
+        }
+
+        function onDimensionMaterialize(lazyCodes) {
+          if (groupAll) {
+            return;
+          }
+          if (!lazyIdentityMode && !lazyBucketMode) {
+            return;
+          }
+
+          var wasIdentity = lazyIdentityMode;
+          lazyIdentityMode = false;
+          lazyBucketMode = false;
+          lazyOrderVersion = -1;
+          bucketOrderVersion = -1;
+          bucketKeys = null;
+          bucketKeyToSlot = null;
+          bucketCodeToSlot = null;
+          bucketCodeCount = 0;
+          bucketIndexedLength = 0;
+          hasInvalidBucket = false;
+          sparseLayoutVersionReset();
+          resetNeeded = true;
+          valuesSynced = false;
+
+          if (wasIdentity && lazyEncodedState && !lazyEncodedState.hasUnorderable) {
+            var codeToValue = lazyEncodedState.codeToValue,
+                codeCounts = lazyEncodedState.codeCounts,
+                sorted = [],
+                c,
+                i;
+            for (c = 1; c < codeToValue.length; ++c) {
+              if (codeCounts[c] > 0 && isNaturallyOrderable(codeToValue[c])) {
+                sorted.push(c);
+              }
+            }
+            sorted.sort(function(a, b) {
+              var order = compareNaturalOrder(codeToValue[a], codeToValue[b]);
+              return order || a - b;
+            });
+            k = sorted.length;
+            if (!k) {
+              groups = [];
+              groupIndex = null;
+              setFilterListener(cr_null, cr_null);
+              return;
+            }
+            while (k > groupCapacity) {
+              groupWidth <<= 1;
+              groupCapacity = capacity(groupWidth);
+            }
+            groups = new Array(k);
+            var codeToGroup = new Uint32Array(codeToValue.length);
+            for (i = 0; i < k; ++i) {
+              groups[i] = { key: codeToValue[sorted[i]], value: undefined };
+              codeToGroup[sorted[i]] = i;
+            }
+            if (k > 1) {
+              groupIndex = cr_index(n, groupCapacity);
+              for (i = 0; i < lazyCodes.length; ++i) {
+                groupIndex[i] = codeToGroup[lazyCodes[i]];
+              }
+              setFilterListener(updateMany, resetMany);
+            } else {
+              groupIndex = null;
+              setFilterListener(updateOne, resetOne);
+            }
+            lazySortedCodes = null;
+            lazyCodeToGroup = null;
+            materializedVersion += 1;
+            return;
+          }
+
+          lazySortedCodes = null;
+          lazyCodeToGroup = null;
+          k = 0;
+          groups = [];
+          groupIndex = null;
+          add(values, index, 0, lazyCodes.length);
+          materializedVersion += 1;
+        }
+
+        function sparseLayoutVersionReset() {
+          sparseDimVersion = -1;
+          sparseN = -1;
+          sparseSplitStride = -1;
+        }
+
         // Incorporate any existing data into the grouping.
         add(values, index, 0, n);
 
         // Incorporates the specified new values into this group.
         // This function is responsible for updating groups and groupIndex.
         function add(newValues, newIndex, n0, n1, appendedCodes) {
-
-          // Incremental lazy append: groups already exist, dimension is still encoded
-          if (appendedCodes && lazyEncodedState && !values && k > 0) {
-            // groupAll (k=1, no groupIndex): just mark reset needed
-            if (groupAll) {
-              resetNeeded = true;
-              return;
+          if (groupAll && (rawNumericState || lazyEncodedState) && !values) {
+            k = 1;
+            if (!groups || !groups.length) {
+              groups = [{ key: null, value: resetNeeded ? undefined : reduceInitial() }];
             }
-
-            if (lazyCodeToGroup) {
-            var hasNewGroups = false,
-                incrCode,
-                incrI;
-
-            for (incrI = 0; incrI < appendedCodes.length; ++incrI) {
-              incrCode = appendedCodes[incrI];
-              if (incrCode > 0 && lazyCodeToGroup[incrCode] === undefined) {
-                hasNewGroups = true;
-                break;
-              }
-            }
-
-            if (!hasNewGroups) {
-              // Fast path: extend groupIndex for new rows, no new groups
-              if (k > 1) {
-                groupIndex = xfilterArray.arrayLengthen(groupIndex, n);
-                for (incrI = 0; incrI < appendedCodes.length; ++incrI) {
-                  groupIndex[n0 + incrI] = lazyCodeToGroup[appendedCodes[incrI]];
-                }
-              }
-              resetNeeded = true;
-              return;
-            }
-            // hasNewGroups: fall through to full lazy rebuild below
-            }
-          }
-
-          if (useLazyEncodedGrouping && lazyEncodedState && !values) {
-            var codeToValue = lazyEncodedState.codeToValue,
-                codes = getLazyCodes(),
-                sortedCodes = [],
-                initialValue = resetNeeded ? cr_null : reduceInitial,
-                rowIndex,
-                encodedCode,
-                sortIndex;
-
-            groups = [];
-            k = 0;
-
-            for (var code = 1; code < codeToValue.length; ++code) {
-              if (!isNaturallyOrderable(codeToValue[code])) {
-                continue;
-              }
-              sortedCodes.push(code);
-            }
-
-            sortedCodes.sort(function(a, b) {
-              var valueA = codeToValue[a],
-                  valueB = codeToValue[b];
-              var order = compareNaturalOrder(valueA, valueB);
-              return order || a - b;
-            });
-
-            if (groupAll) {
-              k = 1;
-              groups = [{key: null, value: initialValue()}];
-              groupIndex = null;
-              lazyCodeToGroup = null;
-            } else if (!sortedCodes.length) {
-              k = 0;
-              groups = [];
-              groupIndex = null;
-              lazyCodeToGroup = null;
-            } else {
-              while (sortedCodes.length > groupCapacity) {
-                groupWidth <<= 1;
-                groupCapacity = capacity(groupWidth);
-              }
-
-              lazyCodeToGroup = new Array(codeToValue.length);
-
-              for (sortIndex = 0; sortIndex < sortedCodes.length; ++sortIndex) {
-                encodedCode = sortedCodes[sortIndex];
-                groups[sortIndex] = {key: codeToValue[encodedCode], value: initialValue()};
-                lazyCodeToGroup[encodedCode] = sortIndex;
-              }
-
-              k = groups.length;
-              groupIndex = k > 1 ? cr_index(n, groupCapacity) : null;
-
-              if (groupIndex) {
-                for (rowIndex = 0; rowIndex < n; ++rowIndex) {
-                  groupIndex[rowIndex] = lazyCodeToGroup[codes[rowIndex]];
-                }
-              }
-            }
-
+            groupIndex = null;
             resetNeeded = true;
-
-            var listenerIndex = filterListeners.indexOf(update);
-            if (k > 1) {
-              update = updateMany;
-              reset = resetMany;
-            } else if (k === 1) {
-              update = updateOne;
-              reset = resetOne;
-              groupIndex = null;
-            } else {
-              update = cr_null;
-              reset = cr_null;
-              groupIndex = null;
-            }
-            filterListeners[listenerIndex] = update;
+            valuesSynced = false;
+            setFilterListener(updateOne, resetOne);
             return;
           }
 
-          if(iterable) {
+          if (rawBucketMode && rawNumericState && !values) {
+            resetNeeded = true;
+            valuesSynced = false;
+            setFilterListener(updateMany, resetMany);
+            return;
+          }
+
+          if (lazyIdentityMode && lazyEncodedState && !values) {
+            if (lazyEncodedState.hasUnorderable) {
+              materializeLazyEncodedState();
+              return;
+            }
+            resetNeeded = true;
+            valuesSynced = false;
+            setFilterListener(updateMany, resetMany);
+            return;
+          }
+
+          if (lazyBucketMode && lazyEncodedState && !values) {
+            if (lazyEncodedState.hasUnorderable) {
+              materializeLazyEncodedState();
+              return;
+            }
+            resetNeeded = true;
+            valuesSynced = false;
+            setFilterListener(updateMany, resetMany);
+            return;
+          }
+
+          if (iterable) {
             n0old = n0;
             n0 = values.length - newValues.length;
             n1 = newValues.length;
           }
 
+          if (reduceMode !== null && !iterable) {
+            resetNeeded = true;
+            valuesSynced = false;
+          }
+
           var oldGroups = groups,
               reIndex = iterable ? [] : cr_index(k, groupCapacity),
-              add = reduceAdd,
-              remove = reduceRemove,
+              addFn = reduceAdd,
+              removeFn = reduceRemove,
               initial = reduceInitial,
               k0 = k, // old cardinality
               i0 = 0, // index of old group
@@ -6764,19 +10094,17 @@ self.onmessage = async function(event) {
               x; // key of group to add
 
           // If a reset is needed, we don't need to update the reduce values.
-          if (resetNeeded) add = initial = cr_null;
-          if (resetNeeded) remove = initial = cr_null;
+          if (resetNeeded) addFn = initial = cr_null;
+          if (resetNeeded) removeFn = initial = cr_null;
 
           // Reset the new groups (k is a lower bound).
           // Also, make sure that groupIndex exists and is long enough.
           groups = new Array(k), k = 0;
-          if(iterable){
+          if (iterable) {
             groupIndex = k0 ? groupIndex : [];
-          }
-          else {
+          } else {
             groupIndex = k0 > 1 ? xfilterArray.arrayLengthen(groupIndex, n) : cr_index(n, groupCapacity);
           }
-
 
           // Get the first old key (x0 of g0), if it exists.
           if (k0) x0 = (g0 = oldGroups[0]).key;
@@ -6799,7 +10127,7 @@ self.onmessage = async function(event) {
               g0 = oldGroups[++i0];
               if (g0) x0 = g0.key;
             } else {
-              g = {key: x1, value: initial()}, x = x1;
+              g = { key: x1, value: initial() }, x = x1;
             }
 
             // Add the lesser group.
@@ -6807,43 +10135,30 @@ self.onmessage = async function(event) {
 
             // Add any selected records belonging to the added group, while
             // advancing the new key and populating the associated group index.
-
             while (compareNaturalOrder(x1, x) <= 0) {
               j = newIndex[i1] + (iterable ? n0old : n0);
 
-
-              if(iterable){
-                if(groupIndex[j]){
+              if (iterable) {
+                if (groupIndex[j]) {
                   groupIndex[j].push(k);
-                }
-                else {
+                } else {
                   groupIndex[j] = [k];
                 }
-              }
-              else {
+              } else {
                 groupIndex[j] = k;
               }
 
-              // Always add new values to groups. Only remove when another dimension has filtered them out.
-              // This gives groups full information on data life-cycle without paying for no-op filter checks.
-              if (reduceMode === 'count') {
-                if (!resetNeeded) {
+              if (!resetNeeded) {
+                if (reduceMode === 'count') {
                   g.value += 1;
                   if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
                     g.value -= 1;
                   }
+                } else {
+                  var rowRecord = getRecord(j);
+                  g.value = addFn(g.value, rowRecord, true);
+                  if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = removeFn(g.value, rowRecord, false);
                 }
-              } else if (reduceMode === 'metricSpec') {
-                if (!resetNeeded) {
-                  g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, j, 1);
-                  if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
-                    g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, j, -1);
-                  }
-                }
-              } else {
-                var rowRecord = getRecord(j);
-                g.value = add(g.value, rowRecord, true);
-                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = remove(g.value, rowRecord, false);
               }
               if (++i1 >= n1) break;
               x1 = key(newValues[i1]);
@@ -6852,19 +10167,16 @@ self.onmessage = async function(event) {
             groupIncrement();
           }
 
-          // Add any remaining old groups that were greater th1an all new keys.
-          // No incremental reduce is needed; these groups have no new records.
-          // Also record the new index of the old group.
+          // Add any remaining old groups that were greater than all new keys.
           while (i0 < k0) {
             groups[reIndex[i0] = k] = oldGroups[i0++];
             groupIncrement();
           }
 
-
           // Fill in gaps with empty arrays where there may have been rows with empty iterables
-          if(iterable){
+          if (iterable) {
             for (var index1 = 0; index1 < n; index1++) {
-              if(!groupIndex[index1]){
+              if (!groupIndex[index1]) {
                 groupIndex[index1] = [];
               }
             }
@@ -6872,52 +10184,41 @@ self.onmessage = async function(event) {
 
           // If we added any new groups before any old groups,
           // update the group index of all the old records.
-          if(k > i0){
-            if(iterable){
+          if (k > i0) {
+            if (iterable) {
               for (i0 = 0; i0 < n0old; ++i0) {
                 for (index1 = 0; index1 < groupIndex[i0].length; index1++) {
                   groupIndex[i0][index1] = reIndex[groupIndex[i0][index1]];
                 }
               }
-            }
-            else {
+            } else {
               for (i0 = 0; i0 < n0; ++i0) {
                 groupIndex[i0] = reIndex[groupIndex[i0]];
               }
             }
           }
 
-          // Modify the update and reset behavior based on the cardinality.
-          // If the cardinality is less than or equal to one, then the groupIndex
-          // is not needed. If the cardinality is zero, then there are no records
-          // and therefore no groups to update or reset. Note that we also must
-          // change the registered listener to point to the new method.
-          j = filterListeners.indexOf(update);
+          materializedVersion += 1;
+
           if (k > 1 || iterable) {
-            update = updateMany;
-            reset = resetMany;
+            setFilterListener(updateMany, resetMany);
           } else {
             if (!k && groupAll) {
               k = 1;
-              groups = [{key: null, value: initial()}];
+              groups = [{ key: null, value: initial() }];
             }
             if (k === 1) {
-              update = updateOne;
-              reset = resetOne;
+              setFilterListener(updateOne, resetOne);
             } else {
-              update = cr_null;
-              reset = cr_null;
+              setFilterListener(cr_null, cr_null);
             }
             groupIndex = null;
           }
-          filterListeners[j] = update;
 
-          // Count the number of added groups,
-          // and widen the group index as needed.
           function groupIncrement() {
-            if(iterable){
+            if (iterable) {
               k++;
-              return
+              return;
             }
             if (++k === groupCapacity) {
               reIndex = xfilterArray.arrayWiden(reIndex, groupWidth <<= 1);
@@ -6928,7 +10229,45 @@ self.onmessage = async function(event) {
         }
 
         function removeData(reIndex) {
-          lazyCodeToGroup = null;
+          sparseLayoutVersionReset();
+
+          if (lazyIdentityMode && lazyEncodedState && !values) {
+            lazyOrderVersion = -1;
+            lazySortedCodes = null;
+            lazyCodeToGroup = null;
+            groups = null;
+            valuesSynced = false;
+            resetNeeded = true;
+            if (lazyEncodedState.hasUnorderable) {
+              materializeLazyEncodedState();
+            }
+            return;
+          }
+
+          if (lazyBucketMode && lazyEncodedState && !values) {
+            bucketOrderVersion = -1;
+            bucketKeys = null;
+            bucketKeyToSlot = null;
+            bucketCodeToSlot = null;
+            bucketCodeCount = 0;
+            bucketIndexedLength = 0;
+            hasInvalidBucket = false;
+            groups = null;
+            groupIndex = null;
+            valuesSynced = false;
+            resetNeeded = true;
+            if (lazyEncodedState.hasUnorderable) {
+              materializeLazyEncodedState();
+            }
+            return;
+          }
+
+          if (reduceMode !== null && !iterable) {
+            resetNeeded = true;
+            valuesSynced = false;
+          }
+          materializedVersion += 1;
+
           if (k > 1 || iterable) {
             var oldK = k,
                 oldGroups = groups,
@@ -6937,8 +10276,6 @@ self.onmessage = async function(event) {
                 i0,
                 j;
 
-            // Filter out non-matches by copying matching group index entries to
-            // the beginning of the array.
             if (!iterable) {
               for (i = 0, j = 0; i < n; ++i) {
                 if (reIndex[i] !== REMOVED_INDEX) {
@@ -6959,9 +10296,6 @@ self.onmessage = async function(event) {
               groupIndex = groupIndex.slice(0, j);
             }
 
-            // Reassemble groups including only those groups that were referred
-            // to by matching group index entries.  Note the new group index in
-            // seenGroups.
             groups = [], k = 0;
             for (i = 0; i < oldK; ++i) {
               if (seenGroups[i]) {
@@ -6971,7 +10305,6 @@ self.onmessage = async function(event) {
             }
 
             if (k > 1 || iterable) {
-              // Reindex the group index using seenGroups to find the new index.
               if (!iterable) {
                 for (i = 0; i < j; ++i) groupIndex[i] = seenGroups[groupIndex[i]];
               } else {
@@ -6984,60 +10317,53 @@ self.onmessage = async function(event) {
             } else {
               groupIndex = null;
             }
-            filterListeners[filterListeners.indexOf(update)] = k > 1 || iterable
-                ? (reset = resetMany, update = updateMany)
-                : k === 1 ? (reset = resetOne, update = updateOne)
-                : reset = update = cr_null;
+            if (k > 1 || iterable) {
+              setFilterListener(updateMany, resetMany);
+            } else if (k === 1) {
+              setFilterListener(updateOne, resetOne);
+            } else {
+              setFilterListener(cr_null, cr_null);
+            }
           } else if (k === 1) {
             if (groupAll) return;
             for (var index3 = 0; index3 < n; ++index3) if (reIndex[index3] !== REMOVED_INDEX) return;
             groups = [], k = 0;
-            filterListeners[filterListeners.indexOf(update)] =
-            update = reset = cr_null;
+            setFilterListener(cr_null, cr_null);
           }
         }
 
         // Reduces the specified selected or deselected records.
-        // This function is only used when the cardinality is greater than 1.
-        // notFilter indicates a crossfilter.add/remove operation.
         function updateMany(filterOne, filterOffset, added, removed, notFilter) {
-
           if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
 
           var i,
               j,
-              k,
-              n,
+              rowIdx,
+              len,
               g;
 
-          if(iterable){
-            // Add the added values.
-            for (i = 0, n = added.length; i < n; ++i) {
-              if (filters.zeroExcept(k = added[i], offset, zero)) {
-                for (j = 0; j < groupIndex[k].length; j++) {
-                  g = groups[groupIndex[k][j]];
+          if (iterable) {
+            for (i = 0, len = added.length; i < len; ++i) {
+              if (filters.zeroExcept(rowIdx = added[i], offset, zero)) {
+                for (j = 0; j < groupIndex[rowIdx].length; j++) {
+                  g = groups[groupIndex[rowIdx][j]];
                   if (reduceMode === 'count') {
                     g.value += 1;
-                  } else if (reduceMode === 'metricSpec') {
-                    g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, 1);
                   } else {
-                    g.value = reduceAdd(g.value, getRecord(k), false, j);
+                    g.value = reduceAdd(g.value, getRecord(rowIdx), false, j);
                   }
                 }
               }
             }
 
-            // Remove the removed values.
-            for (i = 0, n = removed.length; i < n; ++i) {
-              if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
-                for (j = 0; j < groupIndex[k].length; j++) {
-                  g = groups[groupIndex[k][j]];
+            for (i = 0, len = removed.length; i < len; ++i) {
+              if (filters.onlyExcept(rowIdx = removed[i], offset, zero, filterOffset, filterOne)) {
+                for (j = 0; j < groupIndex[rowIdx].length; j++) {
+                  g = groups[groupIndex[rowIdx][j]];
                   if (reduceMode === 'count') {
                     g.value -= 1;
-                  } else if (reduceMode === 'metricSpec') {
-                    g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, -1);
                   } else {
-                    g.value = reduceRemove(g.value, getRecord(k), notFilter, j);
+                    g.value = reduceRemove(g.value, getRecord(rowIdx), notFilter, j);
                   }
                 }
               }
@@ -7045,97 +10371,249 @@ self.onmessage = async function(event) {
             return;
           }
 
-          // Add the added values.
-          for (i = 0, n = added.length; i < n; ++i) {
-            if (filters.zeroExcept(k = added[i], offset, zero)) {
-              g = groups[groupIndex[k]];
-              if (reduceMode === 'count') {
-                g.value += 1;
-              } else if (reduceMode === 'metricSpec') {
-                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, 1);
-              } else {
-                g.value = reduceAdd(g.value, getRecord(k), false);
+          if (reduceMode !== null) {
+            if (notFilter || added.length + removed.length > (n >>> 2)) {
+              resetNeeded = true;
+              valuesSynced = false;
+              return;
+            }
+
+            var slotArr = getPrimarySlotArray();
+            if (!slotArr || k === 0) {
+              return;
+            }
+
+            if (reduceMode === 'count') {
+              for (i = 0, len = added.length; i < len; ++i) {
+                rowIdx = added[i];
+                if (filters.zeroExcept(rowIdx, offset, zero)) {
+                  countBuf[slotArr[rowIdx]] += 1;
+                }
+              }
+              for (i = 0, len = removed.length; i < len; ++i) {
+                rowIdx = removed[i];
+                if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) {
+                  countBuf[slotArr[rowIdx]] -= 1;
+                }
+              }
+              valuesSynced = false;
+              return;
+            }
+
+            var addCount = 0,
+                remCount = 0,
+                maxWork = added.length > removed.length ? added.length : removed.length;
+
+            if (reduceMode === 'splitMetricSpec') {
+              var splitCol = getSplitColumn(reduceSplitField);
+              if (splitCol.codeToKey.length !== splitActiveStride) {
+                resetNeeded = true;
+                valuesSynced = false;
+                return;
+              }
+              if (maxWork > 0) {
+                deltaWorkBuf = ensureUint32Capacity(deltaWorkBuf, maxWork);
+              }
+              for (i = 0, len = added.length; i < len; ++i) {
+                rowIdx = added[i];
+                if (filters.zeroExcept(rowIdx, offset, zero)) {
+                  deltaWorkBuf[addCount++] = rowIdx;
+                }
+              }
+              if (addCount > 0) {
+                if (splitMode === 'dense') {
+                  reduceSplitDenseIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, splitActiveStride, deltaWorkBuf, addCount, 1, 0);
+                } else {
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, deltaWorkBuf, addCount, 1, 0);
+                }
+              }
+              for (i = 0, len = removed.length; i < len; ++i) {
+                rowIdx = removed[i];
+                if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) {
+                  deltaWorkBuf[remCount++] = rowIdx;
+                }
+              }
+              if (remCount > 0) {
+                if (splitMode === 'dense') {
+                  reduceSplitDenseIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, splitActiveStride, deltaWorkBuf, remCount, -1, 0);
+                } else {
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, deltaWorkBuf, remCount, -1, 0);
+                }
+              }
+              valuesSynced = false;
+              return;
+            }
+
+            // reduceMode === 'metricSpec'
+            if (maxWork > 0) {
+              deltaWorkBuf = ensureUint32Capacity(deltaWorkBuf, maxWork);
+            }
+            for (i = 0, len = added.length; i < len; ++i) {
+              rowIdx = added[i];
+              if (filters.zeroExcept(rowIdx, offset, zero)) {
+                deltaWorkBuf[addCount++] = rowIdx;
+              }
+            }
+            if (addCount > 0) {
+              reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, deltaWorkBuf, addCount, 1, 0);
+            }
+            for (i = 0, len = removed.length; i < len; ++i) {
+              rowIdx = removed[i];
+              if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) {
+                deltaWorkBuf[remCount++] = rowIdx;
+              }
+            }
+            if (remCount > 0) {
+              reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, deltaWorkBuf, remCount, -1, 0);
+            }
+            valuesSynced = false;
+            return;
+          }
+
+          // Custom reducer path
+          var customSlotArr = lazyIdentityMode ? lazyEncodedState.codes : groupIndex;
+          for (i = 0, len = added.length; i < len; ++i) {
+            if (filters.zeroExcept(rowIdx = added[i], offset, zero)) {
+              var ag = lazyIdentityMode
+                ? lazyCodeToGroup[customSlotArr[rowIdx]]
+                : (rawBucketMode ? rawBucketSlotToGroup[customSlotArr[rowIdx]] : customSlotArr[rowIdx]);
+              if (ag >= 0 && ag < k) {
+                g = groups[ag];
+                g.value = reduceAdd(g.value, getRecord(rowIdx), false);
               }
             }
           }
 
-          // Remove the removed values.
-          for (i = 0, n = removed.length; i < n; ++i) {
-            if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
-              g = groups[groupIndex[k]];
-              if (reduceMode === 'count') {
-                g.value -= 1;
-              } else if (reduceMode === 'metricSpec') {
-                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, -1);
-              } else {
-                g.value = reduceRemove(g.value, getRecord(k), notFilter);
+          for (i = 0, len = removed.length; i < len; ++i) {
+            if (filters.onlyExcept(rowIdx = removed[i], offset, zero, filterOffset, filterOne)) {
+              var rg = lazyIdentityMode
+                ? lazyCodeToGroup[customSlotArr[rowIdx]]
+                : (rawBucketMode ? rawBucketSlotToGroup[customSlotArr[rowIdx]] : customSlotArr[rowIdx]);
+              if (rg >= 0 && rg < k) {
+                g = groups[rg];
+                g.value = reduceRemove(g.value, getRecord(rowIdx), notFilter);
               }
             }
           }
         }
 
-        // Reduces the specified selected or deselected records.
-        // This function is only used when the cardinality is 1.
-        // notFilter indicates a crossfilter.add/remove operation.
+        // Reduces the specified selected or deselected records (cardinality 1).
         function updateOne(filterOne, filterOffset, added, removed, notFilter) {
           if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
 
           var i,
-              k,
-              n,
-              g = groups[0];
+              rowIdx,
+              len,
+              g;
 
-          // Add the added values.
-          for (i = 0, n = added.length; i < n; ++i) {
-            if (filters.zeroExcept(k = added[i], offset, zero)) {
-              if (reduceMode === 'count') {
-                g.value += 1;
-              } else if (reduceMode === 'metricSpec') {
-                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, 1);
-              } else {
-                g.value = reduceAdd(g.value, getRecord(k), false);
-              }
+          if (reduceMode !== null) {
+            if (notFilter || added.length + removed.length > (n >>> 2)) {
+              resetNeeded = true;
+              valuesSynced = false;
+              return;
             }
+
+            if (reduceMode === 'count') {
+              var delta = 0;
+              for (i = 0, len = added.length; i < len; ++i) {
+                if (filters.zeroExcept(added[i], offset, zero)) ++delta;
+              }
+              for (i = 0, len = removed.length; i < len; ++i) {
+                if (filters.onlyExcept(removed[i], offset, zero, filterOffset, filterOne)) --delta;
+              }
+              countBuf[0] += delta;
+              valuesSynced = false;
+              return;
+            }
+
+            var addCount = 0,
+                remCount = 0,
+                maxWork = added.length > removed.length ? added.length : removed.length;
+            if (maxWork > 0) {
+              deltaWorkBuf = ensureUint32Capacity(deltaWorkBuf, maxWork);
+            }
+
+            if (reduceMode === 'splitMetricSpec') {
+              var splitCol = getSplitColumn(reduceSplitField);
+              if (splitCol.codeToKey.length !== splitActiveStride) {
+                resetNeeded = true;
+                valuesSynced = false;
+                return;
+              }
+              for (i = 0, len = added.length; i < len; ++i) {
+                rowIdx = added[i];
+                if (filters.zeroExcept(rowIdx, offset, zero)) deltaWorkBuf[addCount++] = rowIdx;
+              }
+              if (addCount > 0) {
+                reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, deltaWorkBuf, addCount, 1, 0);
+              }
+              for (i = 0, len = removed.length; i < len; ++i) {
+                rowIdx = removed[i];
+                if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) deltaWorkBuf[remCount++] = rowIdx;
+              }
+              if (remCount > 0) {
+                reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, deltaWorkBuf, remCount, -1, 0);
+              }
+              valuesSynced = false;
+              return;
+            }
+
+            // reduceMode === 'metricSpec'
+            for (i = 0, len = added.length; i < len; ++i) {
+              rowIdx = added[i];
+              if (filters.zeroExcept(rowIdx, offset, zero)) deltaWorkBuf[addCount++] = rowIdx;
+            }
+            if (addCount > 0) {
+              reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, addCount, 1);
+            }
+            for (i = 0, len = removed.length; i < len; ++i) {
+              rowIdx = removed[i];
+              if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) deltaWorkBuf[remCount++] = rowIdx;
+            }
+            if (remCount > 0) {
+              reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, remCount, -1);
+            }
+            valuesSynced = false;
+            return;
           }
 
-          // Remove the removed values.
-          for (i = 0, n = removed.length; i < n; ++i) {
-            if (filters.onlyExcept(k = removed[i], offset, zero, filterOffset, filterOne)) {
-              if (reduceMode === 'count') {
-                g.value -= 1;
-              } else if (reduceMode === 'metricSpec') {
-                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, k, -1);
-              } else {
-                g.value = reduceRemove(g.value, getRecord(k), notFilter);
-              }
+          g = groups[0];
+          for (i = 0, len = added.length; i < len; ++i) {
+            if (filters.zeroExcept(rowIdx = added[i], offset, zero)) {
+              g.value = reduceAdd(g.value, getRecord(rowIdx), false);
+            }
+          }
+          for (i = 0, len = removed.length; i < len; ++i) {
+            if (filters.onlyExcept(rowIdx = removed[i], offset, zero, filterOffset, filterOne)) {
+              g.value = reduceRemove(g.value, getRecord(rowIdx), notFilter);
             }
           }
         }
 
         // Recomputes the group reduce values from scratch.
-        // This function is only used when the cardinality is greater than 1.
         function resetMany() {
           var i,
               j,
               g,
               applyFilteredRemovals = hasOtherActiveDimensionFilters();
 
-          // Reset all group values.
-          for (i = 0; i < k; ++i) {
-            groups[i].value = reduceInitial();
+          if (lazyIdentityMode) {
+            ensureLazyOrder();
+          } else if (rawBucketMode) {
+            ensureRawBucketLayout();
+          } else if (lazyBucketMode) {
+            ensureLazyBucketLayout();
           }
 
-          // We add all records and then remove filtered records so that reducers
-          // can build an 'unfiltered' view even if there are already filters in
-          // place on other dimensions.
-          if(iterable){
+          if (iterable) {
+            for (i = 0; i < k; ++i) {
+              groups[i].value = reduceInitial();
+            }
             for (i = 0; i < n; ++i) {
               for (j = 0; j < groupIndex[i].length; j++) {
                 g = groups[groupIndex[i][j]];
                 if (reduceMode === 'count') {
                   g.value += 1;
-                } else if (reduceMode === 'metricSpec') {
-                  g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, 1);
                 } else {
                   var iterableRecord = getRecord(i);
                   g.value = reduceAdd(g.value, iterableRecord, true, j);
@@ -7143,6 +10621,7 @@ self.onmessage = async function(event) {
               }
             }
             if (!applyFilteredRemovals) {
+              valuesSynced = true;
               return;
             }
             for (i = 0; i < n; ++i) {
@@ -7151,8 +10630,6 @@ self.onmessage = async function(event) {
                   g = groups[groupIndex[i][j]];
                   if (reduceMode === 'count') {
                     g.value -= 1;
-                  } else if (reduceMode === 'metricSpec') {
-                    g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, -1);
                   } else {
                     var filteredIterableRecord = getRecord(i);
                     g.value = reduceRemove(g.value, filteredIterableRecord, false, j);
@@ -7160,78 +10637,306 @@ self.onmessage = async function(event) {
                 }
               }
             }
+            valuesSynced = true;
             return;
           }
 
-          for (i = 0; i < n; ++i) {
-            g = groups[groupIndex[i]];
+          if (k === 0) {
+            groups = [];
+            valuesSynced = true;
+            return;
+          }
+
+          if (reduceMode !== null) {
+            var slotArr = getPrimarySlotArray(),
+                slotCount = getPrimarySlotCount(),
+                rows;
+
             if (reduceMode === 'count') {
-              g.value += 1;
-            } else if (reduceMode === 'metricSpec') {
-              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, 1);
-            } else {
+              ensureCountBuf(slotCount);
+              countBuf.fill(0, 0, slotCount);
+              if (!applyFilteredRemovals) {
+                if (lazyIdentityMode) {
+                  var cc = lazyEncodedState.codeCounts;
+                  for (i = 1; i < slotCount; ++i) {
+                    countBuf[i] = cc[i];
+                  }
+                } else {
+                  for (i = 0; i < n; ++i) {
+                    countBuf[slotArr[i]] += 1;
+                  }
+                }
+              } else {
+                rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
+                var rIdx = rows.indices,
+                    rLen = rows.length;
+                for (i = 0; i < rLen; ++i) {
+                  countBuf[slotArr[rIdx[i]]] += 1;
+                }
+              }
+              valuesSynced = false;
+              return;
+            }
+
+            if (reduceMode === 'metricSpec') {
+              metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+              zeroMetricBuffers(metricBuffers, slotCount);
+              if (!applyFilteredRemovals) {
+                reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, slotArr, n, slotCount);
+              } else {
+                rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
+                reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, rows.indices, rows.length, 1, slotCount);
+              }
+              valuesSynced = false;
+              return;
+            }
+
+            if (reduceMode === 'splitMetricSpec') {
+              var splitCol = getSplitColumn(reduceSplitField),
+                  stride = splitCol.codeToKey.length;
+              splitActiveStride = stride;
+              if (stride === 0) {
+                splitMode = 'dense';
+                metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+                zeroMetricBuffers(metricBuffers, 1);
+                valuesSynced = false;
+                return;
+              }
+              if (slotCount * stride <= 262144) {
+                splitMode = 'dense';
+                var totalSlots = slotCount * stride;
+                metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
+                zeroMetricBuffers(metricBuffers, totalSlots);
+                if (!applyFilteredRemovals) {
+                  reduceSplitDenseAll(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, n, totalSlots);
+                } else {
+                  rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
+                  reduceSplitDenseIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, rows.indices, rows.length, 1, totalSlots);
+                }
+              } else {
+                splitMode = 'sparse';
+                ensureSparseSplitLayout(slotArr, slotCount, splitCol);
+                metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, sparsePairCount || 1, false);
+                zeroMetricBuffers(metricBuffers, sparsePairCount);
+                if (!applyFilteredRemovals) {
+                  reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, n, sparsePairCount);
+                } else {
+                  rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, rows.indices, rows.length, 1, sparsePairCount);
+                }
+              }
+              valuesSynced = false;
+              return;
+            }
+          }
+
+          // Custom reducer path
+          if (lazyIdentityMode) {
+            ensureLazyIdentityGroups();
+          } else if (rawBucketMode) {
+            if (!groups || groups.length !== k) {
+              groups = new Array(k);
+              for (i = 0; i < k; ++i) {
+                groups[i] = { key: rawBucketKeys[rawBucketSortedOrder[i]], value: undefined };
+              }
+            }
+          } else if (lazyBucketMode && (!groups || groups.length !== k)) {
+            groups = new Array(k);
+            for (i = 0; i < k; ++i) {
+              groups[i] = { key: bucketKeys[i], value: undefined };
+            }
+          }
+
+          for (i = 0; i < k; ++i) {
+            groups[i].value = reduceInitial();
+          }
+
+          var rawToSorted = null;
+          if (rawBucketMode) {
+            rawToSorted = new Uint32Array(k);
+            for (i = 0; i < k; ++i) rawToSorted[rawBucketSortedOrder[i]] = i;
+          }
+
+          var customSlotArr = lazyIdentityMode ? lazyEncodedState.codes : groupIndex;
+          for (i = 0; i < n; ++i) {
+            var ag = lazyIdentityMode
+              ? lazyCodeToGroup[customSlotArr[i]]
+              : (rawBucketMode ? rawToSorted[customSlotArr[i]] : customSlotArr[i]);
+            if (ag >= 0 && ag < k) {
+              g = groups[ag];
               g.value = reduceAdd(g.value, getRecord(i), true);
             }
           }
           if (!applyFilteredRemovals) {
+            valuesSynced = true;
             return;
           }
           for (i = 0; i < n; ++i) {
             if (!filters.zeroExcept(i, offset, zero)) {
-              g = groups[groupIndex[i]];
-              if (reduceMode === 'count') {
-                g.value -= 1;
-              } else if (reduceMode === 'metricSpec') {
-                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, -1);
-              } else {
+              var rg = lazyIdentityMode
+                ? lazyCodeToGroup[customSlotArr[i]]
+                : (rawBucketMode ? rawToSorted[customSlotArr[i]] : customSlotArr[i]);
+              if (rg >= 0 && rg < k) {
+                g = groups[rg];
                 g.value = reduceRemove(g.value, getRecord(i), false);
               }
             }
           }
+          valuesSynced = true;
         }
 
-        // Recomputes the group reduce values from scratch.
-        // This function is only used when the cardinality is 1.
+        // Recomputes the group reduce values from scratch (cardinality 1).
         function resetOne() {
           var i,
               applyFilteredRemovals = hasOtherActiveDimensionFilters(),
-              g = groups[0];
+              rows;
 
-          // Reset the singleton group values.
-          g.value = reduceInitial();
-
-          // We add all records and then remove filtered records so that reducers
-          // can build an 'unfiltered' view even if there are already filters in
-          // place on other dimensions.
-          for (i = 0; i < n; ++i) {
+          if (reduceMode !== null) {
             if (reduceMode === 'count') {
-              g.value += 1;
-            } else if (reduceMode === 'metricSpec') {
-              g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, 1);
-            } else {
-              g.value = reduceAdd(g.value, getRecord(i), true);
+              ensureCountBuf(1);
+              if (!applyFilteredRemovals) {
+                countBuf[0] = n;
+              } else if (!filterValuePresent) {
+                countBuf[0] = filteredCount();
+              } else {
+                countBuf[0] = collectZeroExceptRows(offset, zero).length;
+              }
+              valuesSynced = false;
+              return;
+            }
+
+            if (reduceMode === 'metricSpec') {
+              metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+              zeroMetricBuffers(metricBuffers, 1);
+              if (!applyFilteredRemovals) {
+                reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+              } else {
+                rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
+                reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, rows.indices, rows.length, 1);
+              }
+              valuesSynced = false;
+              return;
+            }
+
+            if (reduceMode === 'splitMetricSpec') {
+              var splitCol = getSplitColumn(reduceSplitField),
+                  stride = splitCol.codeToKey.length;
+              splitMode = 'dense';
+              splitActiveStride = stride;
+              metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, stride || 1, false);
+              zeroMetricBuffers(metricBuffers, stride);
+              if (stride > 0) {
+                if (!applyFilteredRemovals) {
+                  reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, n, stride);
+                } else {
+                  rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, rows.indices, rows.length, 1, stride);
+                }
+              }
+              valuesSynced = false;
+              return;
             }
           }
 
+          var g = groups[0];
+          g.value = reduceInitial();
+          for (i = 0; i < n; ++i) {
+            g.value = reduceAdd(g.value, getRecord(i), true);
+          }
           if (!applyFilteredRemovals) {
+            valuesSynced = true;
             return;
           }
           for (i = 0; i < n; ++i) {
             if (!filters.zeroExcept(i, offset, zero)) {
-              if (reduceMode === 'count') {
-                g.value -= 1;
-              } else if (reduceMode === 'metricSpec') {
-                g.value = applyReduceMetricSpec(g.value, reduceMetricSpec, i, -1);
-              } else {
-                g.value = reduceRemove(g.value, getRecord(i), false);
-              }
+              g.value = reduceRemove(g.value, getRecord(i), false);
             }
           }
+          valuesSynced = true;
+        }
+
+        function readColumnar() {
+          if (iterable || (reduceMode !== 'metricSpec' && reduceMode !== 'splitMetricSpec')) {
+            return null;
+          }
+          if (lazyIdentityMode) {
+            ensureLazyOrder();
+          } else if (rawBucketMode) {
+            ensureRawBucketLayout();
+          } else if (lazyBucketMode) {
+            ensureLazyBucketLayout();
+          }
+          if (resetNeeded) {
+            reset();
+            resetNeeded = false;
+          }
+
+          var keySource = null,
+              codeToValue = null,
+              slotOf = null,
+              groupsRef = null;
+
+          if (lazyIdentityMode) {
+            codeToValue = lazyEncodedState.codeToValue;
+            slotOf = lazySortedCodes;
+          } else if (rawBucketMode) {
+            codeToValue = rawBucketKeys;
+            slotOf = rawBucketSortedOrder;
+          } else if (lazyBucketMode) {
+            keySource = bucketKeys;
+          } else {
+            groupsRef = groups;
+          }
+
+          if (reduceMode === 'metricSpec') {
+            return {
+              buffers: metricBuffers,
+              codeToValue: codeToValue,
+              count: k,
+              groups: groupsRef,
+              keys: keySource,
+              mode: 'flat',
+              plan: metricPlan,
+              slotOf: slotOf
+            };
+          }
+
+          var splitCol = getSplitColumn(reduceSplitField);
+          if (splitMode === 'dense') {
+            return {
+              buffers: metricBuffers,
+              codeToValue: codeToValue,
+              count: k,
+              groups: groupsRef,
+              keys: keySource,
+              mode: 'splitDense',
+              plan: metricPlan,
+              slotOf: slotOf,
+              splitKeys: splitCol.codeToKey,
+              splitStride: splitActiveStride
+            };
+          }
+
+          return {
+            buffers: metricBuffers,
+            codeToValue: codeToValue,
+            count: k,
+            groups: groupsRef,
+            headBySlot: sparseHeadBySlot,
+            keys: keySource,
+            mode: 'splitSparse',
+            nextPair: sparseNextPair,
+            pairSplitCode: sparsePairSplitCode,
+            plan: metricPlan,
+            slotOf: slotOf,
+            splitKeys: splitCol.codeToKey
+          };
         }
 
         // Returns the array of group values, in the dimension's natural order.
         function all() {
           if (resetNeeded) reset(), resetNeeded = false;
+          syncGroupsFromBuffers();
           return groups;
         }
 
@@ -7243,16 +10948,23 @@ self.onmessage = async function(event) {
 
         // Sets the reduce behavior for this group to use the specified functions.
         // This method lazily recomputes the reduce values, waiting until needed.
-        function reduce(add, remove, initial) {
-          reduceAdd = add;
-          reduceRemove = remove;
-          reduceInitial = initial;
-          reduceMetricSpec = resolveReduceMetricSpec(add, remove, initial);
+        function reduce(addFn, removeFn, initialFn) {
+          reduceAdd = addFn;
+          reduceRemove = removeFn;
+          reduceInitial = initialFn;
+          var resolved = resolveReduceMetricSpec(addFn, removeFn, initialFn);
+          reduceMetricSpec = resolved ? resolved.metrics : null;
+          reduceSplitField = resolved ? resolved.splitField : null;
+          metricPlan = reduceMetricSpec ? compileMetricPlan(reduceMetricSpec) : null;
+          metricBuffers = null;
+          splitMode = null;
+          splitActiveStride = 0;
           reduceMode = null;
-          if (reduceMetricSpec) {
-            reduceMode = 'metricSpec';
+          if (reduceMetricSpec && !iterable) {
+            reduceMode = reduceSplitField ? 'splitMetricSpec' : 'metricSpec';
           }
           resetNeeded = true;
+          valuesSynced = false;
           return group;
         }
 
@@ -7283,6 +10995,13 @@ self.onmessage = async function(event) {
 
         // Returns the cardinality of this group, irrespective of any filters.
         function size() {
+          if (lazyIdentityMode) {
+            ensureLazyOrder();
+          } else if (rawBucketMode) {
+            ensureRawBucketLayout();
+          } else if (lazyBucketMode) {
+            ensureLazyBucketLayout();
+          }
           return k;
         }
 
@@ -7340,7 +11059,8 @@ self.onmessage = async function(event) {
         reduceSum: reduceSum,
         value: value,
         dispose: dispose,
-        remove: dispose // for backwards-compatibility
+        remove: dispose, // for backwards-compatibility
+        _readScalar: readScalar
       };
 
       var reduceValue,
@@ -7348,10 +11068,14 @@ self.onmessage = async function(event) {
           reduceRemove,
           reduceInitial,
           reduceMetricSpec = null,
+          metricPlan = null,
+          metricBuffers = null,
           reduceMode = null,
+          valueSynced = false,
           resetNeeded = true,
           markResetNeeded = registerResetListener(function() {
             resetNeeded = true;
+            valueSynced = false;
           });
 
       // The group listens to the crossfilter for when any dimension changes, so
@@ -7370,28 +11094,42 @@ self.onmessage = async function(event) {
 
         if (resetNeeded) return;
 
+        if (reduceMode === 'count') {
+          if (!applyFilteredRemovals) {
+            reduceValue += (n - n0);
+          } else {
+            for (i = n0; i < n; ++i) {
+              if (filters.zero(i)) reduceValue += 1;
+            }
+          }
+          return;
+        }
+
+        if (reduceMode === 'metricSpec') {
+          var addedLen = n - n0;
+          if (!addedLen) return;
+          deltaWorkBuf = ensureUint32Capacity(deltaWorkBuf, addedLen);
+          var count = 0;
+          if (!applyFilteredRemovals) {
+            for (i = n0; i < n; ++i) deltaWorkBuf[count++] = i;
+          } else {
+            for (i = n0; i < n; ++i) {
+              if (filters.zero(i)) deltaWorkBuf[count++] = i;
+            }
+          }
+          if (count > 0) {
+            reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, count, 1);
+            valueSynced = false;
+          }
+          return;
+        }
+
         // Cycle through all the values.
         for (i = n0; i < n; ++i) {
-          if (reduceMode === 'count') {
-            reduceValue += 1;
-            if (applyFilteredRemovals && !filters.zero(i)) {
-              reduceValue -= 1;
-            }
-          } else if (reduceMode === 'metricSpec') {
-            reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, 1);
-            if (applyFilteredRemovals && !filters.zero(i)) {
-              reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, -1);
-            }
-          } else {
-            var rowRecord = getRecord(i);
-
-            // Add all values all the time.
-            reduceValue = reduceAdd(reduceValue, rowRecord, true);
-
-            // Remove the value if filtered.
-            if (applyFilteredRemovals && !filters.zero(i)) {
-              reduceValue = reduceRemove(reduceValue, rowRecord, false);
-            }
+          var rowRecord = getRecord(i);
+          reduceValue = reduceAdd(reduceValue, rowRecord, true);
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue = reduceRemove(reduceValue, rowRecord, false);
           }
         }
       }
@@ -7400,33 +11138,65 @@ self.onmessage = async function(event) {
       function update(filterOne, filterOffset, added, removed, notFilter) {
         var i,
             k,
-            n;
+            len;
 
         if (resetNeeded) return;
 
-        // Add the added values.
-        for (i = 0, n = added.length; i < n; ++i) {
-          if (filters.zero(k = added[i])) {
-            if (reduceMode === 'count') {
-              reduceValue += 1;
-            } else if (reduceMode === 'metricSpec') {
-              reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, k, 1);
-            } else {
-              reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
+        if (reduceMode !== null) {
+          if (notFilter || added.length + removed.length > (n >>> 2)) {
+            resetNeeded = true;
+            valueSynced = false;
+            return;
+          }
+
+          if (reduceMode === 'count') {
+            var delta = 0;
+            for (i = 0, len = added.length; i < len; ++i) {
+              if (filters.zero(added[i])) ++delta;
             }
+            for (i = 0, len = removed.length; i < len; ++i) {
+              if (filters.only(removed[i], filterOffset, filterOne)) --delta;
+            }
+            reduceValue += delta;
+            return;
+          }
+
+          // reduceMode === 'metricSpec'
+          var maxWork = added.length > removed.length ? added.length : removed.length;
+          if (maxWork > 0) {
+            deltaWorkBuf = ensureUint32Capacity(deltaWorkBuf, maxWork);
+          }
+          var addCount = 0;
+          for (i = 0, len = added.length; i < len; ++i) {
+            k = added[i];
+            if (filters.zero(k)) deltaWorkBuf[addCount++] = k;
+          }
+          if (addCount > 0) {
+            reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, addCount, 1);
+          }
+          var remCount = 0;
+          for (i = 0, len = removed.length; i < len; ++i) {
+            k = removed[i];
+            if (filters.only(k, filterOffset, filterOne)) deltaWorkBuf[remCount++] = k;
+          }
+          if (remCount > 0) {
+            reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, remCount, -1);
+          }
+          valueSynced = false;
+          return;
+        }
+
+        // Add the added values.
+        for (i = 0, len = added.length; i < len; ++i) {
+          if (filters.zero(k = added[i])) {
+            reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
           }
         }
 
         // Remove the removed values.
-        for (i = 0, n = removed.length; i < n; ++i) {
+        for (i = 0, len = removed.length; i < len; ++i) {
           if (filters.only(k = removed[i], filterOffset, filterOne)) {
-            if (reduceMode === 'count') {
-              reduceValue -= 1;
-            } else if (reduceMode === 'metricSpec') {
-              reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, k, -1);
-            } else {
-              reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
-            }
+            reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
           }
         }
       }
@@ -7436,46 +11206,50 @@ self.onmessage = async function(event) {
         var i,
             applyFilteredRemovals = hasAnyActiveDimensionFilters();
 
+        if (reduceMode === 'count') {
+          reduceValue = filteredCount();
+          valueSynced = true;
+          return;
+        }
+
+        if (reduceMode === 'metricSpec') {
+          metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+          zeroMetricBuffers(metricBuffers, 1);
+          if (!applyFilteredRemovals) {
+            reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+          } else {
+            var active = getActiveRows();
+            reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, active.indices, active.length, 1);
+          }
+          valueSynced = false;
+          return;
+        }
+
         reduceValue = reduceInitial();
 
-        // Cycle through all the values.
         for (i = 0; i < n; ++i) {
-          if (reduceMode === 'count') {
-            reduceValue += 1;
-            if (applyFilteredRemovals && !filters.zero(i)) {
-              reduceValue -= 1;
-            }
-          } else if (reduceMode === 'metricSpec') {
-            reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, 1);
-            if (applyFilteredRemovals && !filters.zero(i)) {
-              reduceValue = applyReduceMetricSpec(reduceValue, reduceMetricSpec, i, -1);
-            }
-          } else {
-            var rowRecord = getRecord(i);
-
-            // Add all values all the time.
-            reduceValue = reduceAdd(reduceValue, rowRecord, true);
-
-            // Remove the value if it is filtered.
-            if (applyFilteredRemovals && !filters.zero(i)) {
-              reduceValue = reduceRemove(reduceValue, rowRecord, false);
-            }
+          var rowRecord = getRecord(i);
+          reduceValue = reduceAdd(reduceValue, rowRecord, true);
+          if (applyFilteredRemovals && !filters.zero(i)) {
+            reduceValue = reduceRemove(reduceValue, rowRecord, false);
           }
         }
+        valueSynced = true;
       }
 
       // Sets the reduce behavior for this group to use the specified functions.
       // This method lazily recomputes the reduce value, waiting until needed.
-      function reduce(add, remove, initial) {
-        reduceAdd = add;
-        reduceRemove = remove;
-        reduceInitial = initial;
-        reduceMetricSpec = resolveReduceMetricSpec(add, remove, initial);
-        reduceMode = null;
-        if (reduceMetricSpec) {
-          reduceMode = 'metricSpec';
-        }
+      function reduce(addFn, removeFn, initialFn) {
+        reduceAdd = addFn;
+        reduceRemove = removeFn;
+        reduceInitial = initialFn;
+        var resolved = resolveReduceMetricSpec(addFn, removeFn, initialFn);
+        reduceMetricSpec = resolved && !resolved.splitField ? resolved.metrics : null;
+        metricPlan = reduceMetricSpec ? compileMetricPlan(reduceMetricSpec) : null;
+        metricBuffers = null;
+        reduceMode = reduceMetricSpec ? 'metricSpec' : null;
         resetNeeded = true;
+        valueSynced = false;
         return group;
       }
 
@@ -7491,9 +11265,22 @@ self.onmessage = async function(event) {
         return reduce(xfilterReduce.reduceAdd(value), xfilterReduce.reduceSubtract(value), cr_zero);
       }
 
+      function readScalar() {
+        if (reduceMode !== 'metricSpec') {
+          return null;
+        }
+        if (resetNeeded) reset(), resetNeeded = false;
+        return finalizeMetricSlot(metricPlan, metricBuffers, 0);
+      }
+
       // Returns the computed reduce value.
       function value() {
         if (resetNeeded) reset(), resetNeeded = false;
+        if (reduceMode === 'metricSpec' && !valueSynced) {
+          if (!reduceValue) reduceValue = reduceInitial();
+          writeMetricSlotToState(reduceValue, metricPlan, metricBuffers, 0);
+          valueSynced = true;
+        }
         return reduceValue;
       }
 
@@ -7537,9 +11324,25 @@ self.onmessage = async function(event) {
     }
 
     function allFilteredIndexes(ignore_dimensions) {
-      var array = [],
+      var array,
           i = 0,
-          mask = maskForDimensions(ignore_dimensions || []);
+          mask;
+
+      if (!ignore_dimensions || !ignore_dimensions.length) {
+        if (!activeDimensionFilterCount) {
+          array = new Array(n);
+          for (i = 0; i < n; ++i) array[i] = i;
+          return array;
+        }
+        var active = getActiveRows();
+        array = new Array(active.length);
+        var indices = active.indices;
+        for (i = 0; i < active.length; ++i) array[i] = indices[i];
+        return array;
+      }
+
+      array = [];
+      mask = maskForDimensions(ignore_dimensions);
 
       for (i = 0; i < n; i++) {
         if (filters.zeroExceptMask(i, mask)) {
@@ -7550,12 +11353,34 @@ self.onmessage = async function(event) {
       return array;
     }
 
+    function resolveUniformTypedArrayConstructor(field) {
+      if (!columnarBatches.length) return null;
+      var expectedStart = 0;
+      var ctor = null;
+      var b, batch, col;
+      for (b = 0; b < columnarBatches.length; ++b) {
+        batch = columnarBatches[b];
+        if (batch.start !== expectedStart) return null;
+        expectedStart = batch.end;
+        col = batch.columns[field];
+        if (!ArrayBuffer.isView(col) || typeof col.BYTES_PER_ELEMENT !== 'number') return null;
+        if (ctor === null) ctor = col.constructor;
+        else if (col.constructor !== ctor) return null;
+      }
+      return expectedStart === n ? ctor : null;
+    }
+
     function takeColumns(rowIndexes, fields) {
       var selectedFields = fields && fields.length ? fields.slice() : null;
       var columns = {};
       var rowCount = rowIndexes ? rowIndexes.length : 0;
       var fieldIndex;
       var rowIndex;
+      var singleFullBatch = columnarBatches.length === 1
+        && columnarBatches[0].start === 0
+        && columnarBatches[0].end === n
+        ? columnarBatches[0]
+        : null;
 
       if (!selectedFields) {
         return {
@@ -7566,14 +11391,38 @@ self.onmessage = async function(event) {
       }
 
       for (fieldIndex = 0; fieldIndex < selectedFields.length; ++fieldIndex) {
-        columns[selectedFields[fieldIndex]] = new Array(rowCount);
-      }
+        var field = selectedFields[fieldIndex];
+        var typedCtor = resolveUniformTypedArrayConstructor(field);
+        var out = typedCtor ? new typedCtor(rowCount) : new Array(rowCount);
 
-      for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
-        for (fieldIndex = 0; fieldIndex < selectedFields.length; ++fieldIndex) {
-          var field = selectedFields[fieldIndex];
-          columns[field][rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+        if (singleFullBatch) {
+          var srcCol = singleFullBatch.columns[field];
+          var srcAcc = singleFullBatch.accessors && singleFullBatch.accessors[field];
+          if (ArrayBuffer.isView(srcCol) || Array.isArray(srcCol)) {
+            for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+              out[rowIndex] = srcCol[rowIndexes[rowIndex]];
+            }
+          } else if (srcAcc) {
+            for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+              out[rowIndex] = srcAcc(rowIndexes[rowIndex]);
+            }
+          } else {
+            for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+              out[rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+            }
+          }
+        } else if (!columnarBatches.length) {
+          for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+            var row = data[rowIndexes[rowIndex]];
+            out[rowIndex] = row ? row[field] : undefined;
+          }
+        } else {
+          for (rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+            out[rowIndex] = getFieldValue(rowIndexes[rowIndex], field);
+          }
         }
+
+        columns[field] = out;
       }
 
       return {
@@ -7628,7 +11477,7 @@ self.onmessage = async function(event) {
         : 0x100000000;
   }
 
-  const version = "3.0.3";
+  const version = "3.1.0";
 
   crossfilter.version = version;
 

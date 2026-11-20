@@ -1,3 +1,13 @@
+import {
+  OP_AVG,
+  OP_AVG_NON_ZERO,
+  OP_COUNT,
+  OP_RATIO,
+  OP_SUM,
+  finalizeMetricSlot,
+  slotHasAnyActivity
+} from "./columnar-reduce.js";
+
 function isFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
@@ -47,17 +57,20 @@ function normalizeMetrics(metrics, prefix) {
   return normalized;
 }
 
+var reusableMonthDate = new Date(0);
+
 function normalizeTimeBucketValue(value) {
+  if (typeof value === "number") {
+    return value === value && value !== Infinity && value !== -Infinity ? value : null;
+  }
+
   if (value == null) {
     return null;
   }
 
   if (value instanceof Date) {
-    return value.getTime();
-  }
-
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : null;
+    var time = value.getTime();
+    return time === time ? time : null;
   }
 
   var numeric = Number(value);
@@ -75,20 +88,25 @@ function bucketTimestampValue(value, granularity) {
     return null;
   }
 
-  if (granularity === "month") {
-    var monthDate = new Date(numeric);
-    return Date.UTC(monthDate.getUTCFullYear(), monthDate.getUTCMonth(), 1);
+  if (granularity === "day") {
+    return Math.floor(numeric / 86400000) * 86400000;
+  }
+
+  if (granularity === "hour") {
+    return Math.floor(numeric / 3600000) * 3600000;
+  }
+
+  if (granularity === "minute") {
+    return Math.floor(numeric / 60000) * 60000;
   }
 
   if (granularity === "week") {
-    var weekDate = new Date(numeric);
-    var day = weekDate.getUTCDay();
-    var monday = new Date(Date.UTC(
-      weekDate.getUTCFullYear(),
-      weekDate.getUTCMonth(),
-      weekDate.getUTCDate() - ((day + 6) % 7)
-    ));
-    return monday.getTime();
+    return Math.floor((numeric + 259200000) / 604800000) * 604800000 - 259200000;
+  }
+
+  if (granularity === "month") {
+    reusableMonthDate.setTime(numeric);
+    return Date.UTC(reusableMonthDate.getUTCFullYear(), reusableMonthDate.getUTCMonth(), 1);
   }
 
   var step = TIME_BUCKET_MS[granularity];
@@ -109,9 +127,24 @@ function resolveGroupAccessor(spec) {
   }
 
   var granularity = spec.bucket.granularity || "day";
-  return function(value) {
+  var accessor = function(value) {
     return bucketTimestampValue(value, granularity);
   };
+  accessor._xfilterPureMonotonic = true;
+  if (granularity === "day") {
+    accessor._xfilterTimeStep = 86400000;
+    accessor._xfilterTimeOffset = 0;
+  } else if (granularity === "hour") {
+    accessor._xfilterTimeStep = 3600000;
+    accessor._xfilterTimeOffset = 0;
+  } else if (granularity === "minute") {
+    accessor._xfilterTimeStep = 60000;
+    accessor._xfilterTimeOffset = 0;
+  } else if (granularity === "week") {
+    accessor._xfilterTimeStep = 604800000;
+    accessor._xfilterTimeOffset = 259200000;
+  }
+  return accessor;
 }
 
 function buildMetricReducer(metrics, splitField) {
@@ -119,6 +152,7 @@ function buildMetricReducer(metrics, splitField) {
     return {
       field: metric.field || null,
       denominator: metric.denominator || null,
+      hidden: !!metric.hidden,
       id: metric.id,
       op: metric.op
     };
@@ -305,8 +339,12 @@ function buildMetricReducer(metrics, splitField) {
       return result;
     };
 
-    // Do NOT attach _xfilterMetricSpec — the metricSpec fast path in
-    // crossfilter core bypasses custom reducers, which we need for split.
+    splitAdd._xfilterMetricSpec = metricSpec;
+    splitRemove._xfilterMetricSpec = metricSpec;
+    splitInitial._xfilterMetricSpec = metricSpec;
+    splitAdd._xfilterSplitField = splitField;
+    splitRemove._xfilterSplitField = splitField;
+    splitInitial._xfilterSplitField = splitField;
 
     return { add: splitAdd, finalize: splitFinalize, initial: splitInitial, remove: splitRemove };
   }
@@ -373,19 +411,6 @@ function buildMetricReducer(metrics, splitField) {
     finalize: finalize,
     initial: initial,
     remove: remove
-  };
-}
-
-function getNativeSumMetric(metrics) {
-  return metrics && metrics.length === 1 && metrics[0].op === "sum"
-    ? metrics[0]
-    : null;
-}
-
-function createNativeSumAccessor(metric) {
-  return function(row) {
-    var value = row[metric.field];
-    return isFiniteNumber(value) ? value : 0;
   };
 }
 
@@ -468,6 +493,21 @@ function sameFilter(left, right) {
     }
   }
 
+  return true;
+}
+
+function sameFilterState(left, right) {
+  var field;
+  for (field in left) {
+    if (!sameFilter(left[field], right[field])) {
+      return false;
+    }
+  }
+  for (field in right) {
+    if (!(field in left) && right[field] != null) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -558,25 +598,64 @@ function insertSortedEntry(entries, entry, compare, maxSize) {
 }
 
 function createKpiRuntime(cf, metrics) {
-  var nativeSumMetric = getNativeSumMetric(metrics);
-  var reducer = nativeSumMetric ? null : buildMetricReducer(metrics);
-  var group = nativeSumMetric && typeof cf.groupAll === "function"
-    ? cf.groupAll().reduceSum(createNativeSumAccessor(nativeSumMetric))
-    : cf.groupAll().reduce(reducer.add, reducer.remove, reducer.initial);
+  var reducer = buildMetricReducer(metrics);
+  var group = cf.groupAll().reduce(reducer.add, reducer.remove, reducer.initial);
 
   return {
     dispose: function() {
       group.dispose();
     },
     read: function() {
-      if (nativeSumMetric) {
-        var result = {};
-        result[nativeSumMetric.id] = group.value();
-        return result;
+      if (typeof group._readScalar === "function") {
+        var fast = group._readScalar();
+        if (fast) {
+          return fast;
+        }
       }
       return reducer.finalize(group.value());
     }
   };
+}
+
+function finalizeColumnarSlot(view, slot) {
+  if (view.mode === "flat") {
+    return finalizeMetricSlot(view.plan, view.buffers, slot);
+  }
+
+  var result = {};
+  var splitKeys = view.splitKeys;
+  var plan = view.plan;
+  var buffers = view.buffers;
+
+  if (view.mode === "splitDense") {
+    var stride = view.splitStride;
+    var base = slot * stride;
+    for (var sc = 0; sc < stride; ++sc) {
+      var cell = base + sc;
+      if (slotHasAnyActivity(plan, buffers, cell)) {
+        result[splitKeys[sc]] = finalizeMetricSlot(plan, buffers, cell);
+      }
+    }
+    return result;
+  }
+
+  var activePairs = [];
+  for (var pid = view.headBySlot[slot]; pid !== -1; pid = view.nextPair[pid]) {
+    if (slotHasAnyActivity(plan, buffers, pid)) {
+      activePairs.push(pid);
+    }
+  }
+  if (activePairs.length > 1) {
+    var pairSplitCode = view.pairSplitCode;
+    activePairs.sort(function(a, b) {
+      return pairSplitCode[a] - pairSplitCode[b];
+    });
+  }
+  for (var pi = 0; pi < activePairs.length; ++pi) {
+    var pairId = activePairs[pi];
+    result[splitKeys[view.pairSplitCode[pairId]]] = finalizeMetricSlot(plan, buffers, pairId);
+  }
+  return result;
 }
 
 function createGroupRuntime(dimension, spec, index) {
@@ -587,39 +666,37 @@ function createGroupRuntime(dimension, spec, index) {
     metrics = metrics.concat([{ field: undefined, id: "__rows", op: "count", denominator: null, hidden: true }]);
   }
   var metricsById = {};
+  var metricIndexById = {};
   var metricIndex;
   var splitField = spec.splitField || null;
-  var nativeSumMetric = splitField ? null : getNativeSumMetric(metrics);
-  var reducer = nativeSumMetric ? null : buildMetricReducer(metrics, splitField);
+  var reducer = buildMetricReducer(metrics, splitField);
   var groupAccessor = resolveGroupAccessor(spec);
   var group = groupAccessor ? dimension.group(groupAccessor) : dimension.group();
   var visibleMetric = null;
+  var visibleMetricIndex = 0;
   var defaultSortMetric = null;
   var orderedMetricId = null;
-  if (nativeSumMetric && typeof group.reduceSum === "function") {
-    group.reduceSum(createNativeSumAccessor(nativeSumMetric));
-  } else {
-    group.reduce(reducer.add, reducer.remove, reducer.initial);
-  }
+
+  group.reduce(reducer.add, reducer.remove, reducer.initial);
 
   for (metricIndex = 0; metricIndex < metrics.length; ++metricIndex) {
     metricsById[metrics[metricIndex].id] = metrics[metricIndex];
+    metricIndexById[metrics[metricIndex].id] = metricIndex;
     if (!visibleMetric && metrics[metricIndex].op === "count") {
       visibleMetric = metrics[metricIndex];
+      visibleMetricIndex = metricIndex;
     }
   }
 
   if (!visibleMetric) {
     visibleMetric = metrics[0] || null;
+    visibleMetricIndex = 0;
   }
   defaultSortMetric = metricsById[spec.sortMetric] || metricsById.rows || metrics[0] || null;
 
   function metricStateValue(value, metric) {
     if (!metric) {
       return 0;
-    }
-    if (nativeSumMetric) {
-      return metric.id === nativeSumMetric.id ? value : 0;
     }
     if (splitField) {
       // Sum the metric across all split buckets for comparability
@@ -646,24 +723,49 @@ function createGroupRuntime(dimension, spec, index) {
     return entry ? metricStateValue(entry.value, metric) : 0;
   }
 
-  function finalizeEntryValue(value) {
-    if (!nativeSumMetric) {
-      return reducer.finalize(value);
-    }
-
-    var result = {};
-    result[nativeSumMetric.id] = value;
-    return result;
-  }
-
   function finalizeEntry(entry) {
     return {
       key: entry.key,
-      value: finalizeEntryValue(entry.value)
+      value: reducer.finalize(entry.value)
     };
   }
 
+  function readAllColumnar(view) {
+    var count = view.count;
+    var out = new Array(count);
+    var slotOf = view.slotOf;
+    var codeToValue = view.codeToValue;
+    var keys = view.keys;
+    var groupsRef = view.groups;
+    var i, slot, key;
+
+    for (i = 0; i < count; ++i) {
+      if (slotOf) {
+        slot = slotOf[i];
+        key = codeToValue[slot];
+      } else if (keys) {
+        slot = i;
+        key = keys[i];
+      } else {
+        slot = i;
+        key = groupsRef[i].key;
+      }
+      out[i] = {
+        key: key,
+        value: finalizeColumnarSlot(view, slot)
+      };
+    }
+
+    return out;
+  }
+
   function readAll() {
+    if (typeof group._readColumnar === "function") {
+      var view = group._readColumnar();
+      if (view) {
+        return readAllColumnar(view);
+      }
+    }
     return group.all().map(finalizeEntry);
   }
 
@@ -776,6 +878,291 @@ function createGroupRuntime(dimension, spec, index) {
     };
   }
 
+  function readQueryColumnar(view, normalized, sortMetric) {
+    var count = view.count;
+    var mode = view.mode;
+    var plan = view.plan;
+    var buffers = view.buffers;
+    var slotOf = view.slotOf;
+    var codeToValue = view.codeToValue;
+    var keys = view.keys;
+    var groupsRef = view.groups;
+    var stride = view.splitStride || 0;
+    var headBySlot = view.headBySlot;
+    var nextPair = view.nextPair;
+
+    var includeKeySet = normalized.includeKeys ? new Set(normalized.includeKeys) : null;
+    var keySet = normalized.keys ? new Set(normalized.keys) : null;
+    var visibleOnly = normalized.visibleOnly;
+    var nonEmptyKeys = normalized.nonEmptyKeys;
+    var searchTerm = normalized.search;
+    var sortDir = normalized.sort;
+    var isAsc = sortDir === "asc";
+    var isNatural = sortDir === "natural" || !sortMetric;
+    var limitWindow = normalized.limit == null ? null : normalized.offset + normalized.limit;
+    var useHeap = !isNatural && limitWindow != null && limitWindow > 0 && limitWindow < count;
+
+    var visPrim = buffers ? buffers.primary[visibleMetricIndex] : null;
+    var visSec = buffers ? buffers.secondary[visibleMetricIndex] : null;
+    var visOp = plan.ops[visibleMetricIndex];
+
+    var sortIdx = sortMetric ? metricIndexById[sortMetric.id] : -1;
+    var sortPrim = (buffers && sortIdx >= 0) ? buffers.primary[sortIdx] : null;
+    var sortSec = (buffers && sortIdx >= 0) ? buffers.secondary[sortIdx] : null;
+    var sortOp = sortIdx >= 0 ? plan.ops[sortIdx] : OP_COUNT;
+    var splitSortNumeric = sortOp === OP_COUNT || sortOp === OP_SUM;
+
+    function isSlotVisible(slot) {
+      if (!buffers) return false;
+      if (mode === "flat") {
+        if (visOp === OP_COUNT || visOp === OP_SUM) {
+          return visPrim[slot] > 0;
+        }
+        if (visOp === OP_AVG || visOp === OP_AVG_NON_ZERO) {
+          return visSec[slot] > 0 && (visPrim[slot] / visSec[slot]) > 0;
+        }
+        if (visOp === OP_RATIO) {
+          return visSec[slot] !== 0 && (visPrim[slot] / visSec[slot]) > 0;
+        }
+        return false;
+      }
+      var sum = 0;
+      if (mode === "splitDense") {
+        var base = slot * stride;
+        for (var sc = 0; sc < stride; ++sc) {
+          sum += visPrim[base + sc];
+        }
+        return sum > 0;
+      }
+      for (var pid = headBySlot[slot]; pid !== -1; pid = nextPair[pid]) {
+        sum += visPrim[pid];
+      }
+      return sum > 0;
+    }
+
+    function readSortComparable(slot) {
+      if (!sortPrim) return 0;
+      if (mode === "flat") {
+        if (sortOp === OP_COUNT || sortOp === OP_SUM) {
+          return sortPrim[slot];
+        }
+        if (sortOp === OP_AVG || sortOp === OP_AVG_NON_ZERO) {
+          var c = sortSec[slot];
+          return c ? sortPrim[slot] / c : 0;
+        }
+        if (sortOp === OP_RATIO) {
+          var d = sortSec[slot];
+          return d !== 0 ? sortPrim[slot] / d : 0;
+        }
+        return 0;
+      }
+      if (!splitSortNumeric) {
+        return 0;
+      }
+      var sum = 0;
+      if (mode === "splitDense") {
+        var base = slot * stride;
+        for (var sc = 0; sc < stride; ++sc) {
+          sum += sortPrim[base + sc];
+        }
+        return sum;
+      }
+      for (var pid = headBySlot[slot]; pid !== -1; pid = nextPair[pid]) {
+        sum += sortPrim[pid];
+      }
+      return sum;
+    }
+
+    var total = 0;
+    var forcedItems = includeKeySet ? [] : null;
+    var matchedItems = useHeap ? null : [];
+    var heapVal = useHeap ? new Float64Array(limitWindow) : null;
+    var heapSlot = useHeap ? new Uint32Array(limitWindow) : null;
+    var heapKey = useHeap ? new Array(limitWindow) : null;
+    var heapSize = 0;
+    var canBreakNatural = isNatural && limitWindow != null && !normalized.includeTotals && !includeKeySet;
+
+    function isHeapWorse(valA, keyA, valB, keyB) {
+      var diff = valA - valB;
+      if (!Number.isFinite(diff) || diff === 0) {
+        return compareGroupKeys(keyA, keyB) > 0;
+      }
+      return isAsc ? diff > 0 : diff < 0;
+    }
+
+    var i, slot, key, visible, matchesKey, val, pos, parent, left, right, child;
+    for (i = 0; i < count; ++i) {
+      if (slotOf) {
+        slot = slotOf[i];
+        key = codeToValue[slot];
+      } else if (keys) {
+        slot = i;
+        key = keys[i];
+      } else {
+        slot = i;
+        key = groupsRef[i].key;
+      }
+
+      var forceInclude = includeKeySet !== null && includeKeySet.has(key);
+
+      visible = !visibleOnly || isSlotVisible(slot);
+      if (visible) {
+        matchesKey = true;
+        if (nonEmptyKeys && (key == null || key === "")) {
+          matchesKey = false;
+        } else if (keySet && !keySet.has(key)) {
+          matchesKey = false;
+        } else if (searchTerm && String(key).toLowerCase().indexOf(searchTerm) < 0) {
+          matchesKey = false;
+        }
+      } else {
+        matchesKey = false;
+      }
+
+      if (matchesKey) {
+        total += 1;
+        if (limitWindow === 0) {
+          // Only counting total
+        } else if (useHeap) {
+          val = readSortComparable(slot);
+          if (heapSize < limitWindow) {
+            pos = heapSize++;
+            while (pos > 0) {
+              parent = (pos - 1) >>> 1;
+              if (isHeapWorse(val, key, heapVal[parent], heapKey[parent])) {
+                heapVal[pos] = heapVal[parent];
+                heapSlot[pos] = heapSlot[parent];
+                heapKey[pos] = heapKey[parent];
+                pos = parent;
+              } else {
+                break;
+              }
+            }
+            heapVal[pos] = val;
+            heapSlot[pos] = slot;
+            heapKey[pos] = key;
+          } else {
+            var rootVal = heapVal[0];
+            var better = isAsc
+              ? (val < rootVal || (val === rootVal && compareGroupKeys(key, heapKey[0]) < 0))
+              : (val > rootVal || (val === rootVal && compareGroupKeys(key, heapKey[0]) < 0));
+            if (better) {
+              pos = 0;
+              while ((left = (pos << 1) + 1) < heapSize) {
+                child = left;
+                right = left + 1;
+                if (right < heapSize && isHeapWorse(heapVal[right], heapKey[right], heapVal[left], heapKey[left])) {
+                  child = right;
+                }
+                if (isHeapWorse(heapVal[child], heapKey[child], val, key)) {
+                  heapVal[pos] = heapVal[child];
+                  heapSlot[pos] = heapSlot[child];
+                  heapKey[pos] = heapKey[child];
+                  pos = child;
+                } else {
+                  break;
+                }
+              }
+              heapVal[pos] = val;
+              heapSlot[pos] = slot;
+              heapKey[pos] = key;
+            }
+          }
+        } else if (isNatural) {
+          if (limitWindow == null || (total > normalized.offset && matchedItems.length < normalized.limit)) {
+            matchedItems.push({ key: key, slot: slot, val: 0 });
+            if (canBreakNatural && matchedItems.length >= normalized.limit) {
+              break;
+            }
+          }
+        } else {
+          matchedItems.push({ key: key, slot: slot, val: readSortComparable(slot) });
+        }
+      }
+
+      if (forceInclude) {
+        forcedItems.push({
+          key: key,
+          slot: slot,
+          val: isNatural ? 0 : readSortComparable(slot)
+        });
+      }
+    }
+
+    var compareItems = function(leftItem, rightItem) {
+      var diff = leftItem.val - rightItem.val;
+      if (!Number.isFinite(diff) || diff === 0) {
+        return compareGroupKeys(leftItem.key, rightItem.key);
+      }
+      return isAsc ? diff : -diff;
+    };
+
+    var pagedItems;
+    if (useHeap) {
+      var extracted = new Array(heapSize);
+      for (i = 0; i < heapSize; ++i) {
+        extracted[i] = { key: heapKey[i], slot: heapSlot[i], val: heapVal[i] };
+      }
+      extracted.sort(compareItems);
+      pagedItems = normalized.offset > 0
+        ? extracted.slice(normalized.offset, normalized.offset + normalized.limit)
+        : (extracted.length > normalized.limit ? extracted.slice(0, normalized.limit) : extracted);
+    } else if (isNatural) {
+      pagedItems = limitWindow != null
+        ? matchedItems
+        : (normalized.offset > 0 ? matchedItems.slice(normalized.offset) : matchedItems);
+    } else {
+      matchedItems.sort(compareItems);
+      pagedItems = normalized.limit == null
+        ? matchedItems.slice(normalized.offset)
+        : matchedItems.slice(normalized.offset, normalized.offset + normalized.limit);
+    }
+
+    var finalItems = pagedItems;
+    if (forcedItems && forcedItems.length) {
+      if (!isNatural) {
+        forcedItems.sort(compareItems);
+      }
+      var seenKeys = new Set();
+      var merged = [];
+      for (i = 0; i < pagedItems.length; ++i) {
+        merged.push(pagedItems[i]);
+        seenKeys.add(pagedItems[i].key);
+      }
+      for (i = 0; i < forcedItems.length; ++i) {
+        if (seenKeys.has(forcedItems[i].key)) continue;
+        merged.push(forcedItems[i]);
+        seenKeys.add(forcedItems[i].key);
+      }
+      if (!isNatural) {
+        merged.sort(compareItems);
+      }
+      finalItems = merged;
+    }
+
+    var entries = new Array(finalItems.length);
+    for (i = 0; i < finalItems.length; ++i) {
+      entries[i] = {
+        key: finalItems[i].key,
+        value: finalizeColumnarSlot(view, finalItems[i].slot)
+      };
+    }
+
+    var result = {
+      entries: entries,
+      limit: normalized.limit,
+      offset: normalized.offset,
+      sort: normalized.sort,
+      sortMetric: sortMetric ? sortMetric.id : null
+    };
+
+    if (normalized.includeTotals) {
+      result.total = total;
+    }
+
+    return result;
+  }
+
   function readQuery(query) {
     var normalized = normalizeGroupQuery(query);
     var allEntries;
@@ -792,6 +1179,13 @@ function createGroupRuntime(dimension, spec, index) {
 
     if (!normalized) {
       return readAll();
+    }
+
+    if (typeof group._readColumnar === "function") {
+      var view = group._readColumnar();
+      if (view) {
+        return readQueryColumnar(view, normalized, sortMetric);
+      }
     }
 
     if (canUseTopQuery(normalized, sortMetric)) {
@@ -1020,7 +1414,7 @@ export function createDashboardRuntime(crossfilter, options) {
   var currentFilters = {};
   var groupRuntimes = {};
   var kpiRuntime = createKpiRuntime(cf, normalizeMetrics(options.kpis, "kpi"));
-  var rowCountGroup = cf.groupAll().reduceCount();
+  var rowCountGroup = typeof cf._filteredCount === "function" ? null : cf.groupAll().reduceCount();
 
   for (var fieldIndex = 0; fieldIndex < dimensionFields.length; ++fieldIndex) {
     dimensions[dimensionFields[fieldIndex]] = cf.dimension(dimensionFields[fieldIndex]);
@@ -1123,6 +1517,9 @@ export function createDashboardRuntime(crossfilter, options) {
   }
 
   function readRowCount() {
+    if (typeof cf._filteredCount === "function") {
+      return cf._filteredCount();
+    }
     return rowCountGroup.value();
   }
 
@@ -1142,6 +1539,8 @@ export function createDashboardRuntime(crossfilter, options) {
           : typeof columnDimension.topIndex === "function"
             ? columnDimension.topIndex(normalized.limit, normalized.offset)
             : null;
+      } else if (typeof cf._filteredIndexesSlice === "function") {
+        rowIndexes = cf._filteredIndexesSlice(normalized.offset, normalized.limit);
       } else if (typeof cf.allFilteredIndexes === "function") {
         rowIndexes = cf.allFilteredIndexes().slice(normalized.offset, normalized.offset + normalized.limit);
       }
@@ -1172,6 +1571,13 @@ export function createDashboardRuntime(crossfilter, options) {
     for (fieldIndex = 0; fieldIndex < normalized.fields.length; ++fieldIndex) {
       var field = normalized.fields[fieldIndex];
       var dimension = ensureDimension(dimensions, dimensionFields, cf, field);
+      if (typeof dimension._bounds === "function") {
+        var fastBounds = dimension._bounds();
+        if (fastBounds) {
+          bounds[field] = fastBounds;
+          continue;
+        }
+      }
       var lowerIndexes = typeof dimension.bottomIndex === "function" ? dimension.bottomIndex(1) : null;
       var upperIndexes = typeof dimension.topIndex === "function" ? dimension.topIndex(1) : null;
       var minValue = null;
@@ -1217,17 +1623,7 @@ export function createDashboardRuntime(crossfilter, options) {
     return rowSets;
   }
 
-  function queryRuntime(request) {
-    request = request || {};
-
-    var savedFilters = null;
-    if (request.isolatedFilters) {
-      savedFilters = shallowCopy(currentFilters);
-      updateFilters(request.isolatedFilters);
-    } else if (request.filters) {
-      updateFilters(request.filters);
-    }
-
+  function executeQueryReads(request) {
     var response = {
       rows: request.rows ? readRows(request.rows) : [],
       snapshot: request.snapshot === false ? null : readSnapshot(request.snapshot)
@@ -1249,11 +1645,47 @@ export function createDashboardRuntime(crossfilter, options) {
       response.rowSets = readRowSets(request.rowSets);
     }
 
-    if (savedFilters) {
-      updateFilters(savedFilters);
+    return response;
+  }
+
+  function queryRuntime(request) {
+    request = request || {};
+
+    if (request.isolatedFilters) {
+      var normalizedIsolated = normalizeFilterState(request.isolatedFilters);
+      for (var isolatedField in normalizedIsolated) {
+        if (!dimensions[isolatedField]) {
+          throw new Error("Unknown dashboard filter dimension: " + isolatedField);
+        }
+      }
+      if (sameFilterState(currentFilters, normalizedIsolated)) {
+        return executeQueryReads(request);
+      }
+      var savedFilters = shallowCopy(currentFilters);
+      var needsGroupState = request.snapshot !== false || !!request.groups;
+      if (!needsGroupState && typeof cf._withTransientFilters === "function") {
+        return cf._withTransientFilters(function() {
+          updateFilters(normalizedIsolated);
+          try {
+            return executeQueryReads(request);
+          } finally {
+            updateFilters(savedFilters);
+          }
+        });
+      }
+      updateFilters(normalizedIsolated);
+      try {
+        return executeQueryReads(request);
+      } finally {
+        updateFilters(savedFilters);
+      }
     }
 
-    return response;
+    if (request.filters) {
+      updateFilters(request.filters);
+    }
+
+    return executeQueryReads(request);
   }
 
   function queryGroups(request) {
@@ -1311,7 +1743,7 @@ export function createDashboardRuntime(crossfilter, options) {
         groupRuntimes[groupId].dispose();
       }
       kpiRuntime.dispose();
-      rowCountGroup.dispose();
+      if (rowCountGroup) rowCountGroup.dispose();
       for (var dimensionIndex = 0; dimensionIndex < dimensionFields.length; ++dimensionIndex) {
         dimensions[dimensionFields[dimensionIndex]].dispose();
       }

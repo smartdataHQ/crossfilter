@@ -135,9 +135,153 @@ function getColumn(table, name, index) {
 }
 function getValue(column, index) {
   if (column == null) return undefined;
+  if (ArrayBuffer.isView(column) || Array.isArray(column)) return column[index];
   if (typeof column.get === 'function') return column.get(index);
   if (typeof column.at === 'function') return column.at(index);
   return column[index];
+}
+var typedArrayToString = Object.prototype.toString;
+function isStandardNumericTypedArray(arr) {
+  if (!ArrayBuffer.isView(arr)) return false;
+  var tag = typedArrayToString.call(arr);
+  return tag === '[object Float64Array]'
+    || tag === '[object Float32Array]'
+    || tag === '[object Int32Array]'
+    || tag === '[object Uint32Array]'
+    || tag === '[object Int16Array]'
+    || tag === '[object Uint16Array]'
+    || tag === '[object Int8Array]'
+    || tag === '[object Uint8Array]';
+}
+function isIntegerTypedArray(arr) {
+  if (!ArrayBuffer.isView(arr)) return false;
+  var tag = typedArrayToString.call(arr);
+  return tag === '[object Int32Array]'
+    || tag === '[object Uint32Array]'
+    || tag === '[object Int16Array]'
+    || tag === '[object Uint16Array]'
+    || tag === '[object Int8Array]'
+    || tag === '[object Uint8Array]';
+}
+function isBigIntTypedArray(arr) {
+  if (!ArrayBuffer.isView(arr)) return false;
+  var tag = typedArrayToString.call(arr);
+  return tag === '[object BigInt64Array]' || tag === '[object BigUint64Array]';
+}
+function extractArrowNumericChunks(sourceColumn, length, mode) {
+  if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
+    return null;
+  }
+  var typeId = sourceColumn.type && typeof sourceColumn.type.typeId === 'number'
+    ? sourceColumn.type.typeId
+    : (sourceColumn.data[0].type && sourceColumn.data[0].type.typeId);
+  if (typeId !== 2 && typeId !== 3) {
+    return null;
+  }
+  var chunks = sourceColumn.data;
+  var c, chunk, chunkLen, vals, j, v;
+  var total = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    if (!chunk || chunk.nullCount !== 0 || !ArrayBuffer.isView(chunk.values)) {
+      return null;
+    }
+    chunkLen = chunk.length;
+    if (chunk.values.length < chunkLen) {
+      return null;
+    }
+    if (typeId === 2 && chunk.type && chunk.type.bitWidth > 32 && !isBigIntTypedArray(chunk.values)) {
+      return null;
+    }
+    if (!isStandardNumericTypedArray(chunk.values) && !isBigIntTypedArray(chunk.values)) {
+      return null;
+    }
+    total += chunkLen;
+  }
+  if (total !== length) {
+    return null;
+  }
+
+  if (mode === 'raw') {
+    if (chunks.length === 1 && isStandardNumericTypedArray(chunks[0].values)) {
+      vals = chunks[0].values;
+      return vals.length === length ? vals : vals.subarray(0, length);
+    }
+    return null;
+  }
+
+  var out = new Float64Array(length);
+  var outOffset = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    chunkLen = chunk.length;
+    vals = chunk.values;
+    if (mode === 'number') {
+      if (isIntegerTypedArray(vals)) {
+        out.set(vals.length === chunkLen ? vals : vals.subarray(0, chunkLen), outOffset);
+      } else if (isBigIntTypedArray(vals)) {
+        for (j = 0; j < chunkLen; ++j) {
+          v = Number(vals[j]);
+          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+        }
+      } else {
+        for (j = 0; j < chunkLen; ++j) {
+          v = vals[j];
+          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? v : 0;
+        }
+      }
+    } else if (mode === 'timestampMs') {
+      if (isBigIntTypedArray(vals)) {
+        for (j = 0; j < chunkLen; ++j) {
+          v = Number(vals[j]);
+          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+        }
+      } else {
+        for (j = 0; j < chunkLen; ++j) {
+          v = vals[j];
+          out[outOffset + j] = (v === v && v !== Infinity && v !== -Infinity) ? (v < 1e12 ? v * 1000 : v) : 0;
+        }
+      }
+    }
+    outOffset += chunkLen;
+  }
+  return out;
+}
+function extractArrowDictionaryColumn(sourceColumn, length) {
+  if (!sourceColumn || !Array.isArray(sourceColumn.data) || !sourceColumn.data.length) {
+    return null;
+  }
+  var chunks = sourceColumn.data;
+  var c, chunk, total = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    if (!chunk || !chunk.dictionary || typeof chunk.dictionary.get !== 'function' || chunk.nullCount !== 0 || !ArrayBuffer.isView(chunk.values) || chunk.values.length < chunk.length) {
+      return null;
+    }
+    total += chunk.length;
+  }
+  if (total !== length) {
+    return null;
+  }
+  var out = new Array(length);
+  var outOffset = 0;
+  for (c = 0; c < chunks.length; ++c) {
+    chunk = chunks[c];
+    var dict = chunk.dictionary;
+    var dictLen = dict.length;
+    var dictVals = new Array(dictLen);
+    var d;
+    for (d = 0; d < dictLen; ++d) {
+      dictVals[d] = dict.get(d);
+    }
+    var indices = chunk.values;
+    var chunkLen = chunk.length;
+    for (var j = 0; j < chunkLen; ++j) {
+      out[outOffset + j] = dictVals[indices[j]];
+    }
+    outOffset += chunkLen;
+  }
+  return out;
 }
 function resolveColumnAccessor(column) {
   if (column == null) return null;
@@ -349,17 +493,27 @@ function projectBatch(batch, projection) {
     var sourceKind = resolveColumnAccessor(sourceColumn);
 
     if (transform === 'timestampMs') {
-      var values = new Float64Array(length);
-      for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
-        values[rowIndex] = normalizeTimestampValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+      var fastTs = extractArrowNumericChunks(sourceColumn, length, 'timestampMs');
+      if (fastTs) {
+        columns[outputName] = fastTs;
+      } else {
+        var values = new Float64Array(length);
+        for (var rowIndex = 0; rowIndex < length; ++rowIndex) {
+          values[rowIndex] = normalizeTimestampValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+        }
+        columns[outputName] = values;
       }
-      columns[outputName] = values;
     } else if (transform === 'number') {
-      values = new Float64Array(length);
-      for (rowIndex = 0; rowIndex < length; ++rowIndex) {
-        values[rowIndex] = normalizeNumericValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+      var fastNum = extractArrowNumericChunks(sourceColumn, length, 'number');
+      if (fastNum) {
+        columns[outputName] = fastNum;
+      } else {
+        values = new Float64Array(length);
+        for (rowIndex = 0; rowIndex < length; ++rowIndex) {
+          values[rowIndex] = normalizeNumericValue(sourceColumn == null ? undefined : getValueByKind(sourceColumn, rowIndex, sourceKind));
+        }
+        columns[outputName] = values;
       }
-      columns[outputName] = values;
     } else if (transform === 'boolean') {
       values = new Array(length);
       for (rowIndex = 0; rowIndex < length; ++rowIndex) {
@@ -371,7 +525,9 @@ function projectBatch(batch, projection) {
       values.fill(1);
       columns[outputName] = values;
     } else {
-      columns[outputName] = sourceColumn;
+      var fastRaw = extractArrowNumericChunks(sourceColumn, length, 'raw')
+        || extractArrowDictionaryColumn(sourceColumn, length);
+      columns[outputName] = fastRaw || sourceColumn;
     }
   }
 

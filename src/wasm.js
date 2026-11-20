@@ -180,6 +180,9 @@ function buildRuntime() {
     cachedTargets: null,
     cachedTargetsLength: 0,
     cachedTargetsOffset: 0,
+    lastMarkPtr: -1,
+    lastMarkMax: -1,
+    marksDirty: false,
     filterInU32: instance.exports.filterInU32,
     markFilterInU32: instance.exports.markFilterInU32,
     memory: instance.exports.memory,
@@ -204,6 +207,7 @@ function buildRuntime() {
       this.cachedTargets = null;
       this.cachedTargetsLength = 0;
       this.cachedTargetsOffset = 0;
+      this.marksDirty = true;
 
       return this.memory.buffer;
     },
@@ -234,6 +238,7 @@ function buildRuntime() {
 
       this.syncCodes(buffer, codes);
       this.syncTargets(buffer, targetCodes, dataBytes);
+      this.marksDirty = true;
 
       var count = this.filterInU32(0, codes.length, dataBytes, targetCodes.length, outPtr);
       // SAFETY: returned view is only valid until next matchSmall/matchMarked call
@@ -251,8 +256,12 @@ function buildRuntime() {
       this.syncCodes(buffer, codes);
       this.syncTargets(buffer, targetCodes, dataBytes);
 
-      // Zero marks region — it may contain stale data from prior matchSmall output
-      new Uint32Array(buffer, markPtr, maxTargetCode + 1).fill(0);
+      if (this.marksDirty || this.lastMarkPtr !== markPtr || maxTargetCode > this.lastMarkMax) {
+        new Uint32Array(buffer, markPtr, maxTargetCode + 1).fill(0);
+        this.marksDirty = false;
+        this.lastMarkPtr = markPtr;
+        this.lastMarkMax = maxTargetCode;
+      }
 
       var count = this.markFilterInU32(0, codes.length, dataBytes, targetCodes.length, markPtr, outPtr);
       // SAFETY: returned view is only valid until next matchSmall/matchMarked call
@@ -317,7 +326,7 @@ function ensureScratchCapacity(state, size) {
   return state.scratch;
 }
 
-function denseLookupMatches(codes, targetCodes, state) {
+function denseLookupMatches(codes, targetCodes, state, maxCodeHint) {
   var matches = ensureScratchCapacity(state, codes.length);
   var count = 0;
   var i;
@@ -339,7 +348,11 @@ function denseLookupMatches(codes, targetCodes, state) {
     }
   }
 
-  ensureDenseLookupCapacity(state, maxTargetCode + 1);
+  var requiredMarks = maxTargetCode + 1;
+  if (typeof maxCodeHint === 'number' && maxCodeHint + 1 > requiredMarks && (maxCodeHint + 1) * 4 <= MAX_WASM_MARK_BYTES) {
+    requiredMarks = maxCodeHint + 1;
+  }
+  ensureDenseLookupCapacity(state, requiredMarks);
   if (state.version === 0xffffffff) {
     state.marks.fill(0);
     state.version = 1;
@@ -347,13 +360,15 @@ function denseLookupMatches(codes, targetCodes, state) {
 
   var version = state.version++;
   var marks = state.marks;
+  var marksLen = marks.length;
 
   for (i = 0; i < targetCodes.length; ++i) {
     marks[targetCodes[i]] = version;
   }
 
   for (i = 0; i < codes.length; ++i) {
-    if (marks[codes[i]] === version) {
+    var code = codes[i];
+    if (code < marksLen && marks[code] === version) {
       matches[count++] = i;
     }
   }
@@ -396,7 +411,7 @@ export function createWasmRuntimeController(options) {
     return !!getSharedRuntime(enabled);
   }
 
-  function findMatches(codes, targetCodes) {
+  function findMatches(codes, targetCodes, maxCodeHint) {
     if (!targetCodes.length) {
       return new Uint32Array(0);
     }
@@ -419,7 +434,12 @@ export function createWasmRuntimeController(options) {
     }
 
     if (runtime) {
-      maxTargetCode = Math.max(maxCodeValue(targetCodes), maxCodeValue(codes));
+      if (targetCodes.length === 1 && (runtime.cachedCodes !== codes || runtime.cachedCodesLength !== codes.length)) {
+        return denseLookupMatches(codes, targetCodes, denseLookupState, maxCodeHint);
+      }
+      maxTargetCode = typeof maxCodeHint === 'number' && maxCodeHint >= 0
+        ? Math.max(maxCodeValue(targetCodes), maxCodeHint)
+        : Math.max(maxCodeValue(targetCodes), maxCodeValue(codes));
       if ((maxTargetCode + 1) * 4 <= MAX_WASM_MARK_BYTES) {
         try {
           return runtime.matchMarked(codes, targetCodes, maxTargetCode);
@@ -430,7 +450,7 @@ export function createWasmRuntimeController(options) {
       }
     }
 
-    return denseLookupMatches(codes, targetCodes, denseLookupState);
+    return denseLookupMatches(codes, targetCodes, denseLookupState, maxCodeHint);
   }
 
   return {
@@ -458,8 +478,8 @@ export function canUseWasmScan() {
   return defaultRuntimeController.canUseWasmScan();
 }
 
-export function findEncodedMatches(codes, targetCodes) {
-  return defaultRuntimeController.findEncodedMatches(codes, targetCodes);
+export function findEncodedMatches(codes, targetCodes, maxCodeHint) {
+  return defaultRuntimeController.findEncodedMatches(codes, targetCodes, maxCodeHint);
 }
 
 export { denseLookupMatches as _denseLookupMatches };
