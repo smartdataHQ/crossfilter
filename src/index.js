@@ -1,5 +1,7 @@
 import xfilterArray from './array.js';
 import xfilterFilter from './filter.js';
+import { createFilterBitsetStore } from './filter-bitsets.js';
+import { createFalconBrushCache } from './falcon-brush.js';
 import cr_identity from './identity.js';
 import cr_null from './null.js';
 import cr_zero from './zero.js';
@@ -23,11 +25,16 @@ import {
   getWasmRuntimeInfo
 } from './wasm.js';
 import {
+  canPlanUseComplement,
+  cleanupComplementEmptySlots,
   compileMetricPlan,
   ensureMetricBuffers,
   finalizeMetricSlot,
+  getExactCountOffset,
   reduceGroupedAll,
   reduceGroupedIndexed,
+  reduceMultiGroupsAll,
+  reduceMultiGroupsIndexed,
   reduceScalarAll,
   reduceScalarIndexed,
   reduceSplitDenseAll,
@@ -106,13 +113,14 @@ function crossfilter() {
     runtimeInfo: runtimeController.runtimeInfo,
     _filteredCount: filteredCount,
     _filteredIndexesSlice: filteredIndexesSlice,
+    _flushGroups: flushGroups,
     _materializeRowsByIndex: materializeRowsByIndex,
     _withTransientFilters: withTransientFilters
   };
 
   var data = [], // the records
       n = 0, // the number of records; data.length
-      filters, // 1 is filtered out
+      filterStore = createFilterBitsetStore(), // per-dimension 1-bit filter bitsets
       filterListeners = [], // when the filters change
       dataListeners = [], // when data is added
       removeDataListeners = [], // when data is removed
@@ -124,20 +132,39 @@ function crossfilter() {
       numericColumns = Object.create(null),
       splitColumns = Object.create(null),
       activeRowsDirty = true,
+      activeCountDirty = true,
+      activeCountCached = 0,
       activeRowsBuf = new Uint32Array(0),
       activeRowsLength = 0,
+      excludedRowsBuf = new Uint32Array(0),
       dimActiveRowsBuf = new Uint32Array(0),
       deltaAddedBuf = new Uint32Array(0),
       deltaRemovedBuf = new Uint32Array(0),
       deltaWorkBuf = new Uint32Array(0),
       deltaBufInUse = false,
-      activeDimensionFilterCount = 0,
       batchedFilterDepth = 0,
       batchedFilterEventPending = false,
       batchedFilterResetPending = false,
-      transientFilterDepth = 0;
+      transientFilterDepth = 0,
+      brushDimSlot = null,
+      brushSameDimCount = 0,
+      brushActive = false,
+      brushQueryKind = null,
+      brushLo = 0,
+      brushHi = 0,
+      brushDimSource = null,
+      brushFalcon = null,
+      brushBuildFailed = false;
 
-  filters = new xfilterArray.bitarray(0);
+  function invalidateBrushState() {
+    brushDimSlot = null;
+    brushSameDimCount = 0;
+    brushActive = false;
+    brushQueryKind = null;
+    brushDimSource = null;
+    brushFalcon = null;
+    brushBuildFailed = false;
+  }
 
   function ensureUint32Capacity(buf, required) {
     if (buf.length >= required) return buf;
@@ -388,34 +415,52 @@ function crossfilter() {
   }
 
   function getActiveRows() {
-    if (!activeDimensionFilterCount) {
+    if (!filterStore.hasAnyActive()) {
       return null;
     }
     if (activeRowsDirty) {
       activeRowsBuf = ensureUint32Capacity(activeRowsBuf, n);
-      var count = 0,
-          i;
-      if (filters.subarrays === 1) {
-        var f0 = filters[0];
-        for (i = 0; i < n; ++i) {
-          if (!f0[i]) activeRowsBuf[count++] = i;
-        }
-      } else {
-        for (i = 0; i < n; ++i) {
-          if (filters.zero(i)) activeRowsBuf[count++] = i;
-        }
+      var count = filterStore.extractActive(activeRowsBuf, null);
+      if (count < 0) {
+        activeRowsLength = n;
+        activeCountCached = n;
+        activeCountDirty = false;
+        activeRowsDirty = false;
+        return null;
       }
       activeRowsLength = count;
+      activeCountCached = count;
+      activeCountDirty = false;
       activeRowsDirty = false;
     }
     return { indices: activeRowsBuf, length: activeRowsLength };
   }
 
+  function getExcludedRows(ignoreSlot) {
+    if (!filterStore.hasAnyActive()) {
+      return { indices: excludedRowsBuf, length: 0 };
+    }
+    excludedRowsBuf = ensureUint32Capacity(excludedRowsBuf, n);
+    var count = filterStore.extractExcluded(excludedRowsBuf, ignoreSlot || null);
+    return { indices: excludedRowsBuf, length: count };
+  }
+
   function filteredCount() {
-    if (!activeDimensionFilterCount) {
+    if (!filterStore.hasAnyActive()) {
       return n;
     }
-    return getActiveRows().length;
+    if (!activeRowsDirty) {
+      return activeRowsLength;
+    }
+    if (activeCountDirty) {
+      if (brushActive && brushFalcon && transientFilterDepth === 0) {
+        activeCountCached = brushFalcon.queryCount(brushQueryKind, brushLo, brushHi);
+      } else {
+        activeCountCached = filterStore.countActive(null);
+      }
+      activeCountDirty = false;
+    }
+    return activeCountCached;
   }
 
   function filteredIndexesSlice(startOffset, limitCount) {
@@ -425,7 +470,7 @@ function crossfilter() {
     if (limit <= 0) {
       return [];
     }
-    if (!activeDimensionFilterCount) {
+    if (!filterStore.hasAnyActive()) {
       if (start >= n) return [];
       end = Math.min(n, start + limit);
       len = end - start;
@@ -434,6 +479,14 @@ function crossfilter() {
       return out;
     }
     var active = getActiveRows();
+    if (!active) {
+      if (start >= n) return [];
+      end = Math.min(n, start + limit);
+      len = end - start;
+      out = new Array(len);
+      for (i = 0; i < len; ++i) out[i] = start + i;
+      return out;
+    }
     if (start >= active.length) return [];
     end = Math.min(active.length, start + limit);
     len = end - start;
@@ -443,27 +496,212 @@ function crossfilter() {
     return out;
   }
 
-  function collectZeroExceptRows(dimOffset, dimZero) {
+  function collectZeroExceptRows(dimSlot) {
     dimActiveRowsBuf = ensureUint32Capacity(dimActiveRowsBuf, n);
-    var count = 0,
-        i;
-    if (filters.subarrays === 1) {
-      var f0 = filters[0];
-      if (dimOffset === 0) {
-        for (i = 0; i < n; ++i) {
-          if (!(f0[i] & dimZero)) dimActiveRowsBuf[count++] = i;
-        }
-      } else {
-        for (i = 0; i < n; ++i) {
-          if (!f0[i]) dimActiveRowsBuf[count++] = i;
-        }
-      }
-    } else {
-      for (i = 0; i < n; ++i) {
-        if (filters.zeroExcept(i, dimOffset, dimZero)) dimActiveRowsBuf[count++] = i;
-      }
+    var count = filterStore.extractActive(dimActiveRowsBuf, dimSlot);
+    if (count < 0) {
+      return null;
     }
     return { indices: dimActiveRowsBuf, length: count };
+  }
+
+  function flushGroups(rawGroups, kpiGroup) {
+    if (!n) return;
+    var gLen = rawGroups ? rawGroups.length : 0;
+    if (!gLen && !kpiGroup) return;
+
+    var kpiInfo = (kpiGroup && typeof kpiGroup._coScanInfo === 'function') ? kpiGroup._coScanInfo() : null;
+    var kpiUsed = false;
+
+    // Falcon prefix-sum brush fast path (handles all low/medium-card charts + KPI in O(slots)!)
+    if (brushActive && brushDimSlot && transientFilterDepth === 0) {
+      var falconTargets = [];
+      for (var fgi = 0; fgi < gLen; ++fgi) {
+        var fg = rawGroups[fgi];
+        if (!fg || typeof fg._coScanInfo !== 'function') continue;
+        var finfo = fg._coScanInfo();
+        if (finfo && finfo.usesGlobalActive) {
+          falconTargets.push(finfo);
+        }
+      }
+      var falconKpi = (kpiInfo && !kpiInfo.unfiltered) ? kpiInfo : null;
+      if (!brushFalcon && !brushBuildFailed && (falconTargets.length > 0 || falconKpi)) {
+        var baseRows = filterStore.hasOtherActive(brushDimSlot) ? collectZeroExceptRows(brushDimSlot) : null;
+        brushFalcon = createFalconBrushCache(brushDimSource(), baseRows, n, falconTargets, falconKpi, getNumericColumn);
+        if (!brushFalcon) {
+          brushBuildFailed = true;
+          brushActive = false;
+        }
+      }
+      if (brushFalcon && (falconTargets.length > 0 || falconKpi)) {
+        var fRes = brushFalcon.applyQueryBatch(brushQueryKind, brushLo, brushHi, falconTargets, falconKpi);
+        activeCountCached = fRes.totalCount;
+        activeCountDirty = false;
+        if (fRes.kpiApplied) kpiUsed = true;
+        if (fRes.appliedCount === falconTargets.length && (!falconKpi || fRes.kpiApplied)) {
+          // Check if any unfiltered or self-filtered dirty groups still remain
+          var anyRemaining = false;
+          for (var rci = 0; rci < gLen; ++rci) {
+            var rg = rawGroups[rci];
+            if (rg && typeof rg._coScanInfo === 'function' && rg._coScanInfo()) {
+              anyRemaining = true;
+              break;
+            }
+          }
+          if (!anyRemaining) return;
+        }
+      }
+    }
+
+    var unfilteredByKey = Object.create(null);
+    var unfilteredKeys = [];
+    var filteredByKey = Object.create(null);
+    var filteredKeys = [];
+    var i, info, key, list;
+
+    for (i = 0; i < gLen; ++i) {
+      var g = rawGroups[i];
+      if (!g || typeof g._coScanInfo !== 'function') continue;
+      info = g._coScanInfo();
+      if (!info) continue;
+      if (info.unfiltered) {
+        if (info.tryRestoreUnfiltered()) {
+          info.commit(false);
+          continue;
+        }
+        key = info.coScanKey;
+        list = unfilteredByKey[key];
+        if (!list) {
+          list = [];
+          unfilteredByKey[key] = list;
+          unfilteredKeys.push(key);
+        }
+        list.push(info);
+      } else if (info.usesGlobalActive) {
+        key = info.coScanKey;
+        list = filteredByKey[key];
+        if (!list) {
+          list = [];
+          filteredByKey[key] = list;
+          filteredKeys.push(key);
+        }
+        list.push(info);
+      }
+    }
+
+    for (i = 0; i < unfilteredKeys.length; ++i) {
+      var uKey = unfilteredKeys[i];
+      list = unfilteredByKey[uKey];
+      var matchKpiUnf = null;
+      if (kpiInfo && !kpiUsed && kpiInfo.unfiltered && kpiInfo.coScanKey === uKey) {
+        if (kpiInfo.tryRestoreUnfiltered()) {
+          kpiInfo.commit(false);
+          kpiUsed = true;
+        } else {
+          kpiInfo.prepareZero();
+          matchKpiUnf = kpiInfo;
+          kpiUsed = true;
+        }
+      }
+      if (list.length >= 2 || matchKpiUnf) {
+        for (var ui = 0; ui < list.length; ++ui) list[ui].prepareZero();
+        reduceMultiGroupsAll(list, matchKpiUnf ? matchKpiUnf.buffers : null, list[0].plan, getNumericColumn, n);
+        for (var uc = 0; uc < list.length; ++uc) list[uc].commit(true);
+        if (matchKpiUnf) matchKpiUnf.commit(true);
+      }
+    }
+
+    if (filteredKeys.length > 0) {
+      var activeCnt = filteredCount();
+      if (activeCnt === 0) {
+        for (i = 0; i < filteredKeys.length; ++i) {
+          list = filteredByKey[filteredKeys[i]];
+          for (var zi = 0; zi < list.length; ++zi) {
+            list[zi].prepareZero();
+            list[zi].commit(false);
+          }
+        }
+        if (kpiInfo && !kpiUsed && !kpiInfo.unfiltered) {
+          kpiInfo.prepareZero();
+          kpiInfo.commit(false);
+          kpiUsed = true;
+        }
+        return;
+      }
+
+      var tryComp = activeCnt > (n >>> 1);
+      var activeRows = null;
+      var excludedRows = null;
+
+      for (i = 0; i < filteredKeys.length; ++i) {
+        var fKey = filteredKeys[i];
+        list = filteredByKey[fKey];
+        var plan = list[0].plan;
+        var canCompPlan = tryComp && canPlanUseComplement(plan, getNumericColumn);
+
+        var compList = null;
+        var directList = null;
+        if (canCompPlan) {
+          compList = [];
+          directList = [];
+          for (var fi = 0; fi < list.length; ++fi) {
+            if (list[fi].canComplement()) compList.push(list[fi]);
+            else directList.push(list[fi]);
+          }
+        } else {
+          directList = list;
+        }
+
+        if (compList && compList.length > 0) {
+          if (activeCnt === n) {
+            for (var ri = 0; ri < compList.length; ++ri) {
+              compList[ri].tryRestoreUnfiltered();
+              compList[ri].commit(false);
+            }
+            if (kpiInfo && !kpiUsed && !kpiInfo.unfiltered && kpiInfo.coScanKey === fKey && kpiInfo.canComplement()) {
+              kpiInfo.tryRestoreUnfiltered();
+              kpiInfo.commit(false);
+              kpiUsed = true;
+            }
+          } else {
+            var matchKpiComp = null;
+            if (kpiInfo && !kpiUsed && !kpiInfo.unfiltered && kpiInfo.coScanKey === fKey && kpiInfo.canComplement()) {
+              kpiInfo.tryRestoreUnfiltered(true);
+              matchKpiComp = kpiInfo;
+              kpiUsed = true;
+            }
+            if (compList.length >= 2 || matchKpiComp) {
+              if (!excludedRows) excludedRows = getExcludedRows(null);
+              for (var ci = 0; ci < compList.length; ++ci) compList[ci].tryRestoreUnfiltered(true);
+              reduceMultiGroupsIndexed(compList, matchKpiComp ? matchKpiComp.buffers : null, plan, getNumericColumn, excludedRows.indices, excludedRows.length, -1);
+              for (var cc = 0; cc < compList.length; ++cc) {
+                compList[cc].cleanupComplement(excludedRows.indices, excludedRows.length);
+                compList[cc].commit(false);
+              }
+              if (matchKpiComp) matchKpiComp.commit(false);
+            }
+          }
+        }
+
+        if (directList && directList.length > 0) {
+          var matchKpiDir = null;
+          if (kpiInfo && !kpiUsed && !kpiInfo.unfiltered && kpiInfo.coScanKey === fKey) {
+            kpiInfo.prepareZero();
+            matchKpiDir = kpiInfo;
+            kpiUsed = true;
+          }
+          if (directList.length >= 2 || matchKpiDir) {
+            if (!activeRows) activeRows = getActiveRows();
+            if (activeRows) {
+              for (var di = 0; di < directList.length; ++di) directList[di].prepareZero();
+              reduceMultiGroupsIndexed(directList, matchKpiDir ? matchKpiDir.buffers : null, plan, getNumericColumn, activeRows.indices, activeRows.length, 1);
+              for (var dc = 0; dc < directList.length; ++dc) directList[dc].commit(false);
+              if (matchKpiDir) matchKpiDir.commit(false);
+            }
+          }
+        }
+      }
+    }
   }
 
   function fillNumericFromRows(dest, entry, field, start, end) {
@@ -473,6 +711,7 @@ function crossfilter() {
       raw = row ? row[field] : undefined;
       if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
         dest[i] = raw;
+        if (raw > 1e12 || raw < -1e12) entry.hasExtreme = true;
       } else {
         dest[i] = NaN;
         entry.hasNaN = true;
@@ -496,21 +735,24 @@ function crossfilter() {
         }
         if (directF64 && directF64.length >= n) {
           var nonFiniteFound = false;
+          var extremeFound = false;
           for (var fi = 0; fi < n; ++fi) {
-            if (directF64[fi] - directF64[fi] !== 0) {
+            var fv = directF64[fi];
+            if (fv - fv !== 0) {
               nonFiniteFound = true;
               break;
             }
+            if (fv > 1e12 || fv < -1e12) extremeFound = true;
           }
           if (!nonFiniteFound) {
-            entry = { values: directF64, hasNaN: false, length: n, shared: true };
+            entry = { values: directF64, hasNaN: false, hasExtreme: extremeFound, length: n, shared: true };
             numericColumns[field] = entry;
             return entry;
           }
         }
       }
       var initCap = n < 64 ? 64 : n;
-      entry = { values: new Float64Array(initCap), hasNaN: false, length: 0, shared: false };
+      entry = { values: new Float64Array(initCap), hasNaN: false, hasExtreme: false, length: 0, shared: false };
       numericColumns[field] = entry;
     }
     if (entry.length >= n) {
@@ -561,6 +803,7 @@ function crossfilter() {
           v = col[i];
           if (v - v === 0) {
             values[segStart + i - localStart] = v;
+            if (v > 1e12 || v < -1e12) entry.hasExtreme = true;
           } else {
             values[segStart + i - localStart] = NaN;
             entry.hasNaN = true;
@@ -571,6 +814,7 @@ function crossfilter() {
           raw = col[i];
           if (typeof raw === 'number' && raw - raw === 0) {
             values[segStart + i - localStart] = raw;
+            if (raw > 1e12 || raw < -1e12) entry.hasExtreme = true;
           } else {
             values[segStart + i - localStart] = NaN;
             entry.hasNaN = true;
@@ -600,6 +844,7 @@ function crossfilter() {
                   v = chunkVals[i];
                   if (v - v === 0) {
                     values[dstBase + i - subStart] = v;
+                    if (v > 1e12 || v < -1e12) entry.hasExtreme = true;
                   } else {
                     values[dstBase + i - subStart] = NaN;
                     entry.hasNaN = true;
@@ -619,6 +864,7 @@ function crossfilter() {
                   v = chunkVals[i];
                   if (isIntChunk || v - v === 0) {
                     values[dstBase + i - subStart] = v;
+                    if (!isIntChunk && (v > 1e12 || v < -1e12)) entry.hasExtreme = true;
                   } else {
                     values[dstBase + i - subStart] = NaN;
                     entry.hasNaN = true;
@@ -655,6 +901,7 @@ function crossfilter() {
                   else if (tDiv !== 1) v /= tDiv;
                   if (v - v === 0) {
                     values[tDstBase + i - tSubStart] = v;
+                    if (v > 1e12 || v < -1e12) entry.hasExtreme = true;
                   } else {
                     values[tDstBase + i - tSubStart] = NaN;
                     entry.hasNaN = true;
@@ -674,6 +921,7 @@ function crossfilter() {
                     else if (tDiv !== 1) v /= tDiv;
                     if (v - v === 0) {
                       values[tDstBase + i - tSubStart] = v;
+                      if (v > 1e12 || v < -1e12) entry.hasExtreme = true;
                     } else {
                       values[tDstBase + i - tSubStart] = NaN;
                       entry.hasNaN = true;
@@ -689,6 +937,7 @@ function crossfilter() {
               raw = accessor(i);
               if (typeof raw === 'number' && raw - raw === 0) {
                 values[segStart + i - localStart] = raw;
+                if (raw > 1e12 || raw < -1e12) entry.hasExtreme = true;
               } else {
                 values[segStart + i - localStart] = NaN;
                 entry.hasNaN = true;
@@ -699,6 +948,7 @@ function crossfilter() {
               raw = getColumnValue(col, i);
               if (typeof raw === 'number' && raw - raw === 0) {
                 values[segStart + i - localStart] = raw;
+                if (raw > 1e12 || raw < -1e12) entry.hasExtreme = true;
               } else {
                 values[segStart + i - localStart] = NaN;
                 entry.hasNaN = true;
@@ -984,7 +1234,7 @@ function crossfilter() {
   }
 
   function hasAnyActiveDimensionFilters() {
-    return activeDimensionFilterCount > 0;
+    return filterStore.hasAnyActive();
   }
 
   function registerResetListener(listener) {
@@ -1010,15 +1260,15 @@ function crossfilter() {
   }
 
   // Returns:
-  //   0 = no active filter listener outside (dimOne, dimOffset)
+  //   0 = no active filter listener outside dimSlot
   //   1 = at least one other listener exists, and ALL are built-in resettable groups
   //   2 = at least one other listener requires exact added/removed delta arrays
-  function inspectOtherFilterListeners(dimOne, dimOffset) {
+  function inspectOtherFilterListeners(dimSlot) {
     var hasResettable = false;
     for (var i = 0; i < filterListeners.length; ++i) {
       var l = filterListeners[i];
       if (l === cr_null) continue;
-      if (l._xfilterDimOne === dimOne && l._xfilterDimOffset === dimOffset) continue;
+      if (l._xfilterDimSlot === dimSlot) continue;
       if (l._xfilterResettable === true) {
         hasResettable = true;
       } else {
@@ -1028,8 +1278,12 @@ function crossfilter() {
     return hasResettable ? 1 : 0;
   }
 
-  function notifyFilterListeners(filterOne, filterOffset, added, removed, forceReset) {
+  function notifyFilterListeners(filterSlot, added, removed, forceReset) {
     activeRowsDirty = true;
+    activeCountDirty = true;
+    if (filterSlot !== brushDimSlot) {
+      invalidateBrushState();
+    }
     if (transientFilterDepth > 0) {
       return;
     }
@@ -1042,11 +1296,11 @@ function crossfilter() {
     var li;
     if (forceReset) {
       for (li = 0; li < filterListeners.length; ++li) {
-        filterListeners[li](filterOne, filterOffset, added, removed, false, true);
+        filterListeners[li](filterSlot, added, removed, false, true);
       }
     } else {
       for (li = 0; li < filterListeners.length; ++li) {
-        filterListeners[li](filterOne, filterOffset, added, removed);
+        filterListeners[li](filterSlot, added, removed);
       }
     }
     triggerOnChange('filtered');
@@ -1074,12 +1328,15 @@ function crossfilter() {
   }
 
   function withTransientFilters(callback) {
+    filterStore.ensureMaterialized(null);
+    invalidateBrushState();
     transientFilterDepth += 1;
     try {
       return callback();
     } finally {
       transientFilterDepth -= 1;
       activeRowsDirty = true;
+      activeCountDirty = true;
     }
   }
 
@@ -1304,10 +1561,12 @@ function crossfilter() {
     // Lengthen the filter bitset to handle the new records.
     // Notify listeners (dimensions and groups) that new data is available.
     if (n1) {
+      invalidateBrushState();
       appendData(newData);
       rememberColumnarBatch(newData, n0, n1);
-      filters.lengthen(n += n1);
+      filterStore.lengthen(n += n1);
       activeRowsDirty = true;
+      activeCountDirty = true;
       dataListeners.forEach(function(l) { l(newData, n0, n1); });
       triggerOnChange('dataAdded');
     }
@@ -1346,6 +1605,8 @@ function crossfilter() {
   // Removes all records that match the current filters, or if a predicate function is passed,
   // removes all records matching the predicate (ignoring filters).
   function removeData(predicate) {
+    filterStore.ensureMaterialized(null);
+    invalidateBrushState();
     var usePred = typeof predicate === 'function',
         indexOnlyPred = !usePred || predicate._xfilterIndexOnly === true,
         compactColumnar = indexOnlyPred && canCompactColumnarOnRemove();
@@ -1362,7 +1623,7 @@ function crossfilter() {
 
     if (compactColumnar) {
       for (var ci = 0; ci < n; ++ci) {
-        var dropRow = usePred ? predicate(undefined, ci) : filters.zero(ci);
+        var dropRow = usePred ? predicate(undefined, ci) : filterStore.isActive(ci);
         if (dropRow) {
           removed.push(ci);
           newIndex[ci] = REMOVED_INDEX;
@@ -1373,7 +1634,7 @@ function crossfilter() {
       }
     } else {
       for (var index1 = 0, index2 = 0; index1 < n; ++index1) {
-        if (usePred ? predicate(getRecord(index1), index1) : filters.zero(index1)) {
+        if (usePred ? predicate(getRecord(index1), index1) : filterStore.isActive(index1)) {
           removed.push(index1);
           newIndex[index1] = REMOVED_INDEX;
         } else {
@@ -1399,70 +1660,61 @@ function crossfilter() {
     }
 
     // Remove all matching records from groups.
-    filterListeners.forEach(function(l) { l(-1, -1, [], removed, true); });
+    filterListeners.forEach(function(l) { l(null, [], removed, true); });
 
     // Update indexes.
     removeDataListeners.forEach(function(l) { l(newIndex); });
 
     // Remove old filters and data by overwriting.
     if (compactColumnar) {
-      for (var fi = 0, fo = 0; fi < n; ++fi) {
-        if (newIndex[fi] !== REMOVED_INDEX) {
-          if (fi !== fo) filters.copy(fo, fi);
-          ++fo;
-        }
-      }
-      n = fo;
-      data = new Array(fo);
-      filters.truncate(fo);
+      filterStore.compact(newIndex, keptCount, REMOVED_INDEX);
+      n = keptCount;
+      data = new Array(keptCount);
       columnarBatches = nextColumnarBatch ? [nextColumnarBatch] : [];
       anyRowMaterialized = false;
     } else {
       for (var index3 = 0, index4 = 0; index3 < n; ++index3) {
         if (newIndex[index3] !== REMOVED_INDEX) {
-          if (index3 !== index4) filters.copy(index4, index3), data[index4] = data[index3];
+          if (index3 !== index4) data[index4] = data[index3];
           ++index4;
         }
       }
+      filterStore.compact(newIndex, index4, REMOVED_INDEX);
       data.length = n = index4;
-      filters.truncate(index4);
       columnarBatches = [];
     }
 
     numericColumns = Object.create(null);
     splitColumns = Object.create(null);
     activeRowsDirty = true;
+    activeCountDirty = true;
     triggerOnChange('dataRemoved');
   }
 
-  function maskForDimensions(dimensions) {
-    var n,
-        d,
-        len,
-        id,
-        mask = Array(filters.subarrays);
-    for (n = 0; n < filters.subarrays; n++) { mask[n] = ~0; }
-    for (d = 0, len = dimensions.length; d < len; d++) {
-      // The top bits of the ID are the subarray offset and the lower bits are the bit
-      // offset of the "one" mask.
-      id = dimensions[d].id();
-      mask[id >> 7] &= ~(0x1 << (id & 0x3f));
+  function buildIgnoreIdMap(dimensions) {
+    if (!dimensions || !dimensions.length) {
+      return null;
     }
-    return mask;
+    var map = Object.create(null);
+    for (var d = 0, len = dimensions.length; d < len; d++) {
+      map[dimensions[d].id()] = true;
+    }
+    return map;
   }
 
   // Return true if the data element at index i is filtered IN.
   // Optionally, ignore the filters of any dimensions in the ignore_dimensions list.
   function isElementFiltered(i, ignore_dimensions) {
-    var mask = maskForDimensions(ignore_dimensions || []);
-    return filters.zeroExceptMask(i,mask);
+    var ignoreMap = buildIgnoreIdMap(ignore_dimensions);
+    return ignoreMap ? filterStore.isActiveIgnoring(i, ignoreMap) : filterStore.isActive(i);
   }
 
   // Adds a new dimension with the specified value accessor function.
   function dimension(value, iterable) {
-    var accessorPath;
+    var accessorPath,
+        isStringField = typeof value === 'string';
 
-    if (typeof value === 'string') {
+    if (isStringField) {
       accessorPath = value;
       value = function(d) { return result(d, accessorPath); };
     } else if (typeof value === 'function') {
@@ -1491,9 +1743,7 @@ function crossfilter() {
       _bounds: readDimensionBounds
     };
 
-    var one, // lowest unset bit as mask, e.g., 00001000
-        zero, // inverted one, e.g., 11110111
-        offset, // offset into the filters arrays
+    var dimSlot, // 1-bit filter slot in filterStore
         id, // unique ID for this dimension (reused when dimensions are disposed)
         values, // sorted, cached array
         index, // maps sorted value index -> record index (in data)
@@ -1567,6 +1817,7 @@ function crossfilter() {
         lazyFilterTargetCodesVersion = 0,
         lazyEncodedState = null,
         rawNumericState = null,
+        deferredInit = false,
         indexListeners = [], // when data is added
         dimensionGroups = [],
         lo0 = 0,
@@ -2326,50 +2577,40 @@ function crossfilter() {
         return dimension;
       }
 
-      var f = filters[offset],
-          otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
-            ? inspectOtherFilterListeners(one, offset)
+      var otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+            ? inspectOtherFilterListeners(dimSlot)
             : 0,
           prevSelected = lazyEncodedState.lastSelectedCount,
-          useForceReset = otherMode === 1 && prevSelected >= 0 && (n - prevSelected) > (n >>> 2),
-          needDeltas = otherMode > 0 && !useForceReset,
-          i;
+          useForceReset = otherMode === 1 && (
+            !filterStore.hasOtherActive(dimSlot)
+            || (prevSelected >= 0 && (n - prevSelected) > (n >>> 2))
+          ),
+          needDeltas = otherMode > 0 && !useForceReset;
 
       lazyEncodedState.hasActiveFilterMask = false;
       lazyEncodedState.lastSelectedCount = -1;
 
       if (!needDeltas) {
-        for (i = 0; i < n; ++i) {
-          if (f[i] & one) {
-            f[i] &= zero;
-          }
-        }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
+        filterStore.deactivate(dimSlot);
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
 
       var useScratch = !deltaBufInUse,
           added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
-          addedCount = 0;
+          addedCount;
 
       if (useScratch) deltaBufInUse = true;
-
-      for (i = 0; i < n; ++i) {
-        if (f[i] & one) {
-          f[i] &= zero;
-          if (useScratch) added[addedCount++] = i;
-          else added.push(i);
-        }
-      }
+      addedCount = filterStore.clearSlotWithDeltas(dimSlot, added, useScratch);
 
       if (useScratch) {
         try {
-          notifyFilterListeners(one, offset, added.subarray(0, addedCount), EMPTY_ARRAY);
+          notifyFilterListeners(dimSlot, added.subarray(0, addedCount), EMPTY_ARRAY);
         } finally {
           deltaBufInUse = false;
         }
       } else {
-        notifyFilterListeners(one, offset, added, EMPTY_ARRAY);
+        notifyFilterListeners(dimSlot, added, EMPTY_ARRAY);
       }
       return dimension;
     }
@@ -2390,14 +2631,13 @@ function crossfilter() {
       var hadMask = lazyEncodedState.hasActiveFilterMask,
           prevSelected = lazyEncodedState.lastSelectedCount,
           codes = lazyEncodedState.codes,
-          f = filters[offset],
           targetCount = targetCodes.length,
           otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
-            ? inspectOtherFilterListeners(one, offset)
+            ? inspectOtherFilterListeners(dimSlot)
             : 0,
           useForceReset = otherMode === 1 && (
             !hadMask
-              ? (n - selectedCount) > (n >>> 2)
+              ? ((n - selectedCount) > 1024 || (n - selectedCount) > (n >>> 2))
               : (prevSelected >= 0 && Math.abs(selectedCount - prevSelected) > (n >>> 2))
           ),
           needDeltas = otherMode > 0 && !useForceReset,
@@ -2419,43 +2659,21 @@ function crossfilter() {
       lazyEncodedState.hasActiveFilterMask = true;
       lazyEncodedState.lastSelectedCount = selectedCount;
 
+      var writeMode = targetCount === 0 ? 0 : (targetCount === 1 ? 1 : 2);
+      var argA = targetCount === 1 ? t0 : selectionMarks;
+      var argB = markVersion;
+
       if (!needDeltas) {
-        if (targetCount === 0) {
-          for (i = 0; i < n; ++i) {
-            f[i] |= one;
-          }
-        } else if (targetCount === 1) {
-          if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              if (codes[i] !== t0) f[i] |= one;
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              if (codes[i] === t0) f[i] &= zero;
-              else f[i] |= one;
-            }
-          }
-        } else {
-          if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              if (selectionMarks[codes[i]] !== markVersion) f[i] |= one;
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              if (selectionMarks[codes[i]] === markVersion) f[i] &= zero;
-              else f[i] |= one;
-            }
-          }
-        }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
+        filterStore.writePredicateNoDelta(dimSlot, writeMode, codes, argA, argB);
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
 
       var useScratch = !deltaBufInUse,
           added,
           removed,
-          addedCount = 0,
-          removedCount = 0;
+          canBail = otherMode === 1,
+          bailLimit = n >>> 2;
 
       if (useScratch) {
         deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n);
@@ -2468,89 +2686,29 @@ function crossfilter() {
         removed = [];
       }
 
-      if (targetCount === 0) {
-        if (!hadMask) {
-          for (i = 0; i < n; ++i) {
-            f[i] |= one;
-            if (useScratch) removed[removedCount++] = i;
-            else removed.push(i);
-          }
-        } else {
-          for (i = 0; i < n; ++i) {
-            if (!(f[i] & one)) {
-              f[i] |= one;
-              if (useScratch) removed[removedCount++] = i;
-              else removed.push(i);
-            }
-          }
-        }
-      } else if (targetCount === 1) {
-        if (!hadMask) {
-          for (i = 0; i < n; ++i) {
-            if (codes[i] !== t0) {
-              f[i] |= one;
-              if (useScratch) removed[removedCount++] = i;
-              else removed.push(i);
-            }
-          }
-        } else {
-          for (i = 0; i < n; ++i) {
-            if (codes[i] === t0) {
-              if (f[i] & one) {
-                f[i] &= zero;
-                if (useScratch) added[addedCount++] = i;
-                else added.push(i);
-              }
-            } else {
-              if (!(f[i] & one)) {
-                f[i] |= one;
-                if (useScratch) removed[removedCount++] = i;
-                else removed.push(i);
-              }
-            }
-          }
-        }
-      } else {
-        if (!hadMask) {
-          for (i = 0; i < n; ++i) {
-            if (selectionMarks[codes[i]] !== markVersion) {
-              f[i] |= one;
-              if (useScratch) removed[removedCount++] = i;
-              else removed.push(i);
-            }
-          }
-        } else {
-          for (i = 0; i < n; ++i) {
-            if (selectionMarks[codes[i]] === markVersion) {
-              if (f[i] & one) {
-                f[i] &= zero;
-                if (useScratch) added[addedCount++] = i;
-                else added.push(i);
-              }
-            } else {
-              if (!(f[i] & one)) {
-                f[i] |= one;
-                if (useScratch) removed[removedCount++] = i;
-                else removed.push(i);
-              }
-            }
-          }
-        }
+      var res = filterStore.writePredicateWithDeltas(
+        dimSlot, writeMode, codes, argA, argB,
+        added, removed, useScratch, canBail, bailLimit
+      );
+
+      if (res.bailed) {
+        if (useScratch) deltaBufInUse = false;
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, true);
+        return dimension;
       }
 
       if (useScratch) {
         try {
           notifyFilterListeners(
-            one,
-            offset,
-            added.subarray(0, addedCount),
-            removed.subarray(0, removedCount)
+            dimSlot,
+            added.subarray(0, res.addedCount),
+            removed.subarray(0, res.removedCount)
           );
         } finally {
           deltaBufInUse = false;
         }
       } else {
-        notifyFilterListeners(one, offset, added, removed);
+        notifyFilterListeners(dimSlot, added, removed);
       }
       return dimension;
     }
@@ -2587,9 +2745,9 @@ function crossfilter() {
         return new Uint32Array(0);
       }
 
-      if (lazyFilterTargetCodes) {
+      if (lazyFilterTargetCodes || (filterMode === 'bounds' && Array.isArray(filterValue))) {
         var currentCodeCount = lazyEncodedState.codeToValue.length;
-        if (currentCodeCount === lazyFilterTargetCodesVersion) {
+        if (lazyFilterTargetCodes && currentCodeCount === lazyFilterTargetCodesVersion) {
           return lazyFilterTargetCodes;
         }
         lazyFilterTargetCodes = computeLazyRangeCodes(filterValue);
@@ -2616,7 +2774,6 @@ function crossfilter() {
       }
 
       var codes = lazyEncodedState.codes,
-          f = filters[offset],
           targetCount = targetCodes.length,
           endRow = startRow + length,
           maskedAny = false,
@@ -2624,14 +2781,14 @@ function crossfilter() {
 
       if (targetCount === 0) {
         for (i = startRow; i < endRow; ++i) {
-          f[i] |= one;
+          filterStore.setSlotExcluded(dimSlot, i);
         }
         maskedAny = true;
       } else if (targetCount === 1) {
         var t0 = targetCodes[0];
         for (i = startRow; i < endRow; ++i) {
           if (codes[i] !== t0) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
@@ -2643,7 +2800,7 @@ function crossfilter() {
         }
         for (i = startRow; i < endRow; ++i) {
           if (selectionMarks[codes[i]] !== markVersion) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
@@ -2660,7 +2817,6 @@ function crossfilter() {
           i,
           nextCodes,
           rowIndex,
-          f = filters[offset],
           hasActiveMask = false;
 
       for (i = 0; i < reIndex.length; ++i) {
@@ -2678,10 +2834,13 @@ function crossfilter() {
           continue;
         }
         nextCodes[rowIndex] = existingCodes[i];
-        if (f[i] & one) {
+        if (!hasActiveMask && filterStore.isSlotExcluded(dimSlot, i)) {
           hasActiveMask = true;
         }
         ++rowIndex;
+      }
+      if (!hasActiveMask && dimSlot.active) {
+        filterStore.deactivate(dimSlot);
       }
 
       var codeToValue = lazyEncodedState.codeToValue;
@@ -2769,6 +2928,10 @@ function crossfilter() {
       if (!rawNumericState || lazyEncodedState || values) {
         return;
       }
+      if (brushDimSlot === dimSlot) {
+        filterStore.ensureSlotMaterialized(dimSlot);
+        invalidateBrushState();
+      }
       var len = existingLength === undefined ? n : existingLength;
       var rawValues = rawNumericState.values;
       var hadMask = rawNumericState.hasActiveFilterMask;
@@ -2792,41 +2955,34 @@ function crossfilter() {
       if (!rawNumericState.hasActiveFilterMask) {
         return dimension;
       }
-      var f = filters[offset],
-          otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
-            ? inspectOtherFilterListeners(one, offset)
+      var otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+            ? inspectOtherFilterListeners(dimSlot)
             : 0,
-          useForceReset = otherMode === 1 && rawNumericState.lastMaskedCount > (n >>> 2),
-          needDeltas = otherMode > 0 && !useForceReset,
-          i;
+          useForceReset = otherMode === 1 && (
+            !filterStore.hasOtherActive(dimSlot)
+            || rawNumericState.lastMaskedCount > (n >>> 2)
+          ),
+          needDeltas = otherMode > 0 && !useForceReset;
       rawNumericState.hasActiveFilterMask = false;
       rawNumericState.lastMaskedCount = -1;
       if (!needDeltas) {
-        for (i = 0; i < n; ++i) {
-          if (f[i] & one) f[i] &= zero;
-        }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
+        filterStore.deactivate(dimSlot);
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
       var useScratch = !deltaBufInUse,
           added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
-          addedCount = 0;
+          addedCount;
       if (useScratch) deltaBufInUse = true;
-      for (i = 0; i < n; ++i) {
-        if (f[i] & one) {
-          f[i] &= zero;
-          if (useScratch) added[addedCount++] = i;
-          else added.push(i);
-        }
-      }
+      addedCount = filterStore.clearSlotWithDeltas(dimSlot, added, useScratch);
       if (useScratch) {
         try {
-          notifyFilterListeners(one, offset, added.subarray(0, addedCount), EMPTY_ARRAY);
+          notifyFilterListeners(dimSlot, added.subarray(0, addedCount), EMPTY_ARRAY);
         } finally {
           deltaBufInUse = false;
         }
       } else {
-        notifyFilterListeners(one, offset, added, EMPTY_ARRAY);
+        notifyFilterListeners(dimSlot, added, EMPTY_ARRAY);
       }
       return dimension;
     }
@@ -2840,157 +2996,70 @@ function crossfilter() {
       }
       var hadMask = rawNumericState.hasActiveFilterMask,
           vals = rawNumericState.values,
-          f = filters[offset],
           otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
-            ? inspectOtherFilterListeners(one, offset)
+            ? inspectOtherFilterListeners(dimSlot)
             : 0,
-          useForceReset = otherMode === 1 && !hadMask && kind === 0 && n > (n >>> 2),
+          useForceReset = otherMode === 1 && !hadMask && n > 1024,
           needDeltas = otherMode > 0 && !useForceReset,
-          maskedCount = 0,
-          i,
-          v,
-          match;
+          writeMode = kind === 0 ? 0 : (kind === 1 ? 3 : (kind === 2 ? 4 : 5)),
+          matchedCount,
+          maskedCount;
 
-      // kind: 0=empty, 1=exact(argA), 2=range(argA, argB), 3=inSet(argA:Set)
       if (!needDeltas) {
-        if (kind === 0) {
-          for (i = 0; i < n; ++i) f[i] |= one;
-          maskedCount = n;
-        } else if (kind === 1) {
+        matchedCount = filterStore.writePredicateNoDelta(dimSlot, writeMode, vals, argA, argB);
+        maskedCount = n - matchedCount;
+        if (maskedCount === 0) {
+          filterStore.deactivate(dimSlot);
+          rawNumericState.hasActiveFilterMask = false;
+          rawNumericState.lastMaskedCount = 0;
           if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              if (vals[i] !== argA) { f[i] |= one; ++maskedCount; }
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              if (vals[i] === argA) f[i] &= zero;
-              else { f[i] |= one; ++maskedCount; }
-            }
+            return dimension;
           }
-        } else if (kind === 2) {
-          if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              v = vals[i];
-              if (!(v >= argA && v < argB)) { f[i] |= one; ++maskedCount; }
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              v = vals[i];
-              if (v >= argA && v < argB) f[i] &= zero;
-              else { f[i] |= one; ++maskedCount; }
-            }
-          }
-        } else {
-          if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              if (!argA.has(vals[i])) { f[i] |= one; ++maskedCount; }
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              if (argA.has(vals[i])) f[i] &= zero;
-              else { f[i] |= one; ++maskedCount; }
-            }
-          }
-        }
-        rawNumericState.hasActiveFilterMask = maskedCount > 0;
-        rawNumericState.lastMaskedCount = maskedCount;
-        if (!hadMask && maskedCount === 0) {
+          notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
           return dimension;
         }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
+        rawNumericState.hasActiveFilterMask = true;
+        rawNumericState.lastMaskedCount = maskedCount;
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
 
       var useScratch = !deltaBufInUse,
           added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
           removed = useScratch ? (deltaRemovedBuf = ensureUint32Capacity(deltaRemovedBuf, n)) : [],
-          addedCount = 0,
-          removedCount = 0,
           canBail = otherMode === 1,
-          bailLimit = n >>> 2,
-          bailed = false;
+          bailLimit = n >>> 2;
       if (useScratch) deltaBufInUse = true;
 
-      for (i = 0; i < n; ++i) {
-        if (kind === 0) {
-          match = false;
-        } else if (kind === 1) {
-          match = vals[i] === argA;
-        } else if (kind === 2) {
-          v = vals[i];
-          match = v >= argA && v < argB;
-        } else {
-          match = argA.has(vals[i]);
-        }
-        if (match) {
-          if (hadMask && (f[i] & one)) {
-            f[i] &= zero;
-            if (useScratch) added[addedCount++] = i;
-            else added.push(i);
-            if (canBail && addedCount + removedCount > bailLimit) {
-              bailed = true;
-              ++i;
-              break;
-            }
-          }
-        } else {
-          ++maskedCount;
-          if (!hadMask || !(f[i] & one)) {
-            f[i] |= one;
-            if (useScratch) removed[removedCount++] = i;
-            else removed.push(i);
-            if (canBail && addedCount + removedCount > bailLimit) {
-              bailed = true;
-              ++i;
-              break;
-            }
-          }
-        }
+      var res = filterStore.writePredicateWithDeltas(
+        dimSlot, writeMode, vals, argA, argB,
+        added, removed, useScratch, canBail, bailLimit
+      );
+      maskedCount = n - res.matchedCount;
+      if (maskedCount === 0) {
+        filterStore.deactivate(dimSlot);
       }
+      rawNumericState.hasActiveFilterMask = maskedCount > 0;
+      rawNumericState.lastMaskedCount = maskedCount;
 
-      if (bailed) {
-        if (kind === 0) {
-          for (; i < n; ++i) { f[i] |= one; ++maskedCount; }
-        } else if (kind === 1) {
-          if (!hadMask) {
-            for (; i < n; ++i) { if (vals[i] !== argA) { f[i] |= one; ++maskedCount; } }
-          } else {
-            for (; i < n; ++i) { if (vals[i] === argA) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
-          }
-        } else if (kind === 2) {
-          if (!hadMask) {
-            for (; i < n; ++i) { v = vals[i]; if (!(v >= argA && v < argB)) { f[i] |= one; ++maskedCount; } }
-          } else {
-            for (; i < n; ++i) { v = vals[i]; if (v >= argA && v < argB) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
-          }
-        } else {
-          if (!hadMask) {
-            for (; i < n; ++i) { if (!argA.has(vals[i])) { f[i] |= one; ++maskedCount; } }
-          } else {
-            for (; i < n; ++i) { if (argA.has(vals[i])) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
-          }
-        }
-        rawNumericState.hasActiveFilterMask = maskedCount > 0;
-        rawNumericState.lastMaskedCount = maskedCount;
+      if (res.bailed) {
         if (useScratch) deltaBufInUse = false;
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, true);
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, true);
         return dimension;
       }
 
-      rawNumericState.hasActiveFilterMask = maskedCount > 0;
-      rawNumericState.lastMaskedCount = maskedCount;
       if (!hadMask && maskedCount === 0) {
         if (useScratch) deltaBufInUse = false;
         return dimension;
       }
       if (useScratch) {
         try {
-          notifyFilterListeners(one, offset, added.subarray(0, addedCount), removed.subarray(0, removedCount));
+          notifyFilterListeners(dimSlot, added.subarray(0, res.addedCount), removed.subarray(0, res.removedCount));
         } finally {
           deltaBufInUse = false;
         }
       } else {
-        notifyFilterListeners(one, offset, added, removed);
+        notifyFilterListeners(dimSlot, added, removed);
       }
       return dimension;
     }
@@ -3000,7 +3069,6 @@ function crossfilter() {
         return;
       }
       var vals = rawNumericState.values,
-          f = filters[offset],
           endRow = startRow + length,
           maskedAny = false,
           i,
@@ -3009,7 +3077,7 @@ function crossfilter() {
         var inSet = new Set(filterInValues || []);
         for (i = startRow; i < endRow; ++i) {
           if (!inSet.has(vals[i])) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
@@ -3019,14 +3087,14 @@ function crossfilter() {
         for (i = startRow; i < endRow; ++i) {
           v = vals[i];
           if (!(v >= lo && v < hi)) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
       } else {
         for (i = startRow; i < endRow; ++i) {
           if (vals[i] !== filterValue) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
@@ -3038,6 +3106,10 @@ function crossfilter() {
     }
 
     function materializeLazyEncodedState() {
+      if (brushDimSlot === dimSlot) {
+        filterStore.ensureSlotMaterialized(dimSlot);
+        invalidateBrushState();
+      }
       if (rawNumericState && !values) {
         upgradeRawNumericToLazy(n);
       }
@@ -3086,17 +3158,11 @@ function crossfilter() {
     }
 
     function setFilterValuePresent(nextPresent) {
-      var currentPresent = filterValuePresent === true;
-      nextPresent = !!nextPresent;
-      if (currentPresent === nextPresent) {
-        return;
-      }
-      activeDimensionFilterCount += nextPresent ? 1 : -1;
-      filterValuePresent = nextPresent;
+      filterValuePresent = !!nextPresent;
     }
 
     function hasOtherActiveDimensionFilters() {
-      return activeDimensionFilterCount > (filterValuePresent ? 1 : 0);
+      return filterStore.hasOtherActive(dimSlot);
     }
 
     function getExactRange(value) {
@@ -3162,16 +3228,27 @@ function crossfilter() {
 
     function applyFilterChanges(added, removed, valueIndexAdded, valueIndexRemoved, includeEmptyRows) {
       var i,
-          k,
           row;
 
-      if(!iterable) {
-        for(i = 0; i < added.length; i++) {
-          filters[offset][added[i]] ^= one;
-        }
-
-        for(i = 0; i < removed.length; i++) {
-          filters[offset][removed[i]] ^= one;
+      if (!iterable) {
+        if (filterMode === 'all') {
+          filterStore.deactivate(dimSlot);
+        } else {
+          if (removed.length > 0 && !dimSlot.active) {
+            filterStore.activateAllOnes(dimSlot);
+          }
+          if (dimSlot.active) {
+            filterStore.ensureSlotMaterialized(dimSlot);
+            var bits = dimSlot.bitset;
+            for (i = 0; i < added.length; i++) {
+              row = added[i];
+              bits[row >>> 5] |= (1 << (row & 31));
+            }
+            for (i = 0; i < removed.length; i++) {
+              row = removed[i];
+              bits[row >>> 5] &= ~(1 << (row & 31));
+            }
+          }
         }
       } else {
         var newAdded = [];
@@ -3180,16 +3257,16 @@ function crossfilter() {
         for (i = 0; i < added.length; i++) {
           iterablesIndexCount[added[i]]++;
           iterablesIndexFilterStatus[valueIndexAdded[i]] = 0;
-          if(iterablesIndexCount[added[i]] === 1) {
-            filters[offset][added[i]] ^= one;
+          if (iterablesIndexCount[added[i]] === 1) {
+            filterStore.setSlotIncluded(dimSlot, added[i]);
             newAdded.push(added[i]);
           }
         }
         for (i = 0; i < removed.length; i++) {
           iterablesIndexCount[removed[i]]--;
           iterablesIndexFilterStatus[valueIndexRemoved[i]] = 1;
-          if(iterablesIndexCount[removed[i]] === 0) {
-            filters[offset][removed[i]] ^= one;
+          if (iterablesIndexCount[removed[i]] === 0) {
+            filterStore.setSlotExcluded(dimSlot, removed[i]);
             newRemoved.push(removed[i]);
           }
         }
@@ -3197,24 +3274,29 @@ function crossfilter() {
         added = newAdded;
         removed = newRemoved;
 
-        if(includeEmptyRows) {
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if((filters[offset][row = iterablesEmptyRows[i]] & one)) {
-              filters[offset][row] ^= one;
+        if (includeEmptyRows) {
+          for (i = 0; i < iterablesEmptyRows.length; i++) {
+            row = iterablesEmptyRows[i];
+            if (filterStore.isSlotExcluded(dimSlot, row)) {
+              filterStore.setSlotIncluded(dimSlot, row);
               added.push(row);
             }
           }
         } else {
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if(!(filters[offset][row = iterablesEmptyRows[i]] & one)) {
-              filters[offset][row] ^= one;
+          for (i = 0; i < iterablesEmptyRows.length; i++) {
+            row = iterablesEmptyRows[i];
+            if (!filterStore.isSlotExcluded(dimSlot, row)) {
+              filterStore.setSlotExcluded(dimSlot, row);
               removed.push(row);
             }
           }
         }
+        if (filterMode === 'all') {
+          filterStore.deactivate(dimSlot);
+        }
       }
 
-      notifyFilterListeners(one, offset, added, removed);
+      notifyFilterListeners(dimSlot, added, removed);
       return dimension;
     }
 
@@ -3299,24 +3381,38 @@ function crossfilter() {
       lazyDimensionsByField[accessorPath].push(lazyStateGetter);
     }
 
-    // Add a new dimension in the filter bitmap and store the offset and bitmask.
-    var tmp = filters.add();
-    offset = tmp.offset;
-    one = tmp.one;
-    zero = ~one;
+    // Allocate a 1-bit filter slot in filterStore (reusing disposed dimension IDs).
+    dimSlot = filterStore.allocSlot();
+    id = dimSlot.id;
 
-    // Create a unique ID for the dimension
-    // IDs will be re-used if dimensions are disposed.
-    // For internal use the ID is the subarray offset shifted left 7 bits or'd with the
-    // bit offset of the set bit in the dimension's "one" mask.
-    id = (offset << 7) | (Math.log(one) / Math.log(2));
+    function ensureDeferredReady() {
+      if (!deferredInit) return;
+      deferredInit = false;
+      preAdd(data, 0, n);
+      postAdd(data, 0, n);
+    }
 
-    preAdd(data, 0, n);
-    postAdd(data, 0, n);
+    if (isStringField && !iterable && (columnarBatches.length > 0 || n === 0)) {
+      deferredInit = true;
+      runtimeController.canUseWasmScan();
+    } else {
+      preAdd(data, 0, n);
+      postAdd(data, 0, n);
+    }
 
     // Incorporates the specified new records into this dimension.
     // This function is responsible for updating filters, values, and index.
     function preAdd(newData, n0, n1) {
+      if (deferredInit) {
+        if (columnarBatches.length > 0 && columnarBatches[columnarBatches.length - 1].end === n) {
+          return;
+        }
+        deferredInit = false;
+        if (n0 > 0) {
+          preAdd(data, 0, n);
+          return;
+        }
+      }
       var newIterablesIndexCount,
           sourceValues = null,
           columnAccessorSegment = accessorPath && !iterable
@@ -3530,27 +3626,27 @@ function crossfilter() {
       var bounds = refilter(newValues), lo1 = bounds[0], hi1 = bounds[1];
 
       var index2, index3, index4;
-      if(iterable) {
+      if (iterable) {
         n1 = t;
         if (refilterFunction) {
           for (index2 = 0; index2 < n1; ++index2) {
             if (!refilterFunction(newValues[index2], index2)) {
-              if(--newIterablesIndexCount[newIndex[index2]] === 0) {
-                filters[offset][newIndex[index2] + n0] |= one;
+              if (--newIterablesIndexCount[newIndex[index2]] === 0) {
+                filterStore.setSlotExcluded(dimSlot, newIndex[index2] + n0);
               }
               newIterablesIndexFilterStatus[index2] = 1;
             }
           }
         } else {
           for (index3 = 0; index3 < lo1; ++index3) {
-            if(--newIterablesIndexCount[newIndex[index3]] === 0) {
-              filters[offset][newIndex[index3] + n0] |= one;
+            if (--newIterablesIndexCount[newIndex[index3]] === 0) {
+              filterStore.setSlotExcluded(dimSlot, newIndex[index3] + n0);
             }
             newIterablesIndexFilterStatus[index3] = 1;
           }
           for (index4 = hi1; index4 < n1; ++index4) {
-            if(--newIterablesIndexCount[newIndex[index4]] === 0) {
-              filters[offset][newIndex[index4] + n0] |= one;
+            if (--newIterablesIndexCount[newIndex[index4]] === 0) {
+              filterStore.setSlotExcluded(dimSlot, newIndex[index4] + n0);
             }
             newIterablesIndexFilterStatus[index4] = 1;
           }
@@ -3559,15 +3655,15 @@ function crossfilter() {
         if (refilterFunction) {
           for (index2 = 0; index2 < n1; ++index2) {
             if (!refilterFunction(newValues[index2], index2)) {
-              filters[offset][newIndex[index2] + n0] |= one;
+              filterStore.setSlotExcluded(dimSlot, newIndex[index2] + n0);
             }
           }
         } else {
           for (index3 = 0; index3 < lo1; ++index3) {
-            filters[offset][newIndex[index3] + n0] |= one;
+            filterStore.setSlotExcluded(dimSlot, newIndex[index3] + n0);
           }
           for (index4 = hi1; index4 < n1; ++index4) {
-            filters[offset][newIndex[index4] + n0] |= one;
+            filterStore.setSlotExcluded(dimSlot, newIndex[index4] + n0);
           }
         }
       }
@@ -3650,17 +3746,18 @@ function crossfilter() {
 
     // When all filters have updated, notify index listeners of the new values.
     function postAdd(newData, n0, n1) {
+      if (deferredInit) return;
       indexListeners.forEach(function(l) { l(newValues, newIndex, n0, n1, lastAppendedCodes); });
       newValues = newIndex = null;
       lastAppendedCodes = null;
     }
 
     function removeData(reIndex) {
+      if (deferredInit) return;
       if (rawNumericState && !values) {
         var rLen = 0,
             ri,
             rj,
-            fRaw = filters[offset],
             rawHasMask = false;
         for (ri = 0; ri < reIndex.length; ++ri) {
           if (reIndex[ri] !== REMOVED_INDEX) ++rLen;
@@ -3670,7 +3767,10 @@ function crossfilter() {
         for (ri = 0, rj = 0; ri < reIndex.length; ++ri) {
           if (reIndex[ri] === REMOVED_INDEX) continue;
           nextRawVals[rj++] = oldRawVals[ri];
-          if (fRaw[ri] & one) rawHasMask = true;
+          if (!rawHasMask && filterStore.isSlotExcluded(dimSlot, ri)) rawHasMask = true;
+        }
+        if (!rawHasMask && dimSlot.active) {
+          filterStore.deactivate(dimSlot);
         }
         rawNumericState.values = nextRawVals;
         rawNumericState.hasActiveFilterMask = rawHasMask;
@@ -3812,8 +3912,105 @@ function crossfilter() {
           : filterExact(range);
     }
 
+    function materializeRawBrushBitset() {
+      if (!rawNumericState || values) return;
+      var vals = rawNumericState.values;
+      var writeMode = brushQueryKind === 'exact' ? 3 : 4;
+      var matched = filterStore.writePredicateNoDelta(dimSlot, writeMode, vals, brushLo, brushHi);
+      if (matched === n) {
+        filterStore.deactivate(dimSlot);
+        rawNumericState.hasActiveFilterMask = false;
+        rawNumericState.lastMaskedCount = 0;
+      } else {
+        rawNumericState.hasActiveFilterMask = true;
+        rawNumericState.lastMaskedCount = n - matched;
+      }
+    }
+
+    function materializeLazyBrushBitset() {
+      if (!lazyEncodedState || values) return;
+      var targetCodes = brushQueryKind === 'exact'
+        ? encodeLazyFilterValues([brushLo])
+        : computeLazyRangeCodes([brushLo, brushHi]);
+      if (!targetCodes) {
+        filterStore.writePredicateNoDelta(dimSlot, 0, lazyEncodedState.codes, 0, 0);
+        lazyEncodedState.hasActiveFilterMask = true;
+        lazyEncodedState.lastSelectedCount = 0;
+        return;
+      }
+      if (brushQueryKind === 'range') {
+        lazyFilterTargetCodes = targetCodes;
+        lazyFilterTargetCodesVersion = lazyEncodedState.codeToValue.length;
+      }
+      var selCount = countLazySelectedRows(targetCodes);
+      if (selCount === n) {
+        filterStore.deactivate(dimSlot);
+        lazyEncodedState.hasActiveFilterMask = false;
+        lazyEncodedState.lastSelectedCount = -1;
+        return;
+      }
+      var targetCount = targetCodes.length;
+      var writeMode = targetCount === 0 ? 0 : (targetCount === 1 ? 1 : 2);
+      var argA = targetCount === 1 ? targetCodes[0] : null;
+      var argB = 0;
+      if (targetCount > 1) {
+        argB = nextLazyMarkVersion();
+        argA = lazyEncodedState.selectionMarks;
+        for (var mi = 0; mi < targetCount; ++mi) argA[targetCodes[mi]] = argB;
+      }
+      filterStore.writePredicateNoDelta(dimSlot, writeMode, lazyEncodedState.codes, argA, argB);
+      lazyEncodedState.hasActiveFilterMask = true;
+      lazyEncodedState.lastSelectedCount = selCount;
+    }
+
+    function tryEnterFalconBrush(queryKind, lo, hi, isRaw) {
+      if (transientFilterDepth > 0 || batchedFilterDepth > 0 || n < 256) {
+        return false;
+      }
+      var otherMode = filterListeners.length > 0 ? inspectOtherFilterListeners(dimSlot) : 0;
+      if (otherMode !== 1) {
+        return false;
+      }
+      if (brushDimSlot !== dimSlot) {
+        invalidateBrushState();
+        brushDimSlot = dimSlot;
+        brushSameDimCount = 1;
+        return false;
+      }
+      brushSameDimCount += 1;
+      if (brushBuildFailed) {
+        return false;
+      }
+      // On exact queries, only use Falcon if discrete mode (raw or lazy); avoid continuous CSR exact scan overhead on single clicks
+      if (queryKind === 'exact' && brushFalcon && brushFalcon.mode !== 'discrete') {
+        return false;
+      }
+      filterMode = 'bounds';
+      lo0 = 0;
+      hi0 = 0;
+      brushActive = true;
+      brushQueryKind = queryKind;
+      brushLo = lo;
+      brushHi = hi;
+      brushDimSource = isRaw
+        ? function() { return { isNumeric: true, rawVals: rawNumericState.values, lazyCodes: null, lazyCodeToValue: null }; }
+        : function() { return { isNumeric: lazyEncodedState.isPureNumeric, rawVals: null, lazyCodes: lazyEncodedState.codes, lazyCodeToValue: lazyEncodedState.codeToValue }; };
+      dimSlot.materialize = isRaw ? materializeRawBrushBitset : materializeLazyBrushBitset;
+      filterStore.markDirty(dimSlot);
+      if (isRaw) {
+        rawNumericState.hasActiveFilterMask = true;
+        rawNumericState.lastMaskedCount = -1;
+      } else {
+        lazyEncodedState.hasActiveFilterMask = true;
+        lazyEncodedState.lastSelectedCount = -1;
+      }
+      notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, true);
+      return true;
+    }
+
     // Filters this dimension to select the exact value.
     function filterExact(value) {
+      ensureDeferredReady();
       lazyFilterTargetCodes = null;
       lazyFilterTargetCodesVersion = 0;
       if (rawNumericState && !values) {
@@ -3824,8 +4021,13 @@ function crossfilter() {
           refilterFunction = null;
           filterInValues = null;
           if (typeof value === 'number' && value === value) {
+            if (tryEnterFalconBrush('exact', value, value, true)) {
+              return dimension;
+            }
+            if (brushDimSlot === dimSlot) brushActive = false;
             return applyRawNumericPredicate(1, value, 0, 'bounds');
           }
+          if (brushDimSlot === dimSlot) invalidateBrushState();
           return applyRawNumericPredicate(0, 0, 0, 'bounds');
         }
         materializeLazyEncodedState();
@@ -3838,11 +4040,21 @@ function crossfilter() {
           refilter = xfilterFilter.filterExact(bisect, value);
           refilterFunction = null;
           filterInValues = null;
+          if (
+            hasLazyEncodedGroupingSupport()
+            && ((lazyEncodedState.isPureNumeric && typeof value === 'number' && value === value)
+              || (lazyEncodedState.isPureString && typeof value === 'string'))
+            && tryEnterFalconBrush('exact', value, value, false)
+          ) {
+            return dimension;
+          }
+          if (brushDimSlot === dimSlot) brushActive = false;
           return applyLazyEncodedFilter(exactCodes, 'bounds');
         }
         materializeLazyEncodedState();
       }
 
+      if (brushDimSlot === dimSlot) invalidateBrushState();
       filterValue = value;
       setFilterValuePresent(true);
       refilter = xfilterFilter.filterExact(bisect, value);
@@ -3851,6 +4063,11 @@ function crossfilter() {
     }
 
     function filterIn(valuesToSelect) {
+      ensureDeferredReady();
+      if (brushDimSlot === dimSlot) {
+        filterStore.ensureSlotMaterialized(dimSlot);
+        invalidateBrushState();
+      }
       lazyFilterTargetCodes = null;
       lazyFilterTargetCodesVersion = 0;
       if (rawNumericState && !values) {
@@ -3928,6 +4145,7 @@ function crossfilter() {
     // Filters this dimension to select the specified range [lo, hi].
     // The lower bound is inclusive, and the upper bound is exclusive.
     function filterRange(range) {
+      ensureDeferredReady();
       if (rawNumericState && !values) {
         var rLo = range[0],
             rHi = range[1];
@@ -3937,6 +4155,10 @@ function crossfilter() {
           refilter = xfilterFilter.filterRange(bisect, range);
           refilterFunction = null;
           filterInValues = null;
+          if (tryEnterFalconBrush('range', rLo, rHi, true)) {
+            return dimension;
+          }
+          if (brushDimSlot === dimSlot) brushActive = false;
           return applyRawNumericPredicate(2, rLo, rHi, 'bounds');
         }
         upgradeRawNumericToLazy(n);
@@ -3948,6 +4170,16 @@ function crossfilter() {
         refilterFunction = null;
         filterInValues = null;
         filterMode = 'bounds';
+        if (
+          ((lazyEncodedState.isPureNumeric && typeof range[0] === 'number' && typeof range[1] === 'number' && range[0] === range[0] && range[1] === range[1])
+            || (lazyEncodedState.isPureString && typeof range[0] === 'string' && typeof range[1] === 'string'))
+          && tryEnterFalconBrush('range', range[0], range[1], false)
+        ) {
+          lazyFilterTargetCodes = null;
+          lazyFilterTargetCodesVersion = 0;
+          return dimension;
+        }
+        if (brushDimSlot === dimSlot) brushActive = false;
         lazyFilterTargetCodes = computeLazyRangeCodes(range);
         lazyFilterTargetCodesVersion = lazyEncodedState.codeToValue.length;
         return applyLazyEncodedFilter(lazyFilterTargetCodes, 'bounds');
@@ -3957,6 +4189,7 @@ function crossfilter() {
         materializeLazyEncodedState();
       }
 
+      if (brushDimSlot === dimSlot) invalidateBrushState();
       filterValue = range;
       setFilterValuePresent(true);
       return filterIndexBounds((refilter = xfilterFilter.filterRange(bisect, range))(values), false, 'bounds');
@@ -3966,6 +4199,18 @@ function crossfilter() {
     function filterAll() {
       lazyFilterTargetCodes = null;
       lazyFilterTargetCodesVersion = 0;
+      if (brushDimSlot === dimSlot) {
+        invalidateBrushState();
+      }
+      if (deferredInit) {
+        filterValue = undefined;
+        setFilterValuePresent(false);
+        refilter = xfilterFilter.filterAll;
+        refilterFunction = null;
+        filterInValues = null;
+        filterMode = 'all';
+        return dimension;
+      }
       if (rawNumericState && !values) {
         filterValue = undefined;
         setFilterValuePresent(false);
@@ -3994,6 +4239,11 @@ function crossfilter() {
 
     // Filters this dimension using an arbitrary function.
     function filterFunction(f) {
+      ensureDeferredReady();
+      if (brushDimSlot === dimSlot) {
+        filterStore.ensureSlotMaterialized(dimSlot);
+        invalidateBrushState();
+      }
       lazyFilterTargetCodes = null;
       lazyFilterTargetCodesVersion = 0;
       if ((rawNumericState || lazyEncodedState) && !values) {
@@ -4026,18 +4276,19 @@ function crossfilter() {
           valueIndexRemoved = [],
           indexLength = values.length;
 
-      if(!iterable) {
+      if (!iterable) {
         for (i = 0; i < indexLength; ++i) {
-          if (!(filters[offset][k = index[i]] & one) ^ !!(x = f(values[i], i))) {
+          k = index[i];
+          if (!filterStore.isSlotExcluded(dimSlot, k) ^ !!(x = f(values[i], i))) {
             if (x) added.push(k);
             else removed.push(k);
           }
         }
       }
 
-      if(iterable) {
-        for(i=0; i < indexLength; ++i) {
-          if(f(values[i], i)) {
+      if (iterable) {
+        for (i = 0; i < indexLength; ++i) {
+          if (f(values[i], i)) {
             added.push(index[i]);
             valueIndexAdded.push(i);
           } else {
@@ -4047,36 +4298,36 @@ function crossfilter() {
         }
       }
 
-      if(!iterable) {
-        for(i=0; i<added.length; i++) {
-          if(filters[offset][added[i]] & one) filters[offset][added[i]] &= zero;
-        }
-
-        for(i=0; i<removed.length; i++) {
-          if(!(filters[offset][removed[i]] & one)) filters[offset][removed[i]] |= one;
+      if (!iterable) {
+        if (filterAll) {
+          filterStore.deactivate(dimSlot);
+        } else {
+          for (i = 0; i < added.length; i++) {
+            filterStore.setSlotIncluded(dimSlot, added[i]);
+          }
+          for (i = 0; i < removed.length; i++) {
+            filterStore.setSlotExcluded(dimSlot, removed[i]);
+          }
         }
       } else {
-
         var newAdded = [];
         var newRemoved = [];
         for (i = 0; i < added.length; i++) {
-          // First check this particular value needs to be added
-          if(iterablesIndexFilterStatus[valueIndexAdded[i]] === 1) {
-            iterablesIndexCount[added[i]]++
+          if (iterablesIndexFilterStatus[valueIndexAdded[i]] === 1) {
+            iterablesIndexCount[added[i]]++;
             iterablesIndexFilterStatus[valueIndexAdded[i]] = 0;
-            if(iterablesIndexCount[added[i]] === 1) {
-              filters[offset][added[i]] ^= one;
+            if (iterablesIndexCount[added[i]] === 1) {
+              filterStore.setSlotIncluded(dimSlot, added[i]);
               newAdded.push(added[i]);
             }
           }
         }
         for (i = 0; i < removed.length; i++) {
-          // First check this particular value needs to be removed
-          if(iterablesIndexFilterStatus[valueIndexRemoved[i]] === 0) {
-            iterablesIndexCount[removed[i]]--
+          if (iterablesIndexFilterStatus[valueIndexRemoved[i]] === 0) {
+            iterablesIndexCount[removed[i]]--;
             iterablesIndexFilterStatus[valueIndexRemoved[i]] = 1;
-            if(iterablesIndexCount[removed[i]] === 0) {
-              filters[offset][removed[i]] ^= one;
+            if (iterablesIndexCount[removed[i]] === 0) {
+              filterStore.setSlotExcluded(dimSlot, removed[i]);
               newRemoved.push(removed[i]);
             }
           }
@@ -4085,28 +4336,27 @@ function crossfilter() {
         added = newAdded;
         removed = newRemoved;
 
-        // Now handle empty rows.
-        if(filterAll) {
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if((filters[offset][k = iterablesEmptyRows[i]] & one)) {
-              // Was not in the filter, so set the filter and add
-              filters[offset][k] ^= one;
+        if (filterAll) {
+          for (i = 0; i < iterablesEmptyRows.length; i++) {
+            k = iterablesEmptyRows[i];
+            if (filterStore.isSlotExcluded(dimSlot, k)) {
+              filterStore.setSlotIncluded(dimSlot, k);
               added.push(k);
             }
           }
+          filterStore.deactivate(dimSlot);
         } else {
-          // filter in place - remove empty rows if necessary
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if(!(filters[offset][k = iterablesEmptyRows[i]] & one)) {
-              // Was in the filter, so set the filter and remove
-              filters[offset][k] ^= one;
+          for (i = 0; i < iterablesEmptyRows.length; i++) {
+            k = iterablesEmptyRows[i];
+            if (!filterStore.isSlotExcluded(dimSlot, k)) {
+              filterStore.setSlotExcluded(dimSlot, k);
               removed.push(k);
             }
           }
         }
       }
 
-      notifyFilterListeners(one, offset, added, removed);
+      notifyFilterListeners(dimSlot, added, removed);
     }
 
     function currentFilter() {
@@ -4121,14 +4371,16 @@ function crossfilter() {
       if (iterable) {
         return null;
       }
+      ensureDeferredReady();
 
       if (rawNumericState && !values) {
         var rVals = rawNumericState.values,
             rMin,
             rMax,
             ri,
-            rv;
-        if (!activeDimensionFilterCount) {
+            rv,
+            rActive = getActiveRows();
+        if (!rActive) {
           if (!n) return { max: null, min: null };
           rMin = rMax = rVals[0];
           for (ri = 1; ri < n; ++ri) {
@@ -4138,8 +4390,7 @@ function crossfilter() {
           }
           return { max: rMax, min: rMin };
         }
-        var rActive = getActiveRows(),
-            rLen = rActive.length,
+        var rLen = rActive.length,
             rIdx = rActive.indices;
         if (!rLen) return { max: null, min: null };
         rMin = rMax = rVals[rIdx[0]];
@@ -4161,9 +4412,10 @@ function crossfilter() {
             maxVal = null,
             c,
             i,
-            v;
+            v,
+            active = getActiveRows();
 
-        if (!activeDimensionFilterCount) {
+        if (!active) {
           if (!n) return { max: null, min: null };
           if (isPureNum) {
             for (c = 1; c < codeToValue.length; ++c) {
@@ -4196,8 +4448,7 @@ function crossfilter() {
           };
         }
 
-        var active = getActiveRows(),
-            activeLen = active.length,
+        var activeLen = active.length,
             activeIdx = active.indices;
         if (!activeLen) {
           return { max: null, min: null };
@@ -4246,7 +4497,7 @@ function crossfilter() {
           hiVal = null,
           idx;
       for (idx = lo0; idx < hi0; ++idx) {
-        if (filters.zero(index[idx])) {
+        if (filterStore.isActive(index[idx])) {
           loVal = values[idx];
           break;
         }
@@ -4255,7 +4506,7 @@ function crossfilter() {
         return { max: null, min: null };
       }
       for (idx = hi0 - 1; idx >= lo0; --idx) {
-        if (filters.zero(index[idx])) {
+        if (filterStore.isActive(index[idx])) {
           hiVal = values[idx];
           break;
         }
@@ -4280,10 +4531,10 @@ function crossfilter() {
           activeIndices = null,
           rowCount;
 
-      if (!activeDimensionFilterCount) {
+      var active = getActiveRows();
+      if (!active) {
         rowCount = n;
       } else {
-        var active = getActiveRows();
         activeIndices = active.indices;
         rowCount = active.length;
       }
@@ -4532,6 +4783,7 @@ function crossfilter() {
     // Returns the top K selected records based on this dimension's order.
     // Note: observes this dimension's filter, unlike group and groupAll.
     function top(k, top_offset) {
+      ensureDeferredReady();
       if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
         var lazyRows = lazyTopBottomIndex(k, top_offset, true);
         if (lazyRows !== null) {
@@ -4553,7 +4805,7 @@ function crossfilter() {
       if(top_offset && top_offset > 0) toSkip = top_offset;
 
       while (--i >= lo0 && k > 0) {
-        if (filters.zero(j = index[i])) {
+        if (filterStore.isActive(j = index[i])) {
           if(toSkip > 0) {
             //skip matching row
             --toSkip;
@@ -4567,7 +4819,7 @@ function crossfilter() {
       if(iterable){
         for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
           // Add row with empty iterable column at the end
-          if(filters.zero(j = iterablesEmptyRows[i])) {
+          if(filterStore.isActive(j = iterablesEmptyRows[i])) {
             if(toSkip > 0) {
               //skip matching row
               --toSkip;
@@ -4583,6 +4835,7 @@ function crossfilter() {
     }
 
     function topIndex(k, top_offset) {
+      ensureDeferredReady();
       if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
         var lazyRows = lazyTopBottomIndex(k, top_offset, true);
         if (lazyRows !== null) {
@@ -4600,7 +4853,7 @@ function crossfilter() {
       if(top_offset && top_offset > 0) toSkip = top_offset;
 
       while (--i >= lo0 && k > 0) {
-        if (filters.zero(j = index[i])) {
+        if (filterStore.isActive(j = index[i])) {
           if(toSkip > 0) {
             --toSkip;
           } else {
@@ -4612,7 +4865,7 @@ function crossfilter() {
 
       if(iterable){
         for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
-          if(filters.zero(j = iterablesEmptyRows[i])) {
+          if(filterStore.isActive(j = iterablesEmptyRows[i])) {
             if(toSkip > 0) {
               --toSkip;
             } else {
@@ -4629,6 +4882,7 @@ function crossfilter() {
     // Returns the bottom K selected records based on this dimension's order.
     // Note: observes this dimension's filter, unlike group and groupAll.
     function bottom(k, bottom_offset) {
+      ensureDeferredReady();
       if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
         var lazyRows = lazyTopBottomIndex(k, bottom_offset, false);
         if (lazyRows !== null) {
@@ -4652,7 +4906,7 @@ function crossfilter() {
       if(iterable) {
         // Add row with empty iterable column at the top
         for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
-          if(filters.zero(j = iterablesEmptyRows[i])) {
+          if(filterStore.isActive(j = iterablesEmptyRows[i])) {
             if(toSkip > 0) {
               //skip matching row
               --toSkip;
@@ -4667,7 +4921,7 @@ function crossfilter() {
       i = lo0;
 
       while (i < hi0 && k > 0) {
-        if (filters.zero(j = index[i])) {
+        if (filterStore.isActive(j = index[i])) {
           if(toSkip > 0) {
             //skip matching row
             --toSkip;
@@ -4683,6 +4937,7 @@ function crossfilter() {
     }
 
     function bottomIndex(k, bottom_offset) {
+      ensureDeferredReady();
       if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
         var lazyRows = lazyTopBottomIndex(k, bottom_offset, false);
         if (lazyRows !== null) {
@@ -4701,7 +4956,7 @@ function crossfilter() {
 
       if(iterable) {
         for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
-          if(filters.zero(j = iterablesEmptyRows[i])) {
+          if(filterStore.isActive(j = iterablesEmptyRows[i])) {
             if(toSkip > 0) {
               --toSkip;
             } else {
@@ -4715,7 +4970,7 @@ function crossfilter() {
       i = lo0;
 
       while (i < hi0 && k > 0) {
-        if (filters.zero(j = index[i])) {
+        if (filterStore.isActive(j = index[i])) {
           if(toSkip > 0) {
             --toSkip;
           } else {
@@ -4731,6 +4986,7 @@ function crossfilter() {
 
     // Adds a new group to this dimension, using the specified key function.
     function group(key) {
+      ensureDeferredReady();
       if (arguments.length < 1) key = cr_identity;
 
       var groupAll = key === cr_null;
@@ -4764,6 +5020,7 @@ function crossfilter() {
         dispose: dispose,
         remove: dispose, // for backwards-compatibility
         _canPromoteToRawNumeric: !!(groupAll || lazyBucketMode),
+        _coScanInfo: coScanInfo,
         _onDimensionMaterialize: onDimensionMaterialize,
         _onRawNumericPromote: onRawNumericPromote,
         _onRawNumericRemove: onRawNumericRemove,
@@ -4807,6 +5064,14 @@ function crossfilter() {
           reduceSplitField = null,
           metricPlan = null,
           metricBuffers = null,
+          unfilteredData = null,
+          unfilteredRowCounts = null,
+          unfilteredTmpCounts = null,
+          unfilteredSlotCount = 0,
+          unfilteredSplitMode = null,
+          unfilteredSplitStride = 0,
+          unfilteredValid = false,
+          buffersHoldUnfiltered = false,
           countBuf = null,
           splitMode = null, // 'dense' | 'sparse'
           splitActiveStride = 0,
@@ -4860,11 +5125,9 @@ function crossfilter() {
 
       function syncUpdateListenerMeta() {
         var canReset = !iterable && reduceMode !== null;
-        updateMany._xfilterDimOne = one;
-        updateMany._xfilterDimOffset = offset;
+        updateMany._xfilterDimSlot = dimSlot;
         updateMany._xfilterResettable = canReset;
-        updateOne._xfilterDimOne = one;
-        updateOne._xfilterDimOffset = offset;
+        updateOne._xfilterDimSlot = dimSlot;
         updateOne._xfilterResettable = canReset;
       }
 
@@ -5577,6 +5840,157 @@ function crossfilter() {
         sparseDimVersion = -1;
         sparseN = -1;
         sparseSplitStride = -1;
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
+      }
+
+      function markBuffersHoldUnfiltered(totalSlots) {
+        if (!metricPlan || !metricBuffers || totalSlots <= 0 || totalSlots * metricPlan.stride > 131072) {
+          buffersHoldUnfiltered = false;
+          unfilteredValid = false;
+          return;
+        }
+        unfilteredSlotCount = totalSlots;
+        unfilteredSplitMode = splitMode;
+        unfilteredSplitStride = splitActiveStride;
+        unfilteredRowCounts = null;
+        unfilteredValid = false;
+        buffersHoldUnfiltered = true;
+      }
+
+      function materializeUnfilteredCacheIfNeeded() {
+        if (!buffersHoldUnfiltered) return;
+        buffersHoldUnfiltered = false;
+        if (unfilteredValid) return;
+        if (!metricPlan || !metricBuffers || unfilteredSlotCount <= 0) return;
+        var totalDoubles = unfilteredSlotCount * metricPlan.stride;
+        if (totalDoubles > 131072) return;
+        if (!unfilteredData || unfilteredData.length < totalDoubles) {
+          var nextLen = unfilteredData && unfilteredData.length ? unfilteredData.length : totalDoubles;
+          while (nextLen < totalDoubles) nextLen <<= 1;
+          if (nextLen > 131072) nextLen = totalDoubles;
+          unfilteredData = new Float64Array(nextLen);
+        }
+        unfilteredData.set(metricBuffers.data.subarray(0, totalDoubles));
+        unfilteredValid = true;
+      }
+
+      function ensureUnfilteredRowCounts(totalSlots, slotArr, splitCodes, splitStride) {
+        if (unfilteredRowCounts && unfilteredRowCounts.length >= totalSlots) {
+          return unfilteredRowCounts;
+        }
+        unfilteredRowCounts = new Uint32Array(totalSlots);
+        var ci;
+        if (splitCodes) {
+          for (ci = 0; ci < n; ++ci) {
+            unfilteredRowCounts[slotArr[ci] * splitStride + splitCodes[ci]] += 1;
+          }
+        } else if (slotArr) {
+          for (ci = 0; ci < n; ++ci) {
+            unfilteredRowCounts[slotArr[ci]] += 1;
+          }
+        } else {
+          unfilteredRowCounts[0] = n;
+        }
+        return unfilteredRowCounts;
+      }
+
+      function hasValidUnfilteredCache(totalSlots) {
+        return (unfilteredValid || buffersHoldUnfiltered)
+          && unfilteredSlotCount === totalSlots
+          && unfilteredSplitMode === splitMode
+          && unfilteredSplitStride === splitActiveStride;
+      }
+
+      function restoreUnfilteredIntoBuffers(totalSlots, forMutation) {
+        if (!hasValidUnfilteredCache(totalSlots)) {
+          return false;
+        }
+        if (buffersHoldUnfiltered) {
+          if (forMutation) {
+            materializeUnfilteredCacheIfNeeded();
+          }
+          return true;
+        }
+        if (!unfilteredData) return false;
+        metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
+        metricBuffers.data.set(unfilteredData.subarray(0, totalSlots * metricPlan.stride));
+        buffersHoldUnfiltered = !forMutation;
+        return true;
+      }
+
+      function ensureUnfilteredTmpCounts(totalSlots) {
+        if (!unfilteredTmpCounts || unfilteredTmpCounts.length < totalSlots) {
+          unfilteredTmpCounts = new Uint32Array(totalSlots);
+        }
+        return unfilteredTmpCounts;
+      }
+
+      function coScanInfo() {
+        if (!resetNeeded || iterable || groupAll || reduceMode !== 'metricSpec' || !metricPlan || !metricPlan.canCoScan) {
+          return null;
+        }
+        if (lazyIdentityMode) {
+          ensureLazyOrder();
+        } else if (rawBucketMode) {
+          ensureRawBucketLayout();
+        } else if (lazyBucketMode) {
+          ensureLazyBucketLayout();
+        }
+        if (k <= 1) {
+          return null;
+        }
+        var slotArr = getPrimarySlotArray();
+        var slotCount = getPrimarySlotCount();
+        if (!slotArr || slotCount <= 0) {
+          return null;
+        }
+        var applyFilteredRemovals = hasOtherActiveDimensionFilters();
+        var info = {
+          buffers: metricBuffers,
+          canComplement: function() {
+            return hasValidUnfilteredCache(slotCount);
+          },
+          cleanupComplement: function(exclIndices, exclLen) {
+            var exCntOff = getExactCountOffset(metricPlan, getNumericColumn);
+            var trk = exCntOff < 0 ? ensureUnfilteredRowCounts(slotCount, slotArr, null, 0) : null;
+            var tmpC = exCntOff < 0 ? ensureUnfilteredTmpCounts(slotCount) : null;
+            cleanupComplementEmptySlots(metricBuffers, metricPlan, exCntOff, slotArr, null, 0, trk, tmpC, exclIndices, exclLen, slotCount);
+          },
+          coScanKey: metricPlan.coScanKey,
+          commit: function(saveCache) {
+            if (saveCache) {
+              markBuffersHoldUnfiltered(slotCount);
+            }
+            resetNeeded = false;
+            valuesSynced = false;
+          },
+          ensureBuffers: function() {
+            materializeUnfilteredCacheIfNeeded();
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+            info.buffers = metricBuffers;
+          },
+          groupRef: group,
+          plan: metricPlan,
+          prepareZero: function() {
+            materializeUnfilteredCacheIfNeeded();
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+            zeroMetricBuffers(metricBuffers, slotCount);
+            info.buffers = metricBuffers;
+          },
+          slotArr: slotArr,
+          slotCount: slotCount,
+          tryRestoreUnfiltered: function(forMutation) {
+            if (restoreUnfilteredIntoBuffers(slotCount, !!forMutation)) {
+              info.buffers = metricBuffers;
+              return true;
+            }
+            return false;
+          },
+          unfiltered: !applyFilteredRemovals,
+          usesGlobalActive: applyFilteredRemovals && !dimSlot.active
+        };
+        return info;
       }
 
       // Incorporate any existing data into the grouping.
@@ -5585,6 +5999,8 @@ function crossfilter() {
       // Incorporates the specified new values into this group.
       // This function is responsible for updating groups and groupIndex.
       function add(newValues, newIndex, n0, n1, appendedCodes) {
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
         if (groupAll && (rawNumericState || lazyEncodedState) && !values) {
           k = 1;
           if (!groups || !groups.length) {
@@ -5710,13 +6126,13 @@ function crossfilter() {
             if (!resetNeeded) {
               if (reduceMode === 'count') {
                 g.value += 1;
-                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
+                if (hasOtherActiveDimensionFilters() && !filterStore.isActiveExcept(j, dimSlot)) {
                   g.value -= 1;
                 }
               } else {
                 var rowRecord = getRecord(j);
                 g.value = addFn(g.value, rowRecord, true);
-                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = removeFn(g.value, rowRecord, false);
+                if (hasOtherActiveDimensionFilters() && !filterStore.isActiveExcept(j, dimSlot)) g.value = removeFn(g.value, rowRecord, false);
               }
             }
             if (++i1 >= n1) break;
@@ -5788,6 +6204,8 @@ function crossfilter() {
       }
 
       function removeData(reIndex) {
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
         sparseLayoutVersionReset();
 
         if (rawBucketMode && rawNumericState && !values) {
@@ -5897,8 +6315,9 @@ function crossfilter() {
       }
 
       // Reduces the specified selected or deselected records.
-      function updateMany(filterOne, filterOffset, added, removed, notFilter, forceReset) {
-        if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
+      function updateMany(filterSlot, added, removed, notFilter, forceReset) {
+        if (notFilter) { unfilteredValid = false; buffersHoldUnfiltered = false; }
+        if (filterSlot === dimSlot || resetNeeded) return;
 
         var i,
             j,
@@ -5908,7 +6327,7 @@ function crossfilter() {
 
         if (iterable) {
           for (i = 0, len = added.length; i < len; ++i) {
-            if (filters.zeroExcept(rowIdx = added[i], offset, zero)) {
+            if (filterStore.isActiveExcept(rowIdx = added[i], dimSlot)) {
               for (j = 0; j < groupIndex[rowIdx].length; j++) {
                 g = groups[groupIndex[rowIdx][j]];
                 if (reduceMode === 'count') {
@@ -5921,7 +6340,7 @@ function crossfilter() {
           }
 
           for (i = 0, len = removed.length; i < len; ++i) {
-            if (filters.onlyExcept(rowIdx = removed[i], offset, zero, filterOffset, filterOne)) {
+            if (filterStore.isOnlyExcludedByExcept(rowIdx = removed[i], dimSlot, filterSlot)) {
               for (j = 0; j < groupIndex[rowIdx].length; j++) {
                 g = groups[groupIndex[rowIdx][j]];
                 if (reduceMode === 'count') {
@@ -5936,7 +6355,8 @@ function crossfilter() {
         }
 
         if (reduceMode !== null) {
-          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
+          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)
+            || (reduceMode !== 'count' && removed.length > 0 && metricPlan && !canPlanUseComplement(metricPlan, getNumericColumn))) {
             resetNeeded = true;
             valuesSynced = false;
             return;
@@ -5946,17 +6366,18 @@ function crossfilter() {
           if (!slotArr || k === 0) {
             return;
           }
+          materializeUnfilteredCacheIfNeeded();
 
           if (reduceMode === 'count') {
             for (i = 0, len = added.length; i < len; ++i) {
               rowIdx = added[i];
-              if (filters.zeroExcept(rowIdx, offset, zero)) {
+              if (filterStore.isActiveExcept(rowIdx, dimSlot)) {
                 countBuf[slotArr[rowIdx]] += 1;
               }
             }
             for (i = 0, len = removed.length; i < len; ++i) {
               rowIdx = removed[i];
-              if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) {
+              if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) {
                 countBuf[slotArr[rowIdx]] -= 1;
               }
             }
@@ -5980,7 +6401,7 @@ function crossfilter() {
             }
             for (i = 0, len = added.length; i < len; ++i) {
               rowIdx = added[i];
-              if (filters.zeroExcept(rowIdx, offset, zero)) {
+              if (filterStore.isActiveExcept(rowIdx, dimSlot)) {
                 deltaWorkBuf[addCount++] = rowIdx;
               }
             }
@@ -5993,7 +6414,7 @@ function crossfilter() {
             }
             for (i = 0, len = removed.length; i < len; ++i) {
               rowIdx = removed[i];
-              if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) {
+              if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) {
                 deltaWorkBuf[remCount++] = rowIdx;
               }
             }
@@ -6014,7 +6435,7 @@ function crossfilter() {
           }
           for (i = 0, len = added.length; i < len; ++i) {
             rowIdx = added[i];
-            if (filters.zeroExcept(rowIdx, offset, zero)) {
+            if (filterStore.isActiveExcept(rowIdx, dimSlot)) {
               deltaWorkBuf[addCount++] = rowIdx;
             }
           }
@@ -6023,7 +6444,7 @@ function crossfilter() {
           }
           for (i = 0, len = removed.length; i < len; ++i) {
             rowIdx = removed[i];
-            if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) {
+            if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) {
               deltaWorkBuf[remCount++] = rowIdx;
             }
           }
@@ -6037,7 +6458,7 @@ function crossfilter() {
         // Custom reducer path
         var customSlotArr = lazyIdentityMode ? lazyEncodedState.codes : groupIndex;
         for (i = 0, len = added.length; i < len; ++i) {
-          if (filters.zeroExcept(rowIdx = added[i], offset, zero)) {
+          if (filterStore.isActiveExcept(rowIdx = added[i], dimSlot)) {
             var ag = lazyIdentityMode
               ? lazyCodeToGroup[customSlotArr[rowIdx]]
               : (rawBucketMode ? rawBucketSlotToGroup[customSlotArr[rowIdx]] : customSlotArr[rowIdx]);
@@ -6049,7 +6470,7 @@ function crossfilter() {
         }
 
         for (i = 0, len = removed.length; i < len; ++i) {
-          if (filters.onlyExcept(rowIdx = removed[i], offset, zero, filterOffset, filterOne)) {
+          if (filterStore.isOnlyExcludedByExcept(rowIdx = removed[i], dimSlot, filterSlot)) {
             var rg = lazyIdentityMode
               ? lazyCodeToGroup[customSlotArr[rowIdx]]
               : (rawBucketMode ? rawBucketSlotToGroup[customSlotArr[rowIdx]] : customSlotArr[rowIdx]);
@@ -6062,8 +6483,9 @@ function crossfilter() {
       }
 
       // Reduces the specified selected or deselected records (cardinality 1).
-      function updateOne(filterOne, filterOffset, added, removed, notFilter, forceReset) {
-        if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
+      function updateOne(filterSlot, added, removed, notFilter, forceReset) {
+        if (notFilter) { unfilteredValid = false; buffersHoldUnfiltered = false; }
+        if (filterSlot === dimSlot || resetNeeded) return;
 
         var i,
             rowIdx,
@@ -6071,7 +6493,8 @@ function crossfilter() {
             g;
 
         if (reduceMode !== null) {
-          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
+          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)
+            || (reduceMode !== 'count' && removed.length > 0 && metricPlan && !canPlanUseComplement(metricPlan, getNumericColumn))) {
             resetNeeded = true;
             valuesSynced = false;
             return;
@@ -6080,10 +6503,10 @@ function crossfilter() {
           if (reduceMode === 'count') {
             var delta = 0;
             for (i = 0, len = added.length; i < len; ++i) {
-              if (filters.zeroExcept(added[i], offset, zero)) ++delta;
+              if (filterStore.isActiveExcept(added[i], dimSlot)) ++delta;
             }
             for (i = 0, len = removed.length; i < len; ++i) {
-              if (filters.onlyExcept(removed[i], offset, zero, filterOffset, filterOne)) --delta;
+              if (filterStore.isOnlyExcludedByExcept(removed[i], dimSlot, filterSlot)) --delta;
             }
             countBuf[0] += delta;
             valuesSynced = false;
@@ -6104,16 +6527,17 @@ function crossfilter() {
               valuesSynced = false;
               return;
             }
+            materializeUnfilteredCacheIfNeeded();
             for (i = 0, len = added.length; i < len; ++i) {
               rowIdx = added[i];
-              if (filters.zeroExcept(rowIdx, offset, zero)) deltaWorkBuf[addCount++] = rowIdx;
+              if (filterStore.isActiveExcept(rowIdx, dimSlot)) deltaWorkBuf[addCount++] = rowIdx;
             }
             if (addCount > 0) {
               reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, deltaWorkBuf, addCount, 1, 0);
             }
             for (i = 0, len = removed.length; i < len; ++i) {
               rowIdx = removed[i];
-              if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) deltaWorkBuf[remCount++] = rowIdx;
+              if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) deltaWorkBuf[remCount++] = rowIdx;
             }
             if (remCount > 0) {
               reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, deltaWorkBuf, remCount, -1, 0);
@@ -6123,16 +6547,17 @@ function crossfilter() {
           }
 
           // reduceMode === 'metricSpec'
+          materializeUnfilteredCacheIfNeeded();
           for (i = 0, len = added.length; i < len; ++i) {
             rowIdx = added[i];
-            if (filters.zeroExcept(rowIdx, offset, zero)) deltaWorkBuf[addCount++] = rowIdx;
+            if (filterStore.isActiveExcept(rowIdx, dimSlot)) deltaWorkBuf[addCount++] = rowIdx;
           }
           if (addCount > 0) {
             reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, addCount, 1);
           }
           for (i = 0, len = removed.length; i < len; ++i) {
             rowIdx = removed[i];
-            if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) deltaWorkBuf[remCount++] = rowIdx;
+            if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) deltaWorkBuf[remCount++] = rowIdx;
           }
           if (remCount > 0) {
             reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, remCount, -1);
@@ -6143,12 +6568,12 @@ function crossfilter() {
 
         g = groups[0];
         for (i = 0, len = added.length; i < len; ++i) {
-          if (filters.zeroExcept(rowIdx = added[i], offset, zero)) {
+          if (filterStore.isActiveExcept(rowIdx = added[i], dimSlot)) {
             g.value = reduceAdd(g.value, getRecord(rowIdx), false);
           }
         }
         for (i = 0, len = removed.length; i < len; ++i) {
-          if (filters.onlyExcept(rowIdx = removed[i], offset, zero, filterOffset, filterOne)) {
+          if (filterStore.isOnlyExcludedByExcept(rowIdx = removed[i], dimSlot, filterSlot)) {
             g.value = reduceRemove(g.value, getRecord(rowIdx), notFilter);
           }
         }
@@ -6189,7 +6614,7 @@ function crossfilter() {
             return;
           }
           for (i = 0; i < n; ++i) {
-            if (!filters.zeroExcept(i, offset, zero)) {
+            if (!filterStore.isActiveExcept(i, dimSlot)) {
               for (j = 0; j < groupIndex[i].length; j++) {
                 g = groups[groupIndex[i][j]];
                 if (reduceMode === 'count') {
@@ -6231,11 +6656,24 @@ function crossfilter() {
                 }
               }
             } else {
-              rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-              var rIdx = rows.indices,
-                  rLen = rows.length;
-              for (i = 0; i < rLen; ++i) {
-                countBuf[slotArr[rIdx[i]]] += 1;
+              rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+              if (!rows) {
+                if (lazyIdentityMode) {
+                  var ccAll = lazyEncodedState.codeCounts;
+                  for (i = 1; i < slotCount; ++i) {
+                    countBuf[i] = ccAll[i];
+                  }
+                } else {
+                  for (i = 0; i < n; ++i) {
+                    countBuf[slotArr[i]] += 1;
+                  }
+                }
+              } else {
+                var rIdx = rows.indices,
+                    rLen = rows.length;
+                for (i = 0; i < rLen; ++i) {
+                  countBuf[slotArr[rIdx[i]]] += 1;
+                }
               }
             }
             valuesSynced = false;
@@ -6243,13 +6681,60 @@ function crossfilter() {
           }
 
           if (reduceMode === 'metricSpec') {
-            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
-            zeroMetricBuffers(metricBuffers, slotCount);
             if (!applyFilteredRemovals) {
-              reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, slotArr, n, slotCount);
+              if (!restoreUnfilteredIntoBuffers(slotCount, false)) {
+                buffersHoldUnfiltered = false;
+                unfilteredValid = false;
+                metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+                zeroMetricBuffers(metricBuffers, slotCount);
+                reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, slotArr, n, slotCount);
+                markBuffersHoldUnfiltered(slotCount);
+              }
+            } else if (brushActive && brushFalcon && transientFilterDepth === 0 && !dimSlot.active && brushFalcon.hasGroup(group)) {
+              var singleInfo = {
+                buffers: metricBuffers,
+                ensureBuffers: function() {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+                  singleInfo.buffers = metricBuffers;
+                },
+                groupRef: group,
+                slotArr: slotArr,
+                slotCount: slotCount
+              };
+              brushFalcon.applyQuerySingle(brushQueryKind, brushLo, brushHi, singleInfo);
             } else {
-              rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-              reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, rows.indices, rows.length, 1, slotCount);
+              var mActCnt = !dimSlot.active ? filteredCount() : filterStore.countActive(dimSlot);
+              if (mActCnt === 0) {
+                materializeUnfilteredCacheIfNeeded();
+                metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+                zeroMetricBuffers(metricBuffers, slotCount);
+              } else if (mActCnt === n && restoreUnfilteredIntoBuffers(slotCount, false)) {
+                // restored from unfiltered cache
+              } else if (mActCnt > (n >>> 1) && hasValidUnfilteredCache(slotCount) && canPlanUseComplement(metricPlan, getNumericColumn)) {
+                var mExcl = getExcludedRows(dimSlot.active ? dimSlot : null);
+                restoreUnfilteredIntoBuffers(slotCount, true);
+                if (mExcl.length > 0) {
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, mExcl.indices, mExcl.length, -1, slotCount);
+                  var mExCntOff = getExactCountOffset(metricPlan, getNumericColumn);
+                  var mTrk = mExCntOff < 0 ? ensureUnfilteredRowCounts(slotCount, slotArr, null, 0) : null;
+                  cleanupComplementEmptySlots(
+                    metricBuffers, metricPlan, mExCntOff, slotArr, null, 0,
+                    mTrk, mExCntOff < 0 ? ensureUnfilteredTmpCounts(slotCount) : null,
+                    mExcl.indices, mExcl.length, slotCount
+                  );
+                }
+              } else {
+                materializeUnfilteredCacheIfNeeded();
+                metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+                zeroMetricBuffers(metricBuffers, slotCount);
+                rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+                if (!rows) {
+                  reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, slotArr, n, slotCount);
+                } else {
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, rows.indices, rows.length, 1, slotCount);
+                }
+              }
             }
             valuesSynced = false;
             return;
@@ -6261,6 +6746,8 @@ function crossfilter() {
             splitActiveStride = stride;
             if (stride === 0) {
               splitMode = 'dense';
+              buffersHoldUnfiltered = false;
+              unfilteredValid = false;
               metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
               zeroMetricBuffers(metricBuffers, 1);
               valuesSynced = false;
@@ -6269,24 +6756,93 @@ function crossfilter() {
             if (slotCount * stride <= 262144) {
               splitMode = 'dense';
               var totalSlots = slotCount * stride;
-              metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
-              zeroMetricBuffers(metricBuffers, totalSlots);
               if (!applyFilteredRemovals) {
-                reduceSplitDenseAll(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, n, totalSlots);
+                if (!restoreUnfilteredIntoBuffers(totalSlots, false)) {
+                  buffersHoldUnfiltered = false;
+                  unfilteredValid = false;
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
+                  zeroMetricBuffers(metricBuffers, totalSlots);
+                  reduceSplitDenseAll(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, n, totalSlots);
+                  markBuffersHoldUnfiltered(totalSlots);
+                }
               } else {
-                rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-                reduceSplitDenseIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, rows.indices, rows.length, 1, totalSlots);
+                var sdActCnt = !dimSlot.active ? filteredCount() : filterStore.countActive(dimSlot);
+                if (sdActCnt === 0) {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
+                  zeroMetricBuffers(metricBuffers, totalSlots);
+                } else if (sdActCnt === n && restoreUnfilteredIntoBuffers(totalSlots, false)) {
+                  // restored from unfiltered cache
+                } else if (sdActCnt > (n >>> 1) && hasValidUnfilteredCache(totalSlots) && canPlanUseComplement(metricPlan, getNumericColumn)) {
+                  var sdExcl = getExcludedRows(dimSlot.active ? dimSlot : null);
+                  restoreUnfilteredIntoBuffers(totalSlots, true);
+                  if (sdExcl.length > 0) {
+                    reduceSplitDenseIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, sdExcl.indices, sdExcl.length, -1, totalSlots);
+                    var sdExCntOff = getExactCountOffset(metricPlan, getNumericColumn);
+                    var sdTrk = sdExCntOff < 0 ? ensureUnfilteredRowCounts(totalSlots, slotArr, splitCol.codes, stride) : null;
+                    cleanupComplementEmptySlots(
+                      metricBuffers, metricPlan, sdExCntOff, slotArr, splitCol.codes, stride,
+                      sdTrk, sdExCntOff < 0 ? ensureUnfilteredTmpCounts(totalSlots) : null,
+                      sdExcl.indices, sdExcl.length, totalSlots
+                    );
+                  }
+                } else {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
+                  zeroMetricBuffers(metricBuffers, totalSlots);
+                  rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+                  if (!rows) {
+                    reduceSplitDenseAll(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, n, totalSlots);
+                  } else {
+                    reduceSplitDenseIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, rows.indices, rows.length, 1, totalSlots);
+                  }
+                }
               }
             } else {
               splitMode = 'sparse';
               ensureSparseSplitLayout(slotArr, slotCount, splitCol);
-              metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, sparsePairCount || 1, false);
-              zeroMetricBuffers(metricBuffers, sparsePairCount);
+              var spSlots = sparsePairCount || 1;
               if (!applyFilteredRemovals) {
-                reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, n, sparsePairCount);
+                if (!restoreUnfilteredIntoBuffers(sparsePairCount, false)) {
+                  buffersHoldUnfiltered = false;
+                  unfilteredValid = false;
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, spSlots, false);
+                  zeroMetricBuffers(metricBuffers, sparsePairCount);
+                  reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, n, sparsePairCount);
+                  markBuffersHoldUnfiltered(sparsePairCount);
+                }
               } else {
-                rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-                reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, rows.indices, rows.length, 1, sparsePairCount);
+                var spActCnt = !dimSlot.active ? filteredCount() : filterStore.countActive(dimSlot);
+                if (spActCnt === 0) {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, spSlots, false);
+                  zeroMetricBuffers(metricBuffers, sparsePairCount);
+                } else if (spActCnt === n && restoreUnfilteredIntoBuffers(sparsePairCount, false)) {
+                  // restored from unfiltered cache
+                } else if (spActCnt > (n >>> 1) && hasValidUnfilteredCache(sparsePairCount) && canPlanUseComplement(metricPlan, getNumericColumn)) {
+                  var spExcl = getExcludedRows(dimSlot.active ? dimSlot : null);
+                  restoreUnfilteredIntoBuffers(sparsePairCount, true);
+                  if (spExcl.length > 0) {
+                    reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, spExcl.indices, spExcl.length, -1, sparsePairCount);
+                    var spExCntOff = getExactCountOffset(metricPlan, getNumericColumn);
+                    var spTrk = spExCntOff < 0 ? ensureUnfilteredRowCounts(sparsePairCount, sparsePairGroupIds, null, 0) : null;
+                    cleanupComplementEmptySlots(
+                      metricBuffers, metricPlan, spExCntOff, sparsePairGroupIds, null, 0,
+                      spTrk, spExCntOff < 0 ? ensureUnfilteredTmpCounts(sparsePairCount) : null,
+                      spExcl.indices, spExcl.length, sparsePairCount
+                    );
+                  }
+                } else {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, spSlots, false);
+                  zeroMetricBuffers(metricBuffers, sparsePairCount);
+                  rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+                  if (!rows) {
+                    reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, n, sparsePairCount);
+                  } else {
+                    reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, rows.indices, rows.length, 1, sparsePairCount);
+                  }
+                }
               }
             }
             valuesSynced = false;
@@ -6336,7 +6892,7 @@ function crossfilter() {
           return;
         }
         for (i = 0; i < n; ++i) {
-          if (!filters.zeroExcept(i, offset, zero)) {
+          if (!filterStore.isActiveExcept(i, dimSlot)) {
             var rg = lazyIdentityMode
               ? lazyCodeToGroup[customSlotArr[i]]
               : (rawBucketMode ? rawToSorted[customSlotArr[i]] : customSlotArr[i]);
@@ -6360,29 +6916,37 @@ function crossfilter() {
             ensureCountBuf(1);
             if (!applyFilteredRemovals) {
               countBuf[0] = n;
-            } else if (!filterValuePresent) {
+            } else if (!dimSlot.active) {
               countBuf[0] = filteredCount();
             } else {
-              countBuf[0] = collectZeroExceptRows(offset, zero).length;
+              countBuf[0] = filterStore.countActive(dimSlot);
             }
             valuesSynced = false;
             return;
           }
 
           if (reduceMode === 'metricSpec') {
+            buffersHoldUnfiltered = false;
+            unfilteredValid = false;
             metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
             zeroMetricBuffers(metricBuffers, 1);
             if (!applyFilteredRemovals) {
               reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
             } else {
-              rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-              reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, rows.indices, rows.length, 1);
+              rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+              if (!rows) {
+                reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+              } else {
+                reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, rows.indices, rows.length, 1);
+              }
             }
             valuesSynced = false;
             return;
           }
 
           if (reduceMode === 'splitMetricSpec') {
+            buffersHoldUnfiltered = false;
+            unfilteredValid = false;
             var splitCol = getSplitColumn(reduceSplitField),
                 stride = splitCol.codeToKey.length;
             splitMode = 'dense';
@@ -6393,8 +6957,12 @@ function crossfilter() {
               if (!applyFilteredRemovals) {
                 reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, n, stride);
               } else {
-                rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-                reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, rows.indices, rows.length, 1, stride);
+                rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+                if (!rows) {
+                  reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, n, stride);
+                } else {
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, rows.indices, rows.length, 1, stride);
+                }
               }
             }
             valuesSynced = false;
@@ -6412,7 +6980,7 @@ function crossfilter() {
           return;
         }
         for (i = 0; i < n; ++i) {
-          if (!filters.zeroExcept(i, offset, zero)) {
+          if (!filterStore.isActiveExcept(i, dimSlot)) {
             g.value = reduceRemove(g.value, getRecord(i), false);
           }
         }
@@ -6521,6 +7089,15 @@ function crossfilter() {
         reduceSplitField = resolved ? resolved.splitField : null;
         metricPlan = reduceMetricSpec ? compileMetricPlan(reduceMetricSpec) : null;
         metricBuffers = null;
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
+        unfilteredData = null;
+        unfilteredRowCounts = null;
+        unfilteredTmpCounts = null;
+        if (brushFalcon && brushFalcon.hasGroup(group)) {
+          brushFalcon = null;
+          brushBuildFailed = false;
+        }
         splitMode = null;
         splitActiveStride = 0;
         reduceMode = null;
@@ -6573,6 +7150,15 @@ function crossfilter() {
 
       // Removes this group and associated event listeners.
       function dispose() {
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
+        unfilteredData = null;
+        unfilteredRowCounts = null;
+        unfilteredTmpCounts = null;
+        if (brushFalcon && brushFalcon.hasGroup(group)) {
+          brushFalcon = null;
+          brushBuildFailed = false;
+        }
         var i = filterListeners.indexOf(update);
         if (i >= 0) filterListeners.splice(i, 1);
         i = indexListeners.indexOf(add);
@@ -6613,8 +7199,12 @@ function crossfilter() {
       if (i >= 0) dataListeners.splice(i, 1);
       i = removeDataListeners.indexOf(removeData);
       if (i >= 0) removeDataListeners.splice(i, 1);
-      filters.masks[offset] &= zero;
-      return filterAll();
+      filterAll();
+      if (brushDimSlot === dimSlot) {
+        invalidateBrushState();
+      }
+      filterStore.freeSlot(dimSlot);
+      return dimension;
     }
 
     return dimension;
@@ -6630,6 +7220,7 @@ function crossfilter() {
       value: value,
       dispose: dispose,
       remove: dispose, // for backwards-compatibility
+      _coScanInfo: coScanInfo,
       _readScalar: readScalar
     };
 
@@ -6640,6 +7231,8 @@ function crossfilter() {
         reduceMetricSpec = null,
         metricPlan = null,
         metricBuffers = null,
+        unfilteredData = null,
+        unfilteredValid = false,
         reduceMode = null,
         valueSynced = false,
         resetNeeded = true,
@@ -6648,11 +7241,66 @@ function crossfilter() {
           valueSynced = false;
         });
 
+    function saveUnfilteredScalar() {
+      if (!metricPlan || !metricBuffers) return;
+      var stride = metricPlan.stride;
+      if (!unfilteredData || unfilteredData.length < stride) {
+        unfilteredData = new Float64Array(stride);
+      }
+      unfilteredData.set(metricBuffers.data.subarray(0, stride));
+      unfilteredValid = true;
+    }
+
+    function restoreUnfilteredScalar() {
+      if (!unfilteredValid || !unfilteredData || !metricPlan) return false;
+      metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+      metricBuffers.data.set(unfilteredData.subarray(0, metricPlan.stride));
+      return true;
+    }
+
+    function coScanInfo() {
+      if (!resetNeeded || reduceMode !== 'metricSpec' || !metricPlan || !metricPlan.canCoScan) {
+        return null;
+      }
+      var applyFilteredRemovals = hasAnyActiveDimensionFilters();
+      var info = {
+        buffers: metricBuffers,
+        canComplement: function() {
+          return unfilteredValid && unfilteredData !== null;
+        },
+        coScanKey: metricPlan.coScanKey,
+        commit: function(saveCache) {
+          if (saveCache) saveUnfilteredScalar();
+          resetNeeded = false;
+          valueSynced = false;
+        },
+        ensureBuffers: function() {
+          metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+          info.buffers = metricBuffers;
+        },
+        groupRef: group,
+        plan: metricPlan,
+        prepareZero: function() {
+          metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+          zeroMetricBuffers(metricBuffers, 1);
+          info.buffers = metricBuffers;
+        },
+        tryRestoreUnfiltered: function() {
+          if (restoreUnfilteredScalar()) {
+            info.buffers = metricBuffers;
+            return true;
+          }
+          return false;
+        },
+        unfiltered: !applyFilteredRemovals
+      };
+      return info;
+    }
+
     // The group listens to the crossfilter for when any dimension changes, so
     // that it can update the reduce value. It must also listen to the parent
     // dimension for when data is added.
-    update._xfilterDimOne = -1;
-    update._xfilterDimOffset = -1;
+    update._xfilterDimSlot = null;
     update._xfilterResettable = false;
     filterListeners.push(update);
     dataListeners.push(add);
@@ -6662,6 +7310,7 @@ function crossfilter() {
 
     // Incorporates the specified new values into this group.
     function add(newData, n0) {
+      unfilteredValid = false;
       var i,
           applyFilteredRemovals = hasAnyActiveDimensionFilters();
 
@@ -6672,7 +7321,7 @@ function crossfilter() {
           reduceValue += (n - n0);
         } else {
           for (i = n0; i < n; ++i) {
-            if (filters.zero(i)) reduceValue += 1;
+            if (filterStore.isActive(i)) reduceValue += 1;
           }
         }
         return;
@@ -6687,7 +7336,7 @@ function crossfilter() {
           for (i = n0; i < n; ++i) deltaWorkBuf[count++] = i;
         } else {
           for (i = n0; i < n; ++i) {
-            if (filters.zero(i)) deltaWorkBuf[count++] = i;
+            if (filterStore.isActive(i)) deltaWorkBuf[count++] = i;
           }
         }
         if (count > 0) {
@@ -6701,14 +7350,15 @@ function crossfilter() {
       for (i = n0; i < n; ++i) {
         var rowRecord = getRecord(i);
         reduceValue = reduceAdd(reduceValue, rowRecord, true);
-        if (applyFilteredRemovals && !filters.zero(i)) {
+        if (applyFilteredRemovals && !filterStore.isActive(i)) {
           reduceValue = reduceRemove(reduceValue, rowRecord, false);
         }
       }
     }
 
     // Reduces the specified selected or deselected records.
-    function update(filterOne, filterOffset, added, removed, notFilter, forceReset) {
+    function update(filterSlot, added, removed, notFilter, forceReset) {
+      if (notFilter) unfilteredValid = false;
       var i,
           k,
           len;
@@ -6716,7 +7366,8 @@ function crossfilter() {
       if (resetNeeded) return;
 
       if (reduceMode !== null) {
-        if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
+        if (notFilter || forceReset || added.length + removed.length > (n >>> 2)
+          || (reduceMode !== 'count' && removed.length > 0 && metricPlan && !canPlanUseComplement(metricPlan, getNumericColumn))) {
           resetNeeded = true;
           valueSynced = false;
           return;
@@ -6725,10 +7376,10 @@ function crossfilter() {
         if (reduceMode === 'count') {
           var delta = 0;
           for (i = 0, len = added.length; i < len; ++i) {
-            if (filters.zero(added[i])) ++delta;
+            if (filterStore.isActive(added[i])) ++delta;
           }
           for (i = 0, len = removed.length; i < len; ++i) {
-            if (filters.only(removed[i], filterOffset, filterOne)) --delta;
+            if (filterStore.isOnlyExcludedBy(removed[i], filterSlot)) --delta;
           }
           reduceValue += delta;
           return;
@@ -6742,7 +7393,7 @@ function crossfilter() {
         var addCount = 0;
         for (i = 0, len = added.length; i < len; ++i) {
           k = added[i];
-          if (filters.zero(k)) deltaWorkBuf[addCount++] = k;
+          if (filterStore.isActive(k)) deltaWorkBuf[addCount++] = k;
         }
         if (addCount > 0) {
           reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, addCount, 1);
@@ -6750,7 +7401,7 @@ function crossfilter() {
         var remCount = 0;
         for (i = 0, len = removed.length; i < len; ++i) {
           k = removed[i];
-          if (filters.only(k, filterOffset, filterOne)) deltaWorkBuf[remCount++] = k;
+          if (filterStore.isOnlyExcludedBy(k, filterSlot)) deltaWorkBuf[remCount++] = k;
         }
         if (remCount > 0) {
           reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, remCount, -1);
@@ -6761,14 +7412,14 @@ function crossfilter() {
 
       // Add the added values.
       for (i = 0, len = added.length; i < len; ++i) {
-        if (filters.zero(k = added[i])) {
+        if (filterStore.isActive(k = added[i])) {
           reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
         }
       }
 
       // Remove the removed values.
       for (i = 0, len = removed.length; i < len; ++i) {
-        if (filters.only(k = removed[i], filterOffset, filterOne)) {
+        if (filterStore.isOnlyExcludedBy(k = removed[i], filterSlot)) {
           reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
         }
       }
@@ -6786,13 +7437,48 @@ function crossfilter() {
       }
 
       if (reduceMode === 'metricSpec') {
-        metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
-        zeroMetricBuffers(metricBuffers, 1);
         if (!applyFilteredRemovals) {
-          reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+          if (!restoreUnfilteredScalar()) {
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+            zeroMetricBuffers(metricBuffers, 1);
+            reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+            saveUnfilteredScalar();
+          }
+        } else if (brushActive && brushFalcon && transientFilterDepth === 0 && brushFalcon.hasGroup(group)) {
+          var kpiSingle = {
+            buffers: metricBuffers,
+            ensureBuffers: function() {
+              metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+              kpiSingle.buffers = metricBuffers;
+            },
+            groupRef: group,
+            slotArr: null,
+            slotCount: 1
+          };
+          brushFalcon.applyQuerySingle(brushQueryKind, brushLo, brushHi, kpiSingle);
         } else {
-          var active = getActiveRows();
-          reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, active.indices, active.length, 1);
+          var sActCnt = filteredCount();
+          if (sActCnt === 0) {
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+            zeroMetricBuffers(metricBuffers, 1);
+          } else if (sActCnt === n && restoreUnfilteredScalar()) {
+            // restored from unfiltered cache
+          } else if (sActCnt > (n >>> 1) && unfilteredValid && canPlanUseComplement(metricPlan, getNumericColumn)) {
+            var sExcl = getExcludedRows(null);
+            restoreUnfilteredScalar();
+            if (sExcl.length > 0) {
+              reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, sExcl.indices, sExcl.length, -1);
+            }
+          } else {
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+            zeroMetricBuffers(metricBuffers, 1);
+            var active = getActiveRows();
+            if (!active) {
+              reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+            } else {
+              reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, active.indices, active.length, 1);
+            }
+          }
         }
         valueSynced = false;
         return;
@@ -6803,7 +7489,7 @@ function crossfilter() {
       for (i = 0; i < n; ++i) {
         var rowRecord = getRecord(i);
         reduceValue = reduceAdd(reduceValue, rowRecord, true);
-        if (applyFilteredRemovals && !filters.zero(i)) {
+        if (applyFilteredRemovals && !filterStore.isActive(i)) {
           reduceValue = reduceRemove(reduceValue, rowRecord, false);
         }
       }
@@ -6820,6 +7506,12 @@ function crossfilter() {
       reduceMetricSpec = resolved && !resolved.splitField ? resolved.metrics : null;
       metricPlan = reduceMetricSpec ? compileMetricPlan(reduceMetricSpec) : null;
       metricBuffers = null;
+      unfilteredValid = false;
+      unfilteredData = null;
+      if (brushFalcon && brushFalcon.hasGroup(group)) {
+        brushFalcon = null;
+        brushBuildFailed = false;
+      }
       reduceMode = reduceMetricSpec ? 'metricSpec' : null;
       update._xfilterResettable = reduceMode !== null;
       resetNeeded = true;
@@ -6861,6 +7553,12 @@ function crossfilter() {
 
     // Removes this group and associated event listeners.
     function dispose() {
+      unfilteredValid = false;
+      unfilteredData = null;
+      if (brushFalcon && brushFalcon.hasGroup(group)) {
+        brushFalcon = null;
+        brushBuildFailed = false;
+      }
       var i = filterListeners.indexOf(update);
       if (i >= 0) filterListeners.splice(i, 1);
       i = dataListeners.indexOf(add);
@@ -6887,29 +7585,52 @@ function crossfilter() {
   function allFiltered(ignore_dimensions) {
     var array = [],
         i = 0,
-        mask = maskForDimensions(ignore_dimensions || []);
+        ignoreMap = buildIgnoreIdMap(ignore_dimensions);
 
-      for (i = 0; i < n; i++) {
-        if (filters.zeroExceptMask(i, mask)) {
-          array.push(getRecord(i));
-        }
+    if (!ignoreMap) {
+      if (!filterStore.hasAnyActive()) {
+        for (i = 0; i < n; i++) array.push(getRecord(i));
+        return array;
       }
-
+      var active = getActiveRows();
+      if (!active) {
+        for (i = 0; i < n; i++) array.push(getRecord(i));
+        return array;
+      }
+      var indices = active.indices,
+          len = active.length;
+      for (i = 0; i < len; i++) {
+        array.push(getRecord(indices[i]));
+      }
       return array;
+    }
+
+    for (i = 0; i < n; i++) {
+      if (filterStore.isActiveIgnoring(i, ignoreMap)) {
+        array.push(getRecord(i));
+      }
+    }
+
+    return array;
   }
 
   function allFilteredIndexes(ignore_dimensions) {
     var array,
         i = 0,
-        mask;
+        ignoreMap;
 
     if (!ignore_dimensions || !ignore_dimensions.length) {
-      if (!activeDimensionFilterCount) {
+      if (!filterStore.hasAnyActive()) {
         array = new Array(n);
         for (i = 0; i < n; ++i) array[i] = i;
         return array;
       }
       var active = getActiveRows();
+      if (!active) {
+        array = new Array(n);
+        for (i = 0; i < n; ++i) array[i] = i;
+        return array;
+      }
       array = new Array(active.length);
       var indices = active.indices;
       for (i = 0; i < active.length; ++i) array[i] = indices[i];
@@ -6917,10 +7638,10 @@ function crossfilter() {
     }
 
     array = [];
-    mask = maskForDimensions(ignore_dimensions);
+    ignoreMap = buildIgnoreIdMap(ignore_dimensions);
 
     for (i = 0; i < n; i++) {
-      if (filters.zeroExceptMask(i, mask)) {
+      if (filterStore.isActiveIgnoring(i, ignoreMap)) {
         array.push(i);
       }
     }

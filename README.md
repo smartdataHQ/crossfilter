@@ -8,52 +8,55 @@ Crossfilter3 is built on top of crossfilter2, already the fastest way to filter 
 
 | Layer | What changed | Why it matters |
 |-------|-------------|----------------|
-| **Ingest** | Columnar Arrow IPC streaming with batch coalescing (default 64K rows), multi-source lookup joins, projection/rename/type-coercion at ingest, Proxy-backed lazy row arrays that defer materialization via `COLUMNAR_BATCH_KEY` | Data goes from Cube.dev (or any Arrow source) straight into crossfilter's sorted indexes without ever building intermediate row objects — a 10K-row dataset allocates zero row objects until a panel actually reads one |
-| **Filtering** | Inline WASM module (no external `.wasm` file) with two scan paths: `filterInU32` for small target sets (k ≤ 4, n ≤ 1K) and `markFilterInU32` with dense lookup for larger sets; automatic regex extraction of `d => d.field` and `function(d){ return d.field }` into string paths for WASM routing | Filter scans stay in linear WASM memory instead of JS object traversal — see [performance estimates](#performance-and-memory-estimates) below |
-| **Lazy encoded path** | Uint32 code encoding per dimension (code 0 = null, 1..n = distinct values), 2x-amortized codes buffer growth on append, incremental `codeCounts` updates, `filterRange` target-codes caching, `groupAll` O(1) fast path, scratch buffer reuse across filter cycles | Appends are O(batch) not O(n log n) — a 10K append into 90K existing records skips the full re-sort and re-reduce |
-| **Aggregation** | Declarative KPIs (`count`, `sum`, `avg`, `avgNonZero`, `ratio`), declarative groups with time bucketing (`minute`/`hour`/`day`/`week`/`month`), split-field groups for nested aggregates keyed by a secondary dimension, incremental group updates on append | One config object replaces dozens of imperative `dimension().group().reduce()` chains |
+| **Ingest** | Columnar Arrow IPC streaming with batch coalescing (default 64K rows), multi-source lookup joins, projection/rename/type-coercion at ingest, zero-copy `Float64Array` fast path for numeric columns, Proxy-backed lazy row arrays via `COLUMNAR_BATCH_KEY` | Data goes from Cube.dev (or any Arrow source) straight into crossfilter's columnar indexes without building intermediate row objects — a 100K-row dataset allocates zero row objects until a panel actually reads one |
+| **1-bit columnar filter bitsets** | Per-dimension 1-bit `Uint32Array` bitsets (`src/filter-bitsets.js`) with **no 32-dimension limit**, 32-unrolled word packing, word-level XOR delta extraction with bailout, `Math.clz32` sparse active/excluded row traversal, SWAR `popcount32` for `filteredCount()`, and `O(1)` filter clear | Replaces byte-per-row bitmasks with 1 bit/row per *active* filter (0 bytes when unfiltered), accelerates sparse filter extraction & counting by 2–7×, and supports arbitrarily many dimensions |
+| **Lazy dimensions & encoding** | Filter-only string-accessor dimensions defer encoding completely until first filter/group/bounds/sort access; active dimensions use `Uint32Array` dictionary codes (2× amortized growth, incremental `codeCounts`) or raw numeric arrays; inline WASM filter acceleration (`src/wasm.js`) with JS fallback | Wide 20-dimension dashboards build **5–6× faster** because unused filter-only dimensions cost 0 CPU and 0 bytes; streaming appends are `O(batch)` instead of `O(n log n)` |
+| **AoS shared-scan & complement reduction** | Interleaved cache-line AoS `Float64Array` metric buffers (`src/columnar-reduce.js`), multi-group shared-scan co-scheduler (`_flushGroups`, up to 5 groups + KPI in a single pass via V8-friendly leaf kernels), Copy-on-Write unfiltered snapshot cache, and complement ("subtract-from-total") reduction when `> 50%` of rows remain active (with `\|v\| > 1e12` cancellation guards and exact empty-slot zeroing) | Clearing filters back to 100% is `O(slots)` (**9× faster** at 100K, **78× faster** at 1M); high-selectivity filters (90–95%) scan only the 5–10% excluded rows (**2–3.3× faster**); multi-chart clicks scan active rows once instead of once per chart |
+| **Falcon-style brush cache** | Automatic precomputed active-dimension 1D prefix-sum cubes (`src/falcon-brush.js`) activated on the 2nd consecutive `filterRange`/`filterExact` on the same dimension — discrete `O(slots)` prefix subtraction (`U ≤ 2048`) and continuous 256-bin quantile prefix cubes + CSR boundary bins (`U > 2048`) with deferred bitset materialization | Delivers **< 0.03 ms/frame** discrete brushing (**20× faster** at 100K, **240× faster** at 1M) and **1.6 ms/frame** continuous float brushing at 1M rows — smooth 60fps range sliders with zero overhead on single clicks |
+| **Aggregation** | Declarative KPIs (`count`, `sum`, `avg`, `avgNonZero`, `ratio`), declarative groups with time bucketing (`minute`/`hour`/`day`/`week`/`month`), dense & sparse split-field groups for nested aggregates keyed by a secondary dimension, incremental group updates on append | One config object replaces dozens of imperative `dimension().group().reduce()` chains |
 | **Worker runtime** | `createStreamingDashboardWorker` owns fetch → decode → filter → reduce → postMessage with Transferable typed-array buffers (zero-copy back to main thread); `createDashboardRuntime` for synchronous fallback; single `query()` round-trip returns filters + snapshot + paged rows + optional `rowCount` and `bounds` | The main thread only renders; structured-clone overhead is eliminated for the largest payloads (column arrays) |
-| **Query model** | Declarative filters (`exact`, `in`, `range`), `isolatedFilters` for within-group filtering without affecting global state, `rowSets` for multiple named row slices per query, `bounds` queries for min/max, ad-hoc `groups` queries | One postMessage round-trip replaces what would otherwise be 4-8 separate calls |
+| **Query model** | Declarative filters (`exact`, `in`, `range`), `isolatedFilters` for within-group filtering without affecting global state, `rowSets` for multiple named row slices per query, `bounds` queries for min/max, ad-hoc `groups` queries | One postMessage round-trip replaces what would otherwise be 4–8 separate calls |
 | **Progressive UI** | Partial snapshot emission during streaming load (throttled at 250ms default), separate fetch-percent and rows-loaded progress events (throttled at 100ms) | Charts and KPIs appear within seconds even on million-row datasets |
-| **Live mutation** | `append()` slots new rows into existing lazy indexes incrementally; `removeFiltered()` rebuilds `codeCounts` safely and re-filters | Dashboards stay live without full rebuild |
-| **Instance extensions** | `cf.allFilteredIndexes()`, `cf.isElementFiltered(index)`, `cf.takeColumns(indexes, fields)`, `cf.configureRuntime()` / `cf.runtimeInfo()` for per-instance WASM control | Columnar extraction and filter introspection without materializing rows |
+| **Live mutation** | `append()` / `appendColumns()` slot new rows into existing lazy indexes incrementally; `removeFiltered()` compacts columns and bitsets safely and invalidates caches | Dashboards stay live without full rebuild |
+| **Instance extensions** | `cf.batch(fn)` for atomic multi-dimension filter updates, `cf.allFilteredIndexes()`, `cf.isElementFiltered(index)`, `cf.takeColumns(indexes, fields)`, `dim.topIndex()`/`dim.bottomIndex()`, `cf.configureRuntime()` / `cf.runtimeInfo()` | Columnar extraction, zero-copy sorting, and atomic multi-filter transitions without materializing rows |
+
 The original crossfilter API (`cf.dimension()`, `group.all()`, etc.) is fully preserved — everything above is additive.
 
-### Performance and memory estimates
+### Performance and memory characteristics
 
-These are analytical estimates based on the architecture — not synthetic benchmarks. Actual results depend on dataset shape, dimension cardinality, and browser.
+#### Measured dashboard benchmarks (Node.js v22, built `crossfilter.cjs`)
 
-#### Filter scan throughput (WASM vs JS)
+Median timings across a multi-chart dashboard (6 groups × 4 metrics: `count`, `sum(revenue)`, `sum(cost)`, `ratio(clicks, impressions)` + KPIs; 5K high-cardinality SKUs + 365 days + continuous floats):
 
-The WASM module operates on flat `Uint32Array` codes in linear memory. The JS fallback (`denseLookupMatches`) builds a marks array and iterates in JS. Both do the same work — the difference is memory access pattern and JIT overhead.
-
-| Operation | JS fallback | WASM (`markFilterInU32`) | Speedup estimate |
-|-----------|------------|--------------------------|------------------|
-| `filterIn` on 100K rows, 50 target values | ~2-4ms | ~0.5-1.5ms | ~2-3x |
-| `filterIn` on 1M rows, 50 target values | ~20-40ms | ~5-15ms | ~2-4x |
-| `filterExact` on 100K rows | ~0.5-1ms | ~0.2-0.5ms | ~2x |
-
-The small-target path (`filterInU32`, k ≤ 4) uses a tight O(n*k) nested loop — effective for `filterExact` and small `filterIn` sets where the marks array setup cost would dominate.
+| Workload | 100K rows | 1M rows | Primary mechanism |
+|----------|-----------|---------|-------------------|
+| Build + initial snapshot (6 dims, 6 groups) | **12.2 ms** | **108.7 ms** | Lazy encoding + AoS shared-scan |
+| Build + initial snapshot (20 dims, 4 groups) | **5.9 ms** | **59.7 ms** | Lazy filter-only dimensions (zero upfront work for unused dims) |
+| Single-dim click (10% active) + full snapshot | **0.44 ms** | **2.63 ms** | 1-bit `clz32` sparse scan + AoS multi-group co-scan |
+| Clear filter → 100% + full snapshot | **0.23 ms** | **0.23 ms** | Copy-on-Write unfiltered snapshot cache (`O(slots)`) |
+| High-selectivity 95% (`in` 19/20) + clear | **0.68 ms** | **2.68 ms** | Complement subtraction (scans only 5% excluded rows) |
+| Low-selectivity 0.5% (2 active dims) + clear | **0.78 ms** | **3.83 ms** | 1-bit `AND` + `clz32` extraction + shared-scan |
+| Cold `rowCount()` after 2-dim filter change | **0.18 ms** | **1.72 ms** | SWAR `popcount32` over 1-bit bitsets |
+| Discrete range brush (60 frames, steady-state) | **0.026 ms/frame** | **0.021 ms/frame** | Falcon 1D prefix-sum cube (`O(slots)`, 0 row scans) |
+| Continuous float range brush (60 frames, `revenue`) | **0.26 ms/frame** | **1.61 ms/frame** | Falcon 256-bin quantile prefix cube + CSR boundary bins |
 
 #### Memory footprint per dimension
 
-| Component | Size for N rows | Example (100K rows) |
-|-----------|----------------|---------------------|
-| `codes` (Uint32Array, 2x capacity) | 4 × 2N bytes | 800 KB |
-| `codeCounts` (Uint32Array) | 4 × cardinality bytes | 4 KB (1000 distinct) |
-| `codeToValue` (Array) | ~50 × cardinality bytes | 50 KB |
-| `selected` (Uint8Array) | N bytes | 100 KB |
-| Filter bitmask (Uint8/16/32) | 1-4 × N bytes | 100-400 KB |
-| **Total per dimension** | **~6-10 bytes/row** | **~1 MB** |
-
-Adding a dimension costs ~6-10 bytes per row. The 32-dimension limit (bitmask width) means worst-case overhead is ~320 bytes/row.
+| Component | Size for N rows | Example (100K rows) | Notes |
+|-----------|----------------|---------------------|-------|
+| Unused filter-only dimension | **0 bytes** | **0 KB** | Deferred until first filter, group, bounds, or sort access |
+| Active filter bitset (1 bit/row) | `N / 8` bytes | **12.5 KB** | Allocated only while a dimension has an active filter; 0 bytes when unfiltered; **no 32-dimension limit** |
+| Encoded `codes` (`Uint32Array`) | `4 × N` bytes | 400 KB | Grows 2× amortized on streaming appends |
+| `codeCounts` (`Uint32Array`) | `4 × U` bytes | 4 KB (1K distinct) | Maintained incrementally on append |
+| `codeToValue` (`Array`) | `~50 × U` bytes | 50 KB (1K distinct) | Shared with `splitField` when field matches a dimension |
+| Raw numeric column (`Float64Array`) | `0 bytes` extra | **0 KB** | Zero-copy shared view for single-batch TypedArray/Arrow float64 columns |
 
 #### Row materialization savings
 
-In upstream crossfilter, every record is a JS object from the start. In this fork, columnar ingest creates Proxy-backed arrays — rows materialize only on access.
+In upstream crossfilter, every record is a JS object from the start. In crossfilter3, columnar ingest creates Proxy-backed arrays — rows materialize only on access.
 
-| Scenario | Upstream (all rows as objects) | This fork (columnar + lazy) | Savings |
-|----------|-------------------------------|----------------------------|---------|
+| Scenario | Upstream (all rows as objects) | Crossfilter3 (columnar + lazy) | Savings |
+|----------|-------------------------------|--------------------------------|---------|
 | 10K rows, 20 fields, 50 visible | ~5 MB (10K objects × ~500 bytes) | ~25 KB (50 objects) + columnar arrays already in memory | ~5 MB heap, ~10K fewer GC objects |
 | 100K rows, 20 fields, 50 visible | ~50 MB | ~25 KB + columnar | ~50 MB heap |
 | 1M rows, 20 fields, 100 visible | ~500 MB | ~50 KB + columnar | ~500 MB heap |
@@ -62,10 +65,10 @@ The columnar arrays themselves (one typed/string array per field) are the same s
 
 #### Append performance (lazy path)
 
-| Operation | Upstream | This fork (lazy encoded) | Why |
-|-----------|----------|--------------------------|-----|
-| Append 10K rows to 90K | O(n log n) re-sort + full reduce | O(m) codes extension + incremental codeCounts | Codes buffer grows 2x amortized; existing sorted indexes untouched |
-| groupAll after append | O(n) full scan | O(1) mark update | Singleton groups skip sorted-key rebuild |
+| Operation | Upstream | Crossfilter3 (lazy encoded) | Why |
+|-----------|----------|-----------------------------|-----|
+| Append 10K rows to 90K | O(n log n) re-sort + full reduce | O(m) codes extension + incremental `codeCounts` | Codes buffer grows 2× amortized; existing sorted indexes untouched; unused dims stay deferred |
+| `groupAll` after append | O(n) full scan | O(m) incremental scalar update | Singleton groups skip sorted-key rebuild |
 
 ## Installation
 
@@ -353,7 +356,8 @@ Arrow IPC source (Cube.dev, file, etc.)
 Web Worker (owns fetch, decode, crossfilter instance)
     |  Apache Arrow RecordBatchReader
     |  Incremental batch append with projection/rename/transforms
-    |  WASM-accelerated encoded filter scans
+    |  Lazy filter-only dims + 1-bit columnar filter bitsets (clz32 + SWAR popcount)
+    |  AoS multi-group co-scan + CoW unfiltered/complement cache + Falcon brush cubes
     v
 Declarative filters in, snapshots + row slices out
     |
@@ -365,8 +369,8 @@ Main thread (renders UI only)
 
 ```bash
 npm install
-npm test          # vitest + eslint
-npm run build     # rollup -> crossfilter.js + crossfilter.min.js
+npm test          # vitest + eslint src/
+npm run build     # rollup -> crossfilter.js, crossfilter.cjs, crossfilter.min.js
 npm run benchmark
 ```
 

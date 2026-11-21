@@ -611,6 +611,7 @@ function createKpiRuntime(cf, metrics) {
     dispose: function() {
       group.dispose();
     },
+    rawGroup: group,
     read: function() {
       if (typeof group._readScalar === "function") {
         var fast = group._readScalar();
@@ -911,70 +912,78 @@ function createGroupRuntime(dimension, spec, index) {
     var limitWindow = normalized.limit == null ? null : normalized.offset + normalized.limit;
     var useHeap = !isNatural && limitWindow != null && limitWindow > 0 && limitWindow < count;
 
-    var visPrim = buffers ? buffers.primary[visibleMetricIndex] : null;
-    var visSec = buffers ? buffers.secondary[visibleMetricIndex] : null;
+    var bufData = buffers ? buffers.data : null;
+    var bufStride = buffers ? buffers.stride : 0;
+    var visPrimOff = plan.primOff[visibleMetricIndex];
+    var visSecOff = plan.secOff[visibleMetricIndex];
     var visOp = plan.ops[visibleMetricIndex];
 
     var sortIdx = sortMetric ? metricIndexById[sortMetric.id] : -1;
-    var sortPrim = (buffers && sortIdx >= 0) ? buffers.primary[sortIdx] : null;
-    var sortSec = (buffers && sortIdx >= 0) ? buffers.secondary[sortIdx] : null;
+    var sortPrimOff = sortIdx >= 0 ? plan.primOff[sortIdx] : -1;
+    var sortSecOff = sortIdx >= 0 ? plan.secOff[sortIdx] : -1;
     var sortOp = sortIdx >= 0 ? plan.ops[sortIdx] : OP_COUNT;
     var modeCode = mode === "flat" ? 0 : (mode === "splitDense" ? 1 : 2);
 
     function isSlotVisible(slot) {
-      if (!buffers) return false;
+      if (!bufData) return false;
+      var off;
       if (modeCode === 0) {
+        off = slot * bufStride;
         if (visOp === OP_COUNT || visOp === OP_SUM) {
-          return visPrim[slot] > 0;
+          return bufData[off + visPrimOff] > 0;
         }
         if (visOp === OP_AVG || visOp === OP_AVG_NON_ZERO) {
-          return visSec[slot] > 0 && (visPrim[slot] / visSec[slot]) > 0;
+          var vc = bufData[off + visSecOff];
+          return vc > 0 && (bufData[off + visPrimOff] / vc) > 0;
         }
         if (visOp === OP_RATIO) {
-          return visSec[slot] !== 0 && (visPrim[slot] / visSec[slot]) > 0;
+          var vd = bufData[off + visSecOff];
+          return vd !== 0 && (bufData[off + visPrimOff] / vd) > 0;
         }
         return false;
       }
       var sum = 0;
       if (modeCode === 1) {
-        var base = slot * stride;
-        for (var sc = 0; sc < stride; ++sc) {
-          sum += visPrim[base + sc];
+        var base = slot * stride * bufStride + visPrimOff;
+        for (var sc = 0; sc < stride; ++sc, base += bufStride) {
+          sum += bufData[base];
         }
         return sum > 0;
       }
       for (var pid = headBySlot[slot]; pid !== -1; pid = nextPair[pid]) {
-        sum += visPrim[pid];
+        sum += bufData[pid * bufStride + visPrimOff];
       }
       return sum > 0;
     }
 
     function readSortComparable(slot) {
-      if (!sortPrim) return 0;
+      if (!bufData || sortPrimOff < 0) return 0;
+      var off;
       if (modeCode === 0) {
+        off = slot * bufStride;
         if (sortOp === OP_COUNT || sortOp === OP_SUM) {
-          return sortPrim[slot];
+          return bufData[off + sortPrimOff];
         }
         if (sortOp === OP_AVG || sortOp === OP_AVG_NON_ZERO) {
-          var c = sortSec[slot];
-          return c ? sortPrim[slot] / c : 0;
+          var c = bufData[off + sortSecOff];
+          return c ? bufData[off + sortPrimOff] / c : 0;
         }
         if (sortOp === OP_RATIO) {
-          var d = sortSec[slot];
-          return d !== 0 ? sortPrim[slot] / d : 0;
+          var d = bufData[off + sortSecOff];
+          return d !== 0 ? bufData[off + sortPrimOff] / d : 0;
         }
         return 0;
       }
       var sum = 0;
       if (modeCode === 1) {
-        var base = slot * stride;
-        for (var sc = 0; sc < stride; ++sc) {
-          sum += sortPrim[base + sc];
+        var base = slot * stride * bufStride + sortPrimOff;
+        for (var sc = 0; sc < stride; ++sc, base += bufStride) {
+          sum += bufData[base];
         }
         return sum;
       }
       for (var pid = headBySlot[slot]; pid !== -1; pid = nextPair[pid]) {
-        sum += sortPrim[pid];
+        sum += bufData[pid * bufStride + sortPrimOff];
       }
       return sum;
     }
@@ -1296,6 +1305,7 @@ function createGroupRuntime(dimension, spec, index) {
       group.dispose();
     },
     id: spec.id || "group_" + index,
+    rawGroup: group,
     read: function(query) {
       return readQuery(query);
     }
@@ -1429,6 +1439,7 @@ export function createDashboardRuntime(crossfilter, options) {
   var dimensions = {};
   var currentFilters = {};
   var groupRuntimes = {};
+  var allRawGroups = [];
   var kpiRuntime = createKpiRuntime(cf, normalizeMetrics(options.kpis, "kpi"));
   var rowCountGroup = typeof cf._filteredCount === "function" ? null : cf.groupAll().reduceCount();
 
@@ -1442,6 +1453,7 @@ export function createDashboardRuntime(crossfilter, options) {
     var groupDimension = ensureDimension(dimensions, dimensionFields, cf, groupSpec.field);
     var groupRuntime = createGroupRuntime(groupDimension, groupSpec, nextGroupIndex);
     groupRuntimes[groupRuntime.id] = groupRuntime;
+    allRawGroups.push(groupRuntime.rawGroup);
   }
 
   function updateFilters(filters) {
@@ -1495,16 +1507,20 @@ export function createDashboardRuntime(crossfilter, options) {
     return typeof cf.runtimeInfo === "function" ? cf.runtimeInfo() : crossfilter.runtimeInfo();
   }
 
-  function readGroups(groupQueries) {
+  function readGroups(groupQueries, skipFlush) {
     var groups = {};
 
     if (!groupQueries) {
+      if (!skipFlush && allRawGroups.length > 1 && typeof cf._flushGroups === "function") {
+        cf._flushGroups(allRawGroups, null);
+      }
       for (var groupId in groupRuntimes) {
         groups[groupId] = groupRuntimes[groupId].read();
       }
       return groups;
     }
 
+    var requestedIds = [];
     for (var requestedGroupId in groupQueries) {
       if (!groupRuntimes[requestedGroupId]) {
         throw new Error("Unknown dashboard group: " + requestedGroupId);
@@ -1512,7 +1528,20 @@ export function createDashboardRuntime(crossfilter, options) {
       if (groupQueries[requestedGroupId] === false) {
         continue;
       }
-      groups[requestedGroupId] = groupRuntimes[requestedGroupId].read(groupQueries[requestedGroupId]);
+      requestedIds.push(requestedGroupId);
+    }
+
+    if (!skipFlush && requestedIds.length > 1 && typeof cf._flushGroups === "function") {
+      var reqRaw = new Array(requestedIds.length);
+      for (var ri = 0; ri < requestedIds.length; ++ri) {
+        reqRaw[ri] = groupRuntimes[requestedIds[ri]].rawGroup;
+      }
+      cf._flushGroups(reqRaw, null);
+    }
+
+    for (var i = 0; i < requestedIds.length; ++i) {
+      var id = requestedIds[i];
+      groups[id] = groupRuntimes[id].read(groupQueries[id]);
     }
 
     return groups;
@@ -1520,9 +1549,25 @@ export function createDashboardRuntime(crossfilter, options) {
 
   function readSnapshot(options) {
     var groups = {};
+    var includeGroups = !options || options.groups !== false;
+    var groupQueries = options && options.groups ? options.groups : null;
 
-    if (!options || options.groups !== false) {
-      groups = readGroups(options && options.groups ? options.groups : null);
+    if (includeGroups && typeof cf._flushGroups === "function") {
+      if (!groupQueries) {
+        cf._flushGroups(allRawGroups, kpiRuntime.rawGroup);
+      } else {
+        var reqRaw = [];
+        for (var gId in groupQueries) {
+          if (groupQueries[gId] !== false && groupRuntimes[gId]) {
+            reqRaw.push(groupRuntimes[gId].rawGroup);
+          }
+        }
+        cf._flushGroups(reqRaw, kpiRuntime.rawGroup);
+      }
+    }
+
+    if (includeGroups) {
+      groups = readGroups(groupQueries, true);
     }
 
     return {

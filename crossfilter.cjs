@@ -1,4 +1,4 @@
-// https://github.com/smartdataHQ/crossfilter v3.1.2 Copyright 2026 Mike Bostock
+// https://github.com/smartdataHQ/crossfilter v3.2.0 Copyright 2026 Mike Bostock
 'use strict';
 
 let array8 = arrayUntyped,
@@ -249,6 +249,4003 @@ var xfilterFilter = {
   filterRange,
   filterAll
 };
+
+// Compact 1-bit-per-row per-dimension filter bitset store.
+// Convention: bit 1 = row INCLUDED by this dimension, bit 0 = row EXCLUDED.
+// Trailing bits beyond `length` are always 0.
+// Unfiltered dimensions are not present in `active` (0 memory traffic, O(1) clear).
+
+function popcount32(x) {
+  x = x - ((x >>> 1) & 0x55555555);
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  return Math.imul((x + (x >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24;
+}
+
+function tailMaskFor(n) {
+  var rem = n & 31;
+  return rem === 0 ? 0xffffffff : (0xffffffff >>> (32 - rem));
+}
+
+function ensureWordCapacity(arr, neededWords) {
+  if (arr && arr.length >= neededWords) {
+    return arr;
+  }
+  var cap = arr && arr.length ? arr.length : 2;
+  while (cap < neededWords) cap <<= 1;
+  var next = new Uint32Array(cap);
+  if (arr) next.set(arr);
+  return next;
+}
+
+function fillBitsOnes(bits, n) {
+  var fullWords = n >>> 5;
+  if (fullWords > 0) {
+    bits.fill(0xffffffff, 0, fullWords);
+  }
+  var rem = n & 31;
+  if (rem > 0) {
+    bits[fullWords] = 0xffffffff >>> (32 - rem);
+  }
+}
+
+function setBitsOnesRange(bits, startRow, endRow) {
+  if (startRow >= endRow) return;
+  var startWord = startRow >>> 5;
+  var startBit = startRow & 31;
+  var lastRow = endRow - 1;
+  var endWord = lastRow >>> 5;
+  var endBit = lastRow & 31;
+  var keepLowMask = startBit === 0 ? 0 : (0xffffffff >>> (32 - startBit));
+
+  if (startWord === endWord) {
+    var span = endBit - startBit + 1;
+    var mask = span === 32 ? 0xffffffff : (((0xffffffff >>> (32 - span)) << startBit) >>> 0);
+    bits[startWord] = ((bits[startWord] & keepLowMask) | mask) >>> 0;
+    return;
+  }
+
+  if (startBit > 0) {
+    bits[startWord] = ((bits[startWord] & keepLowMask) | ((0xffffffff << startBit) >>> 0)) >>> 0;
+    startWord += 1;
+  }
+  if (startWord < endWord) {
+    bits.fill(0xffffffff, startWord, endWord);
+  }
+  var endMask = endBit === 31 ? 0xffffffff : (0xffffffff >>> (31 - endBit));
+  bits[endWord] = endMask >>> 0;
+}
+
+function extractClz1(b0, wordCount, out) {
+  var count = 0, j, w, base, lsb;
+  for (j = 0; j < wordCount; ++j) {
+    w = b0[j];
+    if (w === 0) continue;
+    base = j << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  return count;
+}
+
+function extractClz2(b0, b1, wordCount, out) {
+  var count = 0, j, w, base, lsb;
+  for (j = 0; j < wordCount; ++j) {
+    w = b0[j] & b1[j];
+    if (w === 0) continue;
+    base = j << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  return count;
+}
+
+function extractClz3(b0, b1, b2, wordCount, out) {
+  var count = 0, j, w, base, lsb;
+  for (j = 0; j < wordCount; ++j) {
+    w = b0[j] & b1[j] & b2[j];
+    if (w === 0) continue;
+    base = j << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  return count;
+}
+
+function extractClzN(bitsets, bitsetCount, wordCount, out) {
+  var count = 0, j, k, w, base, lsb;
+  var b0 = bitsets[0];
+  for (j = 0; j < wordCount; ++j) {
+    w = b0[j];
+    for (k = 1; w !== 0 && k < bitsetCount; ++k) {
+      w &= bitsets[k][j];
+    }
+    if (w === 0) continue;
+    base = j << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  return count;
+}
+
+function extractExclClz1(b0, wordCount, tailMask, out) {
+  var count = 0, last = wordCount - 1, j, w, base, lsb;
+  if (last < 0) return 0;
+  for (j = 0; j < last; ++j) {
+    w = (~b0[j]) | 0;
+    if (w === 0) continue;
+    base = j << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  w = (~b0[last]) & tailMask;
+  if (w !== 0) {
+    base = last << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  return count;
+}
+
+function extractExclClz2(b0, b1, wordCount, tailMask, out) {
+  var count = 0, last = wordCount - 1, j, w, base, lsb;
+  if (last < 0) return 0;
+  for (j = 0; j < last; ++j) {
+    w = (~(b0[j] & b1[j])) | 0;
+    if (w === 0) continue;
+    base = j << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  w = (~(b0[last] & b1[last])) & tailMask;
+  if (w !== 0) {
+    base = last << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  return count;
+}
+
+function extractExclClz3(b0, b1, b2, wordCount, tailMask, out) {
+  var count = 0, last = wordCount - 1, j, w, base, lsb;
+  if (last < 0) return 0;
+  for (j = 0; j < last; ++j) {
+    w = (~(b0[j] & b1[j] & b2[j])) | 0;
+    if (w === 0) continue;
+    base = j << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  w = (~(b0[last] & b1[last] & b2[last])) & tailMask;
+  if (w !== 0) {
+    base = last << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  return count;
+}
+
+function extractExclClzN(bitsets, bitsetCount, wordCount, tailMask, out) {
+  var count = 0, last = wordCount - 1, j, k, w, base, lsb;
+  if (last < 0) return 0;
+  var b0 = bitsets[0];
+  for (j = 0; j < wordCount; ++j) {
+    w = b0[j];
+    for (k = 1; w !== 0 && k < bitsetCount; ++k) {
+      w &= bitsets[k][j];
+    }
+    w = j === last ? ((~w) & tailMask) : ((~w) | 0);
+    if (w === 0) continue;
+    base = j << 5;
+    while (w !== 0) {
+      lsb = w & -w;
+      out[count++] = base + (31 - Math.clz32(lsb));
+      w ^= lsb;
+    }
+  }
+  return count;
+}
+
+function countPop1(b0, wordCount) {
+  var total = 0, j, w;
+  for (j = 0; j < wordCount; ++j) {
+    w = b0[j];
+    if (w !== 0) total += popcount32(w);
+  }
+  return total;
+}
+
+function countPop2(b0, b1, wordCount) {
+  var total = 0, j, w;
+  for (j = 0; j < wordCount; ++j) {
+    w = b0[j] & b1[j];
+    if (w !== 0) total += popcount32(w);
+  }
+  return total;
+}
+
+function countPop3(b0, b1, b2, wordCount) {
+  var total = 0, j, w;
+  for (j = 0; j < wordCount; ++j) {
+    w = b0[j] & b1[j] & b2[j];
+    if (w !== 0) total += popcount32(w);
+  }
+  return total;
+}
+
+function countPopN(bitsets, bitsetCount, wordCount) {
+  var total = 0, j, k, w;
+  var b0 = bitsets[0];
+  for (j = 0; j < wordCount; ++j) {
+    w = b0[j];
+    for (k = 1; w !== 0 && k < bitsetCount; ++k) {
+      w &= bitsets[k][j];
+    }
+    if (w !== 0) total += popcount32(w);
+  }
+  return total;
+}
+
+// Fast 32-unrolled word builders (bit 1 = matches filter / included)
+
+function packExactWord(codes, base, target) {
+  var word = 0;
+  if (codes[base] === target) word |= 1;
+  if (codes[base + 1] === target) word |= 2;
+  if (codes[base + 2] === target) word |= 4;
+  if (codes[base + 3] === target) word |= 8;
+  if (codes[base + 4] === target) word |= 16;
+  if (codes[base + 5] === target) word |= 32;
+  if (codes[base + 6] === target) word |= 64;
+  if (codes[base + 7] === target) word |= 128;
+  if (codes[base + 8] === target) word |= 256;
+  if (codes[base + 9] === target) word |= 512;
+  if (codes[base + 10] === target) word |= 1024;
+  if (codes[base + 11] === target) word |= 2048;
+  if (codes[base + 12] === target) word |= 4096;
+  if (codes[base + 13] === target) word |= 8192;
+  if (codes[base + 14] === target) word |= 16384;
+  if (codes[base + 15] === target) word |= 32768;
+  if (codes[base + 16] === target) word |= 65536;
+  if (codes[base + 17] === target) word |= 131072;
+  if (codes[base + 18] === target) word |= 262144;
+  if (codes[base + 19] === target) word |= 524288;
+  if (codes[base + 20] === target) word |= 1048576;
+  if (codes[base + 21] === target) word |= 2097152;
+  if (codes[base + 22] === target) word |= 4194304;
+  if (codes[base + 23] === target) word |= 8388608;
+  if (codes[base + 24] === target) word |= 16777216;
+  if (codes[base + 25] === target) word |= 33554432;
+  if (codes[base + 26] === target) word |= 67108864;
+  if (codes[base + 27] === target) word |= 134217728;
+  if (codes[base + 28] === target) word |= 268435456;
+  if (codes[base + 29] === target) word |= 536870912;
+  if (codes[base + 30] === target) word |= 1073741824;
+  if (codes[base + 31] === target) word |= -2147483648;
+  return word >>> 0;
+}
+
+function packMarkedWord(codes, base, marks, markVersion) {
+  var word = 0;
+  if (marks[codes[base]] === markVersion) word |= 1;
+  if (marks[codes[base + 1]] === markVersion) word |= 2;
+  if (marks[codes[base + 2]] === markVersion) word |= 4;
+  if (marks[codes[base + 3]] === markVersion) word |= 8;
+  if (marks[codes[base + 4]] === markVersion) word |= 16;
+  if (marks[codes[base + 5]] === markVersion) word |= 32;
+  if (marks[codes[base + 6]] === markVersion) word |= 64;
+  if (marks[codes[base + 7]] === markVersion) word |= 128;
+  if (marks[codes[base + 8]] === markVersion) word |= 256;
+  if (marks[codes[base + 9]] === markVersion) word |= 512;
+  if (marks[codes[base + 10]] === markVersion) word |= 1024;
+  if (marks[codes[base + 11]] === markVersion) word |= 2048;
+  if (marks[codes[base + 12]] === markVersion) word |= 4096;
+  if (marks[codes[base + 13]] === markVersion) word |= 8192;
+  if (marks[codes[base + 14]] === markVersion) word |= 16384;
+  if (marks[codes[base + 15]] === markVersion) word |= 32768;
+  if (marks[codes[base + 16]] === markVersion) word |= 65536;
+  if (marks[codes[base + 17]] === markVersion) word |= 131072;
+  if (marks[codes[base + 18]] === markVersion) word |= 262144;
+  if (marks[codes[base + 19]] === markVersion) word |= 524288;
+  if (marks[codes[base + 20]] === markVersion) word |= 1048576;
+  if (marks[codes[base + 21]] === markVersion) word |= 2097152;
+  if (marks[codes[base + 22]] === markVersion) word |= 4194304;
+  if (marks[codes[base + 23]] === markVersion) word |= 8388608;
+  if (marks[codes[base + 24]] === markVersion) word |= 16777216;
+  if (marks[codes[base + 25]] === markVersion) word |= 33554432;
+  if (marks[codes[base + 26]] === markVersion) word |= 67108864;
+  if (marks[codes[base + 27]] === markVersion) word |= 134217728;
+  if (marks[codes[base + 28]] === markVersion) word |= 268435456;
+  if (marks[codes[base + 29]] === markVersion) word |= 536870912;
+  if (marks[codes[base + 30]] === markVersion) word |= 1073741824;
+  if (marks[codes[base + 31]] === markVersion) word |= -2147483648;
+  return word >>> 0;
+}
+
+function packRangeWord(vals, base, lo, hi) {
+  var word = 0, v;
+  v = vals[base]; if (v >= lo && v < hi) word |= 1;
+  v = vals[base + 1]; if (v >= lo && v < hi) word |= 2;
+  v = vals[base + 2]; if (v >= lo && v < hi) word |= 4;
+  v = vals[base + 3]; if (v >= lo && v < hi) word |= 8;
+  v = vals[base + 4]; if (v >= lo && v < hi) word |= 16;
+  v = vals[base + 5]; if (v >= lo && v < hi) word |= 32;
+  v = vals[base + 6]; if (v >= lo && v < hi) word |= 64;
+  v = vals[base + 7]; if (v >= lo && v < hi) word |= 128;
+  v = vals[base + 8]; if (v >= lo && v < hi) word |= 256;
+  v = vals[base + 9]; if (v >= lo && v < hi) word |= 512;
+  v = vals[base + 10]; if (v >= lo && v < hi) word |= 1024;
+  v = vals[base + 11]; if (v >= lo && v < hi) word |= 2048;
+  v = vals[base + 12]; if (v >= lo && v < hi) word |= 4096;
+  v = vals[base + 13]; if (v >= lo && v < hi) word |= 8192;
+  v = vals[base + 14]; if (v >= lo && v < hi) word |= 16384;
+  v = vals[base + 15]; if (v >= lo && v < hi) word |= 32768;
+  v = vals[base + 16]; if (v >= lo && v < hi) word |= 65536;
+  v = vals[base + 17]; if (v >= lo && v < hi) word |= 131072;
+  v = vals[base + 18]; if (v >= lo && v < hi) word |= 262144;
+  v = vals[base + 19]; if (v >= lo && v < hi) word |= 524288;
+  v = vals[base + 20]; if (v >= lo && v < hi) word |= 1048576;
+  v = vals[base + 21]; if (v >= lo && v < hi) word |= 2097152;
+  v = vals[base + 22]; if (v >= lo && v < hi) word |= 4194304;
+  v = vals[base + 23]; if (v >= lo && v < hi) word |= 8388608;
+  v = vals[base + 24]; if (v >= lo && v < hi) word |= 16777216;
+  v = vals[base + 25]; if (v >= lo && v < hi) word |= 33554432;
+  v = vals[base + 26]; if (v >= lo && v < hi) word |= 67108864;
+  v = vals[base + 27]; if (v >= lo && v < hi) word |= 134217728;
+  v = vals[base + 28]; if (v >= lo && v < hi) word |= 268435456;
+  v = vals[base + 29]; if (v >= lo && v < hi) word |= 536870912;
+  v = vals[base + 30]; if (v >= lo && v < hi) word |= 1073741824;
+  v = vals[base + 31]; if (v >= lo && v < hi) word |= -2147483648;
+  return word >>> 0;
+}
+
+function packSetWord(vals, base, valSet) {
+  var word = 0, b;
+  for (b = 0; b < 32; ++b) {
+    if (valSet.has(vals[base + b])) word |= (1 << b);
+  }
+  return word >>> 0;
+}
+
+function createFilterBitsetStore() {
+  var length = 0;
+  var wordCount = 0;
+  var active = [];
+  var nextId = 0;
+  var freeIds = [];
+  var dirtyCount = 0;
+  var scratchBitsets = [];
+
+  function allocSlot() {
+    var id = freeIds.length ? freeIds.pop() : nextId++;
+    return {
+      active: false,
+      bitset: null,
+      bitsetDirty: false,
+      id: id,
+      materialize: null
+    };
+  }
+
+  function freeSlot(slot) {
+    deactivate(slot);
+    slot.bitset = null;
+    slot.materialize = null;
+    freeIds.push(slot.id);
+  }
+
+  function markDirty(slot) {
+    if (!slot.active) {
+      slot.active = true;
+      active.push(slot);
+    }
+    if (!slot.bitsetDirty) {
+      slot.bitsetDirty = true;
+      dirtyCount += 1;
+    }
+  }
+
+  function clearDirty(slot) {
+    if (slot.bitsetDirty) {
+      slot.bitsetDirty = false;
+      dirtyCount -= 1;
+    }
+  }
+
+  function ensureMaterialized(ignoreSlot) {
+    if (dirtyCount === 0) return;
+    for (var i = active.length - 1; i >= 0; --i) {
+      var s = active[i];
+      if (s.bitsetDirty && s !== ignoreSlot) {
+        s.bitsetDirty = false;
+        dirtyCount -= 1;
+        if (s.materialize) {
+          s.materialize();
+        }
+      }
+    }
+  }
+
+  function ensureSlotMaterialized(slot) {
+    if (slot.bitsetDirty) {
+      slot.bitsetDirty = false;
+      dirtyCount -= 1;
+      if (slot.materialize) {
+        slot.materialize();
+      }
+    }
+  }
+
+  function activateForOverwrite(slot) {
+    clearDirty(slot);
+    if (wordCount > 0) {
+      slot.bitset = ensureWordCapacity(slot.bitset, wordCount);
+    } else if (!slot.bitset) {
+      slot.bitset = new Uint32Array(2);
+    }
+    if (!slot.active) {
+      slot.active = true;
+      active.push(slot);
+    }
+    return slot.bitset;
+  }
+
+  function activateAllOnes(slot) {
+    clearDirty(slot);
+    if (wordCount > 0) {
+      slot.bitset = ensureWordCapacity(slot.bitset, wordCount);
+      fillBitsOnes(slot.bitset, length);
+    } else if (!slot.bitset) {
+      slot.bitset = new Uint32Array(2);
+    }
+    if (!slot.active) {
+      slot.active = true;
+      active.push(slot);
+    }
+    return slot.bitset;
+  }
+
+  function deactivate(slot) {
+    clearDirty(slot);
+    if (!slot.active) return;
+    slot.active = false;
+    var idx = active.indexOf(slot);
+    if (idx >= 0) {
+      active.splice(idx, 1);
+    }
+  }
+
+  function lengthen(newN) {
+    ensureMaterialized(null);
+    var oldN = length;
+    var newWordCount = (newN + 31) >>> 5;
+    var i, slot;
+    for (i = 0; i < active.length; ++i) {
+      slot = active[i];
+      slot.bitset = ensureWordCapacity(slot.bitset, newWordCount);
+      if (newN > oldN) {
+        setBitsOnesRange(slot.bitset, oldN, newN);
+      }
+    }
+    length = newN;
+    wordCount = newWordCount;
+  }
+
+  function compact(reIndex, newN, removedSentinel) {
+    ensureMaterialized(null);
+    var oldN = length;
+    var oldWordCount = wordCount;
+    var newWordCount = (newN + 31) >>> 5;
+    var aIdx, slot, bits, fi, outW, outBit, outWord;
+
+    for (aIdx = 0; aIdx < active.length; ++aIdx) {
+      slot = active[aIdx];
+      bits = slot.bitset;
+      if (!bits) continue;
+      outW = 0;
+      outBit = 0;
+      outWord = 0;
+      for (fi = 0; fi < oldN; ++fi) {
+        if (reIndex[fi] === removedSentinel) continue;
+        if (bits[fi >>> 5] & (1 << (fi & 31))) {
+          outWord |= (1 << outBit);
+        }
+        if (++outBit === 32) {
+          bits[outW++] = outWord >>> 0;
+          outBit = 0;
+          outWord = 0;
+        }
+      }
+      if (outBit > 0) {
+        bits[outW++] = outWord >>> 0;
+      }
+      if (outW < oldWordCount) {
+        bits.fill(0, outW, oldWordCount);
+      }
+    }
+    length = newN;
+    wordCount = newWordCount;
+  }
+
+  function collectOtherBitsets(ignoreSlot) {
+    var count = 0, i, s;
+    for (i = 0; i < active.length; ++i) {
+      s = active[i];
+      if (s === ignoreSlot) continue;
+      scratchBitsets[count++] = s.bitset;
+    }
+    return count;
+  }
+
+  // Returns -1 if no active filters apply (all rows active), otherwise number of active rows written to out.
+  function extractActive(out, ignoreSlot) {
+    ensureMaterialized(ignoreSlot);
+    var activeLen = active.length;
+    if (activeLen === 0) return -1;
+    if (ignoreSlot == null) {
+      if (wordCount === 0) return 0;
+      if (activeLen === 1) return extractClz1(active[0].bitset, wordCount, out);
+      if (activeLen === 2) return extractClz2(active[0].bitset, active[1].bitset, wordCount, out);
+      if (activeLen === 3) return extractClz3(active[0].bitset, active[1].bitset, active[2].bitset, wordCount, out);
+      var k = collectOtherBitsets(null);
+      return extractClzN(scratchBitsets, k, wordCount, out);
+    }
+    var otherCount = collectOtherBitsets(ignoreSlot);
+    if (otherCount === 0) return -1;
+    if (wordCount === 0) return 0;
+    if (otherCount === 1) return extractClz1(scratchBitsets[0], wordCount, out);
+    if (otherCount === 2) return extractClz2(scratchBitsets[0], scratchBitsets[1], wordCount, out);
+    if (otherCount === 3) return extractClz3(scratchBitsets[0], scratchBitsets[1], scratchBitsets[2], wordCount, out);
+    return extractClzN(scratchBitsets, otherCount, wordCount, out);
+  }
+
+  // Writes excluded row indices to `out` and returns excluded count (0 if no active filters).
+  function extractExcluded(out, ignoreSlot) {
+    ensureMaterialized(ignoreSlot);
+    var activeLen = active.length;
+    if (activeLen === 0 || wordCount === 0) return 0;
+    var tMask = tailMaskFor(length);
+    if (ignoreSlot == null) {
+      if (activeLen === 1) return extractExclClz1(active[0].bitset, wordCount, tMask, out);
+      if (activeLen === 2) return extractExclClz2(active[0].bitset, active[1].bitset, wordCount, tMask, out);
+      if (activeLen === 3) return extractExclClz3(active[0].bitset, active[1].bitset, active[2].bitset, wordCount, tMask, out);
+      var k = collectOtherBitsets(null);
+      return extractExclClzN(scratchBitsets, k, wordCount, tMask, out);
+    }
+    var otherCount = collectOtherBitsets(ignoreSlot);
+    if (otherCount === 0) return 0;
+    if (otherCount === 1) return extractExclClz1(scratchBitsets[0], wordCount, tMask, out);
+    if (otherCount === 2) return extractExclClz2(scratchBitsets[0], scratchBitsets[1], wordCount, tMask, out);
+    if (otherCount === 3) return extractExclClz3(scratchBitsets[0], scratchBitsets[1], scratchBitsets[2], wordCount, tMask, out);
+    return extractExclClzN(scratchBitsets, otherCount, wordCount, tMask, out);
+  }
+
+  function countActive(ignoreSlot) {
+    ensureMaterialized(ignoreSlot);
+    var activeLen = active.length;
+    if (activeLen === 0) return length;
+    if (wordCount === 0) return 0;
+    if (ignoreSlot == null) {
+      if (activeLen === 1) return countPop1(active[0].bitset, wordCount);
+      if (activeLen === 2) return countPop2(active[0].bitset, active[1].bitset, wordCount);
+      if (activeLen === 3) return countPop3(active[0].bitset, active[1].bitset, active[2].bitset, wordCount);
+      var k = collectOtherBitsets(null);
+      return countPopN(scratchBitsets, k, wordCount);
+    }
+    var otherCount = collectOtherBitsets(ignoreSlot);
+    if (otherCount === 0) return length;
+    if (otherCount === 1) return countPop1(scratchBitsets[0], wordCount);
+    if (otherCount === 2) return countPop2(scratchBitsets[0], scratchBitsets[1], wordCount);
+    if (otherCount === 3) return countPop3(scratchBitsets[0], scratchBitsets[1], scratchBitsets[2], wordCount);
+    return countPopN(scratchBitsets, otherCount, wordCount);
+  }
+
+  function isActive(row) {
+    if (dirtyCount > 0) ensureMaterialized(null);
+    var activeLen = active.length;
+    if (activeLen === 0) return true;
+    var w = row >>> 5;
+    var bit = 1 << (row & 31);
+    if (activeLen === 1) return (active[0].bitset[w] & bit) !== 0;
+    if (activeLen === 2) return ((active[0].bitset[w] & active[1].bitset[w]) & bit) !== 0;
+    for (var i = 0; i < activeLen; ++i) {
+      if (!(active[i].bitset[w] & bit)) return false;
+    }
+    return true;
+  }
+
+  function isActiveExcept(row, selfSlot) {
+    if (dirtyCount > 0) ensureMaterialized(selfSlot);
+    var activeLen = active.length;
+    if (activeLen === 0) return true;
+    var w = row >>> 5;
+    var bit = 1 << (row & 31);
+    if (activeLen === 1) {
+      return active[0] === selfSlot ? true : (active[0].bitset[w] & bit) !== 0;
+    }
+    for (var i = 0; i < activeLen; ++i) {
+      var s = active[i];
+      if (s === selfSlot) continue;
+      if (!(s.bitset[w] & bit)) return false;
+    }
+    return true;
+  }
+
+  function isOnlyExcludedBy(row, excludedSlot) {
+    if (excludedSlot == null) return isActive(row);
+    if (dirtyCount > 0) ensureMaterialized(null);
+    if (!excludedSlot.active) return false;
+    var w = row >>> 5;
+    var bit = 1 << (row & 31);
+    if (excludedSlot.bitset[w] & bit) return false;
+    var activeLen = active.length;
+    if (activeLen === 1) return true;
+    for (var i = 0; i < activeLen; ++i) {
+      var s = active[i];
+      if (s === excludedSlot) continue;
+      if (!(s.bitset[w] & bit)) return false;
+    }
+    return true;
+  }
+
+  function isOnlyExcludedByExcept(row, selfSlot, excludedSlot) {
+    if (excludedSlot == null) return isActiveExcept(row, selfSlot);
+    if (dirtyCount > 0) ensureMaterialized(selfSlot);
+    if (!excludedSlot.active) return false;
+    var w = row >>> 5;
+    var bit = 1 << (row & 31);
+    if (excludedSlot.bitset[w] & bit) return false;
+    var activeLen = active.length;
+    for (var i = 0; i < activeLen; ++i) {
+      var s = active[i];
+      if (s === selfSlot || s === excludedSlot) continue;
+      if (!(s.bitset[w] & bit)) return false;
+    }
+    return true;
+  }
+
+  function isActiveIgnoring(row, ignoreIdMap) {
+    if (dirtyCount > 0) ensureMaterialized(null);
+    var activeLen = active.length;
+    if (activeLen === 0) return true;
+    var w = row >>> 5;
+    var bit = 1 << (row & 31);
+    for (var i = 0; i < activeLen; ++i) {
+      var s = active[i];
+      if (ignoreIdMap && ignoreIdMap[s.id]) continue;
+      if (!(s.bitset[w] & bit)) return false;
+    }
+    return true;
+  }
+
+  function isSlotExcluded(slot, row) {
+    if (!slot.active) return false;
+    ensureSlotMaterialized(slot);
+    if (!slot.active) return false;
+    return (slot.bitset[row >>> 5] & (1 << (row & 31))) === 0;
+  }
+
+  function setSlotIncluded(slot, row) {
+    if (!slot.active) return;
+    ensureSlotMaterialized(slot);
+    if (!slot.active) return;
+    slot.bitset[row >>> 5] |= (1 << (row & 31));
+  }
+
+  function setSlotExcluded(slot, row) {
+    if (slot.active) {
+      ensureSlotMaterialized(slot);
+    }
+    if (!slot.active) {
+      activateAllOnes(slot);
+    }
+    slot.bitset[row >>> 5] &= ~(1 << (row & 31));
+  }
+
+  function toggleSlotRow(slot, row) {
+    if (slot.active) {
+      ensureSlotMaterialized(slot);
+    }
+    if (!slot.active) {
+      activateAllOnes(slot);
+    }
+    slot.bitset[row >>> 5] ^= (1 << (row & 31));
+  }
+
+  function slotHasAnyExcluded(slot) {
+    if (!slot.active || length === 0) return false;
+    ensureSlotMaterialized(slot);
+    if (!slot.active) return false;
+    return countPop1(slot.bitset, wordCount) < length;
+  }
+
+  // Clear filter on `slot` and optionally extract added (previously excluded) rows.
+  function clearSlotWithDeltas(slot, added, useScratch) {
+    if (!slot.active) return 0;
+    ensureSlotMaterialized(slot);
+    if (!slot.active) return 0;
+    var bits = slot.bitset;
+    var tMask = tailMaskFor(length);
+    var last = wordCount - 1;
+    var count = 0, j, w, base, lsb;
+    if (last >= 0) {
+      for (j = 0; j < last; ++j) {
+        w = (~bits[j]) | 0;
+        if (w === 0) continue;
+        base = j << 5;
+        while (w !== 0) {
+          lsb = w & -w;
+          if (useScratch) added[count++] = base + (31 - Math.clz32(lsb));
+          else added.push(base + (31 - Math.clz32(lsb)));
+          w ^= lsb;
+        }
+      }
+      w = (~bits[last]) & tMask;
+      if (w !== 0) {
+        base = last << 5;
+        while (w !== 0) {
+          lsb = w & -w;
+          if (useScratch) added[count++] = base + (31 - Math.clz32(lsb));
+          else added.push(base + (31 - Math.clz32(lsb)));
+          w ^= lsb;
+        }
+      }
+    }
+    deactivate(slot);
+    return useScratch ? count : added.length;
+  }
+
+  // Fast overwrite writers (no deltas required).
+  // mode: 0=allZero, 1=exactCode(argA), 2=markedCodes(argA=marks, argB=markVersion),
+  //       3=numExact(argA), 4=numRange(argA=lo, argB=hi), 5=numSet(argA=Set)
+  function writePredicateNoDelta(slot, mode, source, argA, argB) {
+    var bits = activateForOverwrite(slot);
+    var n = length;
+    var fullWords = n >>> 5;
+    var w, base, word, i, b, v;
+    var matchedCount = 0;
+
+    if (mode === 0) {
+      if (wordCount > 0) bits.fill(0, 0, wordCount);
+      return 0;
+    }
+
+    if (mode === 1) {
+      for (w = 0, base = 0; w < fullWords; ++w, base += 32) {
+        bits[w] = packExactWord(source, base, argA);
+      }
+      if (base < n) {
+        word = 0;
+        for (i = base, b = 0; i < n; ++i, ++b) {
+          if (source[i] === argA) word |= (1 << b);
+        }
+        bits[fullWords] = word >>> 0;
+      }
+      return -1;
+    }
+
+    if (mode === 2) {
+      for (w = 0, base = 0; w < fullWords; ++w, base += 32) {
+        bits[w] = packMarkedWord(source, base, argA, argB);
+      }
+      if (base < n) {
+        word = 0;
+        for (i = base, b = 0; i < n; ++i, ++b) {
+          if (argA[source[i]] === argB) word |= (1 << b);
+        }
+        bits[fullWords] = word >>> 0;
+      }
+      return -1;
+    }
+
+    if (mode === 3) {
+      for (w = 0, base = 0; w < fullWords; ++w, base += 32) {
+        word = packExactWord(source, base, argA);
+        bits[w] = word;
+        if (word !== 0) matchedCount += popcount32(word);
+      }
+      if (base < n) {
+        word = 0;
+        for (i = base, b = 0; i < n; ++i, ++b) {
+          if (source[i] === argA) word |= (1 << b);
+        }
+        word = word >>> 0;
+        bits[fullWords] = word;
+        if (word !== 0) matchedCount += popcount32(word);
+      }
+      return matchedCount;
+    }
+
+    if (mode === 4) {
+      for (w = 0, base = 0; w < fullWords; ++w, base += 32) {
+        word = packRangeWord(source, base, argA, argB);
+        bits[w] = word;
+        if (word !== 0) matchedCount += popcount32(word);
+      }
+      if (base < n) {
+        word = 0;
+        for (i = base, b = 0; i < n; ++i, ++b) {
+          v = source[i];
+          if (v >= argA && v < argB) word |= (1 << b);
+        }
+        word = word >>> 0;
+        bits[fullWords] = word;
+        if (word !== 0) matchedCount += popcount32(word);
+      }
+      return matchedCount;
+    }
+
+    // mode === 5: Set membership
+    for (w = 0, base = 0; w < fullWords; ++w, base += 32) {
+      word = packSetWord(source, base, argA);
+      bits[w] = word;
+      if (word !== 0) matchedCount += popcount32(word);
+    }
+    if (base < n) {
+      word = 0;
+      for (i = base, b = 0; i < n; ++i, ++b) {
+        if (argA.has(source[i])) word |= (1 << b);
+      }
+      word = word >>> 0;
+      bits[fullWords] = word;
+      if (word !== 0) matchedCount += popcount32(word);
+    }
+    return matchedCount;
+  }
+
+  // Word-level XOR delta writer with optional bailout!
+  function writePredicateWithDeltas(slot, mode, source, argA, argB, added, removed, useScratch, canBail, bailLimit) {
+    if (slot.active) ensureSlotMaterialized(slot);
+    var hadMask = slot.active;
+    var bits = activateForOverwrite(slot);
+    var n = length;
+    var fullWords = n >>> 5;
+    var tMask = tailMaskFor(n);
+    var addedCount = 0;
+    var removedCount = 0;
+    var matchedCount = 0;
+    var bailed = false;
+    var w, base, newWord, oldWord, diff, addBits, remBits, lsb, i, b, v;
+    var countMatches = mode >= 3;
+
+    for (w = 0, base = 0; w < wordCount; ++w, base += 32) {
+      if (w < fullWords) {
+        if (mode === 0) newWord = 0;
+        else if (mode === 1 || mode === 3) newWord = packExactWord(source, base, argA);
+        else if (mode === 2) newWord = packMarkedWord(source, base, argA, argB);
+        else if (mode === 4) newWord = packRangeWord(source, base, argA, argB);
+        else newWord = packSetWord(source, base, argA);
+        oldWord = hadMask ? bits[w] : 0xffffffff;
+      } else {
+        newWord = 0;
+        if (mode === 1 || mode === 3) {
+          for (i = base, b = 0; i < n; ++i, ++b) if (source[i] === argA) newWord |= (1 << b);
+        } else if (mode === 2) {
+          for (i = base, b = 0; i < n; ++i, ++b) if (argA[source[i]] === argB) newWord |= (1 << b);
+        } else if (mode === 4) {
+          for (i = base, b = 0; i < n; ++i, ++b) { v = source[i]; if (v >= argA && v < argB) newWord |= (1 << b); }
+        } else if (mode === 5) {
+          for (i = base, b = 0; i < n; ++i, ++b) if (argA.has(source[i])) newWord |= (1 << b);
+        }
+        newWord = newWord >>> 0;
+        oldWord = hadMask ? bits[w] : tMask;
+      }
+
+      bits[w] = newWord;
+      if (countMatches && newWord !== 0) {
+        matchedCount += popcount32(newWord);
+      }
+
+      if (bailed) continue;
+
+      diff = (oldWord ^ newWord) >>> 0;
+      if (diff === 0) continue;
+
+      addBits = diff & newWord;
+      if (addBits !== 0) {
+        while (addBits !== 0) {
+          lsb = addBits & -addBits;
+          if (useScratch) added[addedCount++] = base + (31 - Math.clz32(lsb));
+          else { added.push(base + (31 - Math.clz32(lsb))); ++addedCount; }
+          addBits ^= lsb;
+        }
+      }
+
+      remBits = diff & oldWord;
+      if (remBits !== 0) {
+        while (remBits !== 0) {
+          lsb = remBits & -remBits;
+          if (useScratch) removed[removedCount++] = base + (31 - Math.clz32(lsb));
+          else { removed.push(base + (31 - Math.clz32(lsb))); ++removedCount; }
+          remBits ^= lsb;
+        }
+      }
+
+      if (canBail && addedCount + removedCount > bailLimit) {
+        bailed = true;
+      }
+    }
+
+    return {
+      addedCount: addedCount,
+      bailed: bailed,
+      matchedCount: countMatches ? matchedCount : -1,
+      removedCount: removedCount
+    };
+  }
+
+  return {
+    activateAllOnes: activateAllOnes,
+    activateForOverwrite: activateForOverwrite,
+    active: active,
+    allocSlot: allocSlot,
+    clearDirty: clearDirty,
+    clearSlotWithDeltas: clearSlotWithDeltas,
+    compact: compact,
+    countActive: countActive,
+    deactivate: deactivate,
+    ensureMaterialized: ensureMaterialized,
+    ensureSlotMaterialized: ensureSlotMaterialized,
+    extractActive: extractActive,
+    extractExcluded: extractExcluded,
+    freeSlot: freeSlot,
+    hasAnyActive: function() { return active.length > 0; },
+    hasOtherActive: function(selfSlot) {
+      return active.length > (selfSlot && selfSlot.active ? 1 : 0);
+    },
+    isActive: isActive,
+    isActiveExcept: isActiveExcept,
+    isActiveIgnoring: isActiveIgnoring,
+    isOnlyExcludedBy: isOnlyExcludedBy,
+    isOnlyExcludedByExcept: isOnlyExcludedByExcept,
+    isSlotExcluded: isSlotExcluded,
+    lengthen: lengthen,
+    markDirty: markDirty,
+    setSlotExcluded: setSlotExcluded,
+    setSlotIncluded: setSlotIncluded,
+    slotHasAnyExcluded: slotHasAnyExcluded,
+    toggleSlotRow: toggleSlotRow,
+    writePredicateNoDelta: writePredicateNoDelta,
+    writePredicateWithDeltas: writePredicateWithDeltas
+  };
+}
+
+var OP_COUNT = 0;
+var OP_SUM = 1;
+var OP_AVG = 2;
+var OP_AVG_NON_ZERO = 3;
+var OP_RATIO = 4;
+
+function compileMetricPlan(metricSpec) {
+  var count = metricSpec.length;
+  var ops = new Uint8Array(count);
+  var ids = new Array(count);
+  var fields = new Array(count);
+  var denominators = new Array(count);
+  var hidden = new Uint8Array(count);
+  var primOff = new Int32Array(count);
+  var secOff = new Int32Array(count);
+  var sumOffByField = Object.create(null);
+  var avgCountOffByField = Object.create(null);
+  var sumFields = [];
+  var sumFieldOffs = [];
+  var sumFieldAvgOffs = [];
+  var avgNzFields = [];
+  var avgNzPrimOffs = [];
+  var avgNzSecOffs = [];
+  var countOffset = -1;
+  var firstCountIndex = -1;
+  var stride = 0;
+  var i, metric, op, field, denom, off, idx;
+
+  primOff.fill(-1);
+  secOff.fill(-1);
+
+  function ensureSumField(fieldName) {
+    if (sumOffByField[fieldName] !== undefined) {
+      return sumOffByField[fieldName];
+    }
+    var assigned = stride++;
+    sumOffByField[fieldName] = assigned;
+    sumFields.push(fieldName);
+    sumFieldOffs.push(assigned);
+    sumFieldAvgOffs.push(-1);
+    return assigned;
+  }
+
+  for (i = 0; i < count; ++i) {
+    metric = metricSpec[i];
+    ids[i] = metric.id;
+    field = metric.field || null;
+    denom = metric.denominator || null;
+    fields[i] = field;
+    denominators[i] = denom;
+    hidden[i] = metric.hidden ? 1 : 0;
+    switch (metric.op) {
+      case 'count':
+        op = OP_COUNT;
+        if (firstCountIndex < 0) firstCountIndex = i;
+        if (countOffset < 0) countOffset = stride++;
+        primOff[i] = countOffset;
+        break;
+      case 'sum':
+        op = OP_SUM;
+        if (field) {
+          primOff[i] = ensureSumField(field);
+        }
+        break;
+      case 'avg':
+        op = OP_AVG;
+        if (field) {
+          primOff[i] = ensureSumField(field);
+          if (avgCountOffByField[field] !== undefined) {
+            secOff[i] = avgCountOffByField[field];
+          } else {
+            off = stride++;
+            avgCountOffByField[field] = off;
+            secOff[i] = off;
+            idx = sumFields.indexOf(field);
+            if (idx >= 0) sumFieldAvgOffs[idx] = off;
+          }
+        }
+        break;
+      case 'avgNonZero':
+        op = OP_AVG_NON_ZERO;
+        if (field) {
+          primOff[i] = stride++;
+          secOff[i] = stride++;
+          avgNzFields.push(field);
+          avgNzPrimOffs.push(primOff[i]);
+          avgNzSecOffs.push(secOff[i]);
+        }
+        break;
+      case 'ratio':
+        op = OP_RATIO;
+        if (field) {
+          primOff[i] = ensureSumField(field);
+        }
+        if (denom) {
+          secOff[i] = ensureSumField(denom);
+        }
+        break;
+      default:
+        op = OP_COUNT;
+        if (firstCountIndex < 0) firstCountIndex = i;
+        if (countOffset < 0) countOffset = stride++;
+        primOff[i] = countOffset;
+    }
+    ops[i] = op;
+  }
+
+  if (stride === 0) stride = 1;
+
+  // Collect all unique avgCountOffs and unique referenced numeric fields
+  var avgCountOffs = [];
+  var allUniqueFields = [];
+  var seenFields = Object.create(null);
+  for (i = 0; i < sumFields.length; ++i) {
+    if (!seenFields[sumFields[i]]) {
+      seenFields[sumFields[i]] = true;
+      allUniqueFields.push(sumFields[i]);
+    }
+    if (sumFieldAvgOffs[i] >= 0) {
+      avgCountOffs.push(sumFieldAvgOffs[i]);
+    }
+  }
+  for (i = 0; i < avgNzFields.length; ++i) {
+    if (!seenFields[avgNzFields[i]]) {
+      seenFields[avgNzFields[i]] = true;
+      allUniqueFields.push(avgNzFields[i]);
+    }
+  }
+
+  // Primary row-count slot used by fast finite kernels (either OP_COUNT or first OP_AVG secOff)
+  var fastCountOff = countOffset >= 0 ? countOffset : (avgCountOffs.length > 0 ? avgCountOffs[0] : -1);
+  var fastCountField = null;
+  if (countOffset < 0 && fastCountOff >= 0) {
+    for (i = 0; i < sumFields.length; ++i) {
+      if (sumFieldAvgOffs[i] === fastCountOff) {
+        fastCountField = sumFields[i];
+        break;
+      }
+    }
+  }
+  var extraAvgOffs = [];
+  for (i = 0; i < avgCountOffs.length; ++i) {
+    if (avgCountOffs[i] !== fastCountOff) {
+      extraAvgOffs.push(avgCountOffs[i]);
+    }
+  }
+
+  // Co-scan eligibility: no avgNonZero, 0..6 unique sum fields
+  var canCoScan = avgNzFields.length === 0 && sumFields.length <= 6;
+  var coScanKey = null;
+  if (canCoScan) {
+    coScanKey = stride + '|' + fastCountOff + '|' + sumFields.join(',') + '|' + sumFieldOffs.join(',') + '|' + extraAvgOffs.join(',');
+  }
+
+  return {
+    allUniqueFields: allUniqueFields,
+    avgCountOffs: avgCountOffs,
+    avgNzFields: avgNzFields,
+    avgNzPrimOffs: avgNzPrimOffs,
+    avgNzSecOffs: avgNzSecOffs,
+    canCoScan: canCoScan,
+    coScanKey: coScanKey,
+    count: count,
+    countOffset: countOffset,
+    denominators: denominators,
+    extraAvgOffs: extraAvgOffs,
+    fastCountField: fastCountField,
+    fastCountOff: fastCountOff,
+    fields: fields,
+    firstCountIndex: firstCountIndex,
+    hidden: hidden,
+    ids: ids,
+    ops: ops,
+    primOff: primOff,
+    secOff: secOff,
+    spec: metricSpec,
+    stride: stride,
+    sumFieldAvgOffs: sumFieldAvgOffs,
+    sumFieldOffs: sumFieldOffs,
+    sumFields: sumFields
+  };
+}
+
+function ensureMetricBuffers(buffers, plan, required, preserve) {
+  var stride = plan.stride;
+  var nextCap, nextData, copyLen;
+
+  if (buffers && buffers.stride === stride && buffers.capacity >= required) {
+    return buffers;
+  }
+
+  if (buffers && buffers.stride === stride && buffers.capacity > 0) {
+    nextCap = buffers.capacity;
+    while (nextCap < required) {
+      nextCap = nextCap < 65536 ? nextCap * 2 : required;
+    }
+  } else {
+    nextCap = required < 64 ? 64 : required;
+  }
+
+  nextData = new Float64Array(nextCap * stride);
+  if (preserve && buffers && buffers.stride === stride && buffers.capacity > 0) {
+    copyLen = buffers.capacity * stride;
+    nextData.set(buffers.data.subarray(0, copyLen));
+  }
+
+  return {
+    capacity: nextCap,
+    data: nextData,
+    stride: stride
+  };
+}
+
+function zeroMetricBuffers(buffers, slotCount) {
+  if (slotCount > 0) {
+    buffers.data.fill(0, 0, slotCount * buffers.stride);
+  }
+}
+
+function canPlanUseComplement(plan, getNumericColumn) {
+  var fields = plan.allUniqueFields;
+  for (var i = 0; i < fields.length; ++i) {
+    var col = getNumericColumn(fields[i]);
+    if (col && col.hasExtreme) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function getExactCountOffset(plan, getNumericColumn) {
+  if (plan.countOffset >= 0) return plan.countOffset;
+  if (plan.fastCountOff >= 0 && plan.fastCountField) {
+    var col = getNumericColumn(plan.fastCountField);
+    if (col && !col.hasNaN) return plan.fastCountOff;
+  }
+  return -1;
+}
+
+function mirrorExtraAvgCounts(data, stride, slotCount, srcOff, extraAvgOffs) {
+  var extraLen = extraAvgOffs.length;
+  if (!extraLen || srcOff < 0 || slotCount <= 0) return;
+  var s, base, val, e;
+  if (extraLen === 1) {
+    var e0 = extraAvgOffs[0];
+    for (s = 0, base = 0; s < slotCount; ++s, base += stride) {
+      data[base + e0] = data[base + srcOff];
+    }
+    return;
+  }
+  for (s = 0, base = 0; s < slotCount; ++s, base += stride) {
+    val = data[base + srcOff];
+    for (e = 0; e < extraLen; ++e) {
+      data[base + extraAvgOffs[e]] = val;
+    }
+  }
+}
+
+// ============================================================================
+// Single-group interleaved AoS leaf kernels (ALL rows 0..n-1)
+// ============================================================================
+
+function aoCountAll(data, stride, cOff, groupIds, n) {
+  for (var i = 0; i < n; ++i) data[groupIds[i] * stride + cOff] += 1;
+}
+
+function ao1All(data, stride, cOff, o0, groupIds, v0, n) {
+  var i, o;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      o = groupIds[i] * stride;
+      data[o + cOff] += 1;
+      data[o + o0] += v0[i];
+    }
+  } else if (stride === 1 && o0 === 0) {
+    for (i = 0; i < n; ++i) data[groupIds[i]] += v0[i];
+  } else {
+    for (i = 0; i < n; ++i) data[groupIds[i] * stride + o0] += v0[i];
+  }
+}
+
+function ao2All(data, stride, cOff, o0, o1, groupIds, v0, v1, n) {
+  var i, o;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      o = groupIds[i] * stride;
+      data[o + cOff] += 1;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      o = groupIds[i] * stride;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+    }
+  }
+}
+
+function ao3All(data, stride, cOff, o0, o1, o2, groupIds, v0, v1, v2, n) {
+  var i, o;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      o = groupIds[i] * stride;
+      data[o + cOff] += 1;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      o = groupIds[i] * stride;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+    }
+  }
+}
+
+function ao4All(data, stride, cOff, o0, o1, o2, o3, groupIds, v0, v1, v2, v3, n) {
+  var i, o;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      o = groupIds[i] * stride;
+      data[o + cOff] += 1;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+      data[o + o3] += v3[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      o = groupIds[i] * stride;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+      data[o + o3] += v3[i];
+    }
+  }
+}
+
+function ao5All(data, stride, cOff, o0, o1, o2, o3, o4, groupIds, v0, v1, v2, v3, v4, n) {
+  var i, o;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      o = groupIds[i] * stride;
+      data[o + cOff] += 1;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+      data[o + o3] += v3[i];
+      data[o + o4] += v4[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      o = groupIds[i] * stride;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+      data[o + o3] += v3[i];
+      data[o + o4] += v4[i];
+    }
+  }
+}
+
+function ao6All(data, stride, cOff, o0, o1, o2, o3, o4, o5, groupIds, v0, v1, v2, v3, v4, v5, n) {
+  var i, o;
+  for (i = 0; i < n; ++i) {
+    o = groupIds[i] * stride;
+    if (cOff >= 0) data[o + cOff] += 1;
+    data[o + o0] += v0[i];
+    data[o + o1] += v1[i];
+    data[o + o2] += v2[i];
+    data[o + o3] += v3[i];
+    data[o + o4] += v4[i];
+    data[o + o5] += v5[i];
+  }
+}
+
+// ============================================================================
+// Single-group interleaved AoS leaf kernels (INDEXED rows, add or sub)
+// ============================================================================
+
+function aoCountIdx(data, stride, cOff, groupIds, rowIndexes, rowCount, add) {
+  var j;
+  if (add) {
+    for (j = 0; j < rowCount; ++j) data[groupIds[rowIndexes[j]] * stride + cOff] += 1;
+  } else {
+    for (j = 0; j < rowCount; ++j) data[groupIds[rowIndexes[j]] * stride + cOff] -= 1;
+  }
+}
+
+function ao1Idx(data, stride, cOff, o0, groupIds, v0, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    if (cOff >= 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = groupIds[idx] * stride;
+        data[o + cOff] += 1;
+        data[o + o0] += v0[idx];
+      }
+    } else if (stride === 1 && o0 === 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        data[groupIds[idx]] += v0[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        data[groupIds[idx] * stride + o0] += v0[idx];
+      }
+    }
+  } else if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+    }
+  } else if (stride === 1 && o0 === 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      data[groupIds[idx]] -= v0[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      data[groupIds[idx] * stride + o0] -= v0[idx];
+    }
+  }
+}
+
+function ao2Idx(data, stride, cOff, o0, o1, groupIds, v0, v1, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    if (cOff >= 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = groupIds[idx] * stride;
+        data[o + cOff] += 1;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = groupIds[idx] * stride;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+      }
+    }
+  } else if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+    }
+  }
+}
+
+function ao3Idx(data, stride, cOff, o0, o1, o2, groupIds, v0, v1, v2, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    if (cOff >= 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = groupIds[idx] * stride;
+        data[o + cOff] += 1;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = groupIds[idx] * stride;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+      }
+    }
+  } else if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+    }
+  }
+}
+
+function ao4Idx(data, stride, cOff, o0, o1, o2, o3, groupIds, v0, v1, v2, v3, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    if (cOff >= 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = groupIds[idx] * stride;
+        data[o + cOff] += 1;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+        data[o + o3] += v3[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = groupIds[idx] * stride;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+        data[o + o3] += v3[idx];
+      }
+    }
+  } else if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+      data[o + o3] -= v3[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+      data[o + o3] -= v3[idx];
+    }
+  }
+}
+
+function ao5Idx(data, stride, cOff, o0, o1, o2, o3, o4, groupIds, v0, v1, v2, v3, v4, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    if (cOff >= 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = groupIds[idx] * stride;
+        data[o + cOff] += 1;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+        data[o + o3] += v3[idx];
+        data[o + o4] += v4[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = groupIds[idx] * stride;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+        data[o + o3] += v3[idx];
+        data[o + o4] += v4[idx];
+      }
+    }
+  } else if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+      data[o + o3] -= v3[idx];
+      data[o + o4] -= v4[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+      data[o + o3] -= v3[idx];
+      data[o + o4] -= v4[idx];
+    }
+  }
+}
+
+function ao6Idx(data, stride, cOff, o0, o1, o2, o3, o4, o5, groupIds, v0, v1, v2, v3, v4, v5, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      if (cOff >= 0) data[o + cOff] += 1;
+      data[o + o0] += v0[idx];
+      data[o + o1] += v1[idx];
+      data[o + o2] += v2[idx];
+      data[o + o3] += v3[idx];
+      data[o + o4] += v4[idx];
+      data[o + o5] += v5[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = groupIds[idx] * stride;
+      if (cOff >= 0) data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+      data[o + o3] -= v3[idx];
+      data[o + o4] -= v4[idx];
+      data[o + o5] -= v5[idx];
+    }
+  }
+}
+
+// ============================================================================
+// Split-Dense interleaved AoS leaf kernels (ALL & INDEXED)
+// ============================================================================
+
+function sd1All(data, stride, cOff, o0, pSlots, sCodes, sStride, v0, n) {
+  var i, o;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      o = (pSlots[i] * sStride + sCodes[i]) * stride;
+      data[o + cOff] += 1;
+      data[o + o0] += v0[i];
+    }
+  } else if (stride === 1 && o0 === 0) {
+    for (i = 0; i < n; ++i) data[pSlots[i] * sStride + sCodes[i]] += v0[i];
+  } else {
+    for (i = 0; i < n; ++i) data[(pSlots[i] * sStride + sCodes[i]) * stride + o0] += v0[i];
+  }
+}
+
+function sd2All(data, stride, cOff, o0, o1, pSlots, sCodes, sStride, v0, v1, n) {
+  var i, o;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      o = (pSlots[i] * sStride + sCodes[i]) * stride;
+      data[o + cOff] += 1;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      o = (pSlots[i] * sStride + sCodes[i]) * stride;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+    }
+  }
+}
+
+function sd3All(data, stride, cOff, o0, o1, o2, pSlots, sCodes, sStride, v0, v1, v2, n) {
+  var i, o;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      o = (pSlots[i] * sStride + sCodes[i]) * stride;
+      data[o + cOff] += 1;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      o = (pSlots[i] * sStride + sCodes[i]) * stride;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+    }
+  }
+}
+
+function sd4All(data, stride, cOff, o0, o1, o2, o3, pSlots, sCodes, sStride, v0, v1, v2, v3, n) {
+  var i, o;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      o = (pSlots[i] * sStride + sCodes[i]) * stride;
+      data[o + cOff] += 1;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+      data[o + o3] += v3[i];
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      o = (pSlots[i] * sStride + sCodes[i]) * stride;
+      data[o + o0] += v0[i];
+      data[o + o1] += v1[i];
+      data[o + o2] += v2[i];
+      data[o + o3] += v3[i];
+    }
+  }
+}
+
+function sd5All(data, stride, cOff, o0, o1, o2, o3, o4, pSlots, sCodes, sStride, v0, v1, v2, v3, v4, n) {
+  var i, o;
+  for (i = 0; i < n; ++i) {
+    o = (pSlots[i] * sStride + sCodes[i]) * stride;
+    if (cOff >= 0) data[o + cOff] += 1;
+    data[o + o0] += v0[i];
+    data[o + o1] += v1[i];
+    data[o + o2] += v2[i];
+    data[o + o3] += v3[i];
+    data[o + o4] += v4[i];
+  }
+}
+
+function sd6All(data, stride, cOff, o0, o1, o2, o3, o4, o5, pSlots, sCodes, sStride, v0, v1, v2, v3, v4, v5, n) {
+  var i, o;
+  for (i = 0; i < n; ++i) {
+    o = (pSlots[i] * sStride + sCodes[i]) * stride;
+    if (cOff >= 0) data[o + cOff] += 1;
+    data[o + o0] += v0[i];
+    data[o + o1] += v1[i];
+    data[o + o2] += v2[i];
+    data[o + o3] += v3[i];
+    data[o + o4] += v4[i];
+    data[o + o5] += v5[i];
+  }
+}
+
+function sd1Idx(data, stride, cOff, o0, pSlots, sCodes, sStride, v0, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    if (cOff >= 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+        data[o + cOff] += 1;
+        data[o + o0] += v0[idx];
+      }
+    } else if (stride === 1 && o0 === 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        data[pSlots[idx] * sStride + sCodes[idx]] += v0[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        data[(pSlots[idx] * sStride + sCodes[idx]) * stride + o0] += v0[idx];
+      }
+    }
+  } else if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+    }
+  } else if (stride === 1 && o0 === 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      data[pSlots[idx] * sStride + sCodes[idx]] -= v0[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      data[(pSlots[idx] * sStride + sCodes[idx]) * stride + o0] -= v0[idx];
+    }
+  }
+}
+
+function sd2Idx(data, stride, cOff, o0, o1, pSlots, sCodes, sStride, v0, v1, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    if (cOff >= 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+        data[o + cOff] += 1;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+      }
+    }
+  } else if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+    }
+  }
+}
+
+function sd3Idx(data, stride, cOff, o0, o1, o2, pSlots, sCodes, sStride, v0, v1, v2, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    if (cOff >= 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+        data[o + cOff] += 1;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+      }
+    }
+  } else if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+    }
+  }
+}
+
+function sd4Idx(data, stride, cOff, o0, o1, o2, o3, pSlots, sCodes, sStride, v0, v1, v2, v3, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    if (cOff >= 0) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+        data[o + cOff] += 1;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+        data[o + o3] += v3[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+        data[o + o0] += v0[idx];
+        data[o + o1] += v1[idx];
+        data[o + o2] += v2[idx];
+        data[o + o3] += v3[idx];
+      }
+    }
+  } else if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+      data[o + o3] -= v3[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+      data[o + o3] -= v3[idx];
+    }
+  }
+}
+
+function sd5Idx(data, stride, cOff, o0, o1, o2, o3, o4, pSlots, sCodes, sStride, v0, v1, v2, v3, v4, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      if (cOff >= 0) data[o + cOff] += 1;
+      data[o + o0] += v0[idx];
+      data[o + o1] += v1[idx];
+      data[o + o2] += v2[idx];
+      data[o + o3] += v3[idx];
+      data[o + o4] += v4[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      if (cOff >= 0) data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+      data[o + o3] -= v3[idx];
+      data[o + o4] -= v4[idx];
+    }
+  }
+}
+
+function sd6Idx(data, stride, cOff, o0, o1, o2, o3, o4, o5, pSlots, sCodes, sStride, v0, v1, v2, v3, v4, v5, rowIndexes, rowCount, add) {
+  var j, idx, o;
+  if (add) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      if (cOff >= 0) data[o + cOff] += 1;
+      data[o + o0] += v0[idx];
+      data[o + o1] += v1[idx];
+      data[o + o2] += v2[idx];
+      data[o + o3] += v3[idx];
+      data[o + o4] += v4[idx];
+      data[o + o5] += v5[idx];
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+      if (cOff >= 0) data[o + cOff] -= 1;
+      data[o + o0] -= v0[idx];
+      data[o + o1] -= v1[idx];
+      data[o + o2] -= v2[idx];
+      data[o + o3] -= v3[idx];
+      data[o + o4] -= v4[idx];
+      data[o + o5] -= v5[idx];
+    }
+  }
+}
+
+// ============================================================================
+// General NaN / >4-field / avgNonZero AoS fallbacks
+// ============================================================================
+
+function aoGeneralAll(data, stride, plan, getNumericColumn, groupIds, n) {
+  var i, f, col, vals, hasNaN, off, avgOff, pOff, sOff, v, o;
+  var cOff = plan.countOffset;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) data[groupIds[i] * stride + cOff] += 1;
+  }
+  var sumFields = plan.sumFields;
+  var sumFieldOffs = plan.sumFieldOffs;
+  var sumFieldAvgOffs = plan.sumFieldAvgOffs;
+  for (f = 0; f < sumFields.length; ++f) {
+    col = getNumericColumn(sumFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    off = sumFieldOffs[f];
+    avgOff = sumFieldAvgOffs[f];
+    if (avgOff >= 0) {
+      if (!hasNaN) {
+        for (i = 0; i < n; ++i) {
+          o = groupIds[i] * stride;
+          data[o + off] += vals[i];
+          data[o + avgOff] += 1;
+        }
+      } else {
+        for (i = 0; i < n; ++i) {
+          v = vals[i];
+          if (v === v) {
+            o = groupIds[i] * stride;
+            data[o + off] += v;
+            data[o + avgOff] += 1;
+          }
+        }
+      }
+    } else if (!hasNaN) {
+      for (i = 0; i < n; ++i) data[groupIds[i] * stride + off] += vals[i];
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v) data[groupIds[i] * stride + off] += v;
+      }
+    }
+  }
+  var avgNzFields = plan.avgNzFields;
+  var avgNzPrimOffs = plan.avgNzPrimOffs;
+  var avgNzSecOffs = plan.avgNzSecOffs;
+  for (f = 0; f < avgNzFields.length; ++f) {
+    col = getNumericColumn(avgNzFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    pOff = avgNzPrimOffs[f];
+    sOff = avgNzSecOffs[f];
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v !== 0) {
+          o = groupIds[i] * stride;
+          data[o + pOff] += v;
+          data[o + sOff] += 1;
+        }
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v && v !== 0) {
+          o = groupIds[i] * stride;
+          data[o + pOff] += v;
+          data[o + sOff] += 1;
+        }
+      }
+    }
+  }
+}
+
+function aoGeneralIdx(data, stride, plan, getNumericColumn, groupIds, rowIndexes, rowCount, add) {
+  var j, idx, f, col, vals, hasNaN, off, avgOff, pOff, sOff, v, o;
+  var cOff = plan.countOffset;
+  var sign = add ? 1 : -1;
+  if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) data[groupIds[rowIndexes[j]] * stride + cOff] += sign;
+  }
+  var sumFields = plan.sumFields;
+  var sumFieldOffs = plan.sumFieldOffs;
+  var sumFieldAvgOffs = plan.sumFieldAvgOffs;
+  for (f = 0; f < sumFields.length; ++f) {
+    col = getNumericColumn(sumFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    off = sumFieldOffs[f];
+    avgOff = sumFieldAvgOffs[f];
+    if (avgOff >= 0) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          o = groupIds[idx] * stride;
+          data[o + off] += sign * vals[idx];
+          data[o + avgOff] += sign;
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v === v) {
+            o = groupIds[idx] * stride;
+            data[o + off] += sign * v;
+            data[o + avgOff] += sign;
+          }
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        data[groupIds[idx] * stride + off] += sign * vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) data[groupIds[idx] * stride + off] += sign * v;
+      }
+    }
+  }
+  var avgNzFields = plan.avgNzFields;
+  var avgNzPrimOffs = plan.avgNzPrimOffs;
+  var avgNzSecOffs = plan.avgNzSecOffs;
+  for (f = 0; f < avgNzFields.length; ++f) {
+    col = getNumericColumn(avgNzFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    pOff = avgNzPrimOffs[f];
+    sOff = avgNzSecOffs[f];
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v !== 0) {
+          o = groupIds[idx] * stride;
+          data[o + pOff] += sign * v;
+          data[o + sOff] += sign;
+        }
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v && v !== 0) {
+          o = groupIds[idx] * stride;
+          data[o + pOff] += sign * v;
+          data[o + sOff] += sign;
+        }
+      }
+    }
+  }
+}
+
+function sdGeneralAll(data, stride, plan, getNumericColumn, pSlots, sCodes, sStride, n) {
+  var i, f, col, vals, hasNaN, off, avgOff, pOff, sOff, v, o;
+  var cOff = plan.countOffset;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) data[(pSlots[i] * sStride + sCodes[i]) * stride + cOff] += 1;
+  }
+  var sumFields = plan.sumFields;
+  var sumFieldOffs = plan.sumFieldOffs;
+  var sumFieldAvgOffs = plan.sumFieldAvgOffs;
+  for (f = 0; f < sumFields.length; ++f) {
+    col = getNumericColumn(sumFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    off = sumFieldOffs[f];
+    avgOff = sumFieldAvgOffs[f];
+    if (avgOff >= 0) {
+      if (!hasNaN) {
+        for (i = 0; i < n; ++i) {
+          o = (pSlots[i] * sStride + sCodes[i]) * stride;
+          data[o + off] += vals[i];
+          data[o + avgOff] += 1;
+        }
+      } else {
+        for (i = 0; i < n; ++i) {
+          v = vals[i];
+          if (v === v) {
+            o = (pSlots[i] * sStride + sCodes[i]) * stride;
+            data[o + off] += v;
+            data[o + avgOff] += 1;
+          }
+        }
+      }
+    } else if (!hasNaN) {
+      for (i = 0; i < n; ++i) data[(pSlots[i] * sStride + sCodes[i]) * stride + off] += vals[i];
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v) data[(pSlots[i] * sStride + sCodes[i]) * stride + off] += v;
+      }
+    }
+  }
+  var avgNzFields = plan.avgNzFields;
+  var avgNzPrimOffs = plan.avgNzPrimOffs;
+  var avgNzSecOffs = plan.avgNzSecOffs;
+  for (f = 0; f < avgNzFields.length; ++f) {
+    col = getNumericColumn(avgNzFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    pOff = avgNzPrimOffs[f];
+    sOff = avgNzSecOffs[f];
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v !== 0) {
+          o = (pSlots[i] * sStride + sCodes[i]) * stride;
+          data[o + pOff] += v;
+          data[o + sOff] += 1;
+        }
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v && v !== 0) {
+          o = (pSlots[i] * sStride + sCodes[i]) * stride;
+          data[o + pOff] += v;
+          data[o + sOff] += 1;
+        }
+      }
+    }
+  }
+}
+
+function sdGeneralIdx(data, stride, plan, getNumericColumn, pSlots, sCodes, sStride, rowIndexes, rowCount, add) {
+  var j, idx, f, col, vals, hasNaN, off, avgOff, pOff, sOff, v, o;
+  var cOff = plan.countOffset;
+  var sign = add ? 1 : -1;
+  if (cOff >= 0) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      data[(pSlots[idx] * sStride + sCodes[idx]) * stride + cOff] += sign;
+    }
+  }
+  var sumFields = plan.sumFields;
+  var sumFieldOffs = plan.sumFieldOffs;
+  var sumFieldAvgOffs = plan.sumFieldAvgOffs;
+  for (f = 0; f < sumFields.length; ++f) {
+    col = getNumericColumn(sumFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    off = sumFieldOffs[f];
+    avgOff = sumFieldAvgOffs[f];
+    if (avgOff >= 0) {
+      if (!hasNaN) {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+          data[o + off] += sign * vals[idx];
+          data[o + avgOff] += sign;
+        }
+      } else {
+        for (j = 0; j < rowCount; ++j) {
+          idx = rowIndexes[j];
+          v = vals[idx];
+          if (v === v) {
+            o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+            data[o + off] += sign * v;
+            data[o + avgOff] += sign;
+          }
+        }
+      }
+    } else if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        data[(pSlots[idx] * sStride + sCodes[idx]) * stride + off] += sign * vals[idx];
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v) data[(pSlots[idx] * sStride + sCodes[idx]) * stride + off] += sign * v;
+      }
+    }
+  }
+  var avgNzFields = plan.avgNzFields;
+  var avgNzPrimOffs = plan.avgNzPrimOffs;
+  var avgNzSecOffs = plan.avgNzSecOffs;
+  for (f = 0; f < avgNzFields.length; ++f) {
+    col = getNumericColumn(avgNzFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    pOff = avgNzPrimOffs[f];
+    sOff = avgNzSecOffs[f];
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v !== 0) {
+          o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+          data[o + pOff] += sign * v;
+          data[o + sOff] += sign;
+        }
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        v = vals[idx];
+        if (v === v && v !== 0) {
+          o = (pSlots[idx] * sStride + sCodes[idx]) * stride;
+          data[o + pOff] += sign * v;
+          data[o + sOff] += sign;
+        }
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Multi-group shared-scan kernels (2..5 groups + optional KPI in one pass!)
+// ============================================================================
+
+function resolveFastColumns(plan, getNumericColumn) {
+  if (!plan.canCoScan) return null;
+  var sf = plan.sumFields;
+  var fLen = sf.length;
+  var cols = new Array(fLen);
+  for (var f = 0; f < fLen; ++f) {
+    var c = getNumericColumn(sf[f]);
+    if (c.hasNaN) return null;
+    cols[f] = c.values;
+  }
+  return cols;
+}
+
+function coAll0(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, n) {
+  for (var i = 0; i < n; ++i) {
+    d0[s0[i] * stride + cOff] += 1;
+    if (count > 1) d1[s1[i] * stride + cOff] += 1;
+    if (count > 2) d2[s2[i] * stride + cOff] += 1;
+    if (count > 3) d3[s3[i] * stride + cOff] += 1;
+    if (count > 4) d4[s4[i] * stride + cOff] += 1;
+  }
+  if (kpiData) kpiData[cOff] += n;
+}
+
+function coAll1(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, o0, col0, n) {
+  var i, o, v0, k0 = 0;
+  if (cOff >= 0) {
+    for (i = 0; i < n; ++i) {
+      v0 = col0[i]; k0 += v0;
+      o = s0[i] * stride; d0[o + cOff] += 1; d0[o + o0] += v0;
+      if (count > 1) { o = s1[i] * stride; d1[o + cOff] += 1; d1[o + o0] += v0; }
+      if (count > 2) { o = s2[i] * stride; d2[o + cOff] += 1; d2[o + o0] += v0; }
+      if (count > 3) { o = s3[i] * stride; d3[o + cOff] += 1; d3[o + o0] += v0; }
+      if (count > 4) { o = s4[i] * stride; d4[o + cOff] += 1; d4[o + o0] += v0; }
+    }
+    if (kpiData) { kpiData[cOff] += n; kpiData[o0] += k0; }
+  } else if (stride === 1 && o0 === 0) {
+    for (i = 0; i < n; ++i) {
+      v0 = col0[i]; k0 += v0;
+      d0[s0[i]] += v0;
+      if (count > 1) d1[s1[i]] += v0;
+      if (count > 2) d2[s2[i]] += v0;
+      if (count > 3) d3[s3[i]] += v0;
+      if (count > 4) d4[s4[i]] += v0;
+    }
+    if (kpiData) kpiData[0] += k0;
+  } else {
+    for (i = 0; i < n; ++i) {
+      v0 = col0[i]; k0 += v0;
+      d0[s0[i] * stride + o0] += v0;
+      if (count > 1) d1[s1[i] * stride + o0] += v0;
+      if (count > 2) d2[s2[i] * stride + o0] += v0;
+      if (count > 3) d3[s3[i] * stride + o0] += v0;
+      if (count > 4) d4[s4[i] * stride + o0] += v0;
+    }
+    if (kpiData) kpiData[o0] += k0;
+  }
+}
+
+function coAll2(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, p0, p1, a0, a1, n) {
+  var i, o, v0, v1, k0 = 0, k1 = 0, hasC = cOff >= 0;
+  for (i = 0; i < n; ++i) {
+    v0 = a0[i]; v1 = a1[i]; k0 += v0; k1 += v1;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + p0] += v0; d0[o + p1] += v1;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + p0] += v0; d1[o + p1] += v1; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + p0] += v0; d2[o + p1] += v1; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + p0] += v0; d3[o + p1] += v1; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + p0] += v0; d4[o + p1] += v1; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += n; kpiData[p0] += k0; kpiData[p1] += k1; }
+}
+
+function coAll3(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, q0, q1, q2, b0, b1, b2, n) {
+  var i, o, v0, v1, v2, k0 = 0, k1 = 0, k2 = 0, hasC = cOff >= 0;
+  for (i = 0; i < n; ++i) {
+    v0 = b0[i]; v1 = b1[i]; v2 = b2[i]; k0 += v0; k1 += v1; k2 += v2;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + q0] += v0; d0[o + q1] += v1; d0[o + q2] += v2;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + q0] += v0; d1[o + q1] += v1; d1[o + q2] += v2; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + q0] += v0; d2[o + q1] += v1; d2[o + q2] += v2; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + q0] += v0; d3[o + q1] += v1; d3[o + q2] += v2; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + q0] += v0; d4[o + q1] += v1; d4[o + q2] += v2; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += n; kpiData[q0] += k0; kpiData[q1] += k1; kpiData[q2] += k2; }
+}
+
+function coAll4(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, r0, r1, r2, r3, c0, c1, c2, c3, n) {
+  var i, o, v0, v1, v2, v3, k0 = 0, k1 = 0, k2 = 0, k3 = 0, hasC = cOff >= 0;
+  if (hasC && count === 5) {
+    for (i = 0; i < n; ++i) {
+      v0 = c0[i]; v1 = c1[i]; v2 = c2[i]; v3 = c3[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3;
+      o = s0[i] * stride; d0[o + cOff] += 1; d0[o + r0] += v0; d0[o + r1] += v1; d0[o + r2] += v2; d0[o + r3] += v3;
+      o = s1[i] * stride; d1[o + cOff] += 1; d1[o + r0] += v0; d1[o + r1] += v1; d1[o + r2] += v2; d1[o + r3] += v3;
+      o = s2[i] * stride; d2[o + cOff] += 1; d2[o + r0] += v0; d2[o + r1] += v1; d2[o + r2] += v2; d2[o + r3] += v3;
+      o = s3[i] * stride; d3[o + cOff] += 1; d3[o + r0] += v0; d3[o + r1] += v1; d3[o + r2] += v2; d3[o + r3] += v3;
+      o = s4[i] * stride; d4[o + cOff] += 1; d4[o + r0] += v0; d4[o + r1] += v1; d4[o + r2] += v2; d4[o + r3] += v3;
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      v0 = c0[i]; v1 = c1[i]; v2 = c2[i]; v3 = c3[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3;
+      o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + r0] += v0; d0[o + r1] += v1; d0[o + r2] += v2; d0[o + r3] += v3;
+      if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + r0] += v0; d1[o + r1] += v1; d1[o + r2] += v2; d1[o + r3] += v3; }
+      if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + r0] += v0; d2[o + r1] += v1; d2[o + r2] += v2; d2[o + r3] += v3; }
+      if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + r0] += v0; d3[o + r1] += v1; d3[o + r2] += v2; d3[o + r3] += v3; }
+      if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + r0] += v0; d4[o + r1] += v1; d4[o + r2] += v2; d4[o + r3] += v3; }
+    }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += n; kpiData[r0] += k0; kpiData[r1] += k1; kpiData[r2] += k2; kpiData[r3] += k3; }
+}
+
+function coAll5(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, t0, t1, t2, t3, t4, e0, e1, e2, e3, e4, n) {
+  var i, o, v0, v1, v2, v3, v4, k0 = 0, k1 = 0, k2 = 0, k3 = 0, k4 = 0, hasC = cOff >= 0;
+  if (hasC && count === 5) {
+    for (i = 0; i < n; ++i) {
+      v0 = e0[i]; v1 = e1[i]; v2 = e2[i]; v3 = e3[i]; v4 = e4[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3; k4 += v4;
+      o = s0[i] * stride; d0[o + cOff] += 1; d0[o + t0] += v0; d0[o + t1] += v1; d0[o + t2] += v2; d0[o + t3] += v3; d0[o + t4] += v4;
+      o = s1[i] * stride; d1[o + cOff] += 1; d1[o + t0] += v0; d1[o + t1] += v1; d1[o + t2] += v2; d1[o + t3] += v3; d1[o + t4] += v4;
+      o = s2[i] * stride; d2[o + cOff] += 1; d2[o + t0] += v0; d2[o + t1] += v1; d2[o + t2] += v2; d2[o + t3] += v3; d2[o + t4] += v4;
+      o = s3[i] * stride; d3[o + cOff] += 1; d3[o + t0] += v0; d3[o + t1] += v1; d3[o + t2] += v2; d3[o + t3] += v3; d3[o + t4] += v4;
+      o = s4[i] * stride; d4[o + cOff] += 1; d4[o + t0] += v0; d4[o + t1] += v1; d4[o + t2] += v2; d4[o + t3] += v3; d4[o + t4] += v4;
+    }
+  } else {
+    for (i = 0; i < n; ++i) {
+      v0 = e0[i]; v1 = e1[i]; v2 = e2[i]; v3 = e3[i]; v4 = e4[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3; k4 += v4;
+      o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + t0] += v0; d0[o + t1] += v1; d0[o + t2] += v2; d0[o + t3] += v3; d0[o + t4] += v4;
+      if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + t0] += v0; d1[o + t1] += v1; d1[o + t2] += v2; d1[o + t3] += v3; d1[o + t4] += v4; }
+      if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + t0] += v0; d2[o + t1] += v1; d2[o + t2] += v2; d2[o + t3] += v3; d2[o + t4] += v4; }
+      if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + t0] += v0; d3[o + t1] += v1; d3[o + t2] += v2; d3[o + t3] += v3; d3[o + t4] += v4; }
+      if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + t0] += v0; d4[o + t1] += v1; d4[o + t2] += v2; d4[o + t3] += v3; d4[o + t4] += v4; }
+    }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += n; kpiData[t0] += k0; kpiData[t1] += k1; kpiData[t2] += k2; kpiData[t3] += k3; kpiData[t4] += k4; }
+}
+
+function coAll6(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, t0, t1, t2, t3, t4, t5, e0, e1, e2, e3, e4, e5, n) {
+  var i, o, v0, v1, v2, v3, v4, v5, k0 = 0, k1 = 0, k2 = 0, k3 = 0, k4 = 0, k5 = 0, hasC = cOff >= 0;
+  for (i = 0; i < n; ++i) {
+    v0 = e0[i]; v1 = e1[i]; v2 = e2[i]; v3 = e3[i]; v4 = e4[i]; v5 = e5[i];
+    k0 += v0; k1 += v1; k2 += v2; k3 += v3; k4 += v4; k5 += v5;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + t0] += v0; d0[o + t1] += v1; d0[o + t2] += v2; d0[o + t3] += v3; d0[o + t4] += v4; d0[o + t5] += v5;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + t0] += v0; d1[o + t1] += v1; d1[o + t2] += v2; d1[o + t3] += v3; d1[o + t4] += v4; d1[o + t5] += v5; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + t0] += v0; d2[o + t1] += v1; d2[o + t2] += v2; d2[o + t3] += v3; d2[o + t4] += v4; d2[o + t5] += v5; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + t0] += v0; d3[o + t1] += v1; d3[o + t2] += v2; d3[o + t3] += v3; d3[o + t4] += v4; d3[o + t5] += v5; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + t0] += v0; d4[o + t1] += v1; d4[o + t2] += v2; d4[o + t3] += v3; d4[o + t4] += v4; d4[o + t5] += v5; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += n; kpiData[t0] += k0; kpiData[t1] += k1; kpiData[t2] += k2; kpiData[t3] += k3; kpiData[t4] += k4; kpiData[t5] += k5; }
+}
+
+function coScanRunAll(targets, start, count, kpiData, stride, cOff, offs, cols, n) {
+  var fLen = cols.length;
+  var d0 = targets[start].buffers.data, s0 = targets[start].slotArr;
+  var d1 = count > 1 ? targets[start + 1].buffers.data : null, s1 = count > 1 ? targets[start + 1].slotArr : null;
+  var d2 = count > 2 ? targets[start + 2].buffers.data : null, s2 = count > 2 ? targets[start + 2].slotArr : null;
+  var d3 = count > 3 ? targets[start + 3].buffers.data : null, s3 = count > 3 ? targets[start + 3].slotArr : null;
+  var d4 = count > 4 ? targets[start + 4].buffers.data : null, s4 = count > 4 ? targets[start + 4].slotArr : null;
+
+  if (fLen === 0 && cOff >= 0) {
+    coAll0(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, n);
+  } else if (fLen === 1) {
+    coAll1(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], cols[0], n);
+  } else if (fLen === 2) {
+    coAll2(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], cols[0], cols[1], n);
+  } else if (fLen === 3) {
+    coAll3(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], cols[0], cols[1], cols[2], n);
+  } else if (fLen === 4) {
+    coAll4(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], offs[3], cols[0], cols[1], cols[2], cols[3], n);
+  } else if (fLen === 5) {
+    coAll5(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], cols[0], cols[1], cols[2], cols[3], cols[4], n);
+  } else if (fLen === 6) {
+    coAll6(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], offs[5], cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], n);
+  }
+}
+
+function coIdx0(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, rowIndexes, rowCount, sign) {
+  for (var j = 0, i; j < rowCount; ++j) {
+    i = rowIndexes[j];
+    d0[s0[i] * stride + cOff] += sign;
+    if (count > 1) d1[s1[i] * stride + cOff] += sign;
+    if (count > 2) d2[s2[i] * stride + cOff] += sign;
+    if (count > 3) d3[s3[i] * stride + cOff] += sign;
+    if (count > 4) d4[s4[i] * stride + cOff] += sign;
+  }
+  if (kpiData) kpiData[cOff] += sign * rowCount;
+}
+
+function coIdx1Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, o0, col0, rowIndexes, rowCount) {
+  var j, i, o, v0, k0 = 0, hasC = cOff >= 0;
+  for (j = 0; j < rowCount; ++j) {
+    i = rowIndexes[j]; v0 = col0[i]; k0 += v0;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + o0] += v0;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + o0] += v0; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + o0] += v0; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + o0] += v0; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + o0] += v0; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += rowCount; kpiData[o0] += k0; }
+}
+
+function coIdx1Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, o0, col0, rowIndexes, rowCount) {
+  var j, i, o, v0, k0 = 0, hasC = cOff >= 0;
+  for (j = 0; j < rowCount; ++j) {
+    i = rowIndexes[j]; v0 = col0[i]; k0 += v0;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] -= 1; d0[o + o0] -= v0;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] -= 1; d1[o + o0] -= v0; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] -= 1; d2[o + o0] -= v0; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] -= 1; d3[o + o0] -= v0; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] -= 1; d4[o + o0] -= v0; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] -= rowCount; kpiData[o0] -= k0; }
+}
+
+function coIdx2Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, p0, p1, a0, a1, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, k0 = 0, k1 = 0, hasC = cOff >= 0;
+  for (j = 0; j < rowCount; ++j) {
+    i = rowIndexes[j]; v0 = a0[i]; v1 = a1[i]; k0 += v0; k1 += v1;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + p0] += v0; d0[o + p1] += v1;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + p0] += v0; d1[o + p1] += v1; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + p0] += v0; d2[o + p1] += v1; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + p0] += v0; d3[o + p1] += v1; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + p0] += v0; d4[o + p1] += v1; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += rowCount; kpiData[p0] += k0; kpiData[p1] += k1; }
+}
+
+function coIdx2Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, p0, p1, a0, a1, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, k0 = 0, k1 = 0, hasC = cOff >= 0;
+  for (j = 0; j < rowCount; ++j) {
+    i = rowIndexes[j]; v0 = a0[i]; v1 = a1[i]; k0 += v0; k1 += v1;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] -= 1; d0[o + p0] -= v0; d0[o + p1] -= v1;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] -= 1; d1[o + p0] -= v0; d1[o + p1] -= v1; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] -= 1; d2[o + p0] -= v0; d2[o + p1] -= v1; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] -= 1; d3[o + p0] -= v0; d3[o + p1] -= v1; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] -= 1; d4[o + p0] -= v0; d4[o + p1] -= v1; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] -= rowCount; kpiData[p0] -= k0; kpiData[p1] -= k1; }
+}
+
+function coIdx3Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, q0, q1, q2, b0, b1, b2, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, v2, k0 = 0, k1 = 0, k2 = 0, hasC = cOff >= 0;
+  for (j = 0; j < rowCount; ++j) {
+    i = rowIndexes[j]; v0 = b0[i]; v1 = b1[i]; v2 = b2[i]; k0 += v0; k1 += v1; k2 += v2;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + q0] += v0; d0[o + q1] += v1; d0[o + q2] += v2;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + q0] += v0; d1[o + q1] += v1; d1[o + q2] += v2; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + q0] += v0; d2[o + q1] += v1; d2[o + q2] += v2; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + q0] += v0; d3[o + q1] += v1; d3[o + q2] += v2; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + q0] += v0; d4[o + q1] += v1; d4[o + q2] += v2; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += rowCount; kpiData[q0] += k0; kpiData[q1] += k1; kpiData[q2] += k2; }
+}
+
+function coIdx3Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, q0, q1, q2, b0, b1, b2, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, v2, k0 = 0, k1 = 0, k2 = 0, hasC = cOff >= 0;
+  for (j = 0; j < rowCount; ++j) {
+    i = rowIndexes[j]; v0 = b0[i]; v1 = b1[i]; v2 = b2[i]; k0 += v0; k1 += v1; k2 += v2;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] -= 1; d0[o + q0] -= v0; d0[o + q1] -= v1; d0[o + q2] -= v2;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] -= 1; d1[o + q0] -= v0; d1[o + q1] -= v1; d1[o + q2] -= v2; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] -= 1; d2[o + q0] -= v0; d2[o + q1] -= v1; d2[o + q2] -= v2; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] -= 1; d3[o + q0] -= v0; d3[o + q1] -= v1; d3[o + q2] -= v2; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] -= 1; d4[o + q0] -= v0; d4[o + q1] -= v1; d4[o + q2] -= v2; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] -= rowCount; kpiData[q0] -= k0; kpiData[q1] -= k1; kpiData[q2] -= k2; }
+}
+
+function coIdx4Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, r0, r1, r2, r3, c0, c1, c2, c3, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, v2, v3, k0 = 0, k1 = 0, k2 = 0, k3 = 0, hasC = cOff >= 0;
+  if (hasC && count === 5) {
+    for (j = 0; j < rowCount; ++j) {
+      i = rowIndexes[j];
+      v0 = c0[i]; v1 = c1[i]; v2 = c2[i]; v3 = c3[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3;
+      o = s0[i] * stride; d0[o + cOff] += 1; d0[o + r0] += v0; d0[o + r1] += v1; d0[o + r2] += v2; d0[o + r3] += v3;
+      o = s1[i] * stride; d1[o + cOff] += 1; d1[o + r0] += v0; d1[o + r1] += v1; d1[o + r2] += v2; d1[o + r3] += v3;
+      o = s2[i] * stride; d2[o + cOff] += 1; d2[o + r0] += v0; d2[o + r1] += v1; d2[o + r2] += v2; d2[o + r3] += v3;
+      o = s3[i] * stride; d3[o + cOff] += 1; d3[o + r0] += v0; d3[o + r1] += v1; d3[o + r2] += v2; d3[o + r3] += v3;
+      o = s4[i] * stride; d4[o + cOff] += 1; d4[o + r0] += v0; d4[o + r1] += v1; d4[o + r2] += v2; d4[o + r3] += v3;
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      i = rowIndexes[j];
+      v0 = c0[i]; v1 = c1[i]; v2 = c2[i]; v3 = c3[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3;
+      o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + r0] += v0; d0[o + r1] += v1; d0[o + r2] += v2; d0[o + r3] += v3;
+      if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + r0] += v0; d1[o + r1] += v1; d1[o + r2] += v2; d1[o + r3] += v3; }
+      if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + r0] += v0; d2[o + r1] += v1; d2[o + r2] += v2; d2[o + r3] += v3; }
+      if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + r0] += v0; d3[o + r1] += v1; d3[o + r2] += v2; d3[o + r3] += v3; }
+      if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + r0] += v0; d4[o + r1] += v1; d4[o + r2] += v2; d4[o + r3] += v3; }
+    }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += rowCount; kpiData[r0] += k0; kpiData[r1] += k1; kpiData[r2] += k2; kpiData[r3] += k3; }
+}
+
+function coIdx4Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, r0, r1, r2, r3, c0, c1, c2, c3, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, v2, v3, k0 = 0, k1 = 0, k2 = 0, k3 = 0, hasC = cOff >= 0;
+  if (hasC && count === 5) {
+    for (j = 0; j < rowCount; ++j) {
+      i = rowIndexes[j];
+      v0 = c0[i]; v1 = c1[i]; v2 = c2[i]; v3 = c3[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3;
+      o = s0[i] * stride; d0[o + cOff] -= 1; d0[o + r0] -= v0; d0[o + r1] -= v1; d0[o + r2] -= v2; d0[o + r3] -= v3;
+      o = s1[i] * stride; d1[o + cOff] -= 1; d1[o + r0] -= v0; d1[o + r1] -= v1; d1[o + r2] -= v2; d1[o + r3] -= v3;
+      o = s2[i] * stride; d2[o + cOff] -= 1; d2[o + r0] -= v0; d2[o + r1] -= v1; d2[o + r2] -= v2; d2[o + r3] -= v3;
+      o = s3[i] * stride; d3[o + cOff] -= 1; d3[o + r0] -= v0; d3[o + r1] -= v1; d3[o + r2] -= v2; d3[o + r3] -= v3;
+      o = s4[i] * stride; d4[o + cOff] -= 1; d4[o + r0] -= v0; d4[o + r1] -= v1; d4[o + r2] -= v2; d4[o + r3] -= v3;
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      i = rowIndexes[j];
+      v0 = c0[i]; v1 = c1[i]; v2 = c2[i]; v3 = c3[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3;
+      o = s0[i] * stride; if (hasC) d0[o + cOff] -= 1; d0[o + r0] -= v0; d0[o + r1] -= v1; d0[o + r2] -= v2; d0[o + r3] -= v3;
+      if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] -= 1; d1[o + r0] -= v0; d1[o + r1] -= v1; d1[o + r2] -= v2; d1[o + r3] -= v3; }
+      if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] -= 1; d2[o + r0] -= v0; d2[o + r1] -= v1; d2[o + r2] -= v2; d2[o + r3] -= v3; }
+      if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] -= 1; d3[o + r0] -= v0; d3[o + r1] -= v1; d3[o + r2] -= v2; d3[o + r3] -= v3; }
+      if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] -= 1; d4[o + r0] -= v0; d4[o + r1] -= v1; d4[o + r2] -= v2; d4[o + r3] -= v3; }
+    }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] -= rowCount; kpiData[r0] -= k0; kpiData[r1] -= k1; kpiData[r2] -= k2; kpiData[r3] -= k3; }
+}
+
+function coIdx5Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, t0, t1, t2, t3, t4, e0, e1, e2, e3, e4, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, v2, v3, v4, k0 = 0, k1 = 0, k2 = 0, k3 = 0, k4 = 0, hasC = cOff >= 0;
+  if (hasC && count === 5) {
+    for (j = 0; j < rowCount; ++j) {
+      i = rowIndexes[j];
+      v0 = e0[i]; v1 = e1[i]; v2 = e2[i]; v3 = e3[i]; v4 = e4[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3; k4 += v4;
+      o = s0[i] * stride; d0[o + cOff] += 1; d0[o + t0] += v0; d0[o + t1] += v1; d0[o + t2] += v2; d0[o + t3] += v3; d0[o + t4] += v4;
+      o = s1[i] * stride; d1[o + cOff] += 1; d1[o + t0] += v0; d1[o + t1] += v1; d1[o + t2] += v2; d1[o + t3] += v3; d1[o + t4] += v4;
+      o = s2[i] * stride; d2[o + cOff] += 1; d2[o + t0] += v0; d2[o + t1] += v1; d2[o + t2] += v2; d2[o + t3] += v3; d2[o + t4] += v4;
+      o = s3[i] * stride; d3[o + cOff] += 1; d3[o + t0] += v0; d3[o + t1] += v1; d3[o + t2] += v2; d3[o + t3] += v3; d3[o + t4] += v4;
+      o = s4[i] * stride; d4[o + cOff] += 1; d4[o + t0] += v0; d4[o + t1] += v1; d4[o + t2] += v2; d4[o + t3] += v3; d4[o + t4] += v4;
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      i = rowIndexes[j];
+      v0 = e0[i]; v1 = e1[i]; v2 = e2[i]; v3 = e3[i]; v4 = e4[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3; k4 += v4;
+      o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + t0] += v0; d0[o + t1] += v1; d0[o + t2] += v2; d0[o + t3] += v3; d0[o + t4] += v4;
+      if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + t0] += v0; d1[o + t1] += v1; d1[o + t2] += v2; d1[o + t3] += v3; d1[o + t4] += v4; }
+      if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + t0] += v0; d2[o + t1] += v1; d2[o + t2] += v2; d2[o + t3] += v3; d2[o + t4] += v4; }
+      if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + t0] += v0; d3[o + t1] += v1; d3[o + t2] += v2; d3[o + t3] += v3; d3[o + t4] += v4; }
+      if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + t0] += v0; d4[o + t1] += v1; d4[o + t2] += v2; d4[o + t3] += v3; d4[o + t4] += v4; }
+    }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += rowCount; kpiData[t0] += k0; kpiData[t1] += k1; kpiData[t2] += k2; kpiData[t3] += k3; kpiData[t4] += k4; }
+}
+
+function coIdx5Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, t0, t1, t2, t3, t4, e0, e1, e2, e3, e4, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, v2, v3, v4, k0 = 0, k1 = 0, k2 = 0, k3 = 0, k4 = 0, hasC = cOff >= 0;
+  if (hasC && count === 5) {
+    for (j = 0; j < rowCount; ++j) {
+      i = rowIndexes[j];
+      v0 = e0[i]; v1 = e1[i]; v2 = e2[i]; v3 = e3[i]; v4 = e4[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3; k4 += v4;
+      o = s0[i] * stride; d0[o + cOff] -= 1; d0[o + t0] -= v0; d0[o + t1] -= v1; d0[o + t2] -= v2; d0[o + t3] -= v3; d0[o + t4] -= v4;
+      o = s1[i] * stride; d1[o + cOff] -= 1; d1[o + t0] -= v0; d1[o + t1] -= v1; d1[o + t2] -= v2; d1[o + t3] -= v3; d1[o + t4] -= v4;
+      o = s2[i] * stride; d2[o + cOff] -= 1; d2[o + t0] -= v0; d2[o + t1] -= v1; d2[o + t2] -= v2; d2[o + t3] -= v3; d2[o + t4] -= v4;
+      o = s3[i] * stride; d3[o + cOff] -= 1; d3[o + t0] -= v0; d3[o + t1] -= v1; d3[o + t2] -= v2; d3[o + t3] -= v3; d3[o + t4] -= v4;
+      o = s4[i] * stride; d4[o + cOff] -= 1; d4[o + t0] -= v0; d4[o + t1] -= v1; d4[o + t2] -= v2; d4[o + t3] -= v3; d4[o + t4] -= v4;
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      i = rowIndexes[j];
+      v0 = e0[i]; v1 = e1[i]; v2 = e2[i]; v3 = e3[i]; v4 = e4[i];
+      k0 += v0; k1 += v1; k2 += v2; k3 += v3; k4 += v4;
+      o = s0[i] * stride; if (hasC) d0[o + cOff] -= 1; d0[o + t0] -= v0; d0[o + t1] -= v1; d0[o + t2] -= v2; d0[o + t3] -= v3; d0[o + t4] -= v4;
+      if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] -= 1; d1[o + t0] -= v0; d1[o + t1] -= v1; d1[o + t2] -= v2; d1[o + t3] -= v3; d1[o + t4] -= v4; }
+      if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] -= 1; d2[o + t0] -= v0; d2[o + t1] -= v1; d2[o + t2] -= v2; d2[o + t3] -= v3; d2[o + t4] -= v4; }
+      if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] -= 1; d3[o + t0] -= v0; d3[o + t1] -= v1; d3[o + t2] -= v2; d3[o + t3] -= v3; d3[o + t4] -= v4; }
+      if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] -= 1; d4[o + t0] -= v0; d4[o + t1] -= v1; d4[o + t2] -= v2; d4[o + t3] -= v3; d4[o + t4] -= v4; }
+    }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] -= rowCount; kpiData[t0] -= k0; kpiData[t1] -= k1; kpiData[t2] -= k2; kpiData[t3] -= k3; kpiData[t4] -= k4; }
+}
+
+function coIdx6Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, t0, t1, t2, t3, t4, t5, e0, e1, e2, e3, e4, e5, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, v2, v3, v4, v5, k0 = 0, k1 = 0, k2 = 0, k3 = 0, k4 = 0, k5 = 0, hasC = cOff >= 0;
+  for (j = 0; j < rowCount; ++j) {
+    i = rowIndexes[j];
+    v0 = e0[i]; v1 = e1[i]; v2 = e2[i]; v3 = e3[i]; v4 = e4[i]; v5 = e5[i];
+    k0 += v0; k1 += v1; k2 += v2; k3 += v3; k4 += v4; k5 += v5;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] += 1; d0[o + t0] += v0; d0[o + t1] += v1; d0[o + t2] += v2; d0[o + t3] += v3; d0[o + t4] += v4; d0[o + t5] += v5;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] += 1; d1[o + t0] += v0; d1[o + t1] += v1; d1[o + t2] += v2; d1[o + t3] += v3; d1[o + t4] += v4; d1[o + t5] += v5; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] += 1; d2[o + t0] += v0; d2[o + t1] += v1; d2[o + t2] += v2; d2[o + t3] += v3; d2[o + t4] += v4; d2[o + t5] += v5; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] += 1; d3[o + t0] += v0; d3[o + t1] += v1; d3[o + t2] += v2; d3[o + t3] += v3; d3[o + t4] += v4; d3[o + t5] += v5; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] += 1; d4[o + t0] += v0; d4[o + t1] += v1; d4[o + t2] += v2; d4[o + t3] += v3; d4[o + t4] += v4; d4[o + t5] += v5; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] += rowCount; kpiData[t0] += k0; kpiData[t1] += k1; kpiData[t2] += k2; kpiData[t3] += k3; kpiData[t4] += k4; kpiData[t5] += k5; }
+}
+
+function coIdx6Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, t0, t1, t2, t3, t4, t5, e0, e1, e2, e3, e4, e5, rowIndexes, rowCount) {
+  var j, i, o, v0, v1, v2, v3, v4, v5, k0 = 0, k1 = 0, k2 = 0, k3 = 0, k4 = 0, k5 = 0, hasC = cOff >= 0;
+  for (j = 0; j < rowCount; ++j) {
+    i = rowIndexes[j];
+    v0 = e0[i]; v1 = e1[i]; v2 = e2[i]; v3 = e3[i]; v4 = e4[i]; v5 = e5[i];
+    k0 += v0; k1 += v1; k2 += v2; k3 += v3; k4 += v4; k5 += v5;
+    o = s0[i] * stride; if (hasC) d0[o + cOff] -= 1; d0[o + t0] -= v0; d0[o + t1] -= v1; d0[o + t2] -= v2; d0[o + t3] -= v3; d0[o + t4] -= v4; d0[o + t5] -= v5;
+    if (count > 1) { o = s1[i] * stride; if (hasC) d1[o + cOff] -= 1; d1[o + t0] -= v0; d1[o + t1] -= v1; d1[o + t2] -= v2; d1[o + t3] -= v3; d1[o + t4] -= v4; d1[o + t5] -= v5; }
+    if (count > 2) { o = s2[i] * stride; if (hasC) d2[o + cOff] -= 1; d2[o + t0] -= v0; d2[o + t1] -= v1; d2[o + t2] -= v2; d2[o + t3] -= v3; d2[o + t4] -= v4; d2[o + t5] -= v5; }
+    if (count > 3) { o = s3[i] * stride; if (hasC) d3[o + cOff] -= 1; d3[o + t0] -= v0; d3[o + t1] -= v1; d3[o + t2] -= v2; d3[o + t3] -= v3; d3[o + t4] -= v4; d3[o + t5] -= v5; }
+    if (count > 4) { o = s4[i] * stride; if (hasC) d4[o + cOff] -= 1; d4[o + t0] -= v0; d4[o + t1] -= v1; d4[o + t2] -= v2; d4[o + t3] -= v3; d4[o + t4] -= v4; d4[o + t5] -= v5; }
+  }
+  if (kpiData) { if (hasC) kpiData[cOff] -= rowCount; kpiData[t0] -= k0; kpiData[t1] -= k1; kpiData[t2] -= k2; kpiData[t3] -= k3; kpiData[t4] -= k4; kpiData[t5] -= k5; }
+}
+
+function coScanRunIdx(targets, start, count, kpiData, stride, cOff, offs, cols, rowIndexes, rowCount, add) {
+  var fLen = cols.length;
+  var d0 = targets[start].buffers.data, s0 = targets[start].slotArr;
+  var d1 = count > 1 ? targets[start + 1].buffers.data : null, s1 = count > 1 ? targets[start + 1].slotArr : null;
+  var d2 = count > 2 ? targets[start + 2].buffers.data : null, s2 = count > 2 ? targets[start + 2].slotArr : null;
+  var d3 = count > 3 ? targets[start + 3].buffers.data : null, s3 = count > 3 ? targets[start + 3].slotArr : null;
+  var d4 = count > 4 ? targets[start + 4].buffers.data : null, s4 = count > 4 ? targets[start + 4].slotArr : null;
+
+  if (fLen === 0 && cOff >= 0) {
+    coIdx0(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, rowIndexes, rowCount, add ? 1 : -1);
+  } else if (fLen === 1) {
+    if (add) coIdx1Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], cols[0], rowIndexes, rowCount);
+    else coIdx1Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], cols[0], rowIndexes, rowCount);
+  } else if (fLen === 2) {
+    if (add) coIdx2Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], cols[0], cols[1], rowIndexes, rowCount);
+    else coIdx2Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], cols[0], cols[1], rowIndexes, rowCount);
+  } else if (fLen === 3) {
+    if (add) coIdx3Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], cols[0], cols[1], cols[2], rowIndexes, rowCount);
+    else coIdx3Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], cols[0], cols[1], cols[2], rowIndexes, rowCount);
+  } else if (fLen === 4) {
+    if (add) coIdx4Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], offs[3], cols[0], cols[1], cols[2], cols[3], rowIndexes, rowCount);
+    else coIdx4Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], offs[3], cols[0], cols[1], cols[2], cols[3], rowIndexes, rowCount);
+  } else if (fLen === 5) {
+    if (add) coIdx5Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], cols[0], cols[1], cols[2], cols[3], cols[4], rowIndexes, rowCount);
+    else coIdx5Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], cols[0], cols[1], cols[2], cols[3], cols[4], rowIndexes, rowCount);
+  } else if (fLen === 6) {
+    if (add) coIdx6Add(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], offs[5], cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], rowIndexes, rowCount);
+    else coIdx6Sub(d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, count, kpiData, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], offs[5], cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], rowIndexes, rowCount);
+  }
+}
+
+function reduceMultiGroupsAll(targets, kpiBuffers, plan, getNumericColumn, n) {
+  var cols = resolveFastColumns(plan, getNumericColumn);
+  var i;
+  if (!cols) {
+    for (i = 0; i < targets.length; ++i) {
+      reduceGroupedAll(targets[i].buffers, plan, getNumericColumn, targets[i].slotArr, n, targets[i].slotCount);
+    }
+    if (kpiBuffers) {
+      reduceScalarAll(kpiBuffers, plan, getNumericColumn, n);
+    }
+    return;
+  }
+  var stride = plan.stride;
+  var cOff = plan.fastCountOff;
+  var offs = plan.sumFieldOffs;
+  var extra = plan.extraAvgOffs;
+  var kpiData = kpiBuffers ? kpiBuffers.data : null;
+  var pos = 0;
+  var total = targets.length;
+  while (pos < total) {
+    var chunk = total - pos;
+    if (chunk > 5) chunk = 5;
+    coScanRunAll(targets, pos, chunk, pos === 0 ? kpiData : null, stride, cOff, offs, cols, n);
+    pos += chunk;
+  }
+  if (extra.length > 0) {
+    for (i = 0; i < total; ++i) {
+      mirrorExtraAvgCounts(targets[i].buffers.data, stride, targets[i].slotCount, cOff, extra);
+    }
+    if (kpiData) {
+      mirrorExtraAvgCounts(kpiData, stride, 1, cOff, extra);
+    }
+  }
+}
+
+function reduceMultiGroupsIndexed(targets, kpiBuffers, plan, getNumericColumn, rowIndexes, rowCount, delta) {
+  if (!rowCount) return;
+  var cols = resolveFastColumns(plan, getNumericColumn);
+  var i;
+  if (!cols) {
+    for (i = 0; i < targets.length; ++i) {
+      reduceGroupedIndexed(targets[i].buffers, plan, getNumericColumn, targets[i].slotArr, rowIndexes, rowCount, delta, targets[i].slotCount);
+    }
+    if (kpiBuffers) {
+      reduceScalarIndexed(kpiBuffers, plan, getNumericColumn, rowIndexes, rowCount, delta);
+    }
+    return;
+  }
+  var stride = plan.stride;
+  var cOff = plan.fastCountOff;
+  var offs = plan.sumFieldOffs;
+  var extra = plan.extraAvgOffs;
+  var add = delta > 0;
+  var kpiData = kpiBuffers ? kpiBuffers.data : null;
+  var pos = 0;
+  var total = targets.length;
+  while (pos < total) {
+    var chunk = total - pos;
+    if (chunk > 5) chunk = 5;
+    coScanRunIdx(targets, pos, chunk, pos === 0 ? kpiData : null, stride, cOff, offs, cols, rowIndexes, rowCount, add);
+    pos += chunk;
+  }
+  if (extra.length > 0) {
+    for (i = 0; i < total; ++i) {
+      mirrorExtraAvgCounts(targets[i].buffers.data, stride, targets[i].slotCount, cOff, extra);
+    }
+    if (kpiData) {
+      mirrorExtraAvgCounts(kpiData, stride, 1, cOff, extra);
+    }
+  }
+}
+
+// ============================================================================
+// Public single-group & scalar dispatchers
+// ============================================================================
+
+function reduceGroupedAll(buffers, plan, getNumericColumn, groupIds, n, slotCount) {
+  if (!n) return;
+  var data = buffers.data;
+  var stride = plan.stride;
+  var cols = resolveFastColumns(plan, getNumericColumn);
+  if (cols) {
+    var cOff = plan.fastCountOff;
+    var offs = plan.sumFieldOffs;
+    var fLen = cols.length;
+    if (fLen === 0 && cOff >= 0) {
+      aoCountAll(data, stride, cOff, groupIds, n);
+    } else if (fLen === 1) {
+      ao1All(data, stride, cOff, offs[0], groupIds, cols[0], n);
+    } else if (fLen === 2) {
+      ao2All(data, stride, cOff, offs[0], offs[1], groupIds, cols[0], cols[1], n);
+    } else if (fLen === 3) {
+      ao3All(data, stride, cOff, offs[0], offs[1], offs[2], groupIds, cols[0], cols[1], cols[2], n);
+    } else if (fLen === 4) {
+      ao4All(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], groupIds, cols[0], cols[1], cols[2], cols[3], n);
+    } else if (fLen === 5) {
+      ao5All(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], groupIds, cols[0], cols[1], cols[2], cols[3], cols[4], n);
+    } else if (fLen === 6) {
+      ao6All(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], offs[5], groupIds, cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], n);
+    }
+    if (plan.extraAvgOffs.length > 0) {
+      mirrorExtraAvgCounts(data, stride, slotCount, cOff, plan.extraAvgOffs);
+    }
+    return;
+  }
+  aoGeneralAll(data, stride, plan, getNumericColumn, groupIds, n);
+}
+
+function reduceGroupedIndexed(buffers, plan, getNumericColumn, groupIds, rowIndexes, rowCount, delta, slotCount) {
+  if (!rowCount) return;
+  var data = buffers.data;
+  var stride = plan.stride;
+  var add = delta > 0;
+  var cols = resolveFastColumns(plan, getNumericColumn);
+  if (cols) {
+    var cOff = plan.fastCountOff;
+    var offs = plan.sumFieldOffs;
+    var fLen = cols.length;
+    if (fLen === 0 && cOff >= 0) {
+      aoCountIdx(data, stride, cOff, groupIds, rowIndexes, rowCount, add);
+    } else if (fLen === 1) {
+      ao1Idx(data, stride, cOff, offs[0], groupIds, cols[0], rowIndexes, rowCount, add);
+    } else if (fLen === 2) {
+      ao2Idx(data, stride, cOff, offs[0], offs[1], groupIds, cols[0], cols[1], rowIndexes, rowCount, add);
+    } else if (fLen === 3) {
+      ao3Idx(data, stride, cOff, offs[0], offs[1], offs[2], groupIds, cols[0], cols[1], cols[2], rowIndexes, rowCount, add);
+    } else if (fLen === 4) {
+      ao4Idx(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], groupIds, cols[0], cols[1], cols[2], cols[3], rowIndexes, rowCount, add);
+    } else if (fLen === 5) {
+      ao5Idx(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], groupIds, cols[0], cols[1], cols[2], cols[3], cols[4], rowIndexes, rowCount, add);
+    } else if (fLen === 6) {
+      ao6Idx(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], offs[5], groupIds, cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], rowIndexes, rowCount, add);
+    }
+    if (plan.extraAvgOffs.length > 0) {
+      var capSlots = slotCount > 0 ? slotCount : buffers.capacity;
+      mirrorExtraAvgCounts(data, stride, capSlots, cOff, plan.extraAvgOffs);
+    }
+    return;
+  }
+  aoGeneralIdx(data, stride, plan, getNumericColumn, groupIds, rowIndexes, rowCount, add);
+}
+
+function reduceSplitDenseAll(buffers, plan, getNumericColumn, primarySlotArr, splitCodes, splitStride, n, totalSlots) {
+  if (!n || !splitStride) return;
+  var data = buffers.data;
+  var stride = plan.stride;
+  var cols = resolveFastColumns(plan, getNumericColumn);
+  if (cols) {
+    var cOff = plan.fastCountOff;
+    var offs = plan.sumFieldOffs;
+    var fLen = cols.length;
+    if (fLen === 0 && cOff >= 0) {
+      for (var i = 0; i < n; ++i) data[(primarySlotArr[i] * splitStride + splitCodes[i]) * stride + cOff] += 1;
+    } else if (fLen === 1) {
+      sd1All(data, stride, cOff, offs[0], primarySlotArr, splitCodes, splitStride, cols[0], n);
+    } else if (fLen === 2) {
+      sd2All(data, stride, cOff, offs[0], offs[1], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], n);
+    } else if (fLen === 3) {
+      sd3All(data, stride, cOff, offs[0], offs[1], offs[2], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], cols[2], n);
+    } else if (fLen === 4) {
+      sd4All(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], cols[2], cols[3], n);
+    } else if (fLen === 5) {
+      sd5All(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], cols[2], cols[3], cols[4], n);
+    } else if (fLen === 6) {
+      sd6All(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], offs[5], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], n);
+    }
+    if (plan.extraAvgOffs.length > 0) {
+      mirrorExtraAvgCounts(data, stride, totalSlots, cOff, plan.extraAvgOffs);
+    }
+    return;
+  }
+  sdGeneralAll(data, stride, plan, getNumericColumn, primarySlotArr, splitCodes, splitStride, n);
+}
+
+function reduceSplitDenseIndexed(buffers, plan, getNumericColumn, primarySlotArr, splitCodes, splitStride, rowIndexes, rowCount, delta, totalSlots) {
+  if (!rowCount || !splitStride) return;
+  var data = buffers.data;
+  var stride = plan.stride;
+  var add = delta > 0;
+  var cols = resolveFastColumns(plan, getNumericColumn);
+  if (cols) {
+    var cOff = plan.fastCountOff;
+    var offs = plan.sumFieldOffs;
+    var fLen = cols.length;
+    if (fLen === 0 && cOff >= 0) {
+      var sign = add ? 1 : -1;
+      for (var j = 0; j < rowCount; ++j) {
+        var idx = rowIndexes[j];
+        data[(primarySlotArr[idx] * splitStride + splitCodes[idx]) * stride + cOff] += sign;
+      }
+    } else if (fLen === 1) {
+      sd1Idx(data, stride, cOff, offs[0], primarySlotArr, splitCodes, splitStride, cols[0], rowIndexes, rowCount, add);
+    } else if (fLen === 2) {
+      sd2Idx(data, stride, cOff, offs[0], offs[1], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], rowIndexes, rowCount, add);
+    } else if (fLen === 3) {
+      sd3Idx(data, stride, cOff, offs[0], offs[1], offs[2], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], cols[2], rowIndexes, rowCount, add);
+    } else if (fLen === 4) {
+      sd4Idx(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], cols[2], cols[3], rowIndexes, rowCount, add);
+    } else if (fLen === 5) {
+      sd5Idx(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], cols[2], cols[3], cols[4], rowIndexes, rowCount, add);
+    } else if (fLen === 6) {
+      sd6Idx(data, stride, cOff, offs[0], offs[1], offs[2], offs[3], offs[4], offs[5], primarySlotArr, splitCodes, splitStride, cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], rowIndexes, rowCount, add);
+    }
+    if (plan.extraAvgOffs.length > 0) {
+      var capSlots = totalSlots > 0 ? totalSlots : buffers.capacity;
+      mirrorExtraAvgCounts(data, stride, capSlots, cOff, plan.extraAvgOffs);
+    }
+    return;
+  }
+  sdGeneralIdx(data, stride, plan, getNumericColumn, primarySlotArr, splitCodes, splitStride, rowIndexes, rowCount, add);
+}
+
+// ============================================================================
+// Scalar (KPI) reductions into slot 0 of buffers.data
+// ============================================================================
+
+function reduceScalarAll(buffers, plan, getNumericColumn, n) {
+  if (!n) return;
+  var data = buffers.data;
+  var i, f, col, vals, hasNaN, v, s, s2;
+  if (plan.countOffset >= 0) {
+    data[plan.countOffset] += n;
+  }
+  var sumFields = plan.sumFields;
+  var sumFieldOffs = plan.sumFieldOffs;
+  var sumFieldAvgOffs = plan.sumFieldAvgOffs;
+  for (f = 0; f < sumFields.length; ++f) {
+    col = getNumericColumn(sumFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    s = 0;
+    s2 = 0;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) s += vals[i];
+      s2 = n;
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v) { s += v; s2 += 1; }
+      }
+    }
+    data[sumFieldOffs[f]] += s;
+    if (sumFieldAvgOffs[f] >= 0) data[sumFieldAvgOffs[f]] += s2;
+  }
+  var avgNzFields = plan.avgNzFields;
+  var avgNzPrimOffs = plan.avgNzPrimOffs;
+  var avgNzSecOffs = plan.avgNzSecOffs;
+  for (f = 0; f < avgNzFields.length; ++f) {
+    col = getNumericColumn(avgNzFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    s = 0;
+    s2 = 0;
+    if (!hasNaN) {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v !== 0) { s += v; s2 += 1; }
+      }
+    } else {
+      for (i = 0; i < n; ++i) {
+        v = vals[i];
+        if (v === v && v !== 0) { s += v; s2 += 1; }
+      }
+    }
+    data[avgNzPrimOffs[f]] += s;
+    data[avgNzSecOffs[f]] += s2;
+  }
+}
+
+function reduceScalarIndexed(buffers, plan, getNumericColumn, rowIndexes, rowCount, delta) {
+  if (!rowCount) return;
+  var data = buffers.data;
+  var sign = delta > 0 ? 1 : -1;
+  var j, f, col, vals, hasNaN, v, s, s2;
+  if (plan.countOffset >= 0) {
+    data[plan.countOffset] += sign * rowCount;
+  }
+  var sumFields = plan.sumFields;
+  var sumFieldOffs = plan.sumFieldOffs;
+  var sumFieldAvgOffs = plan.sumFieldAvgOffs;
+  for (f = 0; f < sumFields.length; ++f) {
+    col = getNumericColumn(sumFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    s = 0;
+    s2 = 0;
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
+      s2 = rowCount;
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        v = vals[rowIndexes[j]];
+        if (v === v) { s += v; s2 += 1; }
+      }
+    }
+    data[sumFieldOffs[f]] += sign * s;
+    if (sumFieldAvgOffs[f] >= 0) data[sumFieldAvgOffs[f]] += sign * s2;
+  }
+  var avgNzFields = plan.avgNzFields;
+  var avgNzPrimOffs = plan.avgNzPrimOffs;
+  var avgNzSecOffs = plan.avgNzSecOffs;
+  for (f = 0; f < avgNzFields.length; ++f) {
+    col = getNumericColumn(avgNzFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    s = 0;
+    s2 = 0;
+    if (!hasNaN) {
+      for (j = 0; j < rowCount; ++j) {
+        v = vals[rowIndexes[j]];
+        if (v !== 0) { s += v; s2 += 1; }
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        v = vals[rowIndexes[j]];
+        if (v === v && v !== 0) { s += v; s2 += 1; }
+      }
+    }
+    data[avgNzPrimOffs[f]] += sign * s;
+    data[avgNzSecOffs[f]] += sign * s2;
+  }
+}
+
+// ============================================================================
+// Complement subtraction exact empty-slot cleanup (eliminates FP dust!)
+// ============================================================================
+
+function cleanupComplementEmptySlots(buffers, plan, exactCountOff, slotArr, splitCodes, splitStride, trackedCounts, tmpCounts, rowIndexes, rowCount, totalSlots) {
+  var data = buffers.data;
+  var stride = plan.stride;
+  var cOff = exactCountOff >= 0 ? exactCountOff : plan.countOffset;
+  var j, idx, slot, base, k;
+
+  if (cOff >= 0) {
+    if (splitCodes) {
+      for (j = 0; j < rowCount; ++j) {
+        idx = rowIndexes[j];
+        slot = slotArr[idx] * splitStride + splitCodes[idx];
+        base = slot * stride;
+        if (data[base + cOff] <= 0) {
+          for (k = 0; k < stride; ++k) data[base + k] = 0;
+        }
+      }
+    } else {
+      for (j = 0; j < rowCount; ++j) {
+        slot = slotArr[rowIndexes[j]];
+        base = slot * stride;
+        if (data[base + cOff] <= 0) {
+          for (k = 0; k < stride; ++k) data[base + k] = 0;
+        }
+      }
+    }
+    return;
+  }
+
+  if (!trackedCounts || !tmpCounts) return;
+  tmpCounts.set(trackedCounts.subarray(0, totalSlots));
+  if (splitCodes) {
+    for (j = 0; j < rowCount; ++j) {
+      idx = rowIndexes[j];
+      slot = slotArr[idx] * splitStride + splitCodes[idx];
+      if (--tmpCounts[slot] === 0) {
+        base = slot * stride;
+        for (k = 0; k < stride; ++k) data[base + k] = 0;
+      }
+    }
+  } else {
+    for (j = 0; j < rowCount; ++j) {
+      slot = slotArr[rowIndexes[j]];
+      if (--tmpCounts[slot] === 0) {
+        base = slot * stride;
+        for (k = 0; k < stride; ++k) data[base + k] = 0;
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Slot materialization & visibility helpers (interleaved AoS reads)
+// ============================================================================
+
+function writeMetricSlotToState(state, plan, buffers, slot) {
+  var ops = plan.ops;
+  var ids = plan.ids;
+  var primOff = plan.primOff;
+  var secOff = plan.secOff;
+  var data = buffers.data;
+  var base = slot * buffers.stride;
+  var isEmpty = plan.countOffset >= 0 && data[base + plan.countOffset] <= 0;
+  var m, op, id, sub;
+
+  for (m = 0; m < plan.count; ++m) {
+    op = ops[m];
+    id = ids[m];
+    if (op === OP_AVG || op === OP_AVG_NON_ZERO) {
+      sub = state[id];
+      if (!sub) {
+        state[id] = { count: isEmpty ? 0 : data[base + secOff[m]], sum: isEmpty ? 0 : data[base + primOff[m]] };
+      } else {
+        sub.sum = isEmpty ? 0 : data[base + primOff[m]];
+        sub.count = isEmpty ? 0 : data[base + secOff[m]];
+      }
+    } else if (op === OP_RATIO) {
+      sub = state[id];
+      if (!sub) {
+        state[id] = { den: isEmpty ? 0 : data[base + secOff[m]], num: isEmpty ? 0 : data[base + primOff[m]] };
+      } else {
+        sub.num = isEmpty ? 0 : data[base + primOff[m]];
+        sub.den = isEmpty ? 0 : data[base + secOff[m]];
+      }
+    } else {
+      state[id] = isEmpty ? 0 : data[base + primOff[m]];
+    }
+  }
+  if (state.__version !== undefined) {
+    state.__version += 1;
+  }
+}
+
+function finalizeMetricSlot(plan, buffers, slot) {
+  var ops = plan.ops;
+  var ids = plan.ids;
+  var hidden = plan.hidden;
+  var primOff = plan.primOff;
+  var secOff = plan.secOff;
+  var data = buffers.data;
+  var base = slot * buffers.stride;
+  var isEmpty = plan.countOffset >= 0 && data[base + plan.countOffset] <= 0;
+  var result = {};
+  var m, op, denom;
+
+  if (isEmpty) {
+    for (m = 0; m < plan.count; ++m) {
+      if (hidden[m]) continue;
+      op = ops[m];
+      result[ids[m]] = (op === OP_AVG || op === OP_AVG_NON_ZERO || op === OP_RATIO) ? null : 0;
+    }
+    return result;
+  }
+
+  for (m = 0; m < plan.count; ++m) {
+    if (hidden[m]) continue;
+    op = ops[m];
+    if (op === OP_AVG || op === OP_AVG_NON_ZERO) {
+      denom = data[base + secOff[m]];
+      result[ids[m]] = denom ? data[base + primOff[m]] / denom : null;
+    } else if (op === OP_RATIO) {
+      denom = data[base + secOff[m]];
+      result[ids[m]] = denom !== 0 ? data[base + primOff[m]] / denom : null;
+    } else {
+      result[ids[m]] = data[base + primOff[m]];
+    }
+  }
+  return result;
+}
+
+function slotHasAnyActivity(plan, buffers, slot) {
+  var data = buffers.data;
+  var base = slot * buffers.stride;
+  if (plan.countOffset >= 0) {
+    return data[base + plan.countOffset] > 0;
+  }
+  var ops = plan.ops;
+  var primOff = plan.primOff;
+  var secOff = plan.secOff;
+  var m, op;
+
+  for (m = 0; m < plan.count; ++m) {
+    op = ops[m];
+    if (op === OP_COUNT) {
+      if (data[base + primOff[m]] > 0) return true;
+    } else if (op === OP_AVG || op === OP_AVG_NON_ZERO) {
+      if (data[base + secOff[m]] > 0) return true;
+    } else if (op === OP_RATIO) {
+      if (data[base + primOff[m]] !== 0 || data[base + secOff[m]] !== 0) return true;
+    } else {
+      if (data[base + primOff[m]] !== 0) return true;
+    }
+  }
+  return false;
+}
+
+// Falcon-style active-dimension prefix-sum brush cache.
+
+var MAX_DISCRETE_BINS = 2048;
+var CONTINUOUS_BINS = 256;
+var MAX_CUBE_DOUBLES = 262144; // 2 MB cap per chart cube
+
+function bisectLeftNumeric(arr, len, target) {
+  var lo = 0, hi = len, mid;
+  while (lo < hi) {
+    mid = (lo + hi) >>> 1;
+    if (arr[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function bisectLeftString(arr, len, target) {
+  var lo = 0, hi = len, mid;
+  while (lo < hi) {
+    mid = (lo + hi) >>> 1;
+    if (arr[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function findContinuousBin(splitters, splitCount, v) {
+  var lo = 0, hi = splitCount, mid;
+  while (lo < hi) {
+    mid = (lo + hi) >>> 1;
+    if (v < splitters[mid]) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
+function accumulateRowsIntoCube(cube, binCount, slotCount, stride, plan, getNumericColumn, slotArr, rowIndices, rowBins, baseCount) {
+  var sumFields = plan.sumFields;
+  var sumFieldOffs = plan.sumFieldOffs;
+  var sumFieldAvgOffs = plan.sumFieldAvgOffs;
+  var avgNzFields = plan.avgNzFields;
+  var avgNzPrimOffs = plan.avgNzPrimOffs;
+  var avgNzSecOffs = plan.avgNzSecOffs;
+  var cOff = plan.countOffset;
+  var j, row, bin, s, o, f, col, vals, hasNaN, v, off, avgOff, pOff, sOff;
+
+  // Fast fused path for <= 4 finite sum fields and no avgNonZero
+  if (avgNzFields.length === 0 && sumFields.length <= 4) {
+    var fLen = sumFields.length;
+    var cols = new Array(fLen);
+    var allFinite = true;
+    for (f = 0; f < fLen; ++f) {
+      col = getNumericColumn(sumFields[f]);
+      if (col.hasNaN) { allFinite = false; break; }
+      cols[f] = col.values;
+    }
+    if (allFinite) {
+      var fastCOff = plan.fastCountOff;
+      var hasC = fastCOff >= 0;
+      if (fLen === 0 && hasC) {
+        for (j = 0; j < baseCount; ++j) {
+          row = rowIndices ? rowIndices[j] : j;
+          bin = rowBins[j];
+          s = slotArr ? slotArr[row] : 0;
+          cube[((bin + 1) * slotCount + s) * stride + fastCOff] += 1;
+        }
+      } else if (fLen === 1) {
+        var c0 = cols[0], o0 = sumFieldOffs[0];
+        for (j = 0; j < baseCount; ++j) {
+          row = rowIndices ? rowIndices[j] : j;
+          bin = rowBins[j];
+          s = slotArr ? slotArr[row] : 0;
+          o = ((bin + 1) * slotCount + s) * stride;
+          if (hasC) cube[o + fastCOff] += 1;
+          cube[o + o0] += c0[row];
+        }
+      } else if (fLen === 2) {
+        var a0 = cols[0], a1 = cols[1], p0 = sumFieldOffs[0], p1 = sumFieldOffs[1];
+        for (j = 0; j < baseCount; ++j) {
+          row = rowIndices ? rowIndices[j] : j;
+          bin = rowBins[j];
+          s = slotArr ? slotArr[row] : 0;
+          o = ((bin + 1) * slotCount + s) * stride;
+          if (hasC) cube[o + fastCOff] += 1;
+          cube[o + p0] += a0[row];
+          cube[o + p1] += a1[row];
+        }
+      } else if (fLen === 3) {
+        var b0 = cols[0], b1 = cols[1], b2 = cols[2], q0 = sumFieldOffs[0], q1 = sumFieldOffs[1], q2 = sumFieldOffs[2];
+        for (j = 0; j < baseCount; ++j) {
+          row = rowIndices ? rowIndices[j] : j;
+          bin = rowBins[j];
+          s = slotArr ? slotArr[row] : 0;
+          o = ((bin + 1) * slotCount + s) * stride;
+          if (hasC) cube[o + fastCOff] += 1;
+          cube[o + q0] += b0[row];
+          cube[o + q1] += b1[row];
+          cube[o + q2] += b2[row];
+        }
+      } else {
+        var d0 = cols[0], d1 = cols[1], d2 = cols[2], d3 = cols[3];
+        var r0 = sumFieldOffs[0], r1 = sumFieldOffs[1], r2 = sumFieldOffs[2], r3 = sumFieldOffs[3];
+        for (j = 0; j < baseCount; ++j) {
+          row = rowIndices ? rowIndices[j] : j;
+          bin = rowBins[j];
+          s = slotArr ? slotArr[row] : 0;
+          o = ((bin + 1) * slotCount + s) * stride;
+          if (hasC) cube[o + fastCOff] += 1;
+          cube[o + r0] += d0[row];
+          cube[o + r1] += d1[row];
+          cube[o + r2] += d2[row];
+          cube[o + r3] += d3[row];
+        }
+      }
+      if (plan.extraAvgOffs.length > 0 && hasC) {
+        var extra = plan.extraAvgOffs;
+        var totalCells = (binCount + 1) * slotCount;
+        for (var ci = 0, cb = 0; ci < totalCells; ++ci, cb += stride) {
+          var cv = cube[cb + fastCOff];
+          for (var ei = 0; ei < extra.length; ++ei) cube[cb + extra[ei]] = cv;
+        }
+      }
+      return;
+    }
+  }
+
+  // General fallback (NaN / avgNonZero / >4 fields)
+  if (cOff >= 0) {
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      bin = rowBins[j];
+      s = slotArr ? slotArr[row] : 0;
+      cube[((bin + 1) * slotCount + s) * stride + cOff] += 1;
+    }
+  }
+  for (f = 0; f < sumFields.length; ++f) {
+    col = getNumericColumn(sumFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    off = sumFieldOffs[f];
+    avgOff = sumFieldAvgOffs[f];
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      v = vals[row];
+      if (!hasNaN || v === v) {
+        bin = rowBins[j];
+        s = slotArr ? slotArr[row] : 0;
+        o = ((bin + 1) * slotCount + s) * stride;
+        cube[o + off] += v;
+        if (avgOff >= 0) cube[o + avgOff] += 1;
+      }
+    }
+  }
+  for (f = 0; f < avgNzFields.length; ++f) {
+    col = getNumericColumn(avgNzFields[f]);
+    vals = col.values;
+    hasNaN = col.hasNaN;
+    pOff = avgNzPrimOffs[f];
+    sOff = avgNzSecOffs[f];
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      v = vals[row];
+      if ((!hasNaN || v === v) && v !== 0) {
+        bin = rowBins[j];
+        s = slotArr ? slotArr[row] : 0;
+        o = ((bin + 1) * slotCount + s) * stride;
+        cube[o + pOff] += v;
+        cube[o + sOff] += 1;
+      }
+    }
+  }
+}
+
+function prefixSumCube(cube, binCount, rowStride) {
+  var b, k, cur, prev;
+  for (b = 1; b <= binCount; ++b) {
+    cur = b * rowStride;
+    prev = cur - rowStride;
+    for (k = 0; k < rowStride; ++k) {
+      cube[cur + k] += cube[prev + k];
+    }
+  }
+}
+
+function prefixSumUint32(arr, binCount, slotCount) {
+  var b, s, cur, prev;
+  for (b = 1; b <= binCount; ++b) {
+    cur = b * slotCount;
+    prev = cur - slotCount;
+    for (s = 0; s < slotCount; ++s) {
+      arr[cur + s] += arr[prev + s];
+    }
+  }
+}
+
+// Fast fused multi-cube build for groups sharing the exact same finite <=4-field plan!
+function buildSharedCubesPass(cubeEntries, kpiCube, plan, getNumericColumn, rowIndices, rowBins, baseCount) {
+  var fLen = plan.sumFields.length;
+  var cols = new Array(fLen);
+  for (var f = 0; f < fLen; ++f) {
+    var col = getNumericColumn(plan.sumFields[f]);
+    if (col.hasNaN) return false;
+    cols[f] = col.values;
+  }
+  var stride = plan.stride;
+  var cOff = plan.fastCountOff;
+  var hasC = cOff >= 0;
+  var offs = plan.sumFieldOffs;
+  var count = cubeEntries.length;
+  var cb0 = count > 0 ? cubeEntries[0].cube : null, s0 = count > 0 ? cubeEntries[0].slotArr : null, S0 = count > 0 ? cubeEntries[0].slotCount : 0;
+  var cb1 = count > 1 ? cubeEntries[1].cube : null, s1 = count > 1 ? cubeEntries[1].slotArr : null, S1 = count > 1 ? cubeEntries[1].slotCount : 0;
+  var cb2 = count > 2 ? cubeEntries[2].cube : null, s2 = count > 2 ? cubeEntries[2].slotArr : null, S2 = count > 2 ? cubeEntries[2].slotCount : 0;
+  var cb3 = count > 3 ? cubeEntries[3].cube : null, s3 = count > 3 ? cubeEntries[3].slotArr : null, S3 = count > 3 ? cubeEntries[3].slotCount : 0;
+  var cb4 = count > 4 ? cubeEntries[4].cube : null, s4 = count > 4 ? cubeEntries[4].slotArr : null, S4 = count > 4 ? cubeEntries[4].slotCount : 0;
+  var j, row, bin1, o, v0, v1, v2, v3;
+
+  if (fLen === 4) {
+    var d0 = cols[0], d1 = cols[1], d2 = cols[2], d3 = cols[3];
+    var r0 = offs[0], r1 = offs[1], r2 = offs[2], r3 = offs[3];
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      bin1 = rowBins[j] + 1;
+      v0 = d0[row]; v1 = d1[row]; v2 = d2[row]; v3 = d3[row];
+      if (kpiCube) {
+        o = bin1 * stride;
+        if (hasC) kpiCube[o + cOff] += 1;
+        kpiCube[o + r0] += v0; kpiCube[o + r1] += v1; kpiCube[o + r2] += v2; kpiCube[o + r3] += v3;
+      }
+      if (count > 0) { o = (bin1 * S0 + s0[row]) * stride; if (hasC) cb0[o + cOff] += 1; cb0[o + r0] += v0; cb0[o + r1] += v1; cb0[o + r2] += v2; cb0[o + r3] += v3; }
+      if (count > 1) { o = (bin1 * S1 + s1[row]) * stride; if (hasC) cb1[o + cOff] += 1; cb1[o + r0] += v0; cb1[o + r1] += v1; cb1[o + r2] += v2; cb1[o + r3] += v3; }
+      if (count > 2) { o = (bin1 * S2 + s2[row]) * stride; if (hasC) cb2[o + cOff] += 1; cb2[o + r0] += v0; cb2[o + r1] += v1; cb2[o + r2] += v2; cb2[o + r3] += v3; }
+      if (count > 3) { o = (bin1 * S3 + s3[row]) * stride; if (hasC) cb3[o + cOff] += 1; cb3[o + r0] += v0; cb3[o + r1] += v1; cb3[o + r2] += v2; cb3[o + r3] += v3; }
+      if (count > 4) { o = (bin1 * S4 + s4[row]) * stride; if (hasC) cb4[o + cOff] += 1; cb4[o + r0] += v0; cb4[o + r1] += v1; cb4[o + r2] += v2; cb4[o + r3] += v3; }
+    }
+    return true;
+  }
+
+  if (fLen === 1) {
+    var c0 = cols[0], o0 = offs[0];
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      bin1 = rowBins[j] + 1;
+      v0 = c0[row];
+      if (kpiCube) { o = bin1 * stride; if (hasC) kpiCube[o + cOff] += 1; kpiCube[o + o0] += v0; }
+      if (count > 0) { o = (bin1 * S0 + s0[row]) * stride; if (hasC) cb0[o + cOff] += 1; cb0[o + o0] += v0; }
+      if (count > 1) { o = (bin1 * S1 + s1[row]) * stride; if (hasC) cb1[o + cOff] += 1; cb1[o + o0] += v0; }
+      if (count > 2) { o = (bin1 * S2 + s2[row]) * stride; if (hasC) cb2[o + cOff] += 1; cb2[o + o0] += v0; }
+      if (count > 3) { o = (bin1 * S3 + s3[row]) * stride; if (hasC) cb3[o + cOff] += 1; cb3[o + o0] += v0; }
+      if (count > 4) { o = (bin1 * S4 + s4[row]) * stride; if (hasC) cb4[o + cOff] += 1; cb4[o + o0] += v0; }
+    }
+    return true;
+  }
+
+  if (fLen === 2) {
+    var a0 = cols[0], a1 = cols[1], p0 = offs[0], p1 = offs[1];
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      bin1 = rowBins[j] + 1;
+      v0 = a0[row]; v1 = a1[row];
+      if (kpiCube) { o = bin1 * stride; if (hasC) kpiCube[o + cOff] += 1; kpiCube[o + p0] += v0; kpiCube[o + p1] += v1; }
+      if (count > 0) { o = (bin1 * S0 + s0[row]) * stride; if (hasC) cb0[o + cOff] += 1; cb0[o + p0] += v0; cb0[o + p1] += v1; }
+      if (count > 1) { o = (bin1 * S1 + s1[row]) * stride; if (hasC) cb1[o + cOff] += 1; cb1[o + p0] += v0; cb1[o + p1] += v1; }
+      if (count > 2) { o = (bin1 * S2 + s2[row]) * stride; if (hasC) cb2[o + cOff] += 1; cb2[o + p0] += v0; cb2[o + p1] += v1; }
+      if (count > 3) { o = (bin1 * S3 + s3[row]) * stride; if (hasC) cb3[o + cOff] += 1; cb3[o + p0] += v0; cb3[o + p1] += v1; }
+      if (count > 4) { o = (bin1 * S4 + s4[row]) * stride; if (hasC) cb4[o + cOff] += 1; cb4[o + p0] += v0; cb4[o + p1] += v1; }
+    }
+    return true;
+  }
+
+  if (fLen === 3) {
+    var b0 = cols[0], b1 = cols[1], b2 = cols[2], q0 = offs[0], q1 = offs[1], q2 = offs[2];
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      bin1 = rowBins[j] + 1;
+      v0 = b0[row]; v1 = b1[row]; v2 = b2[row];
+      if (kpiCube) { o = bin1 * stride; if (hasC) kpiCube[o + cOff] += 1; kpiCube[o + q0] += v0; kpiCube[o + q1] += v1; kpiCube[o + q2] += v2; }
+      if (count > 0) { o = (bin1 * S0 + s0[row]) * stride; if (hasC) cb0[o + cOff] += 1; cb0[o + q0] += v0; cb0[o + q1] += v1; cb0[o + q2] += v2; }
+      if (count > 1) { o = (bin1 * S1 + s1[row]) * stride; if (hasC) cb1[o + cOff] += 1; cb1[o + q0] += v0; cb1[o + q1] += v1; cb1[o + q2] += v2; }
+      if (count > 2) { o = (bin1 * S2 + s2[row]) * stride; if (hasC) cb2[o + cOff] += 1; cb2[o + q0] += v0; cb2[o + q1] += v1; cb2[o + q2] += v2; }
+      if (count > 3) { o = (bin1 * S3 + s3[row]) * stride; if (hasC) cb3[o + cOff] += 1; cb3[o + q0] += v0; cb3[o + q1] += v1; cb3[o + q2] += v2; }
+      if (count > 4) { o = (bin1 * S4 + s4[row]) * stride; if (hasC) cb4[o + cOff] += 1; cb4[o + q0] += v0; cb4[o + q1] += v1; cb4[o + q2] += v2; }
+    }
+    return true;
+  }
+
+  if (fLen === 5) {
+    var e0 = cols[0], e1 = cols[1], e2 = cols[2], e3 = cols[3], e4 = cols[4];
+    var t0 = offs[0], t1 = offs[1], t2 = offs[2], t3 = offs[3], t4 = offs[4];
+    var v4;
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      bin1 = rowBins[j] + 1;
+      v0 = e0[row]; v1 = e1[row]; v2 = e2[row]; v3 = e3[row]; v4 = e4[row];
+      if (kpiCube) { o = bin1 * stride; if (hasC) kpiCube[o + cOff] += 1; kpiCube[o + t0] += v0; kpiCube[o + t1] += v1; kpiCube[o + t2] += v2; kpiCube[o + t3] += v3; kpiCube[o + t4] += v4; }
+      if (count > 0) { o = (bin1 * S0 + s0[row]) * stride; if (hasC) cb0[o + cOff] += 1; cb0[o + t0] += v0; cb0[o + t1] += v1; cb0[o + t2] += v2; cb0[o + t3] += v3; cb0[o + t4] += v4; }
+      if (count > 1) { o = (bin1 * S1 + s1[row]) * stride; if (hasC) cb1[o + cOff] += 1; cb1[o + t0] += v0; cb1[o + t1] += v1; cb1[o + t2] += v2; cb1[o + t3] += v3; cb1[o + t4] += v4; }
+      if (count > 2) { o = (bin1 * S2 + s2[row]) * stride; if (hasC) cb2[o + cOff] += 1; cb2[o + t0] += v0; cb2[o + t1] += v1; cb2[o + t2] += v2; cb2[o + t3] += v3; cb2[o + t4] += v4; }
+      if (count > 3) { o = (bin1 * S3 + s3[row]) * stride; if (hasC) cb3[o + cOff] += 1; cb3[o + t0] += v0; cb3[o + t1] += v1; cb3[o + t2] += v2; cb3[o + t3] += v3; cb3[o + t4] += v4; }
+      if (count > 4) { o = (bin1 * S4 + s4[row]) * stride; if (hasC) cb4[o + cOff] += 1; cb4[o + t0] += v0; cb4[o + t1] += v1; cb4[o + t2] += v2; cb4[o + t3] += v3; cb4[o + t4] += v4; }
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function createFalconBrushCache(dimSource, baseRows, n, candidateInfos, kpiInfo, getNumericColumn) {
+  var rowIndices = baseRows ? baseRows.indices : null;
+  var baseCount = baseRows ? baseRows.length : n;
+  if (baseCount <= 0) {
+    return null;
+  }
+
+  var mode = null; // 'discrete' | 'continuous'
+  var isNumeric = dimSource.isNumeric;
+  var rawVals = dimSource.rawVals; // Float64Array or null
+  var lazyCodes = dimSource.lazyCodes;
+  var lazyCodeToValue = dimSource.lazyCodeToValue;
+  var sortedVals = null;
+  var binCount = 0;
+  var splitters = null;
+  var binMin = null;
+  var binMax = null;
+  var binOffsets = null;
+  var binRows = null;
+  var rowBins = new Uint16Array(baseCount);
+  var prefixTotalCount;
+  var j, row, v, b;
+
+  if (lazyCodes) {
+    var codeLen = lazyCodeToValue.length;
+    if (codeLen - 1 > MAX_DISCRETE_BINS) {
+      return null;
+    }
+    var activeCodes = [];
+    var codeUsed = new Uint8Array(codeLen);
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      var c = lazyCodes[row];
+      if (!codeUsed[c]) {
+        codeUsed[c] = 1;
+        activeCodes.push(c);
+      }
+    }
+    if (activeCodes.length === 0 || activeCodes.length > MAX_DISCRETE_BINS) {
+      return null;
+    }
+    activeCodes.sort(function(a, b2) {
+      var va = lazyCodeToValue[a], vb = lazyCodeToValue[b2];
+      return va < vb ? -1 : va > vb ? 1 : a - b2;
+    });
+    binCount = activeCodes.length;
+    sortedVals = isNumeric ? new Float64Array(binCount) : new Array(binCount);
+    var codeToBin = new Int32Array(codeLen);
+    codeToBin.fill(-1);
+    for (b = 0; b < binCount; ++b) {
+      sortedVals[b] = lazyCodeToValue[activeCodes[b]];
+      codeToBin[activeCodes[b]] = b;
+    }
+    prefixTotalCount = new Uint32Array(binCount + 1);
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      b = codeToBin[lazyCodes[row]];
+      rowBins[j] = b;
+      prefixTotalCount[b + 1] += 1;
+    }
+    mode = 'discrete';
+  } else if (rawVals) {
+    // Probe uniqueness up to MAX_DISCRETE_BINS
+    var uniqMap = new Map();
+    var tooMany = false;
+    for (j = 0; j < baseCount; ++j) {
+      row = rowIndices ? rowIndices[j] : j;
+      v = rawVals[row];
+      if (!uniqMap.has(v)) {
+        if (uniqMap.size >= MAX_DISCRETE_BINS) {
+          tooMany = true;
+          break;
+        }
+        uniqMap.set(v, 0);
+      }
+    }
+
+    if (!tooMany) {
+      binCount = uniqMap.size;
+      sortedVals = new Float64Array(binCount);
+      var ui = 0;
+      uniqMap.forEach(function(_, key) { sortedVals[ui++] = key; });
+      sortedVals.sort();
+      for (b = 0; b < binCount; ++b) uniqMap.set(sortedVals[b], b);
+      prefixTotalCount = new Uint32Array(binCount + 1);
+      for (j = 0; j < baseCount; ++j) {
+        row = rowIndices ? rowIndices[j] : j;
+        b = uniqMap.get(rawVals[row]);
+        rowBins[j] = b;
+        prefixTotalCount[b + 1] += 1;
+      }
+      mode = 'discrete';
+    } else {
+      // Continuous exact quantile bins (B <= 256) + CSR per-bin row lists
+      var sampleSize = baseCount < 2048 ? baseCount : 2048;
+      var sample = new Float64Array(sampleSize);
+      var step = baseCount / sampleSize;
+      for (j = 0; j < sampleSize; ++j) {
+        var idx = Math.floor(j * step);
+        row = rowIndices ? rowIndices[idx] : idx;
+        sample[j] = rawVals[row];
+      }
+      sample.sort();
+      var rawSplits = [];
+      for (b = 1; b < CONTINUOUS_BINS; ++b) {
+        var sp = sample[Math.floor((b * sampleSize) / CONTINUOUS_BINS)];
+        if (rawSplits.length === 0 || sp > rawSplits[rawSplits.length - 1]) {
+          rawSplits.push(sp);
+        }
+      }
+      var splitCount = rawSplits.length;
+      splitters = Float64Array.from(rawSplits);
+      binCount = splitCount + 1;
+      binMin = new Float64Array(binCount);
+      binMax = new Float64Array(binCount);
+      binMin.fill(Infinity);
+      binMax.fill(-Infinity);
+      var binCounts = new Uint32Array(binCount);
+      prefixTotalCount = new Uint32Array(binCount + 1);
+
+      for (j = 0; j < baseCount; ++j) {
+        row = rowIndices ? rowIndices[j] : j;
+        v = rawVals[row];
+        b = findContinuousBin(splitters, splitCount, v);
+        rowBins[j] = b;
+        binCounts[b] += 1;
+        prefixTotalCount[b + 1] += 1;
+        if (v < binMin[b]) binMin[b] = v;
+        if (v > binMax[b]) binMax[b] = v;
+      }
+
+      binOffsets = new Uint32Array(binCount + 1);
+      for (b = 0; b < binCount; ++b) {
+        binOffsets[b + 1] = binOffsets[b] + binCounts[b];
+      }
+      binRows = new Uint32Array(baseCount);
+      var writePos = new Uint32Array(binOffsets.subarray(0, binCount));
+      for (j = 0; j < baseCount; ++j) {
+        row = rowIndices ? rowIndices[j] : j;
+        b = rowBins[j];
+        binRows[writePos[b]++] = row;
+      }
+      mode = 'continuous';
+    }
+  } else {
+    return null;
+  }
+
+  for (b = 1; b <= binCount; ++b) {
+    prefixTotalCount[b] += prefixTotalCount[b - 1];
+  }
+
+  // Select eligible charts within memory budget & !hasExtreme
+  var cubesByGroup = new Map();
+  var eligibleByPlan = Object.create(null);
+  var planKeys = [];
+  var fallbackEntries = [];
+
+  for (var gi = 0; gi < candidateInfos.length; ++gi) {
+    var info = candidateInfos[gi];
+    if (!info || !info.plan || !canPlanUseComplement(info.plan, getNumericColumn)) continue;
+    var doubles = (binCount + 1) * info.slotCount * info.plan.stride;
+    if (doubles > MAX_CUBE_DOUBLES) continue;
+    var entry = {
+      cube: new Float64Array(doubles),
+      groupRef: info.groupRef,
+      plan: info.plan,
+      prefixRowCounts: info.plan.countOffset < 0 ? new Uint32Array((binCount + 1) * info.slotCount) : null,
+      slotArr: info.slotArr,
+      slotCount: info.slotCount
+    };
+    cubesByGroup.set(info.groupRef, entry);
+    if (info.plan.canCoScan && info.plan.sumFields.length >= 1 && info.plan.sumFields.length <= 5) {
+      var pk = info.plan.coScanKey;
+      if (!eligibleByPlan[pk]) {
+        eligibleByPlan[pk] = [];
+        planKeys.push(pk);
+      }
+      eligibleByPlan[pk].push(entry);
+    } else {
+      fallbackEntries.push(entry);
+    }
+  }
+
+  var kpiEntry = null;
+  if (kpiInfo && kpiInfo.plan && canPlanUseComplement(kpiInfo.plan, getNumericColumn)) {
+    var kpiDoubles = (binCount + 1) * kpiInfo.plan.stride;
+    if (kpiDoubles <= MAX_CUBE_DOUBLES) {
+      kpiEntry = {
+        cube: new Float64Array(kpiDoubles),
+        groupRef: kpiInfo.groupRef,
+        plan: kpiInfo.plan,
+        slotCount: 1
+      };
+      cubesByGroup.set(kpiInfo.groupRef, kpiEntry);
+    }
+  }
+
+  if (cubesByGroup.size === 0) {
+    return null;
+  }
+
+  // Build cubes in fused passes by planKey!
+  var kpiBuilt = false;
+  for (var pki = 0; pki < planKeys.length; ++pki) {
+    var pKey = planKeys[pki];
+    var list = eligibleByPlan[pKey];
+    var plan = list[0].plan;
+    var matchKpiCube = (!kpiBuilt && kpiEntry && kpiEntry.plan.coScanKey === pKey) ? kpiEntry.cube : null;
+    var pos = 0;
+    var usedFused = false;
+    while (pos < list.length) {
+      var chunk = list.slice(pos, pos + 5);
+      var ok = buildSharedCubesPass(chunk, pos === 0 ? matchKpiCube : null, plan, getNumericColumn, rowIndices, rowBins, baseCount);
+      if (!ok) {
+        // hasNaN encountered -> fall back cleanly
+        for (var fi = pos; fi < list.length; ++fi) {
+          list[fi].cube.fill(0);
+          fallbackEntries.push(list[fi]);
+        }
+        if (pos === 0 && matchKpiCube) {
+          matchKpiCube.fill(0);
+          matchKpiCube = null;
+        }
+        usedFused = false;
+        break;
+      }
+      usedFused = true;
+      pos += chunk.length;
+    }
+    if (usedFused) {
+      if (matchKpiCube) {
+        kpiBuilt = true;
+        if (plan.extraAvgOffs.length > 0 && plan.fastCountOff >= 0) {
+          for (b = 0; b <= binCount; ++b) {
+            var kv = matchKpiCube[b * plan.stride + plan.fastCountOff];
+            for (var ke = 0; ke < plan.extraAvgOffs.length; ++ke) matchKpiCube[b * plan.stride + plan.extraAvgOffs[ke]] = kv;
+          }
+        }
+      }
+      if (plan.extraAvgOffs.length > 0 && plan.fastCountOff >= 0) {
+        for (var li = 0; li < list.length; ++li) {
+          var le = list[li];
+          var cells = (binCount + 1) * le.slotCount;
+          for (var ci = 0, cb = 0; ci < cells; ++ci, cb += plan.stride) {
+            var lv = le.cube[cb + plan.fastCountOff];
+            for (var ee = 0; ee < plan.extraAvgOffs.length; ++ee) le.cube[cb + plan.extraAvgOffs[ee]] = lv;
+          }
+        }
+      }
+    }
+  }
+
+  for (var fbi = 0; fbi < fallbackEntries.length; ++fbi) {
+    var fe = fallbackEntries[fbi];
+    accumulateRowsIntoCube(fe.cube, binCount, fe.slotCount, fe.plan.stride, fe.plan, getNumericColumn, fe.slotArr, rowIndices, rowBins, baseCount);
+  }
+  if (kpiEntry && !kpiBuilt) {
+    accumulateRowsIntoCube(kpiEntry.cube, binCount, 1, kpiEntry.plan.stride, kpiEntry.plan, getNumericColumn, null, rowIndices, rowBins, baseCount);
+  }
+
+  // Populate prefixRowCounts for groups without OP_COUNT, and compute 1D prefix sums along bins!
+  cubesByGroup.forEach(function(ce) {
+    if (ce.prefixRowCounts) {
+      var prc = ce.prefixRowCounts;
+      var sArr = ce.slotArr;
+      var sCnt = ce.slotCount;
+      for (j = 0; j < baseCount; ++j) {
+        row = rowIndices ? rowIndices[j] : j;
+        prc[(rowBins[j] + 1) * sCnt + sArr[row]] += 1;
+      }
+      prefixSumUint32(prc, binCount, sCnt);
+    }
+    prefixSumCube(ce.cube, binCount, ce.slotCount * ce.plan.stride);
+  });
+
+  // Free temporary rowBins array immediately!
+  rowBins = null;
+
+  var boundaryBuf = mode === 'continuous' ? new Uint32Array(Math.max(64, (baseCount >>> 6) + 64)) : null;
+
+  function resolveRangeQuery(queryKind, lo, hi) {
+    var fullLo = 0, fullHi = 0, boundaryLen = 0;
+    if (mode === 'discrete') {
+      if (queryKind === 'exact') {
+        var pos = isNumeric ? bisectLeftNumeric(sortedVals, binCount, lo) : bisectLeftString(sortedVals, binCount, lo);
+        if (pos < binCount && sortedVals[pos] === lo) {
+          fullLo = pos;
+          fullHi = pos + 1;
+        }
+      } else {
+        if (lo < hi) {
+          fullLo = isNumeric ? bisectLeftNumeric(sortedVals, binCount, lo) : bisectLeftString(sortedVals, binCount, lo);
+          fullHi = isNumeric ? bisectLeftNumeric(sortedVals, binCount, hi) : bisectLeftString(sortedVals, binCount, hi);
+          if (fullHi < fullLo) fullHi = fullLo;
+        }
+      }
+      return { boundaryLen: 0, fullHi: fullHi, fullLo: fullLo };
+    }
+
+    // Continuous mode
+    if (queryKind === 'exact') {
+      var eb = findContinuousBin(splitters, splitters.length, lo);
+      if (eb < binCount && binMin[eb] <= lo && binMax[eb] >= lo) {
+        var eStart = binOffsets[eb], eEnd = binOffsets[eb + 1];
+        if (boundaryBuf.length < eEnd - eStart) boundaryBuf = new Uint32Array(eEnd - eStart);
+        for (var ei = eStart; ei < eEnd; ++ei) {
+          var er = binRows[ei];
+          if (rawVals[er] === lo) boundaryBuf[boundaryLen++] = er;
+        }
+      }
+      return { boundaryLen: boundaryLen, fullHi: 0, fullLo: 0 };
+    }
+
+    if (!(lo < hi)) {
+      return { boundaryLen: 0, fullHi: 0, fullLo: 0 };
+    }
+
+    var firstFull = -1, lastFull = -1;
+    var pStart, pEnd, pi, pr, pv;
+    for (b = 0; b < binCount; ++b) {
+      var bLo = binMin[b], bHi = binMax[b];
+      if (bLo > bHi) continue; // empty bin
+      if (bHi < lo) continue;
+      if (bLo >= hi) break;
+      if (bLo >= lo && bHi < hi) {
+        if (firstFull < 0) firstFull = b;
+        lastFull = b;
+      } else {
+        pStart = binOffsets[b];
+        pEnd = binOffsets[b + 1];
+        var need = boundaryLen + (pEnd - pStart);
+        if (boundaryBuf.length < need) {
+          var grown = new Uint32Array(need << 1);
+          grown.set(boundaryBuf.subarray(0, boundaryLen));
+          boundaryBuf = grown;
+        }
+        for (pi = pStart; pi < pEnd; ++pi) {
+          pr = binRows[pi];
+          pv = rawVals[pr];
+          if (pv >= lo && pv < hi) {
+            boundaryBuf[boundaryLen++] = pr;
+          }
+        }
+      }
+    }
+    if (firstFull >= 0) {
+      fullLo = firstFull;
+      fullHi = lastFull + 1;
+    }
+    return { boundaryLen: boundaryLen, fullHi: fullHi, fullLo: fullLo };
+  }
+
+  function applyPrefixToEntry(ce, targetBuffers, fullLo, fullHi) {
+    var data = targetBuffers.data;
+    var stride = ce.plan.stride;
+    var slotCount = ce.slotCount;
+    var rowStride = slotCount * stride;
+    var cube = ce.cube;
+    var k;
+    if (fullHi > fullLo) {
+      if (slotCount === 1 && prefixTotalCount[fullHi] - prefixTotalCount[fullLo] <= 0) {
+        data.fill(0, 0, stride);
+        return;
+      }
+      var oLo = fullLo * rowStride;
+      var oHi = fullHi * rowStride;
+      for (k = 0; k < rowStride; ++k) {
+        data[k] = cube[oHi + k] - cube[oLo + k];
+      }
+      var cOff = ce.plan.countOffset;
+      if (cOff >= 0) {
+        for (var s = 0, base = 0; s < slotCount; ++s, base += stride) {
+          if (data[base + cOff] <= 0) {
+            for (k = 0; k < stride; ++k) data[base + k] = 0;
+          }
+        }
+      } else if (ce.prefixRowCounts) {
+        var prc = ce.prefixRowCounts;
+        var cLo = fullLo * slotCount, cHi = fullHi * slotCount;
+        for (var s2 = 0, base2 = 0; s2 < slotCount; ++s2, base2 += stride) {
+          if (prc[cHi + s2] - prc[cLo + s2] <= 0) {
+            for (k = 0; k < stride; ++k) data[base2 + k] = 0;
+          }
+        }
+      }
+    } else {
+      data.fill(0, 0, rowStride);
+    }
+  }
+
+  function applyQueryBatch(queryKind, lo, hi, targetInfos, kpiInfoArg) {
+    var resolved = resolveRangeQuery(queryKind, lo, hi);
+    var fullLo = resolved.fullLo;
+    var fullHi = resolved.fullHi;
+    var bLen = resolved.boundaryLen;
+    var appliedCount = 0;
+
+    // Group boundary work by planKey for co-scan!
+    var bndByPlan = bLen > 0 ? Object.create(null) : null;
+    var bndPlanKeys = bLen > 0 ? [] : null;
+    var bndFallback = bLen > 0 ? [] : null;
+    var kpiBndEntry = null;
+    var i, info, ce;
+
+    for (i = 0; i < targetInfos.length; ++i) {
+      info = targetInfos[i];
+      ce = cubesByGroup.get(info.groupRef);
+      if (!ce) continue;
+      info.ensureBuffers();
+      applyPrefixToEntry(ce, info.buffers, fullLo, fullHi);
+      if (bLen > 0) {
+        if (ce.plan.canCoScan) {
+          var pk = ce.plan.coScanKey;
+          if (!bndByPlan[pk]) {
+            bndByPlan[pk] = [];
+            bndPlanKeys.push(pk);
+          }
+          bndByPlan[pk].push(info);
+        } else {
+          bndFallback.push(info);
+        }
+      } else {
+        info.commit(false);
+      }
+      appliedCount += 1;
+    }
+
+    var kpiApplied = false;
+    if (kpiInfoArg && kpiEntry && kpiInfoArg.groupRef === kpiEntry.groupRef) {
+      kpiInfoArg.ensureBuffers();
+      applyPrefixToEntry(kpiEntry, kpiInfoArg.buffers, fullLo, fullHi);
+      if (bLen > 0) {
+        kpiBndEntry = kpiInfoArg;
+      } else {
+        kpiInfoArg.commit(false);
+      }
+      kpiApplied = true;
+    }
+
+    if (bLen > 0) {
+      var kpiDone = false;
+      for (i = 0; i < bndPlanKeys.length; ++i) {
+        var bKey = bndPlanKeys[i];
+        var bList = bndByPlan[bKey];
+        var matchKpi = (!kpiDone && kpiBndEntry && kpiBndEntry.plan.coScanKey === bKey) ? kpiBndEntry : null;
+        if (bList.length >= 2 || matchKpi) {
+          reduceMultiGroupsIndexed(bList, matchKpi ? matchKpi.buffers : null, bList[0].plan, getNumericColumn, boundaryBuf, bLen, 1);
+          if (matchKpi) { matchKpi.commit(false); kpiDone = true; }
+        } else {
+          reduceGroupedIndexed(bList[0].buffers, bList[0].plan, getNumericColumn, bList[0].slotArr, boundaryBuf, bLen, 1, bList[0].slotCount);
+        }
+        for (var bi = 0; bi < bList.length; ++bi) {
+          bList[bi].commit(false);
+        }
+      }
+      for (i = 0; i < bndFallback.length; ++i) {
+        var bf = bndFallback[i];
+        reduceGroupedIndexed(bf.buffers, bf.plan, getNumericColumn, bf.slotArr, boundaryBuf, bLen, 1, bf.slotCount);
+        bf.commit(false);
+      }
+      if (kpiBndEntry && !kpiDone) {
+        reduceScalarIndexed(kpiBndEntry.buffers, kpiBndEntry.plan, getNumericColumn, boundaryBuf, bLen, 1);
+        kpiBndEntry.commit(false);
+      }
+    }
+
+    return {
+      appliedCount: appliedCount,
+      kpiApplied: kpiApplied,
+      totalCount: (fullHi > fullLo ? prefixTotalCount[fullHi] - prefixTotalCount[fullLo] : 0) + bLen
+    };
+  }
+
+  function applyQuerySingle(queryKind, lo, hi, info) {
+    var ce = cubesByGroup.get(info.groupRef);
+    if (!ce) return false;
+    var resolved = resolveRangeQuery(queryKind, lo, hi);
+    info.ensureBuffers();
+    applyPrefixToEntry(ce, info.buffers, resolved.fullLo, resolved.fullHi);
+    if (resolved.boundaryLen > 0) {
+      if (ce.slotCount === 1 && !info.slotArr) {
+        reduceScalarIndexed(info.buffers, ce.plan, getNumericColumn, boundaryBuf, resolved.boundaryLen, 1);
+      } else {
+        reduceGroupedIndexed(info.buffers, ce.plan, getNumericColumn, ce.slotArr, boundaryBuf, resolved.boundaryLen, 1, ce.slotCount);
+      }
+    }
+    return true;
+  }
+
+  function queryCount(queryKind, lo, hi) {
+    var resolved = resolveRangeQuery(queryKind, lo, hi);
+    return (resolved.fullHi > resolved.fullLo ? prefixTotalCount[resolved.fullHi] - prefixTotalCount[resolved.fullLo] : 0) + resolved.boundaryLen;
+  }
+
+  return {
+    applyQueryBatch: applyQueryBatch,
+    applyQuerySingle: applyQuerySingle,
+    hasGroup: function(groupRef) { return cubesByGroup.has(groupRef); },
+    mode: mode,
+    queryCount: queryCount
+  };
+}
 
 var cr_identity = d => {
   return d;
@@ -1321,1834 +5318,6 @@ function getWasmRuntimeInfo() {
   return defaultRuntimeController.runtimeInfo();
 }
 
-var OP_COUNT = 0;
-var OP_SUM = 1;
-var OP_AVG = 2;
-var OP_AVG_NON_ZERO = 3;
-var OP_RATIO = 4;
-
-function compileMetricPlan(metricSpec) {
-  var count = metricSpec.length;
-  var ops = new Uint8Array(count);
-  var ids = new Array(count);
-  var fields = new Array(count);
-  var denominators = new Array(count);
-  var hidden = new Uint8Array(count);
-  var primarySumSourceIdx = new Int32Array(count);
-  var primarySumSourceSec = new Uint8Array(count);
-  var denomSumSourceIdx = new Int32Array(count);
-  var denomSumSourceSec = new Uint8Array(count);
-  var avgCountSourceIdx = new Int32Array(count);
-  var sumSourceByField = Object.create(null);
-  var avgSourceByField = Object.create(null);
-  var firstCountIndex = -1;
-  var fusedSumIndex = -1;
-  var firstAvgIndex = -1;
-  var i, metric, op, field, denom, src;
-
-  primarySumSourceIdx.fill(-1);
-  denomSumSourceIdx.fill(-1);
-  avgCountSourceIdx.fill(-1);
-
-  for (i = 0; i < count; ++i) {
-    metric = metricSpec[i];
-    ids[i] = metric.id;
-    field = metric.field || null;
-    denom = metric.denominator || null;
-    fields[i] = field;
-    denominators[i] = denom;
-    hidden[i] = metric.hidden ? 1 : 0;
-    switch (metric.op) {
-      case 'count':
-        op = OP_COUNT;
-        if (firstCountIndex < 0) firstCountIndex = i;
-        break;
-      case 'sum':
-        op = OP_SUM;
-        if (field) {
-          src = sumSourceByField[field];
-          if (src) {
-            primarySumSourceIdx[i] = src.idx;
-            primarySumSourceSec[i] = src.sec;
-          } else {
-            sumSourceByField[field] = { idx: i, sec: 0 };
-            if (fusedSumIndex < 0) fusedSumIndex = i;
-          }
-        }
-        break;
-      case 'avg':
-        op = OP_AVG;
-        if (field) {
-          src = sumSourceByField[field];
-          if (src) {
-            primarySumSourceIdx[i] = src.idx;
-            primarySumSourceSec[i] = src.sec;
-          } else {
-            sumSourceByField[field] = { idx: i, sec: 0 };
-            if (firstAvgIndex < 0) firstAvgIndex = i;
-          }
-          if (avgSourceByField[field] !== undefined) {
-            avgCountSourceIdx[i] = avgSourceByField[field];
-          } else {
-            avgSourceByField[field] = i;
-          }
-        }
-        break;
-      case 'avgNonZero':
-        op = OP_AVG_NON_ZERO;
-        break;
-      case 'ratio':
-        op = OP_RATIO;
-        if (field) {
-          src = sumSourceByField[field];
-          if (src) {
-            primarySumSourceIdx[i] = src.idx;
-            primarySumSourceSec[i] = src.sec;
-          } else {
-            sumSourceByField[field] = { idx: i, sec: 0 };
-          }
-        }
-        if (denom) {
-          src = sumSourceByField[denom];
-          if (src && src.idx < i) {
-            denomSumSourceIdx[i] = src.idx;
-            denomSumSourceSec[i] = src.sec;
-          } else if (!src) {
-            sumSourceByField[denom] = { idx: i, sec: 1 };
-          }
-        }
-        break;
-      default:
-        op = OP_COUNT;
-    }
-    ops[i] = op;
-  }
-
-  return {
-    avgCountSourceIdx: avgCountSourceIdx,
-    count: count,
-    denomSumSourceIdx: denomSumSourceIdx,
-    denomSumSourceSec: denomSumSourceSec,
-    denominators: denominators,
-    fields: fields,
-    firstCountIndex: firstCountIndex,
-    fusedAvgIndex: firstCountIndex >= 0 && fusedSumIndex < 0 ? firstAvgIndex : -1,
-    fusedSumIndex: firstCountIndex >= 0 ? fusedSumIndex : -1,
-    hidden: hidden,
-    ids: ids,
-    ops: ops,
-    primarySumSourceIdx: primarySumSourceIdx,
-    primarySumSourceSec: primarySumSourceSec,
-    spec: metricSpec
-  };
-}
-
-function ensureMetricBuffers(buffers, plan, required, preserve) {
-  var count = plan.count;
-  var ops = plan.ops;
-  var i, nextCap, nextPrimary, nextSecondary, copyLen;
-
-  if (buffers && buffers.capacity >= required) {
-    return buffers;
-  }
-
-  if (buffers && buffers.capacity > 0) {
-    nextCap = buffers.capacity;
-    while (nextCap < required) {
-      nextCap = nextCap < 65536 ? nextCap * 2 : required;
-    }
-  } else {
-    nextCap = required < 64 ? 64 : required;
-  }
-
-  var primary = new Array(count);
-  var secondary = new Array(count);
-  copyLen = preserve && buffers ? buffers.capacity : 0;
-
-  for (i = 0; i < count; ++i) {
-    nextPrimary = new Float64Array(nextCap);
-    if (copyLen > 0) {
-      nextPrimary.set(buffers.primary[i].subarray(0, copyLen));
-    }
-    primary[i] = nextPrimary;
-
-    if (ops[i] === OP_AVG || ops[i] === OP_AVG_NON_ZERO || ops[i] === OP_RATIO) {
-      nextSecondary = new Float64Array(nextCap);
-      if (copyLen > 0) {
-        nextSecondary.set(buffers.secondary[i].subarray(0, copyLen));
-      }
-      secondary[i] = nextSecondary;
-    } else {
-      secondary[i] = null;
-    }
-  }
-
-  return {
-    capacity: nextCap,
-    primary: primary,
-    secondary: secondary
-  };
-}
-
-function zeroMetricBuffers(buffers, slotCount) {
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var i;
-  for (i = 0; i < primary.length; ++i) {
-    primary[i].fill(0, 0, slotCount);
-    if (secondary[i]) {
-      secondary[i].fill(0, 0, slotCount);
-    }
-  }
-}
-
-// ============================================================================
-// Grouped-All leaf kernels (small functions for immediate V8 JIT compilation)
-// ============================================================================
-
-function gCountAll(acc, groupIds, n) {
-  for (var i = 0; i < n; ++i) acc[groupIds[i]] += 1;
-}
-
-function gCountSumAll(cntAcc, sumAcc, groupIds, vals, hasNaN, n) {
-  var i, g, v;
-  if (!hasNaN) {
-    for (i = 0; i < n; ++i) {
-      g = groupIds[i];
-      cntAcc[g] += 1;
-      sumAcc[g] += vals[i];
-    }
-  } else {
-    for (i = 0; i < n; ++i) {
-      g = groupIds[i];
-      cntAcc[g] += 1;
-      v = vals[i];
-      if (v === v) sumAcc[g] += v;
-    }
-  }
-}
-
-function gSumAll(acc, groupIds, vals, hasNaN, n) {
-  var i, v;
-  if (!hasNaN) {
-    for (i = 0; i < n; ++i) acc[groupIds[i]] += vals[i];
-  } else {
-    for (i = 0; i < n; ++i) {
-      v = vals[i];
-      if (v === v) acc[groupIds[i]] += v;
-    }
-  }
-}
-
-function gValidCountAll(acc, groupIds, vals, n) {
-  var i, v;
-  for (i = 0; i < n; ++i) {
-    v = vals[i];
-    if (v === v) acc[groupIds[i]] += 1;
-  }
-}
-
-function gAvgAll(acc, acc2, groupIds, vals, hasNaN, n) {
-  var i, g, v;
-  if (!hasNaN) {
-    for (i = 0; i < n; ++i) {
-      g = groupIds[i];
-      acc[g] += vals[i];
-      acc2[g] += 1;
-    }
-  } else {
-    for (i = 0; i < n; ++i) {
-      v = vals[i];
-      if (v === v) {
-        g = groupIds[i];
-        acc[g] += v;
-        acc2[g] += 1;
-      }
-    }
-  }
-}
-
-function gAvgNzAll(acc, acc2, groupIds, vals, hasNaN, n) {
-  var i, g, v;
-  if (!hasNaN) {
-    for (i = 0; i < n; ++i) {
-      v = vals[i];
-      if (v !== 0) {
-        g = groupIds[i];
-        acc[g] += v;
-        acc2[g] += 1;
-      }
-    }
-  } else {
-    for (i = 0; i < n; ++i) {
-      v = vals[i];
-      if (v === v && v !== 0) {
-        g = groupIds[i];
-        acc[g] += v;
-        acc2[g] += 1;
-      }
-    }
-  }
-}
-
-function gRatioAll(acc, acc2, groupIds, vals, hasNaN, vals2, hasNaN2, n) {
-  var i, g, v, v2;
-  if (!hasNaN && !hasNaN2) {
-    for (i = 0; i < n; ++i) {
-      g = groupIds[i];
-      acc[g] += vals[i];
-      acc2[g] += vals2[i];
-    }
-  } else {
-    for (i = 0; i < n; ++i) {
-      g = groupIds[i];
-      v = vals[i];
-      if (v === v) acc[g] += v;
-      v2 = vals2[i];
-      if (v2 === v2) acc2[g] += v2;
-    }
-  }
-}
-
-// ============================================================================
-// Grouped-Indexed leaf kernels
-// ============================================================================
-
-function gCountIdx(acc, groupIds, rowIndexes, rowCount, add) {
-  var j;
-  if (add) {
-    for (j = 0; j < rowCount; ++j) acc[groupIds[rowIndexes[j]]] += 1;
-  } else {
-    for (j = 0; j < rowCount; ++j) acc[groupIds[rowIndexes[j]]] -= 1;
-  }
-}
-
-function gCountSumIdx(cntAcc, sumAcc, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
-  var j, idx, g, v;
-  if (add) {
-    if (!hasNaN) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        g = groupIds[idx];
-        cntAcc[g] += 1;
-        sumAcc[g] += vals[idx];
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        g = groupIds[idx];
-        cntAcc[g] += 1;
-        v = vals[idx];
-        if (v === v) sumAcc[g] += v;
-      }
-    }
-  } else if (!hasNaN) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      g = groupIds[idx];
-      cntAcc[g] -= 1;
-      sumAcc[g] -= vals[idx];
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      g = groupIds[idx];
-      cntAcc[g] -= 1;
-      v = vals[idx];
-      if (v === v) sumAcc[g] -= v;
-    }
-  }
-}
-
-function gSumIdx(acc, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
-  var j, idx, v;
-  if (add) {
-    if (!hasNaN) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        acc[groupIds[idx]] += vals[idx];
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        v = vals[idx];
-        if (v === v) acc[groupIds[idx]] += v;
-      }
-    }
-  } else if (!hasNaN) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      acc[groupIds[idx]] -= vals[idx];
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      v = vals[idx];
-      if (v === v) acc[groupIds[idx]] -= v;
-    }
-  }
-}
-
-function gValidCountIdx(acc, groupIds, vals, rowIndexes, rowCount) {
-  var j, idx, v;
-  for (j = 0; j < rowCount; ++j) {
-    idx = rowIndexes[j];
-    v = vals[idx];
-    if (v === v) acc[groupIds[idx]] += 1;
-  }
-}
-
-function gAvgIdx(acc, acc2, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
-  var j, idx, g, v;
-  if (add) {
-    if (!hasNaN) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        g = groupIds[idx];
-        acc[g] += vals[idx];
-        acc2[g] += 1;
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        v = vals[idx];
-        if (v === v) {
-          g = groupIds[idx];
-          acc[g] += v;
-          acc2[g] += 1;
-        }
-      }
-    }
-  } else if (!hasNaN) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      g = groupIds[idx];
-      acc[g] -= vals[idx];
-      acc2[g] -= 1;
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      v = vals[idx];
-      if (v === v) {
-        g = groupIds[idx];
-        acc[g] -= v;
-        acc2[g] -= 1;
-      }
-    }
-  }
-}
-
-function gAvgNzIdx(acc, acc2, groupIds, vals, hasNaN, rowIndexes, rowCount, add) {
-  var j, idx, g, v;
-  if (add) {
-    if (!hasNaN) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        v = vals[idx];
-        if (v !== 0) {
-          g = groupIds[idx];
-          acc[g] += v;
-          acc2[g] += 1;
-        }
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        v = vals[idx];
-        if (v === v && v !== 0) {
-          g = groupIds[idx];
-          acc[g] += v;
-          acc2[g] += 1;
-        }
-      }
-    }
-  } else if (!hasNaN) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      v = vals[idx];
-      if (v !== 0) {
-        g = groupIds[idx];
-        acc[g] -= v;
-        acc2[g] -= 1;
-      }
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      v = vals[idx];
-      if (v === v && v !== 0) {
-        g = groupIds[idx];
-        acc[g] -= v;
-        acc2[g] -= 1;
-      }
-    }
-  }
-}
-
-function gRatioIdx(acc, acc2, groupIds, vals, hasNaN, vals2, hasNaN2, rowIndexes, rowCount, add) {
-  var j, idx, g, v, v2;
-  if (add) {
-    if (!hasNaN && !hasNaN2) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        g = groupIds[idx];
-        acc[g] += vals[idx];
-        acc2[g] += vals2[idx];
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        g = groupIds[idx];
-        v = vals[idx];
-        if (v === v) acc[g] += v;
-        v2 = vals2[idx];
-        if (v2 === v2) acc2[g] += v2;
-      }
-    }
-  } else if (!hasNaN && !hasNaN2) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      g = groupIds[idx];
-      acc[g] -= vals[idx];
-      acc2[g] -= vals2[idx];
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      g = groupIds[idx];
-      v = vals[idx];
-      if (v === v) acc[g] -= v;
-      v2 = vals2[idx];
-      if (v2 === v2) acc2[g] -= v2;
-    }
-  }
-}
-
-// ============================================================================
-// Split-Dense-All leaf kernels
-// ============================================================================
-
-function sCountAll(acc, groupIds, splitCodes, stride, n) {
-  for (var i = 0; i < n; ++i) acc[groupIds[i] * stride + splitCodes[i]] += 1;
-}
-
-function sCountSumAll(cntAcc, sumAcc, groupIds, splitCodes, stride, vals, hasNaN, n) {
-  var i, cell, v;
-  if (!hasNaN) {
-    for (i = 0; i < n; ++i) {
-      cell = groupIds[i] * stride + splitCodes[i];
-      cntAcc[cell] += 1;
-      sumAcc[cell] += vals[i];
-    }
-  } else {
-    for (i = 0; i < n; ++i) {
-      cell = groupIds[i] * stride + splitCodes[i];
-      cntAcc[cell] += 1;
-      v = vals[i];
-      if (v === v) sumAcc[cell] += v;
-    }
-  }
-}
-
-function sSumAll(acc, groupIds, splitCodes, stride, vals, hasNaN, n) {
-  var i, v;
-  if (!hasNaN) {
-    for (i = 0; i < n; ++i) acc[groupIds[i] * stride + splitCodes[i]] += vals[i];
-  } else {
-    for (i = 0; i < n; ++i) {
-      v = vals[i];
-      if (v === v) acc[groupIds[i] * stride + splitCodes[i]] += v;
-    }
-  }
-}
-
-function sValidCountAll(acc, groupIds, splitCodes, stride, vals, n) {
-  var i, v;
-  for (i = 0; i < n; ++i) {
-    v = vals[i];
-    if (v === v) acc[groupIds[i] * stride + splitCodes[i]] += 1;
-  }
-}
-
-function sAvgAll(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, n) {
-  var i, cell, v;
-  if (!hasNaN) {
-    for (i = 0; i < n; ++i) {
-      cell = groupIds[i] * stride + splitCodes[i];
-      acc[cell] += vals[i];
-      acc2[cell] += 1;
-    }
-  } else {
-    for (i = 0; i < n; ++i) {
-      v = vals[i];
-      if (v === v) {
-        cell = groupIds[i] * stride + splitCodes[i];
-        acc[cell] += v;
-        acc2[cell] += 1;
-      }
-    }
-  }
-}
-
-function sAvgNzAll(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, n) {
-  var i, cell, v;
-  if (!hasNaN) {
-    for (i = 0; i < n; ++i) {
-      v = vals[i];
-      if (v !== 0) {
-        cell = groupIds[i] * stride + splitCodes[i];
-        acc[cell] += v;
-        acc2[cell] += 1;
-      }
-    }
-  } else {
-    for (i = 0; i < n; ++i) {
-      v = vals[i];
-      if (v === v && v !== 0) {
-        cell = groupIds[i] * stride + splitCodes[i];
-        acc[cell] += v;
-        acc2[cell] += 1;
-      }
-    }
-  }
-}
-
-function sRatioAll(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, vals2, hasNaN2, n) {
-  var i, cell, v, v2;
-  if (!hasNaN && !hasNaN2) {
-    for (i = 0; i < n; ++i) {
-      cell = groupIds[i] * stride + splitCodes[i];
-      acc[cell] += vals[i];
-      acc2[cell] += vals2[i];
-    }
-  } else {
-    for (i = 0; i < n; ++i) {
-      cell = groupIds[i] * stride + splitCodes[i];
-      v = vals[i];
-      if (v === v) acc[cell] += v;
-      v2 = vals2[i];
-      if (v2 === v2) acc2[cell] += v2;
-    }
-  }
-}
-
-// ============================================================================
-// Split-Dense-Indexed leaf kernels
-// ============================================================================
-
-function sCountIdx(acc, groupIds, splitCodes, stride, rowIndexes, rowCount, add) {
-  var j, idx;
-  if (add) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      acc[groupIds[idx] * stride + splitCodes[idx]] -= 1;
-    }
-  }
-}
-
-function sCountSumIdx(cntAcc, sumAcc, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
-  var j, idx, cell, v;
-  if (add) {
-    if (!hasNaN) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        cell = groupIds[idx] * stride + splitCodes[idx];
-        cntAcc[cell] += 1;
-        sumAcc[cell] += vals[idx];
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        cell = groupIds[idx] * stride + splitCodes[idx];
-        cntAcc[cell] += 1;
-        v = vals[idx];
-        if (v === v) sumAcc[cell] += v;
-      }
-    }
-  } else if (!hasNaN) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      cell = groupIds[idx] * stride + splitCodes[idx];
-      cntAcc[cell] -= 1;
-      sumAcc[cell] -= vals[idx];
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      cell = groupIds[idx] * stride + splitCodes[idx];
-      cntAcc[cell] -= 1;
-      v = vals[idx];
-      if (v === v) sumAcc[cell] -= v;
-    }
-  }
-}
-
-function sSumIdx(acc, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
-  var j, idx, v;
-  if (add) {
-    if (!hasNaN) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        acc[groupIds[idx] * stride + splitCodes[idx]] += vals[idx];
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        v = vals[idx];
-        if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] += v;
-      }
-    }
-  } else if (!hasNaN) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      acc[groupIds[idx] * stride + splitCodes[idx]] -= vals[idx];
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      v = vals[idx];
-      if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] -= v;
-    }
-  }
-}
-
-function sValidCountIdx(acc, groupIds, splitCodes, stride, vals, rowIndexes, rowCount) {
-  var j, idx, v;
-  for (j = 0; j < rowCount; ++j) {
-    idx = rowIndexes[j];
-    v = vals[idx];
-    if (v === v) acc[groupIds[idx] * stride + splitCodes[idx]] += 1;
-  }
-}
-
-function sAvgIdx(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
-  var j, idx, cell, v;
-  if (add) {
-    if (!hasNaN) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        cell = groupIds[idx] * stride + splitCodes[idx];
-        acc[cell] += vals[idx];
-        acc2[cell] += 1;
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        v = vals[idx];
-        if (v === v) {
-          cell = groupIds[idx] * stride + splitCodes[idx];
-          acc[cell] += v;
-          acc2[cell] += 1;
-        }
-      }
-    }
-  } else if (!hasNaN) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      cell = groupIds[idx] * stride + splitCodes[idx];
-      acc[cell] -= vals[idx];
-      acc2[cell] -= 1;
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      v = vals[idx];
-      if (v === v) {
-        cell = groupIds[idx] * stride + splitCodes[idx];
-        acc[cell] -= v;
-        acc2[cell] -= 1;
-      }
-    }
-  }
-}
-
-function sAvgNzIdx(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, rowIndexes, rowCount, add) {
-  var j, idx, cell, v;
-  if (add) {
-    if (!hasNaN) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        v = vals[idx];
-        if (v !== 0) {
-          cell = groupIds[idx] * stride + splitCodes[idx];
-          acc[cell] += v;
-          acc2[cell] += 1;
-        }
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        v = vals[idx];
-        if (v === v && v !== 0) {
-          cell = groupIds[idx] * stride + splitCodes[idx];
-          acc[cell] += v;
-          acc2[cell] += 1;
-        }
-      }
-    }
-  } else if (!hasNaN) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      v = vals[idx];
-      if (v !== 0) {
-        cell = groupIds[idx] * stride + splitCodes[idx];
-        acc[cell] -= v;
-        acc2[cell] -= 1;
-      }
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      v = vals[idx];
-      if (v === v && v !== 0) {
-        cell = groupIds[idx] * stride + splitCodes[idx];
-        acc[cell] -= v;
-        acc2[cell] -= 1;
-      }
-    }
-  }
-}
-
-function sRatioIdx(acc, acc2, groupIds, splitCodes, stride, vals, hasNaN, vals2, hasNaN2, rowIndexes, rowCount, add) {
-  var j, idx, cell, v, v2;
-  if (add) {
-    if (!hasNaN && !hasNaN2) {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        cell = groupIds[idx] * stride + splitCodes[idx];
-        acc[cell] += vals[idx];
-        acc2[cell] += vals2[idx];
-      }
-    } else {
-      for (j = 0; j < rowCount; ++j) {
-        idx = rowIndexes[j];
-        cell = groupIds[idx] * stride + splitCodes[idx];
-        v = vals[idx];
-        if (v === v) acc[cell] += v;
-        v2 = vals2[idx];
-        if (v2 === v2) acc2[cell] += v2;
-      }
-    }
-  } else if (!hasNaN && !hasNaN2) {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      cell = groupIds[idx] * stride + splitCodes[idx];
-      acc[cell] -= vals[idx];
-      acc2[cell] -= vals2[idx];
-    }
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      idx = rowIndexes[j];
-      cell = groupIds[idx] * stride + splitCodes[idx];
-      v = vals[idx];
-      if (v === v) acc[cell] -= v;
-      v2 = vals2[idx];
-      if (v2 === v2) acc2[cell] -= v2;
-    }
-  }
-}
-
-// ============================================================================
-// Scalar leaf kernels
-// ============================================================================
-
-function scSumAll(vals, hasNaN, n) {
-  var s = 0, i, v;
-  if (!hasNaN) {
-    for (i = 0; i < n; ++i) s += vals[i];
-  } else {
-    for (i = 0; i < n; ++i) {
-      v = vals[i];
-      if (v === v) s += v;
-    }
-  }
-  return s;
-}
-
-function scValidCountAll(vals, n) {
-  var c = 0, i, v;
-  for (i = 0; i < n; ++i) {
-    v = vals[i];
-    if (v === v) c += 1;
-  }
-  return c;
-}
-
-function scSumIdx(vals, hasNaN, rowIndexes, rowCount) {
-  var s = 0, j, v;
-  if (!hasNaN) {
-    for (j = 0; j < rowCount; ++j) s += vals[rowIndexes[j]];
-  } else {
-    for (j = 0; j < rowCount; ++j) {
-      v = vals[rowIndexes[j]];
-      if (v === v) s += v;
-    }
-  }
-  return s;
-}
-
-function scValidCountIdx(vals, rowIndexes, rowCount) {
-  var c = 0, j, v;
-  for (j = 0; j < rowCount; ++j) {
-    v = vals[rowIndexes[j]];
-    if (v === v) c += 1;
-  }
-  return c;
-}
-
-// ============================================================================
-// Orchestrators
-// ============================================================================
-
-function reduceGroupedAll(buffers, plan, getNumericColumn, groupIds, n, slotCount) {
-  var ops = plan.ops;
-  var fields = plan.fields;
-  var denominators = plan.denominators;
-  var primarySumSourceIdx = plan.primarySumSourceIdx;
-  var primarySumSourceSec = plan.primarySumSourceSec;
-  var denomSumSourceIdx = plan.denomSumSourceIdx;
-  var denomSumSourceSec = plan.denomSumSourceSec;
-  var avgCountSourceIdx = plan.avgCountSourceIdx;
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var metricCount = plan.count;
-  var firstCountIndex = plan.firstCountIndex;
-  var fusedSumIndex = plan.fusedSumIndex;
-  var fusedAvgIndex = plan.fusedAvgIndex;
-  var ranFusedAvg = false;
-  var countComputed = false;
-  var pendingAcc = null;
-  var pendingCol = null;
-  var pendingIdx = -1;
-  var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
-
-  if (firstCountIndex >= 0) {
-    if (fusedSumIndex >= 0) {
-      col = getNumericColumn(fields[fusedSumIndex]);
-      gCountSumAll(primary[firstCountIndex], primary[fusedSumIndex], groupIds, col.values, col.hasNaN, n);
-    } else if (fusedAvgIndex >= 0) {
-      col = getNumericColumn(fields[fusedAvgIndex]);
-      if (!col.hasNaN) {
-        gCountSumAll(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, col.values, false, n);
-        secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, slotCount));
-        ranFusedAvg = true;
-      } else {
-        gCountAll(primary[firstCountIndex], groupIds, n);
-      }
-    } else {
-      gCountAll(primary[firstCountIndex], groupIds, n);
-    }
-    countComputed = true;
-  }
-
-  for (m = 0; m < metricCount; ++m) {
-    op = ops[m];
-    acc = primary[m];
-
-    if (op === OP_COUNT) {
-      if (m === firstCountIndex) continue;
-      if (countComputed) {
-        acc.set(primary[firstCountIndex].subarray(0, slotCount));
-      } else {
-        gCountAll(acc, groupIds, n);
-      }
-      continue;
-    }
-
-    if (m === fusedSumIndex || (ranFusedAvg && m === fusedAvgIndex)) continue;
-
-    srcIdx = primarySumSourceIdx[m];
-    if (pendingAcc && (srcIdx === pendingIdx || denomSumSourceIdx[m] === pendingIdx)) {
-      gSumAll(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, n);
-      pendingAcc = null;
-      pendingCol = null;
-      pendingIdx = -1;
-    }
-
-    if (op === OP_SUM) {
-      if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, slotCount));
-      } else {
-        col = getNumericColumn(fields[m]);
-        if (pendingAcc) {
-          gRatioAll(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      }
-    } else if (op === OP_AVG) {
-      acc2 = secondary[m];
-      col = getNumericColumn(fields[m]);
-      if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, slotCount));
-        if (!col.hasNaN && countComputed) {
-          acc2.set(primary[firstCountIndex].subarray(0, slotCount));
-        } else if (avgCountSourceIdx[m] >= 0) {
-          acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, slotCount));
-        } else if (!col.hasNaN) {
-          gCountAll(acc2, groupIds, n);
-        } else {
-          gValidCountAll(acc2, groupIds, col.values, n);
-        }
-      } else if (!col.hasNaN && countComputed) {
-        acc2.set(primary[firstCountIndex].subarray(0, slotCount));
-        if (pendingAcc) {
-          gRatioAll(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, false, n);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      } else {
-        gAvgAll(acc, acc2, groupIds, col.values, col.hasNaN, n);
-      }
-    } else if (op === OP_AVG_NON_ZERO) {
-      col = getNumericColumn(fields[m]);
-      gAvgNzAll(acc, secondary[m], groupIds, col.values, col.hasNaN, n);
-    } else if (op === OP_RATIO) {
-      acc2 = secondary[m];
-      denomIdx = denomSumSourceIdx[m];
-      if (srcIdx >= 0 && denomIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, slotCount));
-        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
-        acc2.set(srcBuf.subarray(0, slotCount));
-      } else if (denomIdx >= 0) {
-        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
-        acc2.set(srcBuf.subarray(0, slotCount));
-        col = getNumericColumn(fields[m]);
-        if (pendingAcc) {
-          gRatioAll(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      } else if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, slotCount));
-        col2 = getNumericColumn(denominators[m]);
-        if (pendingAcc) {
-          gRatioAll(pendingAcc, acc2, groupIds, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, n);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc2;
-          pendingCol = col2;
-          pendingIdx = m;
-        }
-      } else {
-        col = getNumericColumn(fields[m]);
-        col2 = getNumericColumn(denominators[m]);
-        gRatioAll(acc, acc2, groupIds, col.values, col.hasNaN, col2.values, col2.hasNaN, n);
-      }
-    }
-  }
-
-  if (pendingAcc) {
-    gSumAll(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, n);
-  }
-}
-
-function reduceGroupedIndexed(buffers, plan, getNumericColumn, groupIds, rowIndexes, rowCount, delta, slotCount) {
-  if (!rowCount) return;
-
-  var ops = plan.ops;
-  var fields = plan.fields;
-  var denominators = plan.denominators;
-  var primarySumSourceIdx = plan.primarySumSourceIdx;
-  var primarySumSourceSec = plan.primarySumSourceSec;
-  var denomSumSourceIdx = plan.denomSumSourceIdx;
-  var denomSumSourceSec = plan.denomSumSourceSec;
-  var avgCountSourceIdx = plan.avgCountSourceIdx;
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var metricCount = plan.count;
-  var firstCountIndex = plan.firstCountIndex;
-  var fusedSumIndex = plan.fusedSumIndex;
-  var fusedAvgIndex = plan.fusedAvgIndex;
-  var add = delta > 0;
-  var isReset = add && slotCount > 0;
-  var canShareCount = isReset && firstCountIndex >= 0;
-  var ranFused = false;
-  var ranFusedAvg = false;
-  var pendingAcc = null;
-  var pendingCol = null;
-  var pendingIdx = -1;
-  var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
-
-  if (firstCountIndex >= 0 && fusedSumIndex >= 0) {
-    col = getNumericColumn(fields[fusedSumIndex]);
-    gCountSumIdx(primary[firstCountIndex], primary[fusedSumIndex], groupIds, col.values, col.hasNaN, rowIndexes, rowCount, add);
-    ranFused = true;
-  } else if (canShareCount) {
-    if (fusedAvgIndex >= 0) {
-      col = getNumericColumn(fields[fusedAvgIndex]);
-      if (!col.hasNaN) {
-        gCountSumIdx(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, col.values, false, rowIndexes, rowCount, true);
-        secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, slotCount));
-        ranFusedAvg = true;
-      } else {
-        gCountIdx(primary[firstCountIndex], groupIds, rowIndexes, rowCount, true);
-      }
-    } else {
-      gCountIdx(primary[firstCountIndex], groupIds, rowIndexes, rowCount, true);
-    }
-  }
-
-  for (m = 0; m < metricCount; ++m) {
-    op = ops[m];
-    acc = primary[m];
-
-    if (op === OP_COUNT) {
-      if (m === firstCountIndex && (ranFused || canShareCount)) continue;
-      if (canShareCount) {
-        acc.set(primary[firstCountIndex].subarray(0, slotCount));
-      } else {
-        gCountIdx(acc, groupIds, rowIndexes, rowCount, add);
-      }
-      continue;
-    }
-
-    if ((ranFused && m === fusedSumIndex) || (ranFusedAvg && m === fusedAvgIndex)) continue;
-
-    srcIdx = isReset ? primarySumSourceIdx[m] : -1;
-    denomIdx = isReset ? denomSumSourceIdx[m] : -1;
-    if (pendingAcc && (srcIdx === pendingIdx || denomIdx === pendingIdx)) {
-      gSumIdx(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
-      pendingAcc = null;
-      pendingCol = null;
-      pendingIdx = -1;
-    }
-
-    if (op === OP_SUM) {
-      if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, slotCount));
-      } else {
-        col = getNumericColumn(fields[m]);
-        if (pendingAcc) {
-          gRatioIdx(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, add);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      }
-    } else if (op === OP_AVG) {
-      acc2 = secondary[m];
-      col = getNumericColumn(fields[m]);
-      if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, slotCount));
-        if (!col.hasNaN && canShareCount) {
-          acc2.set(primary[firstCountIndex].subarray(0, slotCount));
-        } else if (avgCountSourceIdx[m] >= 0) {
-          acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, slotCount));
-        } else if (!col.hasNaN) {
-          gCountIdx(acc2, groupIds, rowIndexes, rowCount, true);
-        } else {
-          gValidCountIdx(acc2, groupIds, col.values, rowIndexes, rowCount);
-        }
-      } else if (add && !col.hasNaN && canShareCount) {
-        acc2.set(primary[firstCountIndex].subarray(0, slotCount));
-        if (pendingAcc) {
-          gRatioIdx(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, false, rowIndexes, rowCount, true);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      } else {
-        gAvgIdx(acc, acc2, groupIds, col.values, col.hasNaN, rowIndexes, rowCount, add);
-      }
-    } else if (op === OP_AVG_NON_ZERO) {
-      col = getNumericColumn(fields[m]);
-      gAvgNzIdx(acc, secondary[m], groupIds, col.values, col.hasNaN, rowIndexes, rowCount, add);
-    } else if (op === OP_RATIO) {
-      acc2 = secondary[m];
-      if (srcIdx >= 0 && denomIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, slotCount));
-        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
-        acc2.set(srcBuf.subarray(0, slotCount));
-      } else if (denomIdx >= 0) {
-        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
-        acc2.set(srcBuf.subarray(0, slotCount));
-        col = getNumericColumn(fields[m]);
-        if (pendingAcc) {
-          gRatioIdx(pendingAcc, acc, groupIds, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, true);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      } else if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, slotCount));
-        col2 = getNumericColumn(denominators[m]);
-        if (pendingAcc) {
-          gRatioIdx(pendingAcc, acc2, groupIds, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, true);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc2;
-          pendingCol = col2;
-          pendingIdx = m;
-        }
-      } else {
-        col = getNumericColumn(fields[m]);
-        col2 = getNumericColumn(denominators[m]);
-        gRatioIdx(acc, acc2, groupIds, col.values, col.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, add);
-      }
-    }
-  }
-
-  if (pendingAcc) {
-    gSumIdx(pendingAcc, groupIds, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
-  }
-}
-
-function reduceSplitDenseAll(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, n, totalCells) {
-  var ops = plan.ops;
-  var fields = plan.fields;
-  var denominators = plan.denominators;
-  var primarySumSourceIdx = plan.primarySumSourceIdx;
-  var primarySumSourceSec = plan.primarySumSourceSec;
-  var denomSumSourceIdx = plan.denomSumSourceIdx;
-  var denomSumSourceSec = plan.denomSumSourceSec;
-  var avgCountSourceIdx = plan.avgCountSourceIdx;
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var metricCount = plan.count;
-  var firstCountIndex = plan.firstCountIndex;
-  var fusedSumIndex = plan.fusedSumIndex;
-  var fusedAvgIndex = plan.fusedAvgIndex;
-  var ranFusedAvg = false;
-  var countComputed = false;
-  var pendingAcc = null;
-  var pendingCol = null;
-  var pendingIdx = -1;
-  var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
-
-  if (firstCountIndex >= 0) {
-    if (fusedSumIndex >= 0) {
-      col = getNumericColumn(fields[fusedSumIndex]);
-      sCountSumAll(primary[firstCountIndex], primary[fusedSumIndex], groupIds, splitCodes, stride, col.values, col.hasNaN, n);
-    } else if (fusedAvgIndex >= 0) {
-      col = getNumericColumn(fields[fusedAvgIndex]);
-      if (!col.hasNaN) {
-        sCountSumAll(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, splitCodes, stride, col.values, false, n);
-        secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, totalCells));
-        ranFusedAvg = true;
-      } else {
-        sCountAll(primary[firstCountIndex], groupIds, splitCodes, stride, n);
-      }
-    } else {
-      sCountAll(primary[firstCountIndex], groupIds, splitCodes, stride, n);
-    }
-    countComputed = true;
-  }
-
-  for (m = 0; m < metricCount; ++m) {
-    op = ops[m];
-    acc = primary[m];
-
-    if (op === OP_COUNT) {
-      if (m === firstCountIndex) continue;
-      if (countComputed) {
-        acc.set(primary[firstCountIndex].subarray(0, totalCells));
-      } else {
-        sCountAll(acc, groupIds, splitCodes, stride, n);
-      }
-      continue;
-    }
-
-    if (m === fusedSumIndex || (ranFusedAvg && m === fusedAvgIndex)) continue;
-
-    srcIdx = primarySumSourceIdx[m];
-    if (pendingAcc && (srcIdx === pendingIdx || denomSumSourceIdx[m] === pendingIdx)) {
-      sSumAll(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, n);
-      pendingAcc = null;
-      pendingCol = null;
-      pendingIdx = -1;
-    }
-
-    if (op === OP_SUM) {
-      if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, totalCells));
-      } else {
-        col = getNumericColumn(fields[m]);
-        if (pendingAcc) {
-          sRatioAll(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      }
-    } else if (op === OP_AVG) {
-      acc2 = secondary[m];
-      col = getNumericColumn(fields[m]);
-      if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, totalCells));
-        if (!col.hasNaN && countComputed) {
-          acc2.set(primary[firstCountIndex].subarray(0, totalCells));
-        } else if (avgCountSourceIdx[m] >= 0) {
-          acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, totalCells));
-        } else if (!col.hasNaN) {
-          sCountAll(acc2, groupIds, splitCodes, stride, n);
-        } else {
-          sValidCountAll(acc2, groupIds, splitCodes, stride, col.values, n);
-        }
-      } else if (!col.hasNaN && countComputed) {
-        acc2.set(primary[firstCountIndex].subarray(0, totalCells));
-        if (pendingAcc) {
-          sRatioAll(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, false, n);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      } else {
-        sAvgAll(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, n);
-      }
-    } else if (op === OP_AVG_NON_ZERO) {
-      col = getNumericColumn(fields[m]);
-      sAvgNzAll(acc, secondary[m], groupIds, splitCodes, stride, col.values, col.hasNaN, n);
-    } else if (op === OP_RATIO) {
-      acc2 = secondary[m];
-      denomIdx = denomSumSourceIdx[m];
-      if (srcIdx >= 0 && denomIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, totalCells));
-        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
-        acc2.set(srcBuf.subarray(0, totalCells));
-      } else if (denomIdx >= 0) {
-        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
-        acc2.set(srcBuf.subarray(0, totalCells));
-        col = getNumericColumn(fields[m]);
-        if (pendingAcc) {
-          sRatioAll(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, n);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      } else if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, totalCells));
-        col2 = getNumericColumn(denominators[m]);
-        if (pendingAcc) {
-          sRatioAll(pendingAcc, acc2, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, n);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc2;
-          pendingCol = col2;
-          pendingIdx = m;
-        }
-      } else {
-        col = getNumericColumn(fields[m]);
-        col2 = getNumericColumn(denominators[m]);
-        sRatioAll(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, col2.values, col2.hasNaN, n);
-      }
-    }
-  }
-
-  if (pendingAcc) {
-    sSumAll(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, n);
-  }
-}
-
-function reduceSplitDenseIndexed(buffers, plan, getNumericColumn, groupIds, splitCodes, stride, rowIndexes, rowCount, delta, totalCells) {
-  if (!rowCount) return;
-
-  var ops = plan.ops;
-  var fields = plan.fields;
-  var denominators = plan.denominators;
-  var primarySumSourceIdx = plan.primarySumSourceIdx;
-  var primarySumSourceSec = plan.primarySumSourceSec;
-  var denomSumSourceIdx = plan.denomSumSourceIdx;
-  var denomSumSourceSec = plan.denomSumSourceSec;
-  var avgCountSourceIdx = plan.avgCountSourceIdx;
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var metricCount = plan.count;
-  var firstCountIndex = plan.firstCountIndex;
-  var fusedSumIndex = plan.fusedSumIndex;
-  var fusedAvgIndex = plan.fusedAvgIndex;
-  var add = delta > 0;
-  var isReset = add && totalCells > 0;
-  var canShareCount = isReset && firstCountIndex >= 0;
-  var ranFused = false;
-  var ranFusedAvg = false;
-  var pendingAcc = null;
-  var pendingCol = null;
-  var pendingIdx = -1;
-  var m, op, acc, acc2, col, col2, srcIdx, denomIdx, srcBuf;
-
-  if (firstCountIndex >= 0 && fusedSumIndex >= 0) {
-    col = getNumericColumn(fields[fusedSumIndex]);
-    sCountSumIdx(primary[firstCountIndex], primary[fusedSumIndex], groupIds, splitCodes, stride, col.values, col.hasNaN, rowIndexes, rowCount, add);
-    ranFused = true;
-  } else if (canShareCount) {
-    if (fusedAvgIndex >= 0) {
-      col = getNumericColumn(fields[fusedAvgIndex]);
-      if (!col.hasNaN) {
-        sCountSumIdx(primary[firstCountIndex], primary[fusedAvgIndex], groupIds, splitCodes, stride, col.values, false, rowIndexes, rowCount, true);
-        secondary[fusedAvgIndex].set(primary[firstCountIndex].subarray(0, totalCells));
-        ranFusedAvg = true;
-      } else {
-        sCountIdx(primary[firstCountIndex], groupIds, splitCodes, stride, rowIndexes, rowCount, true);
-      }
-    } else {
-      sCountIdx(primary[firstCountIndex], groupIds, splitCodes, stride, rowIndexes, rowCount, true);
-    }
-  }
-
-  for (m = 0; m < metricCount; ++m) {
-    op = ops[m];
-    acc = primary[m];
-
-    if (op === OP_COUNT) {
-      if (m === firstCountIndex && (ranFused || canShareCount)) continue;
-      if (canShareCount) {
-        acc.set(primary[firstCountIndex].subarray(0, totalCells));
-      } else {
-        sCountIdx(acc, groupIds, splitCodes, stride, rowIndexes, rowCount, add);
-      }
-      continue;
-    }
-
-    if ((ranFused && m === fusedSumIndex) || (ranFusedAvg && m === fusedAvgIndex)) continue;
-
-    srcIdx = isReset ? primarySumSourceIdx[m] : -1;
-    denomIdx = isReset ? denomSumSourceIdx[m] : -1;
-    if (pendingAcc && (srcIdx === pendingIdx || denomIdx === pendingIdx)) {
-      sSumIdx(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
-      pendingAcc = null;
-      pendingCol = null;
-      pendingIdx = -1;
-    }
-
-    if (op === OP_SUM) {
-      if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, totalCells));
-      } else {
-        col = getNumericColumn(fields[m]);
-        if (pendingAcc) {
-          sRatioIdx(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, add);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      }
-    } else if (op === OP_AVG) {
-      acc2 = secondary[m];
-      col = getNumericColumn(fields[m]);
-      if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, totalCells));
-        if (!col.hasNaN && canShareCount) {
-          acc2.set(primary[firstCountIndex].subarray(0, totalCells));
-        } else if (avgCountSourceIdx[m] >= 0) {
-          acc2.set(secondary[avgCountSourceIdx[m]].subarray(0, totalCells));
-        } else if (!col.hasNaN) {
-          sCountIdx(acc2, groupIds, splitCodes, stride, rowIndexes, rowCount, true);
-        } else {
-          sValidCountIdx(acc2, groupIds, splitCodes, stride, col.values, rowIndexes, rowCount);
-        }
-      } else if (add && !col.hasNaN && canShareCount) {
-        acc2.set(primary[firstCountIndex].subarray(0, totalCells));
-        if (pendingAcc) {
-          sRatioIdx(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, false, rowIndexes, rowCount, true);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      } else {
-        sAvgIdx(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, rowIndexes, rowCount, add);
-      }
-    } else if (op === OP_AVG_NON_ZERO) {
-      col = getNumericColumn(fields[m]);
-      sAvgNzIdx(acc, secondary[m], groupIds, splitCodes, stride, col.values, col.hasNaN, rowIndexes, rowCount, add);
-    } else if (op === OP_RATIO) {
-      acc2 = secondary[m];
-      if (srcIdx >= 0 && denomIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, totalCells));
-        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
-        acc2.set(srcBuf.subarray(0, totalCells));
-      } else if (denomIdx >= 0) {
-        srcBuf = denomSumSourceSec[m] ? secondary[denomIdx] : primary[denomIdx];
-        acc2.set(srcBuf.subarray(0, totalCells));
-        col = getNumericColumn(fields[m]);
-        if (pendingAcc) {
-          sRatioIdx(pendingAcc, acc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col.values, col.hasNaN, rowIndexes, rowCount, true);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc;
-          pendingCol = col;
-          pendingIdx = m;
-        }
-      } else if (srcIdx >= 0) {
-        srcBuf = primarySumSourceSec[m] ? secondary[srcIdx] : primary[srcIdx];
-        acc.set(srcBuf.subarray(0, totalCells));
-        col2 = getNumericColumn(denominators[m]);
-        if (pendingAcc) {
-          sRatioIdx(pendingAcc, acc2, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, true);
-          pendingAcc = null;
-          pendingCol = null;
-          pendingIdx = -1;
-        } else {
-          pendingAcc = acc2;
-          pendingCol = col2;
-          pendingIdx = m;
-        }
-      } else {
-        col = getNumericColumn(fields[m]);
-        col2 = getNumericColumn(denominators[m]);
-        sRatioIdx(acc, acc2, groupIds, splitCodes, stride, col.values, col.hasNaN, col2.values, col2.hasNaN, rowIndexes, rowCount, add);
-      }
-    }
-  }
-
-  if (pendingAcc) {
-    sSumIdx(pendingAcc, groupIds, splitCodes, stride, pendingCol.values, pendingCol.hasNaN, rowIndexes, rowCount, add);
-  }
-}
-
-function reduceScalarAll(buffers, plan, getNumericColumn, n) {
-  var ops = plan.ops;
-  var fields = plan.fields;
-  var denominators = plan.denominators;
-  var primarySumSourceIdx = plan.primarySumSourceIdx;
-  var primarySumSourceSec = plan.primarySumSourceSec;
-  var denomSumSourceIdx = plan.denomSumSourceIdx;
-  var denomSumSourceSec = plan.denomSumSourceSec;
-  var avgCountSourceIdx = plan.avgCountSourceIdx;
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var metricCount = plan.count;
-  var m, op, col, col2, vals, hasNaN, i, v, s, s2, srcIdx, denomIdx;
-
-  for (m = 0; m < metricCount; ++m) {
-    op = ops[m];
-    if (op === OP_COUNT) {
-      primary[m][0] += n;
-      continue;
-    }
-
-    srcIdx = primarySumSourceIdx[m];
-    s = 0;
-    s2 = 0;
-
-    if (op === OP_SUM) {
-      if (srcIdx >= 0) {
-        primary[m][0] = primarySumSourceSec[m] ? secondary[srcIdx][0] : primary[srcIdx][0];
-      } else {
-        col = getNumericColumn(fields[m]);
-        primary[m][0] += scSumAll(col.values, col.hasNaN, n);
-      }
-    } else if (op === OP_AVG) {
-      col = getNumericColumn(fields[m]);
-      if (srcIdx >= 0) {
-        primary[m][0] = primarySumSourceSec[m] ? secondary[srcIdx][0] : primary[srcIdx][0];
-        if (!col.hasNaN) {
-          secondary[m][0] += n;
-        } else if (avgCountSourceIdx[m] >= 0) {
-          secondary[m][0] = secondary[avgCountSourceIdx[m]][0];
-        } else {
-          secondary[m][0] += scValidCountAll(col.values, n);
-        }
-      } else if (!col.hasNaN) {
-        primary[m][0] += scSumAll(col.values, false, n);
-        secondary[m][0] += n;
-      } else {
-        vals = col.values;
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v) { s += v; s2 += 1; }
-        }
-        primary[m][0] += s;
-        secondary[m][0] += s2;
-      }
-    } else if (op === OP_AVG_NON_ZERO) {
-      col = getNumericColumn(fields[m]);
-      vals = col.values;
-      hasNaN = col.hasNaN;
-      if (!hasNaN) {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v !== 0) { s += v; s2 += 1; }
-        }
-      } else {
-        for (i = 0; i < n; ++i) {
-          v = vals[i];
-          if (v === v && v !== 0) { s += v; s2 += 1; }
-        }
-      }
-      primary[m][0] += s;
-      secondary[m][0] += s2;
-    } else if (op === OP_RATIO) {
-      denomIdx = denomSumSourceIdx[m];
-      if (srcIdx >= 0) {
-        primary[m][0] = primarySumSourceSec[m] ? secondary[srcIdx][0] : primary[srcIdx][0];
-      } else {
-        col = getNumericColumn(fields[m]);
-        primary[m][0] += scSumAll(col.values, col.hasNaN, n);
-      }
-      if (denomIdx >= 0) {
-        secondary[m][0] = denomSumSourceSec[m] ? secondary[denomIdx][0] : primary[denomIdx][0];
-      } else {
-        col2 = getNumericColumn(denominators[m]);
-        secondary[m][0] += scSumAll(col2.values, col2.hasNaN, n);
-      }
-    }
-  }
-}
-
-function reduceScalarIndexed(buffers, plan, getNumericColumn, rowIndexes, rowCount, delta) {
-  if (!rowCount) return;
-
-  var ops = plan.ops;
-  var fields = plan.fields;
-  var denominators = plan.denominators;
-  var primarySumSourceIdx = plan.primarySumSourceIdx;
-  var primarySumSourceSec = plan.primarySumSourceSec;
-  var denomSumSourceIdx = plan.denomSumSourceIdx;
-  var denomSumSourceSec = plan.denomSumSourceSec;
-  var avgCountSourceIdx = plan.avgCountSourceIdx;
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var metricCount = plan.count;
-  var sign = delta > 0 ? 1 : -1;
-  var stepPrimary = new Float64Array(metricCount);
-  var stepSecondary = new Float64Array(metricCount);
-  var m, op, col, col2, vals, hasNaN, j, v, s, s2, srcIdx, denomIdx;
-
-  for (m = 0; m < metricCount; ++m) {
-    op = ops[m];
-    if (op === OP_COUNT) {
-      stepPrimary[m] = rowCount;
-      primary[m][0] += sign * rowCount;
-      continue;
-    }
-
-    srcIdx = primarySumSourceIdx[m];
-    s = 0;
-    s2 = 0;
-
-    if (op === OP_SUM) {
-      if (srcIdx >= 0) {
-        s = primarySumSourceSec[m] ? stepSecondary[srcIdx] : stepPrimary[srcIdx];
-      } else {
-        col = getNumericColumn(fields[m]);
-        s = scSumIdx(col.values, col.hasNaN, rowIndexes, rowCount);
-      }
-      stepPrimary[m] = s;
-      primary[m][0] += sign * s;
-    } else if (op === OP_AVG) {
-      col = getNumericColumn(fields[m]);
-      if (srcIdx >= 0) {
-        s = primarySumSourceSec[m] ? stepSecondary[srcIdx] : stepPrimary[srcIdx];
-        if (!col.hasNaN) {
-          s2 = rowCount;
-        } else if (avgCountSourceIdx[m] >= 0) {
-          s2 = stepSecondary[avgCountSourceIdx[m]];
-        } else {
-          s2 = scValidCountIdx(col.values, rowIndexes, rowCount);
-        }
-      } else if (!col.hasNaN) {
-        s = scSumIdx(col.values, false, rowIndexes, rowCount);
-        s2 = rowCount;
-      } else {
-        vals = col.values;
-        for (j = 0; j < rowCount; ++j) {
-          v = vals[rowIndexes[j]];
-          if (v === v) { s += v; s2 += 1; }
-        }
-      }
-      stepPrimary[m] = s;
-      stepSecondary[m] = s2;
-      primary[m][0] += sign * s;
-      secondary[m][0] += sign * s2;
-    } else if (op === OP_AVG_NON_ZERO) {
-      col = getNumericColumn(fields[m]);
-      vals = col.values;
-      hasNaN = col.hasNaN;
-      if (!hasNaN) {
-        for (j = 0; j < rowCount; ++j) {
-          v = vals[rowIndexes[j]];
-          if (v !== 0) { s += v; s2 += 1; }
-        }
-      } else {
-        for (j = 0; j < rowCount; ++j) {
-          v = vals[rowIndexes[j]];
-          if (v === v && v !== 0) { s += v; s2 += 1; }
-        }
-      }
-      stepPrimary[m] = s;
-      stepSecondary[m] = s2;
-      primary[m][0] += sign * s;
-      secondary[m][0] += sign * s2;
-    } else if (op === OP_RATIO) {
-      denomIdx = denomSumSourceIdx[m];
-      if (srcIdx >= 0) {
-        s = primarySumSourceSec[m] ? stepSecondary[srcIdx] : stepPrimary[srcIdx];
-      } else {
-        col = getNumericColumn(fields[m]);
-        s = scSumIdx(col.values, col.hasNaN, rowIndexes, rowCount);
-      }
-      if (denomIdx >= 0) {
-        s2 = denomSumSourceSec[m] ? stepSecondary[denomIdx] : stepPrimary[denomIdx];
-      } else {
-        col2 = getNumericColumn(denominators[m]);
-        s2 = scSumIdx(col2.values, col2.hasNaN, rowIndexes, rowCount);
-      }
-      stepPrimary[m] = s;
-      stepSecondary[m] = s2;
-      primary[m][0] += sign * s;
-      secondary[m][0] += sign * s2;
-    }
-  }
-}
-
-function writeMetricSlotToState(state, plan, buffers, slot) {
-  var ops = plan.ops;
-  var ids = plan.ids;
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var m, op, id, sub;
-
-  for (m = 0; m < plan.count; ++m) {
-    op = ops[m];
-    id = ids[m];
-    if (op === OP_AVG || op === OP_AVG_NON_ZERO) {
-      sub = state[id];
-      if (!sub) {
-        state[id] = { count: secondary[m][slot], sum: primary[m][slot] };
-      } else {
-        sub.sum = primary[m][slot];
-        sub.count = secondary[m][slot];
-      }
-    } else if (op === OP_RATIO) {
-      sub = state[id];
-      if (!sub) {
-        state[id] = { den: secondary[m][slot], num: primary[m][slot] };
-      } else {
-        sub.num = primary[m][slot];
-        sub.den = secondary[m][slot];
-      }
-    } else {
-      state[id] = primary[m][slot];
-    }
-  }
-  if (state.__version !== undefined) {
-    state.__version += 1;
-  }
-}
-
-function finalizeMetricSlot(plan, buffers, slot) {
-  var ops = plan.ops;
-  var ids = plan.ids;
-  var hidden = plan.hidden;
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var result = {};
-  var m, op, denom;
-
-  for (m = 0; m < plan.count; ++m) {
-    if (hidden[m]) continue;
-    op = ops[m];
-    if (op === OP_AVG || op === OP_AVG_NON_ZERO) {
-      denom = secondary[m][slot];
-      result[ids[m]] = denom ? primary[m][slot] / denom : null;
-    } else if (op === OP_RATIO) {
-      denom = secondary[m][slot];
-      result[ids[m]] = denom !== 0 ? primary[m][slot] / denom : null;
-    } else {
-      result[ids[m]] = primary[m][slot];
-    }
-  }
-  return result;
-}
-
-function slotHasAnyActivity(plan, buffers, slot) {
-  var ops = plan.ops;
-  var primary = buffers.primary;
-  var secondary = buffers.secondary;
-  var m, op;
-
-  for (m = 0; m < plan.count; ++m) {
-    op = ops[m];
-    if (op === OP_COUNT) {
-      if (primary[m][slot] > 0) return true;
-    } else if (op === OP_AVG || op === OP_AVG_NON_ZERO) {
-      if (secondary[m][slot] > 0) return true;
-    } else if (op === OP_RATIO) {
-      if (primary[m][slot] !== 0 || secondary[m][slot] !== 0) return true;
-    } else {
-      if (primary[m][slot] !== 0) return true;
-    }
-  }
-  return false;
-}
-
 function isFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
@@ -3752,6 +5921,7 @@ function createKpiRuntime(cf, metrics) {
     dispose: function() {
       group.dispose();
     },
+    rawGroup: group,
     read: function() {
       if (typeof group._readScalar === "function") {
         var fast = group._readScalar();
@@ -4052,70 +6222,78 @@ function createGroupRuntime(dimension, spec, index) {
     var limitWindow = normalized.limit == null ? null : normalized.offset + normalized.limit;
     var useHeap = !isNatural && limitWindow != null && limitWindow > 0 && limitWindow < count;
 
-    var visPrim = buffers ? buffers.primary[visibleMetricIndex] : null;
-    var visSec = buffers ? buffers.secondary[visibleMetricIndex] : null;
+    var bufData = buffers ? buffers.data : null;
+    var bufStride = buffers ? buffers.stride : 0;
+    var visPrimOff = plan.primOff[visibleMetricIndex];
+    var visSecOff = plan.secOff[visibleMetricIndex];
     var visOp = plan.ops[visibleMetricIndex];
 
     var sortIdx = sortMetric ? metricIndexById[sortMetric.id] : -1;
-    var sortPrim = (buffers && sortIdx >= 0) ? buffers.primary[sortIdx] : null;
-    var sortSec = (buffers && sortIdx >= 0) ? buffers.secondary[sortIdx] : null;
+    var sortPrimOff = sortIdx >= 0 ? plan.primOff[sortIdx] : -1;
+    var sortSecOff = sortIdx >= 0 ? plan.secOff[sortIdx] : -1;
     var sortOp = sortIdx >= 0 ? plan.ops[sortIdx] : OP_COUNT;
     var modeCode = mode === "flat" ? 0 : (mode === "splitDense" ? 1 : 2);
 
     function isSlotVisible(slot) {
-      if (!buffers) return false;
+      if (!bufData) return false;
+      var off;
       if (modeCode === 0) {
+        off = slot * bufStride;
         if (visOp === OP_COUNT || visOp === OP_SUM) {
-          return visPrim[slot] > 0;
+          return bufData[off + visPrimOff] > 0;
         }
         if (visOp === OP_AVG || visOp === OP_AVG_NON_ZERO) {
-          return visSec[slot] > 0 && (visPrim[slot] / visSec[slot]) > 0;
+          var vc = bufData[off + visSecOff];
+          return vc > 0 && (bufData[off + visPrimOff] / vc) > 0;
         }
         if (visOp === OP_RATIO) {
-          return visSec[slot] !== 0 && (visPrim[slot] / visSec[slot]) > 0;
+          var vd = bufData[off + visSecOff];
+          return vd !== 0 && (bufData[off + visPrimOff] / vd) > 0;
         }
         return false;
       }
       var sum = 0;
       if (modeCode === 1) {
-        var base = slot * stride;
-        for (var sc = 0; sc < stride; ++sc) {
-          sum += visPrim[base + sc];
+        var base = slot * stride * bufStride + visPrimOff;
+        for (var sc = 0; sc < stride; ++sc, base += bufStride) {
+          sum += bufData[base];
         }
         return sum > 0;
       }
       for (var pid = headBySlot[slot]; pid !== -1; pid = nextPair[pid]) {
-        sum += visPrim[pid];
+        sum += bufData[pid * bufStride + visPrimOff];
       }
       return sum > 0;
     }
 
     function readSortComparable(slot) {
-      if (!sortPrim) return 0;
+      if (!bufData || sortPrimOff < 0) return 0;
+      var off;
       if (modeCode === 0) {
+        off = slot * bufStride;
         if (sortOp === OP_COUNT || sortOp === OP_SUM) {
-          return sortPrim[slot];
+          return bufData[off + sortPrimOff];
         }
         if (sortOp === OP_AVG || sortOp === OP_AVG_NON_ZERO) {
-          var c = sortSec[slot];
-          return c ? sortPrim[slot] / c : 0;
+          var c = bufData[off + sortSecOff];
+          return c ? bufData[off + sortPrimOff] / c : 0;
         }
         if (sortOp === OP_RATIO) {
-          var d = sortSec[slot];
-          return d !== 0 ? sortPrim[slot] / d : 0;
+          var d = bufData[off + sortSecOff];
+          return d !== 0 ? bufData[off + sortPrimOff] / d : 0;
         }
         return 0;
       }
       var sum = 0;
       if (modeCode === 1) {
-        var base = slot * stride;
-        for (var sc = 0; sc < stride; ++sc) {
-          sum += sortPrim[base + sc];
+        var base = slot * stride * bufStride + sortPrimOff;
+        for (var sc = 0; sc < stride; ++sc, base += bufStride) {
+          sum += bufData[base];
         }
         return sum;
       }
       for (var pid = headBySlot[slot]; pid !== -1; pid = nextPair[pid]) {
-        sum += sortPrim[pid];
+        sum += bufData[pid * bufStride + sortPrimOff];
       }
       return sum;
     }
@@ -4435,6 +6613,7 @@ function createGroupRuntime(dimension, spec, index) {
       group.dispose();
     },
     id: spec.id || "group_" + index,
+    rawGroup: group,
     read: function(query) {
       return readQuery(query);
     }
@@ -4568,6 +6747,7 @@ function createDashboardRuntime(crossfilter, options) {
   var dimensions = {};
   var currentFilters = {};
   var groupRuntimes = {};
+  var allRawGroups = [];
   var kpiRuntime = createKpiRuntime(cf, normalizeMetrics(options.kpis, "kpi"));
   var rowCountGroup = typeof cf._filteredCount === "function" ? null : cf.groupAll().reduceCount();
 
@@ -4581,6 +6761,7 @@ function createDashboardRuntime(crossfilter, options) {
     var groupDimension = ensureDimension(dimensions, dimensionFields, cf, groupSpec.field);
     var groupRuntime = createGroupRuntime(groupDimension, groupSpec, nextGroupIndex);
     groupRuntimes[groupRuntime.id] = groupRuntime;
+    allRawGroups.push(groupRuntime.rawGroup);
   }
 
   function updateFilters(filters) {
@@ -4634,16 +6815,20 @@ function createDashboardRuntime(crossfilter, options) {
     return typeof cf.runtimeInfo === "function" ? cf.runtimeInfo() : crossfilter.runtimeInfo();
   }
 
-  function readGroups(groupQueries) {
+  function readGroups(groupQueries, skipFlush) {
     var groups = {};
 
     if (!groupQueries) {
+      if (!skipFlush && allRawGroups.length > 1 && typeof cf._flushGroups === "function") {
+        cf._flushGroups(allRawGroups, null);
+      }
       for (var groupId in groupRuntimes) {
         groups[groupId] = groupRuntimes[groupId].read();
       }
       return groups;
     }
 
+    var requestedIds = [];
     for (var requestedGroupId in groupQueries) {
       if (!groupRuntimes[requestedGroupId]) {
         throw new Error("Unknown dashboard group: " + requestedGroupId);
@@ -4651,7 +6836,20 @@ function createDashboardRuntime(crossfilter, options) {
       if (groupQueries[requestedGroupId] === false) {
         continue;
       }
-      groups[requestedGroupId] = groupRuntimes[requestedGroupId].read(groupQueries[requestedGroupId]);
+      requestedIds.push(requestedGroupId);
+    }
+
+    if (!skipFlush && requestedIds.length > 1 && typeof cf._flushGroups === "function") {
+      var reqRaw = new Array(requestedIds.length);
+      for (var ri = 0; ri < requestedIds.length; ++ri) {
+        reqRaw[ri] = groupRuntimes[requestedIds[ri]].rawGroup;
+      }
+      cf._flushGroups(reqRaw, null);
+    }
+
+    for (var i = 0; i < requestedIds.length; ++i) {
+      var id = requestedIds[i];
+      groups[id] = groupRuntimes[id].read(groupQueries[id]);
     }
 
     return groups;
@@ -4659,9 +6857,25 @@ function createDashboardRuntime(crossfilter, options) {
 
   function readSnapshot(options) {
     var groups = {};
+    var includeGroups = !options || options.groups !== false;
+    var groupQueries = options && options.groups ? options.groups : null;
 
-    if (!options || options.groups !== false) {
-      groups = readGroups(options && options.groups ? options.groups : null);
+    if (includeGroups && typeof cf._flushGroups === "function") {
+      if (!groupQueries) {
+        cf._flushGroups(allRawGroups, kpiRuntime.rawGroup);
+      } else {
+        var reqRaw = [];
+        for (var gId in groupQueries) {
+          if (groupQueries[gId] !== false && groupRuntimes[gId]) {
+            reqRaw.push(groupRuntimes[gId].rawGroup);
+          }
+        }
+        cf._flushGroups(reqRaw, kpiRuntime.rawGroup);
+      }
+    }
+
+    if (includeGroups) {
+      groups = readGroups(groupQueries, true);
     }
 
     return {
@@ -7208,13 +9422,14 @@ function crossfilter() {
     runtimeInfo: runtimeController.runtimeInfo,
     _filteredCount: filteredCount,
     _filteredIndexesSlice: filteredIndexesSlice,
+    _flushGroups: flushGroups,
     _materializeRowsByIndex: materializeRowsByIndex,
     _withTransientFilters: withTransientFilters
   };
 
   var data = [], // the records
       n = 0, // the number of records; data.length
-      filters, // 1 is filtered out
+      filterStore = createFilterBitsetStore(), // per-dimension 1-bit filter bitsets
       filterListeners = [], // when the filters change
       dataListeners = [], // when data is added
       removeDataListeners = [], // when data is removed
@@ -7226,20 +9441,37 @@ function crossfilter() {
       numericColumns = Object.create(null),
       splitColumns = Object.create(null),
       activeRowsDirty = true,
+      activeCountDirty = true,
+      activeCountCached = 0,
       activeRowsBuf = new Uint32Array(0),
       activeRowsLength = 0,
+      excludedRowsBuf = new Uint32Array(0),
       dimActiveRowsBuf = new Uint32Array(0),
       deltaAddedBuf = new Uint32Array(0),
       deltaRemovedBuf = new Uint32Array(0),
       deltaWorkBuf = new Uint32Array(0),
       deltaBufInUse = false,
-      activeDimensionFilterCount = 0,
       batchedFilterDepth = 0,
       batchedFilterEventPending = false,
       batchedFilterResetPending = false,
-      transientFilterDepth = 0;
+      transientFilterDepth = 0,
+      brushDimSlot = null,
+      brushActive = false,
+      brushQueryKind = null,
+      brushLo = 0,
+      brushHi = 0,
+      brushDimSource = null,
+      brushFalcon = null,
+      brushBuildFailed = false;
 
-  filters = new xfilterArray.bitarray(0);
+  function invalidateBrushState() {
+    brushDimSlot = null;
+    brushActive = false;
+    brushQueryKind = null;
+    brushDimSource = null;
+    brushFalcon = null;
+    brushBuildFailed = false;
+  }
 
   function ensureUint32Capacity(buf, required) {
     if (buf.length >= required) return buf;
@@ -7490,34 +9722,52 @@ function crossfilter() {
   }
 
   function getActiveRows() {
-    if (!activeDimensionFilterCount) {
+    if (!filterStore.hasAnyActive()) {
       return null;
     }
     if (activeRowsDirty) {
       activeRowsBuf = ensureUint32Capacity(activeRowsBuf, n);
-      var count = 0,
-          i;
-      if (filters.subarrays === 1) {
-        var f0 = filters[0];
-        for (i = 0; i < n; ++i) {
-          if (!f0[i]) activeRowsBuf[count++] = i;
-        }
-      } else {
-        for (i = 0; i < n; ++i) {
-          if (filters.zero(i)) activeRowsBuf[count++] = i;
-        }
+      var count = filterStore.extractActive(activeRowsBuf, null);
+      if (count < 0) {
+        activeRowsLength = n;
+        activeCountCached = n;
+        activeCountDirty = false;
+        activeRowsDirty = false;
+        return null;
       }
       activeRowsLength = count;
+      activeCountCached = count;
+      activeCountDirty = false;
       activeRowsDirty = false;
     }
     return { indices: activeRowsBuf, length: activeRowsLength };
   }
 
+  function getExcludedRows(ignoreSlot) {
+    if (!filterStore.hasAnyActive()) {
+      return { indices: excludedRowsBuf, length: 0 };
+    }
+    excludedRowsBuf = ensureUint32Capacity(excludedRowsBuf, n);
+    var count = filterStore.extractExcluded(excludedRowsBuf, ignoreSlot || null);
+    return { indices: excludedRowsBuf, length: count };
+  }
+
   function filteredCount() {
-    if (!activeDimensionFilterCount) {
+    if (!filterStore.hasAnyActive()) {
       return n;
     }
-    return getActiveRows().length;
+    if (!activeRowsDirty) {
+      return activeRowsLength;
+    }
+    if (activeCountDirty) {
+      if (brushActive && brushFalcon && transientFilterDepth === 0) {
+        activeCountCached = brushFalcon.queryCount(brushQueryKind, brushLo, brushHi);
+      } else {
+        activeCountCached = filterStore.countActive(null);
+      }
+      activeCountDirty = false;
+    }
+    return activeCountCached;
   }
 
   function filteredIndexesSlice(startOffset, limitCount) {
@@ -7527,7 +9777,7 @@ function crossfilter() {
     if (limit <= 0) {
       return [];
     }
-    if (!activeDimensionFilterCount) {
+    if (!filterStore.hasAnyActive()) {
       if (start >= n) return [];
       end = Math.min(n, start + limit);
       len = end - start;
@@ -7536,6 +9786,14 @@ function crossfilter() {
       return out;
     }
     var active = getActiveRows();
+    if (!active) {
+      if (start >= n) return [];
+      end = Math.min(n, start + limit);
+      len = end - start;
+      out = new Array(len);
+      for (i = 0; i < len; ++i) out[i] = start + i;
+      return out;
+    }
     if (start >= active.length) return [];
     end = Math.min(active.length, start + limit);
     len = end - start;
@@ -7545,27 +9803,212 @@ function crossfilter() {
     return out;
   }
 
-  function collectZeroExceptRows(dimOffset, dimZero) {
+  function collectZeroExceptRows(dimSlot) {
     dimActiveRowsBuf = ensureUint32Capacity(dimActiveRowsBuf, n);
-    var count = 0,
-        i;
-    if (filters.subarrays === 1) {
-      var f0 = filters[0];
-      if (dimOffset === 0) {
-        for (i = 0; i < n; ++i) {
-          if (!(f0[i] & dimZero)) dimActiveRowsBuf[count++] = i;
-        }
-      } else {
-        for (i = 0; i < n; ++i) {
-          if (!f0[i]) dimActiveRowsBuf[count++] = i;
-        }
-      }
-    } else {
-      for (i = 0; i < n; ++i) {
-        if (filters.zeroExcept(i, dimOffset, dimZero)) dimActiveRowsBuf[count++] = i;
-      }
+    var count = filterStore.extractActive(dimActiveRowsBuf, dimSlot);
+    if (count < 0) {
+      return null;
     }
     return { indices: dimActiveRowsBuf, length: count };
+  }
+
+  function flushGroups(rawGroups, kpiGroup) {
+    if (!n) return;
+    var gLen = rawGroups ? rawGroups.length : 0;
+    if (!gLen && !kpiGroup) return;
+
+    var kpiInfo = (kpiGroup && typeof kpiGroup._coScanInfo === 'function') ? kpiGroup._coScanInfo() : null;
+    var kpiUsed = false;
+
+    // Falcon prefix-sum brush fast path (handles all low/medium-card charts + KPI in O(slots)!)
+    if (brushActive && brushDimSlot && transientFilterDepth === 0) {
+      var falconTargets = [];
+      for (var fgi = 0; fgi < gLen; ++fgi) {
+        var fg = rawGroups[fgi];
+        if (!fg || typeof fg._coScanInfo !== 'function') continue;
+        var finfo = fg._coScanInfo();
+        if (finfo && finfo.usesGlobalActive) {
+          falconTargets.push(finfo);
+        }
+      }
+      var falconKpi = (kpiInfo && !kpiInfo.unfiltered) ? kpiInfo : null;
+      if (!brushFalcon && !brushBuildFailed && (falconTargets.length > 0 || falconKpi)) {
+        var baseRows = filterStore.hasOtherActive(brushDimSlot) ? collectZeroExceptRows(brushDimSlot) : null;
+        brushFalcon = createFalconBrushCache(brushDimSource(), baseRows, n, falconTargets, falconKpi, getNumericColumn);
+        if (!brushFalcon) {
+          brushBuildFailed = true;
+          brushActive = false;
+        }
+      }
+      if (brushFalcon && (falconTargets.length > 0 || falconKpi)) {
+        var fRes = brushFalcon.applyQueryBatch(brushQueryKind, brushLo, brushHi, falconTargets, falconKpi);
+        activeCountCached = fRes.totalCount;
+        activeCountDirty = false;
+        if (fRes.kpiApplied) kpiUsed = true;
+        if (fRes.appliedCount === falconTargets.length && (!falconKpi || fRes.kpiApplied)) {
+          // Check if any unfiltered or self-filtered dirty groups still remain
+          var anyRemaining = false;
+          for (var rci = 0; rci < gLen; ++rci) {
+            var rg = rawGroups[rci];
+            if (rg && typeof rg._coScanInfo === 'function' && rg._coScanInfo()) {
+              anyRemaining = true;
+              break;
+            }
+          }
+          if (!anyRemaining) return;
+        }
+      }
+    }
+
+    var unfilteredByKey = Object.create(null);
+    var unfilteredKeys = [];
+    var filteredByKey = Object.create(null);
+    var filteredKeys = [];
+    var i, info, key, list;
+
+    for (i = 0; i < gLen; ++i) {
+      var g = rawGroups[i];
+      if (!g || typeof g._coScanInfo !== 'function') continue;
+      info = g._coScanInfo();
+      if (!info) continue;
+      if (info.unfiltered) {
+        if (info.tryRestoreUnfiltered()) {
+          info.commit(false);
+          continue;
+        }
+        key = info.coScanKey;
+        list = unfilteredByKey[key];
+        if (!list) {
+          list = [];
+          unfilteredByKey[key] = list;
+          unfilteredKeys.push(key);
+        }
+        list.push(info);
+      } else if (info.usesGlobalActive) {
+        key = info.coScanKey;
+        list = filteredByKey[key];
+        if (!list) {
+          list = [];
+          filteredByKey[key] = list;
+          filteredKeys.push(key);
+        }
+        list.push(info);
+      }
+    }
+
+    for (i = 0; i < unfilteredKeys.length; ++i) {
+      var uKey = unfilteredKeys[i];
+      list = unfilteredByKey[uKey];
+      var matchKpiUnf = null;
+      if (kpiInfo && !kpiUsed && kpiInfo.unfiltered && kpiInfo.coScanKey === uKey) {
+        if (kpiInfo.tryRestoreUnfiltered()) {
+          kpiInfo.commit(false);
+          kpiUsed = true;
+        } else {
+          kpiInfo.prepareZero();
+          matchKpiUnf = kpiInfo;
+          kpiUsed = true;
+        }
+      }
+      if (list.length >= 2 || matchKpiUnf) {
+        for (var ui = 0; ui < list.length; ++ui) list[ui].prepareZero();
+        reduceMultiGroupsAll(list, matchKpiUnf ? matchKpiUnf.buffers : null, list[0].plan, getNumericColumn, n);
+        for (var uc = 0; uc < list.length; ++uc) list[uc].commit(true);
+        if (matchKpiUnf) matchKpiUnf.commit(true);
+      }
+    }
+
+    if (filteredKeys.length > 0) {
+      var activeCnt = filteredCount();
+      if (activeCnt === 0) {
+        for (i = 0; i < filteredKeys.length; ++i) {
+          list = filteredByKey[filteredKeys[i]];
+          for (var zi = 0; zi < list.length; ++zi) {
+            list[zi].prepareZero();
+            list[zi].commit(false);
+          }
+        }
+        if (kpiInfo && !kpiUsed && !kpiInfo.unfiltered) {
+          kpiInfo.prepareZero();
+          kpiInfo.commit(false);
+          kpiUsed = true;
+        }
+        return;
+      }
+
+      var tryComp = activeCnt > (n >>> 1);
+      var activeRows = null;
+      var excludedRows = null;
+
+      for (i = 0; i < filteredKeys.length; ++i) {
+        var fKey = filteredKeys[i];
+        list = filteredByKey[fKey];
+        var plan = list[0].plan;
+        var canCompPlan = tryComp && canPlanUseComplement(plan, getNumericColumn);
+
+        var compList = null;
+        var directList = null;
+        if (canCompPlan) {
+          compList = [];
+          directList = [];
+          for (var fi = 0; fi < list.length; ++fi) {
+            if (list[fi].canComplement()) compList.push(list[fi]);
+            else directList.push(list[fi]);
+          }
+        } else {
+          directList = list;
+        }
+
+        if (compList && compList.length > 0) {
+          if (activeCnt === n) {
+            for (var ri = 0; ri < compList.length; ++ri) {
+              compList[ri].tryRestoreUnfiltered();
+              compList[ri].commit(false);
+            }
+            if (kpiInfo && !kpiUsed && !kpiInfo.unfiltered && kpiInfo.coScanKey === fKey && kpiInfo.canComplement()) {
+              kpiInfo.tryRestoreUnfiltered();
+              kpiInfo.commit(false);
+              kpiUsed = true;
+            }
+          } else {
+            var matchKpiComp = null;
+            if (kpiInfo && !kpiUsed && !kpiInfo.unfiltered && kpiInfo.coScanKey === fKey && kpiInfo.canComplement()) {
+              kpiInfo.tryRestoreUnfiltered(true);
+              matchKpiComp = kpiInfo;
+              kpiUsed = true;
+            }
+            if (compList.length >= 2 || matchKpiComp) {
+              if (!excludedRows) excludedRows = getExcludedRows(null);
+              for (var ci = 0; ci < compList.length; ++ci) compList[ci].tryRestoreUnfiltered(true);
+              reduceMultiGroupsIndexed(compList, matchKpiComp ? matchKpiComp.buffers : null, plan, getNumericColumn, excludedRows.indices, excludedRows.length, -1);
+              for (var cc = 0; cc < compList.length; ++cc) {
+                compList[cc].cleanupComplement(excludedRows.indices, excludedRows.length);
+                compList[cc].commit(false);
+              }
+              if (matchKpiComp) matchKpiComp.commit(false);
+            }
+          }
+        }
+
+        if (directList && directList.length > 0) {
+          var matchKpiDir = null;
+          if (kpiInfo && !kpiUsed && !kpiInfo.unfiltered && kpiInfo.coScanKey === fKey) {
+            kpiInfo.prepareZero();
+            matchKpiDir = kpiInfo;
+            kpiUsed = true;
+          }
+          if (directList.length >= 2 || matchKpiDir) {
+            if (!activeRows) activeRows = getActiveRows();
+            if (activeRows) {
+              for (var di = 0; di < directList.length; ++di) directList[di].prepareZero();
+              reduceMultiGroupsIndexed(directList, matchKpiDir ? matchKpiDir.buffers : null, plan, getNumericColumn, activeRows.indices, activeRows.length, 1);
+              for (var dc = 0; dc < directList.length; ++dc) directList[dc].commit(false);
+              if (matchKpiDir) matchKpiDir.commit(false);
+            }
+          }
+        }
+      }
+    }
   }
 
   function fillNumericFromRows(dest, entry, field, start, end) {
@@ -7575,6 +10018,7 @@ function crossfilter() {
       raw = row ? row[field] : undefined;
       if (typeof raw === 'number' && raw === raw && raw !== Infinity && raw !== -Infinity) {
         dest[i] = raw;
+        if (raw > 1e12 || raw < -1e12) entry.hasExtreme = true;
       } else {
         dest[i] = NaN;
         entry.hasNaN = true;
@@ -7598,21 +10042,24 @@ function crossfilter() {
         }
         if (directF64 && directF64.length >= n) {
           var nonFiniteFound = false;
+          var extremeFound = false;
           for (var fi = 0; fi < n; ++fi) {
-            if (directF64[fi] - directF64[fi] !== 0) {
+            var fv = directF64[fi];
+            if (fv - fv !== 0) {
               nonFiniteFound = true;
               break;
             }
+            if (fv > 1e12 || fv < -1e12) extremeFound = true;
           }
           if (!nonFiniteFound) {
-            entry = { values: directF64, hasNaN: false, length: n, shared: true };
+            entry = { values: directF64, hasNaN: false, hasExtreme: extremeFound, length: n, shared: true };
             numericColumns[field] = entry;
             return entry;
           }
         }
       }
       var initCap = n < 64 ? 64 : n;
-      entry = { values: new Float64Array(initCap), hasNaN: false, length: 0, shared: false };
+      entry = { values: new Float64Array(initCap), hasNaN: false, hasExtreme: false, length: 0, shared: false };
       numericColumns[field] = entry;
     }
     if (entry.length >= n) {
@@ -7663,6 +10110,7 @@ function crossfilter() {
           v = col[i];
           if (v - v === 0) {
             values[segStart + i - localStart] = v;
+            if (v > 1e12 || v < -1e12) entry.hasExtreme = true;
           } else {
             values[segStart + i - localStart] = NaN;
             entry.hasNaN = true;
@@ -7673,6 +10121,7 @@ function crossfilter() {
           raw = col[i];
           if (typeof raw === 'number' && raw - raw === 0) {
             values[segStart + i - localStart] = raw;
+            if (raw > 1e12 || raw < -1e12) entry.hasExtreme = true;
           } else {
             values[segStart + i - localStart] = NaN;
             entry.hasNaN = true;
@@ -7702,6 +10151,7 @@ function crossfilter() {
                   v = chunkVals[i];
                   if (v - v === 0) {
                     values[dstBase + i - subStart] = v;
+                    if (v > 1e12 || v < -1e12) entry.hasExtreme = true;
                   } else {
                     values[dstBase + i - subStart] = NaN;
                     entry.hasNaN = true;
@@ -7721,6 +10171,7 @@ function crossfilter() {
                   v = chunkVals[i];
                   if (isIntChunk || v - v === 0) {
                     values[dstBase + i - subStart] = v;
+                    if (!isIntChunk && (v > 1e12 || v < -1e12)) entry.hasExtreme = true;
                   } else {
                     values[dstBase + i - subStart] = NaN;
                     entry.hasNaN = true;
@@ -7757,6 +10208,7 @@ function crossfilter() {
                   else if (tDiv !== 1) v /= tDiv;
                   if (v - v === 0) {
                     values[tDstBase + i - tSubStart] = v;
+                    if (v > 1e12 || v < -1e12) entry.hasExtreme = true;
                   } else {
                     values[tDstBase + i - tSubStart] = NaN;
                     entry.hasNaN = true;
@@ -7776,6 +10228,7 @@ function crossfilter() {
                     else if (tDiv !== 1) v /= tDiv;
                     if (v - v === 0) {
                       values[tDstBase + i - tSubStart] = v;
+                      if (v > 1e12 || v < -1e12) entry.hasExtreme = true;
                     } else {
                       values[tDstBase + i - tSubStart] = NaN;
                       entry.hasNaN = true;
@@ -7791,6 +10244,7 @@ function crossfilter() {
               raw = accessor(i);
               if (typeof raw === 'number' && raw - raw === 0) {
                 values[segStart + i - localStart] = raw;
+                if (raw > 1e12 || raw < -1e12) entry.hasExtreme = true;
               } else {
                 values[segStart + i - localStart] = NaN;
                 entry.hasNaN = true;
@@ -7801,6 +10255,7 @@ function crossfilter() {
               raw = getColumnValue(col, i);
               if (typeof raw === 'number' && raw - raw === 0) {
                 values[segStart + i - localStart] = raw;
+                if (raw > 1e12 || raw < -1e12) entry.hasExtreme = true;
               } else {
                 values[segStart + i - localStart] = NaN;
                 entry.hasNaN = true;
@@ -8086,7 +10541,7 @@ function crossfilter() {
   }
 
   function hasAnyActiveDimensionFilters() {
-    return activeDimensionFilterCount > 0;
+    return filterStore.hasAnyActive();
   }
 
   function registerResetListener(listener) {
@@ -8112,15 +10567,15 @@ function crossfilter() {
   }
 
   // Returns:
-  //   0 = no active filter listener outside (dimOne, dimOffset)
+  //   0 = no active filter listener outside dimSlot
   //   1 = at least one other listener exists, and ALL are built-in resettable groups
   //   2 = at least one other listener requires exact added/removed delta arrays
-  function inspectOtherFilterListeners(dimOne, dimOffset) {
+  function inspectOtherFilterListeners(dimSlot) {
     var hasResettable = false;
     for (var i = 0; i < filterListeners.length; ++i) {
       var l = filterListeners[i];
       if (l === cr_null) continue;
-      if (l._xfilterDimOne === dimOne && l._xfilterDimOffset === dimOffset) continue;
+      if (l._xfilterDimSlot === dimSlot) continue;
       if (l._xfilterResettable === true) {
         hasResettable = true;
       } else {
@@ -8130,8 +10585,12 @@ function crossfilter() {
     return hasResettable ? 1 : 0;
   }
 
-  function notifyFilterListeners(filterOne, filterOffset, added, removed, forceReset) {
+  function notifyFilterListeners(filterSlot, added, removed, forceReset) {
     activeRowsDirty = true;
+    activeCountDirty = true;
+    if (filterSlot !== brushDimSlot) {
+      invalidateBrushState();
+    }
     if (transientFilterDepth > 0) {
       return;
     }
@@ -8144,11 +10603,11 @@ function crossfilter() {
     var li;
     if (forceReset) {
       for (li = 0; li < filterListeners.length; ++li) {
-        filterListeners[li](filterOne, filterOffset, added, removed, false, true);
+        filterListeners[li](filterSlot, added, removed, false, true);
       }
     } else {
       for (li = 0; li < filterListeners.length; ++li) {
-        filterListeners[li](filterOne, filterOffset, added, removed);
+        filterListeners[li](filterSlot, added, removed);
       }
     }
     triggerOnChange('filtered');
@@ -8176,12 +10635,15 @@ function crossfilter() {
   }
 
   function withTransientFilters(callback) {
+    filterStore.ensureMaterialized(null);
+    invalidateBrushState();
     transientFilterDepth += 1;
     try {
       return callback();
     } finally {
       transientFilterDepth -= 1;
       activeRowsDirty = true;
+      activeCountDirty = true;
     }
   }
 
@@ -8406,10 +10868,12 @@ function crossfilter() {
     // Lengthen the filter bitset to handle the new records.
     // Notify listeners (dimensions and groups) that new data is available.
     if (n1) {
+      invalidateBrushState();
       appendData(newData);
       rememberColumnarBatch(newData, n0, n1);
-      filters.lengthen(n += n1);
+      filterStore.lengthen(n += n1);
       activeRowsDirty = true;
+      activeCountDirty = true;
       dataListeners.forEach(function(l) { l(newData, n0, n1); });
       triggerOnChange('dataAdded');
     }
@@ -8448,6 +10912,8 @@ function crossfilter() {
   // Removes all records that match the current filters, or if a predicate function is passed,
   // removes all records matching the predicate (ignoring filters).
   function removeData(predicate) {
+    filterStore.ensureMaterialized(null);
+    invalidateBrushState();
     var usePred = typeof predicate === 'function',
         indexOnlyPred = !usePred || predicate._xfilterIndexOnly === true,
         compactColumnar = indexOnlyPred && canCompactColumnarOnRemove();
@@ -8464,7 +10930,7 @@ function crossfilter() {
 
     if (compactColumnar) {
       for (var ci = 0; ci < n; ++ci) {
-        var dropRow = usePred ? predicate(undefined, ci) : filters.zero(ci);
+        var dropRow = usePred ? predicate(undefined, ci) : filterStore.isActive(ci);
         if (dropRow) {
           removed.push(ci);
           newIndex[ci] = REMOVED_INDEX;
@@ -8475,7 +10941,7 @@ function crossfilter() {
       }
     } else {
       for (var index1 = 0, index2 = 0; index1 < n; ++index1) {
-        if (usePred ? predicate(getRecord(index1), index1) : filters.zero(index1)) {
+        if (usePred ? predicate(getRecord(index1), index1) : filterStore.isActive(index1)) {
           removed.push(index1);
           newIndex[index1] = REMOVED_INDEX;
         } else {
@@ -8501,70 +10967,61 @@ function crossfilter() {
     }
 
     // Remove all matching records from groups.
-    filterListeners.forEach(function(l) { l(-1, -1, [], removed, true); });
+    filterListeners.forEach(function(l) { l(null, [], removed, true); });
 
     // Update indexes.
     removeDataListeners.forEach(function(l) { l(newIndex); });
 
     // Remove old filters and data by overwriting.
     if (compactColumnar) {
-      for (var fi = 0, fo = 0; fi < n; ++fi) {
-        if (newIndex[fi] !== REMOVED_INDEX) {
-          if (fi !== fo) filters.copy(fo, fi);
-          ++fo;
-        }
-      }
-      n = fo;
-      data = new Array(fo);
-      filters.truncate(fo);
+      filterStore.compact(newIndex, keptCount, REMOVED_INDEX);
+      n = keptCount;
+      data = new Array(keptCount);
       columnarBatches = nextColumnarBatch ? [nextColumnarBatch] : [];
       anyRowMaterialized = false;
     } else {
       for (var index3 = 0, index4 = 0; index3 < n; ++index3) {
         if (newIndex[index3] !== REMOVED_INDEX) {
-          if (index3 !== index4) filters.copy(index4, index3), data[index4] = data[index3];
+          if (index3 !== index4) data[index4] = data[index3];
           ++index4;
         }
       }
+      filterStore.compact(newIndex, index4, REMOVED_INDEX);
       data.length = n = index4;
-      filters.truncate(index4);
       columnarBatches = [];
     }
 
     numericColumns = Object.create(null);
     splitColumns = Object.create(null);
     activeRowsDirty = true;
+    activeCountDirty = true;
     triggerOnChange('dataRemoved');
   }
 
-  function maskForDimensions(dimensions) {
-    var n,
-        d,
-        len,
-        id,
-        mask = Array(filters.subarrays);
-    for (n = 0; n < filters.subarrays; n++) { mask[n] = ~0; }
-    for (d = 0, len = dimensions.length; d < len; d++) {
-      // The top bits of the ID are the subarray offset and the lower bits are the bit
-      // offset of the "one" mask.
-      id = dimensions[d].id();
-      mask[id >> 7] &= ~(0x1 << (id & 0x3f));
+  function buildIgnoreIdMap(dimensions) {
+    if (!dimensions || !dimensions.length) {
+      return null;
     }
-    return mask;
+    var map = Object.create(null);
+    for (var d = 0, len = dimensions.length; d < len; d++) {
+      map[dimensions[d].id()] = true;
+    }
+    return map;
   }
 
   // Return true if the data element at index i is filtered IN.
   // Optionally, ignore the filters of any dimensions in the ignore_dimensions list.
   function isElementFiltered(i, ignore_dimensions) {
-    var mask = maskForDimensions(ignore_dimensions || []);
-    return filters.zeroExceptMask(i,mask);
+    var ignoreMap = buildIgnoreIdMap(ignore_dimensions);
+    return ignoreMap ? filterStore.isActiveIgnoring(i, ignoreMap) : filterStore.isActive(i);
   }
 
   // Adds a new dimension with the specified value accessor function.
   function dimension(value, iterable) {
-    var accessorPath;
+    var accessorPath,
+        isStringField = typeof value === 'string';
 
-    if (typeof value === 'string') {
+    if (isStringField) {
       accessorPath = value;
       value = function(d) { return result(d, accessorPath); };
     } else if (typeof value === 'function') {
@@ -8593,9 +11050,7 @@ function crossfilter() {
       _bounds: readDimensionBounds
     };
 
-    var one, // lowest unset bit as mask, e.g., 00001000
-        zero, // inverted one, e.g., 11110111
-        offset, // offset into the filters arrays
+    var dimSlot, // 1-bit filter slot in filterStore
         id, // unique ID for this dimension (reused when dimensions are disposed)
         values, // sorted, cached array
         index, // maps sorted value index -> record index (in data)
@@ -8669,6 +11124,7 @@ function crossfilter() {
         lazyFilterTargetCodesVersion = 0,
         lazyEncodedState = null,
         rawNumericState = null,
+        deferredInit = false,
         indexListeners = [], // when data is added
         dimensionGroups = [],
         lo0 = 0,
@@ -9428,50 +11884,40 @@ function crossfilter() {
         return dimension;
       }
 
-      var f = filters[offset],
-          otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
-            ? inspectOtherFilterListeners(one, offset)
+      var otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+            ? inspectOtherFilterListeners(dimSlot)
             : 0,
           prevSelected = lazyEncodedState.lastSelectedCount,
-          useForceReset = otherMode === 1 && prevSelected >= 0 && (n - prevSelected) > (n >>> 2),
-          needDeltas = otherMode > 0 && !useForceReset,
-          i;
+          useForceReset = otherMode === 1 && (
+            !filterStore.hasOtherActive(dimSlot)
+            || (prevSelected >= 0 && (n - prevSelected) > (n >>> 2))
+          ),
+          needDeltas = otherMode > 0 && !useForceReset;
 
       lazyEncodedState.hasActiveFilterMask = false;
       lazyEncodedState.lastSelectedCount = -1;
 
       if (!needDeltas) {
-        for (i = 0; i < n; ++i) {
-          if (f[i] & one) {
-            f[i] &= zero;
-          }
-        }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
+        filterStore.deactivate(dimSlot);
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
 
       var useScratch = !deltaBufInUse,
           added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
-          addedCount = 0;
+          addedCount;
 
       if (useScratch) deltaBufInUse = true;
-
-      for (i = 0; i < n; ++i) {
-        if (f[i] & one) {
-          f[i] &= zero;
-          if (useScratch) added[addedCount++] = i;
-          else added.push(i);
-        }
-      }
+      addedCount = filterStore.clearSlotWithDeltas(dimSlot, added, useScratch);
 
       if (useScratch) {
         try {
-          notifyFilterListeners(one, offset, added.subarray(0, addedCount), EMPTY_ARRAY);
+          notifyFilterListeners(dimSlot, added.subarray(0, addedCount), EMPTY_ARRAY);
         } finally {
           deltaBufInUse = false;
         }
       } else {
-        notifyFilterListeners(one, offset, added, EMPTY_ARRAY);
+        notifyFilterListeners(dimSlot, added, EMPTY_ARRAY);
       }
       return dimension;
     }
@@ -9492,14 +11938,13 @@ function crossfilter() {
       var hadMask = lazyEncodedState.hasActiveFilterMask,
           prevSelected = lazyEncodedState.lastSelectedCount,
           codes = lazyEncodedState.codes,
-          f = filters[offset],
           targetCount = targetCodes.length,
           otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
-            ? inspectOtherFilterListeners(one, offset)
+            ? inspectOtherFilterListeners(dimSlot)
             : 0,
           useForceReset = otherMode === 1 && (
             !hadMask
-              ? (n - selectedCount) > (n >>> 2)
+              ? ((n - selectedCount) > 1024 || (n - selectedCount) > (n >>> 2))
               : (prevSelected >= 0 && Math.abs(selectedCount - prevSelected) > (n >>> 2))
           ),
           needDeltas = otherMode > 0 && !useForceReset,
@@ -9521,43 +11966,21 @@ function crossfilter() {
       lazyEncodedState.hasActiveFilterMask = true;
       lazyEncodedState.lastSelectedCount = selectedCount;
 
+      var writeMode = targetCount === 0 ? 0 : (targetCount === 1 ? 1 : 2);
+      var argA = targetCount === 1 ? t0 : selectionMarks;
+      var argB = markVersion;
+
       if (!needDeltas) {
-        if (targetCount === 0) {
-          for (i = 0; i < n; ++i) {
-            f[i] |= one;
-          }
-        } else if (targetCount === 1) {
-          if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              if (codes[i] !== t0) f[i] |= one;
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              if (codes[i] === t0) f[i] &= zero;
-              else f[i] |= one;
-            }
-          }
-        } else {
-          if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              if (selectionMarks[codes[i]] !== markVersion) f[i] |= one;
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              if (selectionMarks[codes[i]] === markVersion) f[i] &= zero;
-              else f[i] |= one;
-            }
-          }
-        }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
+        filterStore.writePredicateNoDelta(dimSlot, writeMode, codes, argA, argB);
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
 
       var useScratch = !deltaBufInUse,
           added,
           removed,
-          addedCount = 0,
-          removedCount = 0;
+          canBail = otherMode === 1,
+          bailLimit = n >>> 2;
 
       if (useScratch) {
         deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n);
@@ -9570,89 +11993,29 @@ function crossfilter() {
         removed = [];
       }
 
-      if (targetCount === 0) {
-        if (!hadMask) {
-          for (i = 0; i < n; ++i) {
-            f[i] |= one;
-            if (useScratch) removed[removedCount++] = i;
-            else removed.push(i);
-          }
-        } else {
-          for (i = 0; i < n; ++i) {
-            if (!(f[i] & one)) {
-              f[i] |= one;
-              if (useScratch) removed[removedCount++] = i;
-              else removed.push(i);
-            }
-          }
-        }
-      } else if (targetCount === 1) {
-        if (!hadMask) {
-          for (i = 0; i < n; ++i) {
-            if (codes[i] !== t0) {
-              f[i] |= one;
-              if (useScratch) removed[removedCount++] = i;
-              else removed.push(i);
-            }
-          }
-        } else {
-          for (i = 0; i < n; ++i) {
-            if (codes[i] === t0) {
-              if (f[i] & one) {
-                f[i] &= zero;
-                if (useScratch) added[addedCount++] = i;
-                else added.push(i);
-              }
-            } else {
-              if (!(f[i] & one)) {
-                f[i] |= one;
-                if (useScratch) removed[removedCount++] = i;
-                else removed.push(i);
-              }
-            }
-          }
-        }
-      } else {
-        if (!hadMask) {
-          for (i = 0; i < n; ++i) {
-            if (selectionMarks[codes[i]] !== markVersion) {
-              f[i] |= one;
-              if (useScratch) removed[removedCount++] = i;
-              else removed.push(i);
-            }
-          }
-        } else {
-          for (i = 0; i < n; ++i) {
-            if (selectionMarks[codes[i]] === markVersion) {
-              if (f[i] & one) {
-                f[i] &= zero;
-                if (useScratch) added[addedCount++] = i;
-                else added.push(i);
-              }
-            } else {
-              if (!(f[i] & one)) {
-                f[i] |= one;
-                if (useScratch) removed[removedCount++] = i;
-                else removed.push(i);
-              }
-            }
-          }
-        }
+      var res = filterStore.writePredicateWithDeltas(
+        dimSlot, writeMode, codes, argA, argB,
+        added, removed, useScratch, canBail, bailLimit
+      );
+
+      if (res.bailed) {
+        if (useScratch) deltaBufInUse = false;
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, true);
+        return dimension;
       }
 
       if (useScratch) {
         try {
           notifyFilterListeners(
-            one,
-            offset,
-            added.subarray(0, addedCount),
-            removed.subarray(0, removedCount)
+            dimSlot,
+            added.subarray(0, res.addedCount),
+            removed.subarray(0, res.removedCount)
           );
         } finally {
           deltaBufInUse = false;
         }
       } else {
-        notifyFilterListeners(one, offset, added, removed);
+        notifyFilterListeners(dimSlot, added, removed);
       }
       return dimension;
     }
@@ -9689,9 +12052,9 @@ function crossfilter() {
         return new Uint32Array(0);
       }
 
-      if (lazyFilterTargetCodes) {
+      if (lazyFilterTargetCodes || (filterMode === 'bounds' && Array.isArray(filterValue))) {
         var currentCodeCount = lazyEncodedState.codeToValue.length;
-        if (currentCodeCount === lazyFilterTargetCodesVersion) {
+        if (lazyFilterTargetCodes && currentCodeCount === lazyFilterTargetCodesVersion) {
           return lazyFilterTargetCodes;
         }
         lazyFilterTargetCodes = computeLazyRangeCodes(filterValue);
@@ -9718,7 +12081,6 @@ function crossfilter() {
       }
 
       var codes = lazyEncodedState.codes,
-          f = filters[offset],
           targetCount = targetCodes.length,
           endRow = startRow + length,
           maskedAny = false,
@@ -9726,14 +12088,14 @@ function crossfilter() {
 
       if (targetCount === 0) {
         for (i = startRow; i < endRow; ++i) {
-          f[i] |= one;
+          filterStore.setSlotExcluded(dimSlot, i);
         }
         maskedAny = true;
       } else if (targetCount === 1) {
         var t0 = targetCodes[0];
         for (i = startRow; i < endRow; ++i) {
           if (codes[i] !== t0) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
@@ -9745,7 +12107,7 @@ function crossfilter() {
         }
         for (i = startRow; i < endRow; ++i) {
           if (selectionMarks[codes[i]] !== markVersion) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
@@ -9762,7 +12124,6 @@ function crossfilter() {
           i,
           nextCodes,
           rowIndex,
-          f = filters[offset],
           hasActiveMask = false;
 
       for (i = 0; i < reIndex.length; ++i) {
@@ -9780,10 +12141,13 @@ function crossfilter() {
           continue;
         }
         nextCodes[rowIndex] = existingCodes[i];
-        if (f[i] & one) {
+        if (!hasActiveMask && filterStore.isSlotExcluded(dimSlot, i)) {
           hasActiveMask = true;
         }
         ++rowIndex;
+      }
+      if (!hasActiveMask && dimSlot.active) {
+        filterStore.deactivate(dimSlot);
       }
 
       var codeToValue = lazyEncodedState.codeToValue;
@@ -9871,6 +12235,10 @@ function crossfilter() {
       if (!rawNumericState || lazyEncodedState || values) {
         return;
       }
+      if (brushDimSlot === dimSlot) {
+        filterStore.ensureSlotMaterialized(dimSlot);
+        invalidateBrushState();
+      }
       var len = existingLength === undefined ? n : existingLength;
       var rawValues = rawNumericState.values;
       var hadMask = rawNumericState.hasActiveFilterMask;
@@ -9894,41 +12262,34 @@ function crossfilter() {
       if (!rawNumericState.hasActiveFilterMask) {
         return dimension;
       }
-      var f = filters[offset],
-          otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
-            ? inspectOtherFilterListeners(one, offset)
+      var otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
+            ? inspectOtherFilterListeners(dimSlot)
             : 0,
-          useForceReset = otherMode === 1 && rawNumericState.lastMaskedCount > (n >>> 2),
-          needDeltas = otherMode > 0 && !useForceReset,
-          i;
+          useForceReset = otherMode === 1 && (
+            !filterStore.hasOtherActive(dimSlot)
+            || rawNumericState.lastMaskedCount > (n >>> 2)
+          ),
+          needDeltas = otherMode > 0 && !useForceReset;
       rawNumericState.hasActiveFilterMask = false;
       rawNumericState.lastMaskedCount = -1;
       if (!needDeltas) {
-        for (i = 0; i < n; ++i) {
-          if (f[i] & one) f[i] &= zero;
-        }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
+        filterStore.deactivate(dimSlot);
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
       var useScratch = !deltaBufInUse,
           added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
-          addedCount = 0;
+          addedCount;
       if (useScratch) deltaBufInUse = true;
-      for (i = 0; i < n; ++i) {
-        if (f[i] & one) {
-          f[i] &= zero;
-          if (useScratch) added[addedCount++] = i;
-          else added.push(i);
-        }
-      }
+      addedCount = filterStore.clearSlotWithDeltas(dimSlot, added, useScratch);
       if (useScratch) {
         try {
-          notifyFilterListeners(one, offset, added.subarray(0, addedCount), EMPTY_ARRAY);
+          notifyFilterListeners(dimSlot, added.subarray(0, addedCount), EMPTY_ARRAY);
         } finally {
           deltaBufInUse = false;
         }
       } else {
-        notifyFilterListeners(one, offset, added, EMPTY_ARRAY);
+        notifyFilterListeners(dimSlot, added, EMPTY_ARRAY);
       }
       return dimension;
     }
@@ -9942,157 +12303,70 @@ function crossfilter() {
       }
       var hadMask = rawNumericState.hasActiveFilterMask,
           vals = rawNumericState.values,
-          f = filters[offset],
           otherMode = (transientFilterDepth === 0 && batchedFilterDepth === 0 && filterListeners.length > 0)
-            ? inspectOtherFilterListeners(one, offset)
+            ? inspectOtherFilterListeners(dimSlot)
             : 0,
-          useForceReset = otherMode === 1 && !hadMask && kind === 0 && n > (n >>> 2),
+          useForceReset = otherMode === 1 && !hadMask && n > 1024,
           needDeltas = otherMode > 0 && !useForceReset,
-          maskedCount = 0,
-          i,
-          v,
-          match;
+          writeMode = kind === 0 ? 0 : (kind === 1 ? 3 : (kind === 2 ? 4 : 5)),
+          matchedCount,
+          maskedCount;
 
-      // kind: 0=empty, 1=exact(argA), 2=range(argA, argB), 3=inSet(argA:Set)
       if (!needDeltas) {
-        if (kind === 0) {
-          for (i = 0; i < n; ++i) f[i] |= one;
-          maskedCount = n;
-        } else if (kind === 1) {
+        matchedCount = filterStore.writePredicateNoDelta(dimSlot, writeMode, vals, argA, argB);
+        maskedCount = n - matchedCount;
+        if (maskedCount === 0) {
+          filterStore.deactivate(dimSlot);
+          rawNumericState.hasActiveFilterMask = false;
+          rawNumericState.lastMaskedCount = 0;
           if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              if (vals[i] !== argA) { f[i] |= one; ++maskedCount; }
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              if (vals[i] === argA) f[i] &= zero;
-              else { f[i] |= one; ++maskedCount; }
-            }
+            return dimension;
           }
-        } else if (kind === 2) {
-          if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              v = vals[i];
-              if (!(v >= argA && v < argB)) { f[i] |= one; ++maskedCount; }
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              v = vals[i];
-              if (v >= argA && v < argB) f[i] &= zero;
-              else { f[i] |= one; ++maskedCount; }
-            }
-          }
-        } else {
-          if (!hadMask) {
-            for (i = 0; i < n; ++i) {
-              if (!argA.has(vals[i])) { f[i] |= one; ++maskedCount; }
-            }
-          } else {
-            for (i = 0; i < n; ++i) {
-              if (argA.has(vals[i])) f[i] &= zero;
-              else { f[i] |= one; ++maskedCount; }
-            }
-          }
-        }
-        rawNumericState.hasActiveFilterMask = maskedCount > 0;
-        rawNumericState.lastMaskedCount = maskedCount;
-        if (!hadMask && maskedCount === 0) {
+          notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
           return dimension;
         }
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
+        rawNumericState.hasActiveFilterMask = true;
+        rawNumericState.lastMaskedCount = maskedCount;
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, useForceReset);
         return dimension;
       }
 
       var useScratch = !deltaBufInUse,
           added = useScratch ? (deltaAddedBuf = ensureUint32Capacity(deltaAddedBuf, n)) : [],
           removed = useScratch ? (deltaRemovedBuf = ensureUint32Capacity(deltaRemovedBuf, n)) : [],
-          addedCount = 0,
-          removedCount = 0,
           canBail = otherMode === 1,
-          bailLimit = n >>> 2,
-          bailed = false;
+          bailLimit = n >>> 2;
       if (useScratch) deltaBufInUse = true;
 
-      for (i = 0; i < n; ++i) {
-        if (kind === 0) {
-          match = false;
-        } else if (kind === 1) {
-          match = vals[i] === argA;
-        } else if (kind === 2) {
-          v = vals[i];
-          match = v >= argA && v < argB;
-        } else {
-          match = argA.has(vals[i]);
-        }
-        if (match) {
-          if (hadMask && (f[i] & one)) {
-            f[i] &= zero;
-            if (useScratch) added[addedCount++] = i;
-            else added.push(i);
-            if (canBail && addedCount + removedCount > bailLimit) {
-              bailed = true;
-              ++i;
-              break;
-            }
-          }
-        } else {
-          ++maskedCount;
-          if (!hadMask || !(f[i] & one)) {
-            f[i] |= one;
-            if (useScratch) removed[removedCount++] = i;
-            else removed.push(i);
-            if (canBail && addedCount + removedCount > bailLimit) {
-              bailed = true;
-              ++i;
-              break;
-            }
-          }
-        }
+      var res = filterStore.writePredicateWithDeltas(
+        dimSlot, writeMode, vals, argA, argB,
+        added, removed, useScratch, canBail, bailLimit
+      );
+      maskedCount = n - res.matchedCount;
+      if (maskedCount === 0) {
+        filterStore.deactivate(dimSlot);
       }
+      rawNumericState.hasActiveFilterMask = maskedCount > 0;
+      rawNumericState.lastMaskedCount = maskedCount;
 
-      if (bailed) {
-        if (kind === 0) {
-          for (; i < n; ++i) { f[i] |= one; ++maskedCount; }
-        } else if (kind === 1) {
-          if (!hadMask) {
-            for (; i < n; ++i) { if (vals[i] !== argA) { f[i] |= one; ++maskedCount; } }
-          } else {
-            for (; i < n; ++i) { if (vals[i] === argA) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
-          }
-        } else if (kind === 2) {
-          if (!hadMask) {
-            for (; i < n; ++i) { v = vals[i]; if (!(v >= argA && v < argB)) { f[i] |= one; ++maskedCount; } }
-          } else {
-            for (; i < n; ++i) { v = vals[i]; if (v >= argA && v < argB) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
-          }
-        } else {
-          if (!hadMask) {
-            for (; i < n; ++i) { if (!argA.has(vals[i])) { f[i] |= one; ++maskedCount; } }
-          } else {
-            for (; i < n; ++i) { if (argA.has(vals[i])) f[i] &= zero; else { f[i] |= one; ++maskedCount; } }
-          }
-        }
-        rawNumericState.hasActiveFilterMask = maskedCount > 0;
-        rawNumericState.lastMaskedCount = maskedCount;
+      if (res.bailed) {
         if (useScratch) deltaBufInUse = false;
-        notifyFilterListeners(one, offset, EMPTY_ARRAY, EMPTY_ARRAY, true);
+        notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, true);
         return dimension;
       }
 
-      rawNumericState.hasActiveFilterMask = maskedCount > 0;
-      rawNumericState.lastMaskedCount = maskedCount;
       if (!hadMask && maskedCount === 0) {
         if (useScratch) deltaBufInUse = false;
         return dimension;
       }
       if (useScratch) {
         try {
-          notifyFilterListeners(one, offset, added.subarray(0, addedCount), removed.subarray(0, removedCount));
+          notifyFilterListeners(dimSlot, added.subarray(0, res.addedCount), removed.subarray(0, res.removedCount));
         } finally {
           deltaBufInUse = false;
         }
       } else {
-        notifyFilterListeners(one, offset, added, removed);
+        notifyFilterListeners(dimSlot, added, removed);
       }
       return dimension;
     }
@@ -10102,7 +12376,6 @@ function crossfilter() {
         return;
       }
       var vals = rawNumericState.values,
-          f = filters[offset],
           endRow = startRow + length,
           maskedAny = false,
           i,
@@ -10111,7 +12384,7 @@ function crossfilter() {
         var inSet = new Set(filterInValues || []);
         for (i = startRow; i < endRow; ++i) {
           if (!inSet.has(vals[i])) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
@@ -10121,14 +12394,14 @@ function crossfilter() {
         for (i = startRow; i < endRow; ++i) {
           v = vals[i];
           if (!(v >= lo && v < hi)) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
       } else {
         for (i = startRow; i < endRow; ++i) {
           if (vals[i] !== filterValue) {
-            f[i] |= one;
+            filterStore.setSlotExcluded(dimSlot, i);
             maskedAny = true;
           }
         }
@@ -10140,6 +12413,10 @@ function crossfilter() {
     }
 
     function materializeLazyEncodedState() {
+      if (brushDimSlot === dimSlot) {
+        filterStore.ensureSlotMaterialized(dimSlot);
+        invalidateBrushState();
+      }
       if (rawNumericState && !values) {
         upgradeRawNumericToLazy(n);
       }
@@ -10188,17 +12465,11 @@ function crossfilter() {
     }
 
     function setFilterValuePresent(nextPresent) {
-      var currentPresent = filterValuePresent === true;
-      nextPresent = !!nextPresent;
-      if (currentPresent === nextPresent) {
-        return;
-      }
-      activeDimensionFilterCount += nextPresent ? 1 : -1;
-      filterValuePresent = nextPresent;
+      filterValuePresent = !!nextPresent;
     }
 
     function hasOtherActiveDimensionFilters() {
-      return activeDimensionFilterCount > (filterValuePresent ? 1 : 0);
+      return filterStore.hasOtherActive(dimSlot);
     }
 
     function getExactRange(value) {
@@ -10266,13 +12537,25 @@ function crossfilter() {
       var i,
           row;
 
-      if(!iterable) {
-        for(i = 0; i < added.length; i++) {
-          filters[offset][added[i]] ^= one;
-        }
-
-        for(i = 0; i < removed.length; i++) {
-          filters[offset][removed[i]] ^= one;
+      if (!iterable) {
+        if (filterMode === 'all') {
+          filterStore.deactivate(dimSlot);
+        } else {
+          if (removed.length > 0 && !dimSlot.active) {
+            filterStore.activateAllOnes(dimSlot);
+          }
+          if (dimSlot.active) {
+            filterStore.ensureSlotMaterialized(dimSlot);
+            var bits = dimSlot.bitset;
+            for (i = 0; i < added.length; i++) {
+              row = added[i];
+              bits[row >>> 5] |= (1 << (row & 31));
+            }
+            for (i = 0; i < removed.length; i++) {
+              row = removed[i];
+              bits[row >>> 5] &= ~(1 << (row & 31));
+            }
+          }
         }
       } else {
         var newAdded = [];
@@ -10281,16 +12564,16 @@ function crossfilter() {
         for (i = 0; i < added.length; i++) {
           iterablesIndexCount[added[i]]++;
           iterablesIndexFilterStatus[valueIndexAdded[i]] = 0;
-          if(iterablesIndexCount[added[i]] === 1) {
-            filters[offset][added[i]] ^= one;
+          if (iterablesIndexCount[added[i]] === 1) {
+            filterStore.setSlotIncluded(dimSlot, added[i]);
             newAdded.push(added[i]);
           }
         }
         for (i = 0; i < removed.length; i++) {
           iterablesIndexCount[removed[i]]--;
           iterablesIndexFilterStatus[valueIndexRemoved[i]] = 1;
-          if(iterablesIndexCount[removed[i]] === 0) {
-            filters[offset][removed[i]] ^= one;
+          if (iterablesIndexCount[removed[i]] === 0) {
+            filterStore.setSlotExcluded(dimSlot, removed[i]);
             newRemoved.push(removed[i]);
           }
         }
@@ -10298,24 +12581,29 @@ function crossfilter() {
         added = newAdded;
         removed = newRemoved;
 
-        if(includeEmptyRows) {
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if((filters[offset][row = iterablesEmptyRows[i]] & one)) {
-              filters[offset][row] ^= one;
+        if (includeEmptyRows) {
+          for (i = 0; i < iterablesEmptyRows.length; i++) {
+            row = iterablesEmptyRows[i];
+            if (filterStore.isSlotExcluded(dimSlot, row)) {
+              filterStore.setSlotIncluded(dimSlot, row);
               added.push(row);
             }
           }
         } else {
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if(!(filters[offset][row = iterablesEmptyRows[i]] & one)) {
-              filters[offset][row] ^= one;
+          for (i = 0; i < iterablesEmptyRows.length; i++) {
+            row = iterablesEmptyRows[i];
+            if (!filterStore.isSlotExcluded(dimSlot, row)) {
+              filterStore.setSlotExcluded(dimSlot, row);
               removed.push(row);
             }
           }
         }
+        if (filterMode === 'all') {
+          filterStore.deactivate(dimSlot);
+        }
       }
 
-      notifyFilterListeners(one, offset, added, removed);
+      notifyFilterListeners(dimSlot, added, removed);
       return dimension;
     }
 
@@ -10400,24 +12688,38 @@ function crossfilter() {
       lazyDimensionsByField[accessorPath].push(lazyStateGetter);
     }
 
-    // Add a new dimension in the filter bitmap and store the offset and bitmask.
-    var tmp = filters.add();
-    offset = tmp.offset;
-    one = tmp.one;
-    zero = ~one;
+    // Allocate a 1-bit filter slot in filterStore (reusing disposed dimension IDs).
+    dimSlot = filterStore.allocSlot();
+    id = dimSlot.id;
 
-    // Create a unique ID for the dimension
-    // IDs will be re-used if dimensions are disposed.
-    // For internal use the ID is the subarray offset shifted left 7 bits or'd with the
-    // bit offset of the set bit in the dimension's "one" mask.
-    id = (offset << 7) | (Math.log(one) / Math.log(2));
+    function ensureDeferredReady() {
+      if (!deferredInit) return;
+      deferredInit = false;
+      preAdd(data, 0, n);
+      postAdd(data, 0, n);
+    }
 
-    preAdd(data, 0, n);
-    postAdd(data, 0, n);
+    if (isStringField && !iterable && (columnarBatches.length > 0 || n === 0)) {
+      deferredInit = true;
+      runtimeController.canUseWasmScan();
+    } else {
+      preAdd(data, 0, n);
+      postAdd(data, 0, n);
+    }
 
     // Incorporates the specified new records into this dimension.
     // This function is responsible for updating filters, values, and index.
     function preAdd(newData, n0, n1) {
+      if (deferredInit) {
+        if (columnarBatches.length > 0 && columnarBatches[columnarBatches.length - 1].end === n) {
+          return;
+        }
+        deferredInit = false;
+        if (n0 > 0) {
+          preAdd(data, 0, n);
+          return;
+        }
+      }
       var newIterablesIndexCount,
           sourceValues = null,
           columnAccessorSegment = accessorPath && !iterable
@@ -10631,27 +12933,27 @@ function crossfilter() {
       var bounds = refilter(newValues), lo1 = bounds[0], hi1 = bounds[1];
 
       var index2, index3, index4;
-      if(iterable) {
+      if (iterable) {
         n1 = t;
         if (refilterFunction) {
           for (index2 = 0; index2 < n1; ++index2) {
             if (!refilterFunction(newValues[index2], index2)) {
-              if(--newIterablesIndexCount[newIndex[index2]] === 0) {
-                filters[offset][newIndex[index2] + n0] |= one;
+              if (--newIterablesIndexCount[newIndex[index2]] === 0) {
+                filterStore.setSlotExcluded(dimSlot, newIndex[index2] + n0);
               }
               newIterablesIndexFilterStatus[index2] = 1;
             }
           }
         } else {
           for (index3 = 0; index3 < lo1; ++index3) {
-            if(--newIterablesIndexCount[newIndex[index3]] === 0) {
-              filters[offset][newIndex[index3] + n0] |= one;
+            if (--newIterablesIndexCount[newIndex[index3]] === 0) {
+              filterStore.setSlotExcluded(dimSlot, newIndex[index3] + n0);
             }
             newIterablesIndexFilterStatus[index3] = 1;
           }
           for (index4 = hi1; index4 < n1; ++index4) {
-            if(--newIterablesIndexCount[newIndex[index4]] === 0) {
-              filters[offset][newIndex[index4] + n0] |= one;
+            if (--newIterablesIndexCount[newIndex[index4]] === 0) {
+              filterStore.setSlotExcluded(dimSlot, newIndex[index4] + n0);
             }
             newIterablesIndexFilterStatus[index4] = 1;
           }
@@ -10660,15 +12962,15 @@ function crossfilter() {
         if (refilterFunction) {
           for (index2 = 0; index2 < n1; ++index2) {
             if (!refilterFunction(newValues[index2], index2)) {
-              filters[offset][newIndex[index2] + n0] |= one;
+              filterStore.setSlotExcluded(dimSlot, newIndex[index2] + n0);
             }
           }
         } else {
           for (index3 = 0; index3 < lo1; ++index3) {
-            filters[offset][newIndex[index3] + n0] |= one;
+            filterStore.setSlotExcluded(dimSlot, newIndex[index3] + n0);
           }
           for (index4 = hi1; index4 < n1; ++index4) {
-            filters[offset][newIndex[index4] + n0] |= one;
+            filterStore.setSlotExcluded(dimSlot, newIndex[index4] + n0);
           }
         }
       }
@@ -10751,17 +13053,18 @@ function crossfilter() {
 
     // When all filters have updated, notify index listeners of the new values.
     function postAdd(newData, n0, n1) {
+      if (deferredInit) return;
       indexListeners.forEach(function(l) { l(newValues, newIndex, n0, n1, lastAppendedCodes); });
       newValues = newIndex = null;
       lastAppendedCodes = null;
     }
 
     function removeData(reIndex) {
+      if (deferredInit) return;
       if (rawNumericState && !values) {
         var rLen = 0,
             ri,
             rj,
-            fRaw = filters[offset],
             rawHasMask = false;
         for (ri = 0; ri < reIndex.length; ++ri) {
           if (reIndex[ri] !== REMOVED_INDEX) ++rLen;
@@ -10771,7 +13074,10 @@ function crossfilter() {
         for (ri = 0, rj = 0; ri < reIndex.length; ++ri) {
           if (reIndex[ri] === REMOVED_INDEX) continue;
           nextRawVals[rj++] = oldRawVals[ri];
-          if (fRaw[ri] & one) rawHasMask = true;
+          if (!rawHasMask && filterStore.isSlotExcluded(dimSlot, ri)) rawHasMask = true;
+        }
+        if (!rawHasMask && dimSlot.active) {
+          filterStore.deactivate(dimSlot);
         }
         rawNumericState.values = nextRawVals;
         rawNumericState.hasActiveFilterMask = rawHasMask;
@@ -10913,8 +13219,103 @@ function crossfilter() {
           : filterExact(range);
     }
 
+    function materializeRawBrushBitset() {
+      if (!rawNumericState || values) return;
+      var vals = rawNumericState.values;
+      var writeMode = brushQueryKind === 'exact' ? 3 : 4;
+      var matched = filterStore.writePredicateNoDelta(dimSlot, writeMode, vals, brushLo, brushHi);
+      if (matched === n) {
+        filterStore.deactivate(dimSlot);
+        rawNumericState.hasActiveFilterMask = false;
+        rawNumericState.lastMaskedCount = 0;
+      } else {
+        rawNumericState.hasActiveFilterMask = true;
+        rawNumericState.lastMaskedCount = n - matched;
+      }
+    }
+
+    function materializeLazyBrushBitset() {
+      if (!lazyEncodedState || values) return;
+      var targetCodes = brushQueryKind === 'exact'
+        ? encodeLazyFilterValues([brushLo])
+        : computeLazyRangeCodes([brushLo, brushHi]);
+      if (!targetCodes) {
+        filterStore.writePredicateNoDelta(dimSlot, 0, lazyEncodedState.codes, 0, 0);
+        lazyEncodedState.hasActiveFilterMask = true;
+        lazyEncodedState.lastSelectedCount = 0;
+        return;
+      }
+      if (brushQueryKind === 'range') {
+        lazyFilterTargetCodes = targetCodes;
+        lazyFilterTargetCodesVersion = lazyEncodedState.codeToValue.length;
+      }
+      var selCount = countLazySelectedRows(targetCodes);
+      if (selCount === n) {
+        filterStore.deactivate(dimSlot);
+        lazyEncodedState.hasActiveFilterMask = false;
+        lazyEncodedState.lastSelectedCount = -1;
+        return;
+      }
+      var targetCount = targetCodes.length;
+      var writeMode = targetCount === 0 ? 0 : (targetCount === 1 ? 1 : 2);
+      var argA = targetCount === 1 ? targetCodes[0] : null;
+      var argB = 0;
+      if (targetCount > 1) {
+        argB = nextLazyMarkVersion();
+        argA = lazyEncodedState.selectionMarks;
+        for (var mi = 0; mi < targetCount; ++mi) argA[targetCodes[mi]] = argB;
+      }
+      filterStore.writePredicateNoDelta(dimSlot, writeMode, lazyEncodedState.codes, argA, argB);
+      lazyEncodedState.hasActiveFilterMask = true;
+      lazyEncodedState.lastSelectedCount = selCount;
+    }
+
+    function tryEnterFalconBrush(queryKind, lo, hi, isRaw) {
+      if (transientFilterDepth > 0 || batchedFilterDepth > 0 || n < 256) {
+        return false;
+      }
+      var otherMode = filterListeners.length > 0 ? inspectOtherFilterListeners(dimSlot) : 0;
+      if (otherMode !== 1) {
+        return false;
+      }
+      if (brushDimSlot !== dimSlot) {
+        invalidateBrushState();
+        brushDimSlot = dimSlot;
+        return false;
+      }
+      if (brushBuildFailed) {
+        return false;
+      }
+      // On exact queries, only use Falcon if discrete mode (raw or lazy); avoid continuous CSR exact scan overhead on single clicks
+      if (queryKind === 'exact' && brushFalcon && brushFalcon.mode !== 'discrete') {
+        return false;
+      }
+      filterMode = 'bounds';
+      lo0 = 0;
+      hi0 = 0;
+      brushActive = true;
+      brushQueryKind = queryKind;
+      brushLo = lo;
+      brushHi = hi;
+      brushDimSource = isRaw
+        ? function() { return { isNumeric: true, rawVals: rawNumericState.values, lazyCodes: null, lazyCodeToValue: null }; }
+        : function() { return { isNumeric: lazyEncodedState.isPureNumeric, rawVals: null, lazyCodes: lazyEncodedState.codes, lazyCodeToValue: lazyEncodedState.codeToValue }; };
+      dimSlot.materialize = isRaw ? materializeRawBrushBitset : materializeLazyBrushBitset;
+      filterStore.markDirty(dimSlot);
+      if (isRaw) {
+        rawNumericState.hasActiveFilterMask = true;
+        rawNumericState.lastMaskedCount = -1;
+      } else {
+        lazyEncodedState.hasActiveFilterMask = true;
+        lazyEncodedState.lastSelectedCount = -1;
+      }
+      notifyFilterListeners(dimSlot, EMPTY_ARRAY, EMPTY_ARRAY, true);
+      return true;
+    }
+
     // Filters this dimension to select the exact value.
     function filterExact(value) {
+      ensureDeferredReady();
       lazyFilterTargetCodes = null;
       lazyFilterTargetCodesVersion = 0;
       if (rawNumericState && !values) {
@@ -10925,8 +13326,13 @@ function crossfilter() {
           refilterFunction = null;
           filterInValues = null;
           if (typeof value === 'number' && value === value) {
+            if (tryEnterFalconBrush('exact', value, value, true)) {
+              return dimension;
+            }
+            if (brushDimSlot === dimSlot) brushActive = false;
             return applyRawNumericPredicate(1, value, 0, 'bounds');
           }
+          if (brushDimSlot === dimSlot) invalidateBrushState();
           return applyRawNumericPredicate(0, 0, 0, 'bounds');
         }
         materializeLazyEncodedState();
@@ -10939,11 +13345,21 @@ function crossfilter() {
           refilter = xfilterFilter.filterExact(bisect, value);
           refilterFunction = null;
           filterInValues = null;
+          if (
+            hasLazyEncodedGroupingSupport()
+            && ((lazyEncodedState.isPureNumeric && typeof value === 'number' && value === value)
+              || (lazyEncodedState.isPureString && typeof value === 'string'))
+            && tryEnterFalconBrush('exact', value, value, false)
+          ) {
+            return dimension;
+          }
+          if (brushDimSlot === dimSlot) brushActive = false;
           return applyLazyEncodedFilter(exactCodes, 'bounds');
         }
         materializeLazyEncodedState();
       }
 
+      if (brushDimSlot === dimSlot) invalidateBrushState();
       filterValue = value;
       setFilterValuePresent(true);
       refilter = xfilterFilter.filterExact(bisect, value);
@@ -10952,6 +13368,11 @@ function crossfilter() {
     }
 
     function filterIn(valuesToSelect) {
+      ensureDeferredReady();
+      if (brushDimSlot === dimSlot) {
+        filterStore.ensureSlotMaterialized(dimSlot);
+        invalidateBrushState();
+      }
       lazyFilterTargetCodes = null;
       lazyFilterTargetCodesVersion = 0;
       if (rawNumericState && !values) {
@@ -11029,6 +13450,7 @@ function crossfilter() {
     // Filters this dimension to select the specified range [lo, hi].
     // The lower bound is inclusive, and the upper bound is exclusive.
     function filterRange(range) {
+      ensureDeferredReady();
       if (rawNumericState && !values) {
         var rLo = range[0],
             rHi = range[1];
@@ -11038,6 +13460,10 @@ function crossfilter() {
           refilter = xfilterFilter.filterRange(bisect, range);
           refilterFunction = null;
           filterInValues = null;
+          if (tryEnterFalconBrush('range', rLo, rHi, true)) {
+            return dimension;
+          }
+          if (brushDimSlot === dimSlot) brushActive = false;
           return applyRawNumericPredicate(2, rLo, rHi, 'bounds');
         }
         upgradeRawNumericToLazy(n);
@@ -11049,6 +13475,16 @@ function crossfilter() {
         refilterFunction = null;
         filterInValues = null;
         filterMode = 'bounds';
+        if (
+          ((lazyEncodedState.isPureNumeric && typeof range[0] === 'number' && typeof range[1] === 'number' && range[0] === range[0] && range[1] === range[1])
+            || (lazyEncodedState.isPureString && typeof range[0] === 'string' && typeof range[1] === 'string'))
+          && tryEnterFalconBrush('range', range[0], range[1], false)
+        ) {
+          lazyFilterTargetCodes = null;
+          lazyFilterTargetCodesVersion = 0;
+          return dimension;
+        }
+        if (brushDimSlot === dimSlot) brushActive = false;
         lazyFilterTargetCodes = computeLazyRangeCodes(range);
         lazyFilterTargetCodesVersion = lazyEncodedState.codeToValue.length;
         return applyLazyEncodedFilter(lazyFilterTargetCodes, 'bounds');
@@ -11058,6 +13494,7 @@ function crossfilter() {
         materializeLazyEncodedState();
       }
 
+      if (brushDimSlot === dimSlot) invalidateBrushState();
       filterValue = range;
       setFilterValuePresent(true);
       return filterIndexBounds((refilter = xfilterFilter.filterRange(bisect, range))(values), false, 'bounds');
@@ -11067,6 +13504,18 @@ function crossfilter() {
     function filterAll() {
       lazyFilterTargetCodes = null;
       lazyFilterTargetCodesVersion = 0;
+      if (brushDimSlot === dimSlot) {
+        invalidateBrushState();
+      }
+      if (deferredInit) {
+        filterValue = undefined;
+        setFilterValuePresent(false);
+        refilter = xfilterFilter.filterAll;
+        refilterFunction = null;
+        filterInValues = null;
+        filterMode = 'all';
+        return dimension;
+      }
       if (rawNumericState && !values) {
         filterValue = undefined;
         setFilterValuePresent(false);
@@ -11095,6 +13544,11 @@ function crossfilter() {
 
     // Filters this dimension using an arbitrary function.
     function filterFunction(f) {
+      ensureDeferredReady();
+      if (brushDimSlot === dimSlot) {
+        filterStore.ensureSlotMaterialized(dimSlot);
+        invalidateBrushState();
+      }
       lazyFilterTargetCodes = null;
       lazyFilterTargetCodesVersion = 0;
       if ((rawNumericState || lazyEncodedState) && !values) {
@@ -11127,18 +13581,19 @@ function crossfilter() {
           valueIndexRemoved = [],
           indexLength = values.length;
 
-      if(!iterable) {
+      if (!iterable) {
         for (i = 0; i < indexLength; ++i) {
-          if (!(filters[offset][k = index[i]] & one) ^ !!(x = f(values[i], i))) {
+          k = index[i];
+          if (!filterStore.isSlotExcluded(dimSlot, k) ^ !!(x = f(values[i], i))) {
             if (x) added.push(k);
             else removed.push(k);
           }
         }
       }
 
-      if(iterable) {
-        for(i=0; i < indexLength; ++i) {
-          if(f(values[i], i)) {
+      if (iterable) {
+        for (i = 0; i < indexLength; ++i) {
+          if (f(values[i], i)) {
             added.push(index[i]);
             valueIndexAdded.push(i);
           } else {
@@ -11148,36 +13603,36 @@ function crossfilter() {
         }
       }
 
-      if(!iterable) {
-        for(i=0; i<added.length; i++) {
-          if(filters[offset][added[i]] & one) filters[offset][added[i]] &= zero;
-        }
-
-        for(i=0; i<removed.length; i++) {
-          if(!(filters[offset][removed[i]] & one)) filters[offset][removed[i]] |= one;
+      if (!iterable) {
+        if (filterAll) {
+          filterStore.deactivate(dimSlot);
+        } else {
+          for (i = 0; i < added.length; i++) {
+            filterStore.setSlotIncluded(dimSlot, added[i]);
+          }
+          for (i = 0; i < removed.length; i++) {
+            filterStore.setSlotExcluded(dimSlot, removed[i]);
+          }
         }
       } else {
-
         var newAdded = [];
         var newRemoved = [];
         for (i = 0; i < added.length; i++) {
-          // First check this particular value needs to be added
-          if(iterablesIndexFilterStatus[valueIndexAdded[i]] === 1) {
+          if (iterablesIndexFilterStatus[valueIndexAdded[i]] === 1) {
             iterablesIndexCount[added[i]]++;
             iterablesIndexFilterStatus[valueIndexAdded[i]] = 0;
-            if(iterablesIndexCount[added[i]] === 1) {
-              filters[offset][added[i]] ^= one;
+            if (iterablesIndexCount[added[i]] === 1) {
+              filterStore.setSlotIncluded(dimSlot, added[i]);
               newAdded.push(added[i]);
             }
           }
         }
         for (i = 0; i < removed.length; i++) {
-          // First check this particular value needs to be removed
-          if(iterablesIndexFilterStatus[valueIndexRemoved[i]] === 0) {
+          if (iterablesIndexFilterStatus[valueIndexRemoved[i]] === 0) {
             iterablesIndexCount[removed[i]]--;
             iterablesIndexFilterStatus[valueIndexRemoved[i]] = 1;
-            if(iterablesIndexCount[removed[i]] === 0) {
-              filters[offset][removed[i]] ^= one;
+            if (iterablesIndexCount[removed[i]] === 0) {
+              filterStore.setSlotExcluded(dimSlot, removed[i]);
               newRemoved.push(removed[i]);
             }
           }
@@ -11186,28 +13641,27 @@ function crossfilter() {
         added = newAdded;
         removed = newRemoved;
 
-        // Now handle empty rows.
-        if(filterAll) {
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if((filters[offset][k = iterablesEmptyRows[i]] & one)) {
-              // Was not in the filter, so set the filter and add
-              filters[offset][k] ^= one;
+        if (filterAll) {
+          for (i = 0; i < iterablesEmptyRows.length; i++) {
+            k = iterablesEmptyRows[i];
+            if (filterStore.isSlotExcluded(dimSlot, k)) {
+              filterStore.setSlotIncluded(dimSlot, k);
               added.push(k);
             }
           }
+          filterStore.deactivate(dimSlot);
         } else {
-          // filter in place - remove empty rows if necessary
-          for(i = 0; i < iterablesEmptyRows.length; i++) {
-            if(!(filters[offset][k = iterablesEmptyRows[i]] & one)) {
-              // Was in the filter, so set the filter and remove
-              filters[offset][k] ^= one;
+          for (i = 0; i < iterablesEmptyRows.length; i++) {
+            k = iterablesEmptyRows[i];
+            if (!filterStore.isSlotExcluded(dimSlot, k)) {
+              filterStore.setSlotExcluded(dimSlot, k);
               removed.push(k);
             }
           }
         }
       }
 
-      notifyFilterListeners(one, offset, added, removed);
+      notifyFilterListeners(dimSlot, added, removed);
     }
 
     function currentFilter() {
@@ -11222,14 +13676,16 @@ function crossfilter() {
       if (iterable) {
         return null;
       }
+      ensureDeferredReady();
 
       if (rawNumericState && !values) {
         var rVals = rawNumericState.values,
             rMin,
             rMax,
             ri,
-            rv;
-        if (!activeDimensionFilterCount) {
+            rv,
+            rActive = getActiveRows();
+        if (!rActive) {
           if (!n) return { max: null, min: null };
           rMin = rMax = rVals[0];
           for (ri = 1; ri < n; ++ri) {
@@ -11239,8 +13695,7 @@ function crossfilter() {
           }
           return { max: rMax, min: rMin };
         }
-        var rActive = getActiveRows(),
-            rLen = rActive.length,
+        var rLen = rActive.length,
             rIdx = rActive.indices;
         if (!rLen) return { max: null, min: null };
         rMin = rMax = rVals[rIdx[0]];
@@ -11262,9 +13717,10 @@ function crossfilter() {
             maxVal = null,
             c,
             i,
-            v;
+            v,
+            active = getActiveRows();
 
-        if (!activeDimensionFilterCount) {
+        if (!active) {
           if (!n) return { max: null, min: null };
           if (isPureNum) {
             for (c = 1; c < codeToValue.length; ++c) {
@@ -11297,8 +13753,7 @@ function crossfilter() {
           };
         }
 
-        var active = getActiveRows(),
-            activeLen = active.length,
+        var activeLen = active.length,
             activeIdx = active.indices;
         if (!activeLen) {
           return { max: null, min: null };
@@ -11347,7 +13802,7 @@ function crossfilter() {
           hiVal = null,
           idx;
       for (idx = lo0; idx < hi0; ++idx) {
-        if (filters.zero(index[idx])) {
+        if (filterStore.isActive(index[idx])) {
           loVal = values[idx];
           break;
         }
@@ -11356,7 +13811,7 @@ function crossfilter() {
         return { max: null, min: null };
       }
       for (idx = hi0 - 1; idx >= lo0; --idx) {
-        if (filters.zero(index[idx])) {
+        if (filterStore.isActive(index[idx])) {
           hiVal = values[idx];
           break;
         }
@@ -11381,10 +13836,10 @@ function crossfilter() {
           activeIndices = null,
           rowCount;
 
-      if (!activeDimensionFilterCount) {
+      var active = getActiveRows();
+      if (!active) {
         rowCount = n;
       } else {
-        var active = getActiveRows();
         activeIndices = active.indices;
         rowCount = active.length;
       }
@@ -11633,6 +14088,7 @@ function crossfilter() {
     // Returns the top K selected records based on this dimension's order.
     // Note: observes this dimension's filter, unlike group and groupAll.
     function top(k, top_offset) {
+      ensureDeferredReady();
       if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
         var lazyRows = lazyTopBottomIndex(k, top_offset, true);
         if (lazyRows !== null) {
@@ -11654,7 +14110,7 @@ function crossfilter() {
       if(top_offset && top_offset > 0) toSkip = top_offset;
 
       while (--i >= lo0 && k > 0) {
-        if (filters.zero(j = index[i])) {
+        if (filterStore.isActive(j = index[i])) {
           if(toSkip > 0) {
             //skip matching row
             --toSkip;
@@ -11668,7 +14124,7 @@ function crossfilter() {
       if(iterable){
         for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
           // Add row with empty iterable column at the end
-          if(filters.zero(j = iterablesEmptyRows[i])) {
+          if(filterStore.isActive(j = iterablesEmptyRows[i])) {
             if(toSkip > 0) {
               //skip matching row
               --toSkip;
@@ -11684,6 +14140,7 @@ function crossfilter() {
     }
 
     function topIndex(k, top_offset) {
+      ensureDeferredReady();
       if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
         var lazyRows = lazyTopBottomIndex(k, top_offset, true);
         if (lazyRows !== null) {
@@ -11701,7 +14158,7 @@ function crossfilter() {
       if(top_offset && top_offset > 0) toSkip = top_offset;
 
       while (--i >= lo0 && k > 0) {
-        if (filters.zero(j = index[i])) {
+        if (filterStore.isActive(j = index[i])) {
           if(toSkip > 0) {
             --toSkip;
           } else {
@@ -11713,7 +14170,7 @@ function crossfilter() {
 
       if(iterable){
         for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
-          if(filters.zero(j = iterablesEmptyRows[i])) {
+          if(filterStore.isActive(j = iterablesEmptyRows[i])) {
             if(toSkip > 0) {
               --toSkip;
             } else {
@@ -11730,6 +14187,7 @@ function crossfilter() {
     // Returns the bottom K selected records based on this dimension's order.
     // Note: observes this dimension's filter, unlike group and groupAll.
     function bottom(k, bottom_offset) {
+      ensureDeferredReady();
       if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
         var lazyRows = lazyTopBottomIndex(k, bottom_offset, false);
         if (lazyRows !== null) {
@@ -11753,7 +14211,7 @@ function crossfilter() {
       if(iterable) {
         // Add row with empty iterable column at the top
         for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
-          if(filters.zero(j = iterablesEmptyRows[i])) {
+          if(filterStore.isActive(j = iterablesEmptyRows[i])) {
             if(toSkip > 0) {
               //skip matching row
               --toSkip;
@@ -11768,7 +14226,7 @@ function crossfilter() {
       i = lo0;
 
       while (i < hi0 && k > 0) {
-        if (filters.zero(j = index[i])) {
+        if (filterStore.isActive(j = index[i])) {
           if(toSkip > 0) {
             //skip matching row
             --toSkip;
@@ -11784,6 +14242,7 @@ function crossfilter() {
     }
 
     function bottomIndex(k, bottom_offset) {
+      ensureDeferredReady();
       if ((rawNumericState || lazyEncodedState) && !values && !iterable) {
         var lazyRows = lazyTopBottomIndex(k, bottom_offset, false);
         if (lazyRows !== null) {
@@ -11802,7 +14261,7 @@ function crossfilter() {
 
       if(iterable) {
         for(i = 0; i < iterablesEmptyRows.length && k > 0; i++) {
-          if(filters.zero(j = iterablesEmptyRows[i])) {
+          if(filterStore.isActive(j = iterablesEmptyRows[i])) {
             if(toSkip > 0) {
               --toSkip;
             } else {
@@ -11816,7 +14275,7 @@ function crossfilter() {
       i = lo0;
 
       while (i < hi0 && k > 0) {
-        if (filters.zero(j = index[i])) {
+        if (filterStore.isActive(j = index[i])) {
           if(toSkip > 0) {
             --toSkip;
           } else {
@@ -11832,6 +14291,7 @@ function crossfilter() {
 
     // Adds a new group to this dimension, using the specified key function.
     function group(key) {
+      ensureDeferredReady();
       if (arguments.length < 1) key = cr_identity;
 
       var groupAll = key === cr_null;
@@ -11865,6 +14325,7 @@ function crossfilter() {
         dispose: dispose,
         remove: dispose, // for backwards-compatibility
         _canPromoteToRawNumeric: !!(groupAll || lazyBucketMode),
+        _coScanInfo: coScanInfo,
         _onDimensionMaterialize: onDimensionMaterialize,
         _onRawNumericPromote: onRawNumericPromote,
         _onRawNumericRemove: onRawNumericRemove,
@@ -11908,6 +14369,14 @@ function crossfilter() {
           reduceSplitField = null,
           metricPlan = null,
           metricBuffers = null,
+          unfilteredData = null,
+          unfilteredRowCounts = null,
+          unfilteredTmpCounts = null,
+          unfilteredSlotCount = 0,
+          unfilteredSplitMode = null,
+          unfilteredSplitStride = 0,
+          unfilteredValid = false,
+          buffersHoldUnfiltered = false,
           countBuf = null,
           splitMode = null, // 'dense' | 'sparse'
           splitActiveStride = 0,
@@ -11961,11 +14430,9 @@ function crossfilter() {
 
       function syncUpdateListenerMeta() {
         var canReset = !iterable && reduceMode !== null;
-        updateMany._xfilterDimOne = one;
-        updateMany._xfilterDimOffset = offset;
+        updateMany._xfilterDimSlot = dimSlot;
         updateMany._xfilterResettable = canReset;
-        updateOne._xfilterDimOne = one;
-        updateOne._xfilterDimOffset = offset;
+        updateOne._xfilterDimSlot = dimSlot;
         updateOne._xfilterResettable = canReset;
       }
 
@@ -12678,6 +15145,157 @@ function crossfilter() {
         sparseDimVersion = -1;
         sparseN = -1;
         sparseSplitStride = -1;
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
+      }
+
+      function markBuffersHoldUnfiltered(totalSlots) {
+        if (!metricPlan || !metricBuffers || totalSlots <= 0 || totalSlots * metricPlan.stride > 131072) {
+          buffersHoldUnfiltered = false;
+          unfilteredValid = false;
+          return;
+        }
+        unfilteredSlotCount = totalSlots;
+        unfilteredSplitMode = splitMode;
+        unfilteredSplitStride = splitActiveStride;
+        unfilteredRowCounts = null;
+        unfilteredValid = false;
+        buffersHoldUnfiltered = true;
+      }
+
+      function materializeUnfilteredCacheIfNeeded() {
+        if (!buffersHoldUnfiltered) return;
+        buffersHoldUnfiltered = false;
+        if (unfilteredValid) return;
+        if (!metricPlan || !metricBuffers || unfilteredSlotCount <= 0) return;
+        var totalDoubles = unfilteredSlotCount * metricPlan.stride;
+        if (totalDoubles > 131072) return;
+        if (!unfilteredData || unfilteredData.length < totalDoubles) {
+          var nextLen = unfilteredData && unfilteredData.length ? unfilteredData.length : totalDoubles;
+          while (nextLen < totalDoubles) nextLen <<= 1;
+          if (nextLen > 131072) nextLen = totalDoubles;
+          unfilteredData = new Float64Array(nextLen);
+        }
+        unfilteredData.set(metricBuffers.data.subarray(0, totalDoubles));
+        unfilteredValid = true;
+      }
+
+      function ensureUnfilteredRowCounts(totalSlots, slotArr, splitCodes, splitStride) {
+        if (unfilteredRowCounts && unfilteredRowCounts.length >= totalSlots) {
+          return unfilteredRowCounts;
+        }
+        unfilteredRowCounts = new Uint32Array(totalSlots);
+        var ci;
+        if (splitCodes) {
+          for (ci = 0; ci < n; ++ci) {
+            unfilteredRowCounts[slotArr[ci] * splitStride + splitCodes[ci]] += 1;
+          }
+        } else if (slotArr) {
+          for (ci = 0; ci < n; ++ci) {
+            unfilteredRowCounts[slotArr[ci]] += 1;
+          }
+        } else {
+          unfilteredRowCounts[0] = n;
+        }
+        return unfilteredRowCounts;
+      }
+
+      function hasValidUnfilteredCache(totalSlots) {
+        return (unfilteredValid || buffersHoldUnfiltered)
+          && unfilteredSlotCount === totalSlots
+          && unfilteredSplitMode === splitMode
+          && unfilteredSplitStride === splitActiveStride;
+      }
+
+      function restoreUnfilteredIntoBuffers(totalSlots, forMutation) {
+        if (!hasValidUnfilteredCache(totalSlots)) {
+          return false;
+        }
+        if (buffersHoldUnfiltered) {
+          if (forMutation) {
+            materializeUnfilteredCacheIfNeeded();
+          }
+          return true;
+        }
+        if (!unfilteredData) return false;
+        metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
+        metricBuffers.data.set(unfilteredData.subarray(0, totalSlots * metricPlan.stride));
+        buffersHoldUnfiltered = !forMutation;
+        return true;
+      }
+
+      function ensureUnfilteredTmpCounts(totalSlots) {
+        if (!unfilteredTmpCounts || unfilteredTmpCounts.length < totalSlots) {
+          unfilteredTmpCounts = new Uint32Array(totalSlots);
+        }
+        return unfilteredTmpCounts;
+      }
+
+      function coScanInfo() {
+        if (!resetNeeded || iterable || groupAll || reduceMode !== 'metricSpec' || !metricPlan || !metricPlan.canCoScan) {
+          return null;
+        }
+        if (lazyIdentityMode) {
+          ensureLazyOrder();
+        } else if (rawBucketMode) {
+          ensureRawBucketLayout();
+        } else if (lazyBucketMode) {
+          ensureLazyBucketLayout();
+        }
+        if (k <= 1) {
+          return null;
+        }
+        var slotArr = getPrimarySlotArray();
+        var slotCount = getPrimarySlotCount();
+        if (!slotArr || slotCount <= 0) {
+          return null;
+        }
+        var applyFilteredRemovals = hasOtherActiveDimensionFilters();
+        var info = {
+          buffers: metricBuffers,
+          canComplement: function() {
+            return hasValidUnfilteredCache(slotCount);
+          },
+          cleanupComplement: function(exclIndices, exclLen) {
+            var exCntOff = getExactCountOffset(metricPlan, getNumericColumn);
+            var trk = exCntOff < 0 ? ensureUnfilteredRowCounts(slotCount, slotArr, null, 0) : null;
+            var tmpC = exCntOff < 0 ? ensureUnfilteredTmpCounts(slotCount) : null;
+            cleanupComplementEmptySlots(metricBuffers, metricPlan, exCntOff, slotArr, null, 0, trk, tmpC, exclIndices, exclLen, slotCount);
+          },
+          coScanKey: metricPlan.coScanKey,
+          commit: function(saveCache) {
+            if (saveCache) {
+              markBuffersHoldUnfiltered(slotCount);
+            }
+            resetNeeded = false;
+            valuesSynced = false;
+          },
+          ensureBuffers: function() {
+            materializeUnfilteredCacheIfNeeded();
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+            info.buffers = metricBuffers;
+          },
+          groupRef: group,
+          plan: metricPlan,
+          prepareZero: function() {
+            materializeUnfilteredCacheIfNeeded();
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+            zeroMetricBuffers(metricBuffers, slotCount);
+            info.buffers = metricBuffers;
+          },
+          slotArr: slotArr,
+          slotCount: slotCount,
+          tryRestoreUnfiltered: function(forMutation) {
+            if (restoreUnfilteredIntoBuffers(slotCount, !!forMutation)) {
+              info.buffers = metricBuffers;
+              return true;
+            }
+            return false;
+          },
+          unfiltered: !applyFilteredRemovals,
+          usesGlobalActive: applyFilteredRemovals && !dimSlot.active
+        };
+        return info;
       }
 
       // Incorporate any existing data into the grouping.
@@ -12686,6 +15304,8 @@ function crossfilter() {
       // Incorporates the specified new values into this group.
       // This function is responsible for updating groups and groupIndex.
       function add(newValues, newIndex, n0, n1, appendedCodes) {
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
         if (groupAll && (rawNumericState || lazyEncodedState) && !values) {
           k = 1;
           if (!groups || !groups.length) {
@@ -12811,13 +15431,13 @@ function crossfilter() {
             if (!resetNeeded) {
               if (reduceMode === 'count') {
                 g.value += 1;
-                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) {
+                if (hasOtherActiveDimensionFilters() && !filterStore.isActiveExcept(j, dimSlot)) {
                   g.value -= 1;
                 }
               } else {
                 var rowRecord = getRecord(j);
                 g.value = addFn(g.value, rowRecord, true);
-                if (hasOtherActiveDimensionFilters() && !filters.zeroExcept(j, offset, zero)) g.value = removeFn(g.value, rowRecord, false);
+                if (hasOtherActiveDimensionFilters() && !filterStore.isActiveExcept(j, dimSlot)) g.value = removeFn(g.value, rowRecord, false);
               }
             }
             if (++i1 >= n1) break;
@@ -12889,6 +15509,8 @@ function crossfilter() {
       }
 
       function removeData(reIndex) {
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
         sparseLayoutVersionReset();
 
         if (rawBucketMode && rawNumericState && !values) {
@@ -12998,8 +15620,9 @@ function crossfilter() {
       }
 
       // Reduces the specified selected or deselected records.
-      function updateMany(filterOne, filterOffset, added, removed, notFilter, forceReset) {
-        if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
+      function updateMany(filterSlot, added, removed, notFilter, forceReset) {
+        if (notFilter) { unfilteredValid = false; buffersHoldUnfiltered = false; }
+        if (filterSlot === dimSlot || resetNeeded) return;
 
         var i,
             j,
@@ -13009,7 +15632,7 @@ function crossfilter() {
 
         if (iterable) {
           for (i = 0, len = added.length; i < len; ++i) {
-            if (filters.zeroExcept(rowIdx = added[i], offset, zero)) {
+            if (filterStore.isActiveExcept(rowIdx = added[i], dimSlot)) {
               for (j = 0; j < groupIndex[rowIdx].length; j++) {
                 g = groups[groupIndex[rowIdx][j]];
                 if (reduceMode === 'count') {
@@ -13022,7 +15645,7 @@ function crossfilter() {
           }
 
           for (i = 0, len = removed.length; i < len; ++i) {
-            if (filters.onlyExcept(rowIdx = removed[i], offset, zero, filterOffset, filterOne)) {
+            if (filterStore.isOnlyExcludedByExcept(rowIdx = removed[i], dimSlot, filterSlot)) {
               for (j = 0; j < groupIndex[rowIdx].length; j++) {
                 g = groups[groupIndex[rowIdx][j]];
                 if (reduceMode === 'count') {
@@ -13037,7 +15660,8 @@ function crossfilter() {
         }
 
         if (reduceMode !== null) {
-          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
+          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)
+            || (reduceMode !== 'count' && removed.length > 0 && metricPlan && !canPlanUseComplement(metricPlan, getNumericColumn))) {
             resetNeeded = true;
             valuesSynced = false;
             return;
@@ -13047,17 +15671,18 @@ function crossfilter() {
           if (!slotArr || k === 0) {
             return;
           }
+          materializeUnfilteredCacheIfNeeded();
 
           if (reduceMode === 'count') {
             for (i = 0, len = added.length; i < len; ++i) {
               rowIdx = added[i];
-              if (filters.zeroExcept(rowIdx, offset, zero)) {
+              if (filterStore.isActiveExcept(rowIdx, dimSlot)) {
                 countBuf[slotArr[rowIdx]] += 1;
               }
             }
             for (i = 0, len = removed.length; i < len; ++i) {
               rowIdx = removed[i];
-              if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) {
+              if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) {
                 countBuf[slotArr[rowIdx]] -= 1;
               }
             }
@@ -13081,7 +15706,7 @@ function crossfilter() {
             }
             for (i = 0, len = added.length; i < len; ++i) {
               rowIdx = added[i];
-              if (filters.zeroExcept(rowIdx, offset, zero)) {
+              if (filterStore.isActiveExcept(rowIdx, dimSlot)) {
                 deltaWorkBuf[addCount++] = rowIdx;
               }
             }
@@ -13094,7 +15719,7 @@ function crossfilter() {
             }
             for (i = 0, len = removed.length; i < len; ++i) {
               rowIdx = removed[i];
-              if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) {
+              if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) {
                 deltaWorkBuf[remCount++] = rowIdx;
               }
             }
@@ -13115,7 +15740,7 @@ function crossfilter() {
           }
           for (i = 0, len = added.length; i < len; ++i) {
             rowIdx = added[i];
-            if (filters.zeroExcept(rowIdx, offset, zero)) {
+            if (filterStore.isActiveExcept(rowIdx, dimSlot)) {
               deltaWorkBuf[addCount++] = rowIdx;
             }
           }
@@ -13124,7 +15749,7 @@ function crossfilter() {
           }
           for (i = 0, len = removed.length; i < len; ++i) {
             rowIdx = removed[i];
-            if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) {
+            if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) {
               deltaWorkBuf[remCount++] = rowIdx;
             }
           }
@@ -13138,7 +15763,7 @@ function crossfilter() {
         // Custom reducer path
         var customSlotArr = lazyIdentityMode ? lazyEncodedState.codes : groupIndex;
         for (i = 0, len = added.length; i < len; ++i) {
-          if (filters.zeroExcept(rowIdx = added[i], offset, zero)) {
+          if (filterStore.isActiveExcept(rowIdx = added[i], dimSlot)) {
             var ag = lazyIdentityMode
               ? lazyCodeToGroup[customSlotArr[rowIdx]]
               : (rawBucketMode ? rawBucketSlotToGroup[customSlotArr[rowIdx]] : customSlotArr[rowIdx]);
@@ -13150,7 +15775,7 @@ function crossfilter() {
         }
 
         for (i = 0, len = removed.length; i < len; ++i) {
-          if (filters.onlyExcept(rowIdx = removed[i], offset, zero, filterOffset, filterOne)) {
+          if (filterStore.isOnlyExcludedByExcept(rowIdx = removed[i], dimSlot, filterSlot)) {
             var rg = lazyIdentityMode
               ? lazyCodeToGroup[customSlotArr[rowIdx]]
               : (rawBucketMode ? rawBucketSlotToGroup[customSlotArr[rowIdx]] : customSlotArr[rowIdx]);
@@ -13163,8 +15788,9 @@ function crossfilter() {
       }
 
       // Reduces the specified selected or deselected records (cardinality 1).
-      function updateOne(filterOne, filterOffset, added, removed, notFilter, forceReset) {
-        if ((filterOne === one && filterOffset === offset) || resetNeeded) return;
+      function updateOne(filterSlot, added, removed, notFilter, forceReset) {
+        if (notFilter) { unfilteredValid = false; buffersHoldUnfiltered = false; }
+        if (filterSlot === dimSlot || resetNeeded) return;
 
         var i,
             rowIdx,
@@ -13172,7 +15798,8 @@ function crossfilter() {
             g;
 
         if (reduceMode !== null) {
-          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
+          if (notFilter || forceReset || added.length + removed.length > (n >>> 2)
+            || (reduceMode !== 'count' && removed.length > 0 && metricPlan && !canPlanUseComplement(metricPlan, getNumericColumn))) {
             resetNeeded = true;
             valuesSynced = false;
             return;
@@ -13181,10 +15808,10 @@ function crossfilter() {
           if (reduceMode === 'count') {
             var delta = 0;
             for (i = 0, len = added.length; i < len; ++i) {
-              if (filters.zeroExcept(added[i], offset, zero)) ++delta;
+              if (filterStore.isActiveExcept(added[i], dimSlot)) ++delta;
             }
             for (i = 0, len = removed.length; i < len; ++i) {
-              if (filters.onlyExcept(removed[i], offset, zero, filterOffset, filterOne)) --delta;
+              if (filterStore.isOnlyExcludedByExcept(removed[i], dimSlot, filterSlot)) --delta;
             }
             countBuf[0] += delta;
             valuesSynced = false;
@@ -13205,16 +15832,17 @@ function crossfilter() {
               valuesSynced = false;
               return;
             }
+            materializeUnfilteredCacheIfNeeded();
             for (i = 0, len = added.length; i < len; ++i) {
               rowIdx = added[i];
-              if (filters.zeroExcept(rowIdx, offset, zero)) deltaWorkBuf[addCount++] = rowIdx;
+              if (filterStore.isActiveExcept(rowIdx, dimSlot)) deltaWorkBuf[addCount++] = rowIdx;
             }
             if (addCount > 0) {
               reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, deltaWorkBuf, addCount, 1, 0);
             }
             for (i = 0, len = removed.length; i < len; ++i) {
               rowIdx = removed[i];
-              if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) deltaWorkBuf[remCount++] = rowIdx;
+              if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) deltaWorkBuf[remCount++] = rowIdx;
             }
             if (remCount > 0) {
               reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, deltaWorkBuf, remCount, -1, 0);
@@ -13224,16 +15852,17 @@ function crossfilter() {
           }
 
           // reduceMode === 'metricSpec'
+          materializeUnfilteredCacheIfNeeded();
           for (i = 0, len = added.length; i < len; ++i) {
             rowIdx = added[i];
-            if (filters.zeroExcept(rowIdx, offset, zero)) deltaWorkBuf[addCount++] = rowIdx;
+            if (filterStore.isActiveExcept(rowIdx, dimSlot)) deltaWorkBuf[addCount++] = rowIdx;
           }
           if (addCount > 0) {
             reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, addCount, 1);
           }
           for (i = 0, len = removed.length; i < len; ++i) {
             rowIdx = removed[i];
-            if (filters.onlyExcept(rowIdx, offset, zero, filterOffset, filterOne)) deltaWorkBuf[remCount++] = rowIdx;
+            if (filterStore.isOnlyExcludedByExcept(rowIdx, dimSlot, filterSlot)) deltaWorkBuf[remCount++] = rowIdx;
           }
           if (remCount > 0) {
             reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, remCount, -1);
@@ -13244,12 +15873,12 @@ function crossfilter() {
 
         g = groups[0];
         for (i = 0, len = added.length; i < len; ++i) {
-          if (filters.zeroExcept(rowIdx = added[i], offset, zero)) {
+          if (filterStore.isActiveExcept(rowIdx = added[i], dimSlot)) {
             g.value = reduceAdd(g.value, getRecord(rowIdx), false);
           }
         }
         for (i = 0, len = removed.length; i < len; ++i) {
-          if (filters.onlyExcept(rowIdx = removed[i], offset, zero, filterOffset, filterOne)) {
+          if (filterStore.isOnlyExcludedByExcept(rowIdx = removed[i], dimSlot, filterSlot)) {
             g.value = reduceRemove(g.value, getRecord(rowIdx), notFilter);
           }
         }
@@ -13290,7 +15919,7 @@ function crossfilter() {
             return;
           }
           for (i = 0; i < n; ++i) {
-            if (!filters.zeroExcept(i, offset, zero)) {
+            if (!filterStore.isActiveExcept(i, dimSlot)) {
               for (j = 0; j < groupIndex[i].length; j++) {
                 g = groups[groupIndex[i][j]];
                 if (reduceMode === 'count') {
@@ -13332,11 +15961,24 @@ function crossfilter() {
                 }
               }
             } else {
-              rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-              var rIdx = rows.indices,
-                  rLen = rows.length;
-              for (i = 0; i < rLen; ++i) {
-                countBuf[slotArr[rIdx[i]]] += 1;
+              rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+              if (!rows) {
+                if (lazyIdentityMode) {
+                  var ccAll = lazyEncodedState.codeCounts;
+                  for (i = 1; i < slotCount; ++i) {
+                    countBuf[i] = ccAll[i];
+                  }
+                } else {
+                  for (i = 0; i < n; ++i) {
+                    countBuf[slotArr[i]] += 1;
+                  }
+                }
+              } else {
+                var rIdx = rows.indices,
+                    rLen = rows.length;
+                for (i = 0; i < rLen; ++i) {
+                  countBuf[slotArr[rIdx[i]]] += 1;
+                }
               }
             }
             valuesSynced = false;
@@ -13344,13 +15986,58 @@ function crossfilter() {
           }
 
           if (reduceMode === 'metricSpec') {
-            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
-            zeroMetricBuffers(metricBuffers, slotCount);
             if (!applyFilteredRemovals) {
-              reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, slotArr, n, slotCount);
+              if (!restoreUnfilteredIntoBuffers(slotCount, false)) {
+                buffersHoldUnfiltered = false;
+                unfilteredValid = false;
+                metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+                zeroMetricBuffers(metricBuffers, slotCount);
+                reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, slotArr, n, slotCount);
+                markBuffersHoldUnfiltered(slotCount);
+              }
+            } else if (brushActive && brushFalcon && transientFilterDepth === 0 && !dimSlot.active && brushFalcon.hasGroup(group)) {
+              var singleInfo = {
+                buffers: metricBuffers,
+                ensureBuffers: function() {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+                  singleInfo.buffers = metricBuffers;
+                },
+                groupRef: group,
+                slotArr: slotArr,
+                slotCount: slotCount
+              };
+              brushFalcon.applyQuerySingle(brushQueryKind, brushLo, brushHi, singleInfo);
             } else {
-              rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-              reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, rows.indices, rows.length, 1, slotCount);
+              var mActCnt = !dimSlot.active ? filteredCount() : filterStore.countActive(dimSlot);
+              if (mActCnt === 0) {
+                materializeUnfilteredCacheIfNeeded();
+                metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+                zeroMetricBuffers(metricBuffers, slotCount);
+              } else if (mActCnt === n && restoreUnfilteredIntoBuffers(slotCount, false)) ; else if (mActCnt > (n >>> 1) && hasValidUnfilteredCache(slotCount) && canPlanUseComplement(metricPlan, getNumericColumn)) {
+                var mExcl = getExcludedRows(dimSlot.active ? dimSlot : null);
+                restoreUnfilteredIntoBuffers(slotCount, true);
+                if (mExcl.length > 0) {
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, mExcl.indices, mExcl.length, -1, slotCount);
+                  var mExCntOff = getExactCountOffset(metricPlan, getNumericColumn);
+                  var mTrk = mExCntOff < 0 ? ensureUnfilteredRowCounts(slotCount, slotArr, null, 0) : null;
+                  cleanupComplementEmptySlots(
+                    metricBuffers, metricPlan, mExCntOff, slotArr, null, 0,
+                    mTrk, mExCntOff < 0 ? ensureUnfilteredTmpCounts(slotCount) : null,
+                    mExcl.indices, mExcl.length, slotCount
+                  );
+                }
+              } else {
+                materializeUnfilteredCacheIfNeeded();
+                metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, slotCount, false);
+                zeroMetricBuffers(metricBuffers, slotCount);
+                rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+                if (!rows) {
+                  reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, slotArr, n, slotCount);
+                } else {
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, rows.indices, rows.length, 1, slotCount);
+                }
+              }
             }
             valuesSynced = false;
             return;
@@ -13362,6 +16049,8 @@ function crossfilter() {
             splitActiveStride = stride;
             if (stride === 0) {
               splitMode = 'dense';
+              buffersHoldUnfiltered = false;
+              unfilteredValid = false;
               metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
               zeroMetricBuffers(metricBuffers, 1);
               valuesSynced = false;
@@ -13370,24 +16059,89 @@ function crossfilter() {
             if (slotCount * stride <= 262144) {
               splitMode = 'dense';
               var totalSlots = slotCount * stride;
-              metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
-              zeroMetricBuffers(metricBuffers, totalSlots);
               if (!applyFilteredRemovals) {
-                reduceSplitDenseAll(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, n, totalSlots);
+                if (!restoreUnfilteredIntoBuffers(totalSlots, false)) {
+                  buffersHoldUnfiltered = false;
+                  unfilteredValid = false;
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
+                  zeroMetricBuffers(metricBuffers, totalSlots);
+                  reduceSplitDenseAll(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, n, totalSlots);
+                  markBuffersHoldUnfiltered(totalSlots);
+                }
               } else {
-                rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-                reduceSplitDenseIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, rows.indices, rows.length, 1, totalSlots);
+                var sdActCnt = !dimSlot.active ? filteredCount() : filterStore.countActive(dimSlot);
+                if (sdActCnt === 0) {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
+                  zeroMetricBuffers(metricBuffers, totalSlots);
+                } else if (sdActCnt === n && restoreUnfilteredIntoBuffers(totalSlots, false)) ; else if (sdActCnt > (n >>> 1) && hasValidUnfilteredCache(totalSlots) && canPlanUseComplement(metricPlan, getNumericColumn)) {
+                  var sdExcl = getExcludedRows(dimSlot.active ? dimSlot : null);
+                  restoreUnfilteredIntoBuffers(totalSlots, true);
+                  if (sdExcl.length > 0) {
+                    reduceSplitDenseIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, sdExcl.indices, sdExcl.length, -1, totalSlots);
+                    var sdExCntOff = getExactCountOffset(metricPlan, getNumericColumn);
+                    var sdTrk = sdExCntOff < 0 ? ensureUnfilteredRowCounts(totalSlots, slotArr, splitCol.codes, stride) : null;
+                    cleanupComplementEmptySlots(
+                      metricBuffers, metricPlan, sdExCntOff, slotArr, splitCol.codes, stride,
+                      sdTrk, sdExCntOff < 0 ? ensureUnfilteredTmpCounts(totalSlots) : null,
+                      sdExcl.indices, sdExcl.length, totalSlots
+                    );
+                  }
+                } else {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, totalSlots, false);
+                  zeroMetricBuffers(metricBuffers, totalSlots);
+                  rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+                  if (!rows) {
+                    reduceSplitDenseAll(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, n, totalSlots);
+                  } else {
+                    reduceSplitDenseIndexed(metricBuffers, metricPlan, getNumericColumn, slotArr, splitCol.codes, stride, rows.indices, rows.length, 1, totalSlots);
+                  }
+                }
               }
             } else {
               splitMode = 'sparse';
               ensureSparseSplitLayout(slotArr, slotCount, splitCol);
-              metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, sparsePairCount || 1, false);
-              zeroMetricBuffers(metricBuffers, sparsePairCount);
+              var spSlots = sparsePairCount || 1;
               if (!applyFilteredRemovals) {
-                reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, n, sparsePairCount);
+                if (!restoreUnfilteredIntoBuffers(sparsePairCount, false)) {
+                  buffersHoldUnfiltered = false;
+                  unfilteredValid = false;
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, spSlots, false);
+                  zeroMetricBuffers(metricBuffers, sparsePairCount);
+                  reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, n, sparsePairCount);
+                  markBuffersHoldUnfiltered(sparsePairCount);
+                }
               } else {
-                rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-                reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, rows.indices, rows.length, 1, sparsePairCount);
+                var spActCnt = !dimSlot.active ? filteredCount() : filterStore.countActive(dimSlot);
+                if (spActCnt === 0) {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, spSlots, false);
+                  zeroMetricBuffers(metricBuffers, sparsePairCount);
+                } else if (spActCnt === n && restoreUnfilteredIntoBuffers(sparsePairCount, false)) ; else if (spActCnt > (n >>> 1) && hasValidUnfilteredCache(sparsePairCount) && canPlanUseComplement(metricPlan, getNumericColumn)) {
+                  var spExcl = getExcludedRows(dimSlot.active ? dimSlot : null);
+                  restoreUnfilteredIntoBuffers(sparsePairCount, true);
+                  if (spExcl.length > 0) {
+                    reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, spExcl.indices, spExcl.length, -1, sparsePairCount);
+                    var spExCntOff = getExactCountOffset(metricPlan, getNumericColumn);
+                    var spTrk = spExCntOff < 0 ? ensureUnfilteredRowCounts(sparsePairCount, sparsePairGroupIds, null, 0) : null;
+                    cleanupComplementEmptySlots(
+                      metricBuffers, metricPlan, spExCntOff, sparsePairGroupIds, null, 0,
+                      spTrk, spExCntOff < 0 ? ensureUnfilteredTmpCounts(sparsePairCount) : null,
+                      spExcl.indices, spExcl.length, sparsePairCount
+                    );
+                  }
+                } else {
+                  materializeUnfilteredCacheIfNeeded();
+                  metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, spSlots, false);
+                  zeroMetricBuffers(metricBuffers, sparsePairCount);
+                  rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+                  if (!rows) {
+                    reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, n, sparsePairCount);
+                  } else {
+                    reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, sparsePairGroupIds, rows.indices, rows.length, 1, sparsePairCount);
+                  }
+                }
               }
             }
             valuesSynced = false;
@@ -13437,7 +16191,7 @@ function crossfilter() {
           return;
         }
         for (i = 0; i < n; ++i) {
-          if (!filters.zeroExcept(i, offset, zero)) {
+          if (!filterStore.isActiveExcept(i, dimSlot)) {
             var rg = lazyIdentityMode
               ? lazyCodeToGroup[customSlotArr[i]]
               : (rawBucketMode ? rawToSorted[customSlotArr[i]] : customSlotArr[i]);
@@ -13461,29 +16215,37 @@ function crossfilter() {
             ensureCountBuf(1);
             if (!applyFilteredRemovals) {
               countBuf[0] = n;
-            } else if (!filterValuePresent) {
+            } else if (!dimSlot.active) {
               countBuf[0] = filteredCount();
             } else {
-              countBuf[0] = collectZeroExceptRows(offset, zero).length;
+              countBuf[0] = filterStore.countActive(dimSlot);
             }
             valuesSynced = false;
             return;
           }
 
           if (reduceMode === 'metricSpec') {
+            buffersHoldUnfiltered = false;
+            unfilteredValid = false;
             metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
             zeroMetricBuffers(metricBuffers, 1);
             if (!applyFilteredRemovals) {
               reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
             } else {
-              rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-              reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, rows.indices, rows.length, 1);
+              rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+              if (!rows) {
+                reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+              } else {
+                reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, rows.indices, rows.length, 1);
+              }
             }
             valuesSynced = false;
             return;
           }
 
           if (reduceMode === 'splitMetricSpec') {
+            buffersHoldUnfiltered = false;
+            unfilteredValid = false;
             var splitCol = getSplitColumn(reduceSplitField),
                 stride = splitCol.codeToKey.length;
             splitMode = 'dense';
@@ -13494,8 +16256,12 @@ function crossfilter() {
               if (!applyFilteredRemovals) {
                 reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, n, stride);
               } else {
-                rows = !filterValuePresent ? getActiveRows() : collectZeroExceptRows(offset, zero);
-                reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, rows.indices, rows.length, 1, stride);
+                rows = !dimSlot.active ? getActiveRows() : collectZeroExceptRows(dimSlot);
+                if (!rows) {
+                  reduceGroupedAll(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, n, stride);
+                } else {
+                  reduceGroupedIndexed(metricBuffers, metricPlan, getNumericColumn, splitCol.codes, rows.indices, rows.length, 1, stride);
+                }
               }
             }
             valuesSynced = false;
@@ -13513,7 +16279,7 @@ function crossfilter() {
           return;
         }
         for (i = 0; i < n; ++i) {
-          if (!filters.zeroExcept(i, offset, zero)) {
+          if (!filterStore.isActiveExcept(i, dimSlot)) {
             g.value = reduceRemove(g.value, getRecord(i), false);
           }
         }
@@ -13622,6 +16388,15 @@ function crossfilter() {
         reduceSplitField = resolved ? resolved.splitField : null;
         metricPlan = reduceMetricSpec ? compileMetricPlan(reduceMetricSpec) : null;
         metricBuffers = null;
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
+        unfilteredData = null;
+        unfilteredRowCounts = null;
+        unfilteredTmpCounts = null;
+        if (brushFalcon && brushFalcon.hasGroup(group)) {
+          brushFalcon = null;
+          brushBuildFailed = false;
+        }
         splitMode = null;
         splitActiveStride = 0;
         reduceMode = null;
@@ -13674,6 +16449,15 @@ function crossfilter() {
 
       // Removes this group and associated event listeners.
       function dispose() {
+        unfilteredValid = false;
+        buffersHoldUnfiltered = false;
+        unfilteredData = null;
+        unfilteredRowCounts = null;
+        unfilteredTmpCounts = null;
+        if (brushFalcon && brushFalcon.hasGroup(group)) {
+          brushFalcon = null;
+          brushBuildFailed = false;
+        }
         var i = filterListeners.indexOf(update);
         if (i >= 0) filterListeners.splice(i, 1);
         i = indexListeners.indexOf(add);
@@ -13714,8 +16498,12 @@ function crossfilter() {
       if (i >= 0) dataListeners.splice(i, 1);
       i = removeDataListeners.indexOf(removeData);
       if (i >= 0) removeDataListeners.splice(i, 1);
-      filters.masks[offset] &= zero;
-      return filterAll();
+      filterAll();
+      if (brushDimSlot === dimSlot) {
+        invalidateBrushState();
+      }
+      filterStore.freeSlot(dimSlot);
+      return dimension;
     }
 
     return dimension;
@@ -13731,6 +16519,7 @@ function crossfilter() {
       value: value,
       dispose: dispose,
       remove: dispose, // for backwards-compatibility
+      _coScanInfo: coScanInfo,
       _readScalar: readScalar
     };
 
@@ -13741,6 +16530,8 @@ function crossfilter() {
         reduceMetricSpec = null,
         metricPlan = null,
         metricBuffers = null,
+        unfilteredData = null,
+        unfilteredValid = false,
         reduceMode = null,
         valueSynced = false,
         resetNeeded = true,
@@ -13749,11 +16540,66 @@ function crossfilter() {
           valueSynced = false;
         });
 
+    function saveUnfilteredScalar() {
+      if (!metricPlan || !metricBuffers) return;
+      var stride = metricPlan.stride;
+      if (!unfilteredData || unfilteredData.length < stride) {
+        unfilteredData = new Float64Array(stride);
+      }
+      unfilteredData.set(metricBuffers.data.subarray(0, stride));
+      unfilteredValid = true;
+    }
+
+    function restoreUnfilteredScalar() {
+      if (!unfilteredValid || !unfilteredData || !metricPlan) return false;
+      metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+      metricBuffers.data.set(unfilteredData.subarray(0, metricPlan.stride));
+      return true;
+    }
+
+    function coScanInfo() {
+      if (!resetNeeded || reduceMode !== 'metricSpec' || !metricPlan || !metricPlan.canCoScan) {
+        return null;
+      }
+      var applyFilteredRemovals = hasAnyActiveDimensionFilters();
+      var info = {
+        buffers: metricBuffers,
+        canComplement: function() {
+          return unfilteredValid && unfilteredData !== null;
+        },
+        coScanKey: metricPlan.coScanKey,
+        commit: function(saveCache) {
+          if (saveCache) saveUnfilteredScalar();
+          resetNeeded = false;
+          valueSynced = false;
+        },
+        ensureBuffers: function() {
+          metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+          info.buffers = metricBuffers;
+        },
+        groupRef: group,
+        plan: metricPlan,
+        prepareZero: function() {
+          metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+          zeroMetricBuffers(metricBuffers, 1);
+          info.buffers = metricBuffers;
+        },
+        tryRestoreUnfiltered: function() {
+          if (restoreUnfilteredScalar()) {
+            info.buffers = metricBuffers;
+            return true;
+          }
+          return false;
+        },
+        unfiltered: !applyFilteredRemovals
+      };
+      return info;
+    }
+
     // The group listens to the crossfilter for when any dimension changes, so
     // that it can update the reduce value. It must also listen to the parent
     // dimension for when data is added.
-    update._xfilterDimOne = -1;
-    update._xfilterDimOffset = -1;
+    update._xfilterDimSlot = null;
     update._xfilterResettable = false;
     filterListeners.push(update);
     dataListeners.push(add);
@@ -13763,6 +16609,7 @@ function crossfilter() {
 
     // Incorporates the specified new values into this group.
     function add(newData, n0) {
+      unfilteredValid = false;
       var i,
           applyFilteredRemovals = hasAnyActiveDimensionFilters();
 
@@ -13773,7 +16620,7 @@ function crossfilter() {
           reduceValue += (n - n0);
         } else {
           for (i = n0; i < n; ++i) {
-            if (filters.zero(i)) reduceValue += 1;
+            if (filterStore.isActive(i)) reduceValue += 1;
           }
         }
         return;
@@ -13788,7 +16635,7 @@ function crossfilter() {
           for (i = n0; i < n; ++i) deltaWorkBuf[count++] = i;
         } else {
           for (i = n0; i < n; ++i) {
-            if (filters.zero(i)) deltaWorkBuf[count++] = i;
+            if (filterStore.isActive(i)) deltaWorkBuf[count++] = i;
           }
         }
         if (count > 0) {
@@ -13802,14 +16649,15 @@ function crossfilter() {
       for (i = n0; i < n; ++i) {
         var rowRecord = getRecord(i);
         reduceValue = reduceAdd(reduceValue, rowRecord, true);
-        if (applyFilteredRemovals && !filters.zero(i)) {
+        if (applyFilteredRemovals && !filterStore.isActive(i)) {
           reduceValue = reduceRemove(reduceValue, rowRecord, false);
         }
       }
     }
 
     // Reduces the specified selected or deselected records.
-    function update(filterOne, filterOffset, added, removed, notFilter, forceReset) {
+    function update(filterSlot, added, removed, notFilter, forceReset) {
+      if (notFilter) unfilteredValid = false;
       var i,
           k,
           len;
@@ -13817,7 +16665,8 @@ function crossfilter() {
       if (resetNeeded) return;
 
       if (reduceMode !== null) {
-        if (notFilter || forceReset || added.length + removed.length > (n >>> 2)) {
+        if (notFilter || forceReset || added.length + removed.length > (n >>> 2)
+          || (reduceMode !== 'count' && removed.length > 0 && metricPlan && !canPlanUseComplement(metricPlan, getNumericColumn))) {
           resetNeeded = true;
           valueSynced = false;
           return;
@@ -13826,10 +16675,10 @@ function crossfilter() {
         if (reduceMode === 'count') {
           var delta = 0;
           for (i = 0, len = added.length; i < len; ++i) {
-            if (filters.zero(added[i])) ++delta;
+            if (filterStore.isActive(added[i])) ++delta;
           }
           for (i = 0, len = removed.length; i < len; ++i) {
-            if (filters.only(removed[i], filterOffset, filterOne)) --delta;
+            if (filterStore.isOnlyExcludedBy(removed[i], filterSlot)) --delta;
           }
           reduceValue += delta;
           return;
@@ -13843,7 +16692,7 @@ function crossfilter() {
         var addCount = 0;
         for (i = 0, len = added.length; i < len; ++i) {
           k = added[i];
-          if (filters.zero(k)) deltaWorkBuf[addCount++] = k;
+          if (filterStore.isActive(k)) deltaWorkBuf[addCount++] = k;
         }
         if (addCount > 0) {
           reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, addCount, 1);
@@ -13851,7 +16700,7 @@ function crossfilter() {
         var remCount = 0;
         for (i = 0, len = removed.length; i < len; ++i) {
           k = removed[i];
-          if (filters.only(k, filterOffset, filterOne)) deltaWorkBuf[remCount++] = k;
+          if (filterStore.isOnlyExcludedBy(k, filterSlot)) deltaWorkBuf[remCount++] = k;
         }
         if (remCount > 0) {
           reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, deltaWorkBuf, remCount, -1);
@@ -13862,14 +16711,14 @@ function crossfilter() {
 
       // Add the added values.
       for (i = 0, len = added.length; i < len; ++i) {
-        if (filters.zero(k = added[i])) {
+        if (filterStore.isActive(k = added[i])) {
           reduceValue = reduceAdd(reduceValue, getRecord(k), notFilter);
         }
       }
 
       // Remove the removed values.
       for (i = 0, len = removed.length; i < len; ++i) {
-        if (filters.only(k = removed[i], filterOffset, filterOne)) {
+        if (filterStore.isOnlyExcludedBy(k = removed[i], filterSlot)) {
           reduceValue = reduceRemove(reduceValue, getRecord(k), notFilter);
         }
       }
@@ -13887,13 +16736,46 @@ function crossfilter() {
       }
 
       if (reduceMode === 'metricSpec') {
-        metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
-        zeroMetricBuffers(metricBuffers, 1);
         if (!applyFilteredRemovals) {
-          reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+          if (!restoreUnfilteredScalar()) {
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+            zeroMetricBuffers(metricBuffers, 1);
+            reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+            saveUnfilteredScalar();
+          }
+        } else if (brushActive && brushFalcon && transientFilterDepth === 0 && brushFalcon.hasGroup(group)) {
+          var kpiSingle = {
+            buffers: metricBuffers,
+            ensureBuffers: function() {
+              metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+              kpiSingle.buffers = metricBuffers;
+            },
+            groupRef: group,
+            slotArr: null,
+            slotCount: 1
+          };
+          brushFalcon.applyQuerySingle(brushQueryKind, brushLo, brushHi, kpiSingle);
         } else {
-          var active = getActiveRows();
-          reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, active.indices, active.length, 1);
+          var sActCnt = filteredCount();
+          if (sActCnt === 0) {
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+            zeroMetricBuffers(metricBuffers, 1);
+          } else if (sActCnt === n && restoreUnfilteredScalar()) ; else if (sActCnt > (n >>> 1) && unfilteredValid && canPlanUseComplement(metricPlan, getNumericColumn)) {
+            var sExcl = getExcludedRows(null);
+            restoreUnfilteredScalar();
+            if (sExcl.length > 0) {
+              reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, sExcl.indices, sExcl.length, -1);
+            }
+          } else {
+            metricBuffers = ensureMetricBuffers(metricBuffers, metricPlan, 1, false);
+            zeroMetricBuffers(metricBuffers, 1);
+            var active = getActiveRows();
+            if (!active) {
+              reduceScalarAll(metricBuffers, metricPlan, getNumericColumn, n);
+            } else {
+              reduceScalarIndexed(metricBuffers, metricPlan, getNumericColumn, active.indices, active.length, 1);
+            }
+          }
         }
         valueSynced = false;
         return;
@@ -13904,7 +16786,7 @@ function crossfilter() {
       for (i = 0; i < n; ++i) {
         var rowRecord = getRecord(i);
         reduceValue = reduceAdd(reduceValue, rowRecord, true);
-        if (applyFilteredRemovals && !filters.zero(i)) {
+        if (applyFilteredRemovals && !filterStore.isActive(i)) {
           reduceValue = reduceRemove(reduceValue, rowRecord, false);
         }
       }
@@ -13921,6 +16803,12 @@ function crossfilter() {
       reduceMetricSpec = resolved && !resolved.splitField ? resolved.metrics : null;
       metricPlan = reduceMetricSpec ? compileMetricPlan(reduceMetricSpec) : null;
       metricBuffers = null;
+      unfilteredValid = false;
+      unfilteredData = null;
+      if (brushFalcon && brushFalcon.hasGroup(group)) {
+        brushFalcon = null;
+        brushBuildFailed = false;
+      }
       reduceMode = reduceMetricSpec ? 'metricSpec' : null;
       update._xfilterResettable = reduceMode !== null;
       resetNeeded = true;
@@ -13962,6 +16850,12 @@ function crossfilter() {
 
     // Removes this group and associated event listeners.
     function dispose() {
+      unfilteredValid = false;
+      unfilteredData = null;
+      if (brushFalcon && brushFalcon.hasGroup(group)) {
+        brushFalcon = null;
+        brushBuildFailed = false;
+      }
       var i = filterListeners.indexOf(update);
       if (i >= 0) filterListeners.splice(i, 1);
       i = dataListeners.indexOf(add);
@@ -13988,29 +16882,52 @@ function crossfilter() {
   function allFiltered(ignore_dimensions) {
     var array = [],
         i = 0,
-        mask = maskForDimensions(ignore_dimensions || []);
+        ignoreMap = buildIgnoreIdMap(ignore_dimensions);
 
-      for (i = 0; i < n; i++) {
-        if (filters.zeroExceptMask(i, mask)) {
-          array.push(getRecord(i));
-        }
+    if (!ignoreMap) {
+      if (!filterStore.hasAnyActive()) {
+        for (i = 0; i < n; i++) array.push(getRecord(i));
+        return array;
       }
-
+      var active = getActiveRows();
+      if (!active) {
+        for (i = 0; i < n; i++) array.push(getRecord(i));
+        return array;
+      }
+      var indices = active.indices,
+          len = active.length;
+      for (i = 0; i < len; i++) {
+        array.push(getRecord(indices[i]));
+      }
       return array;
+    }
+
+    for (i = 0; i < n; i++) {
+      if (filterStore.isActiveIgnoring(i, ignoreMap)) {
+        array.push(getRecord(i));
+      }
+    }
+
+    return array;
   }
 
   function allFilteredIndexes(ignore_dimensions) {
     var array,
         i = 0,
-        mask;
+        ignoreMap;
 
     if (!ignore_dimensions || !ignore_dimensions.length) {
-      if (!activeDimensionFilterCount) {
+      if (!filterStore.hasAnyActive()) {
         array = new Array(n);
         for (i = 0; i < n; ++i) array[i] = i;
         return array;
       }
       var active = getActiveRows();
+      if (!active) {
+        array = new Array(n);
+        for (i = 0; i < n; ++i) array[i] = i;
+        return array;
+      }
       array = new Array(active.length);
       var indices = active.indices;
       for (i = 0; i < active.length; ++i) array[i] = indices[i];
@@ -14018,10 +16935,10 @@ function crossfilter() {
     }
 
     array = [];
-    mask = maskForDimensions(ignore_dimensions);
+    ignoreMap = buildIgnoreIdMap(ignore_dimensions);
 
     for (i = 0; i < n; i++) {
-      if (filters.zeroExceptMask(i, mask)) {
+      if (filterStore.isActiveIgnoring(i, ignoreMap)) {
         array.push(i);
       }
     }
@@ -14305,7 +17222,7 @@ function capacity(w) {
       : 0x100000000;
 }
 
-const version = "3.1.2";
+const version = "3.2.0";
 
 crossfilter.version = version;
 

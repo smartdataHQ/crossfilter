@@ -2151,3 +2151,938 @@ describe("v3.1.2 items 1-11 and splitField sort parity", () => {
     }
   });
 });
+
+describe("architectural optimizations 1-5: bitsets, complement, AoS co-scan, lazy dims, Falcon brush", () => {
+  function makeRng(seed) {
+    let s = seed >>> 0;
+    return () => {
+      s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+
+  function expectCloseObj(actual, expected, digits = 6) {
+    expect(Object.keys(actual).sort()).toEqual(Object.keys(expected).sort());
+    for (const k of Object.keys(expected)) {
+      if (expected[k] === null) {
+        expect(actual[k]).toBeNull();
+      } else {
+        expect(actual[k]).toBeCloseTo(expected[k], digits);
+      }
+    }
+  }
+
+  function oracleMetrics(rows, indices, metrics) {
+    const out = {};
+    for (const m of metrics) {
+      if (m.op === "count") {
+        out[m.id] = indices.length;
+      } else if (m.op === "sum") {
+        let s = 0;
+        for (const i of indices) {
+          const v = rows[i][m.field];
+          if (typeof v === "number" && Number.isFinite(v)) s += v;
+        }
+        out[m.id] = s;
+      } else if (m.op === "avg") {
+        let s = 0, c = 0;
+        for (const i of indices) {
+          const v = rows[i][m.field];
+          if (typeof v === "number" && Number.isFinite(v)) { s += v; c += 1; }
+        }
+        out[m.id] = c > 0 ? s / c : null;
+      } else if (m.op === "avgNonZero") {
+        let s = 0, c = 0;
+        for (const i of indices) {
+          const v = rows[i][m.field];
+          if (typeof v === "number" && Number.isFinite(v) && v !== 0) { s += v; c += 1; }
+        }
+        out[m.id] = c > 0 ? s / c : null;
+      } else if (m.op === "ratio") {
+        let num = 0, den = 0;
+        for (const i of indices) {
+          const vn = rows[i][m.field];
+          const vd = rows[i][m.denominator];
+          if (typeof vn === "number" && Number.isFinite(vn)) num += vn;
+          if (typeof vd === "number" && Number.isFinite(vd)) den += vd;
+        }
+        out[m.id] = den !== 0 ? num / den : null;
+      }
+    }
+    return out;
+  }
+
+  function matchesFilter(val, f) {
+    if (!f || f.type === "all") return true;
+    if (f.type === "exact") return val === f.value;
+    if (f.type === "in") return f.values.includes(val);
+    if (f.type === "range") return val >= f.range[0] && val < f.range[1];
+    return true;
+  }
+
+  function oracleActiveIndices(rows, filters, ignoreField = null) {
+    const out = [];
+    const filterKeys = Object.keys(filters);
+    for (let i = 0; i < rows.length; ++i) {
+      let ok = true;
+      for (let k = 0; k < filterKeys.length; ++k) {
+        const fKey = filterKeys[k];
+        if (fKey === ignoreField) continue;
+        if (!matchesFilter(rows[i][fKey], filters[fKey])) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) out.push(i);
+    }
+    return out;
+  }
+
+  it("Proposal #1: 1-bit bitsets, clz32 extraction, SWAR popcount across word boundaries, 36 dims, remove+re-add, iterables, and ignore_dimensions", () => {
+    // 1. Word-boundary lengths: 0, 1, 31, 32, 33, 63, 64, 65, 97, 257
+    for (const N of [0, 1, 31, 32, 33, 63, 64, 65, 97, 257]) {
+      const a = Int32Array.from({ length: N }, (_, i) => i % 3);
+      const b = Int32Array.from({ length: N }, (_, i) => i % 5);
+      const c = Int32Array.from({ length: N }, (_, i) => i % 7);
+      const d = Int32Array.from({ length: N }, (_, i) => i % 2);
+      const cf = crossfilter.fromColumns({ a, b, c, d });
+      const dA = cf.dimension("a");
+      const dB = cf.dimension("b");
+      const dC = cf.dimension("c");
+      const dD = cf.dimension("d");
+
+      const check = () => {
+        const expected = [];
+        for (let i = 0; i < N; ++i) {
+          if (cf.isElementFiltered(i)) expected.push(i);
+        }
+        expect(cf._filteredCount()).toBe(expected.length);
+        expect(cf.allFilteredIndexes()).toEqual(expected);
+      };
+
+      // 0, 1, 2, 3, 4 active filters (hits extractClz1/2/3/N & countPop1/2/3/N)
+      check();
+      dA.filterExact(0); check();
+      dB.filterIn([0, 2]); check();
+      dC.filterRange([1, 5]); check();
+      dD.filterFunction((v) => v === 1); check();
+
+      // ignore_dimensions check
+      const ignExpected = [];
+      for (let i = 0; i < N; ++i) {
+        if (a[i] === 0 && (b[i] === 0 || b[i] === 2) && d[i] === 1) ignExpected.push(i);
+      }
+      expect(cf.allFilteredIndexes([dC])).toEqual(ignExpected);
+      expect(cf.allFiltered([dC]).length).toBe(ignExpected.length);
+
+      // 0% and 100% matching filters
+      dA.filterExact(999);
+      expect(cf._filteredCount()).toBe(0);
+      expect(cf.allFilteredIndexes()).toEqual([]);
+      dA.filterRange([-10, 100]);
+      dB.filterAll(); dC.filterAll(); dD.filterAll();
+      expect(cf._filteredCount()).toBe(N);
+      expect(cf.allFilteredIndexes().length).toBe(N);
+    }
+
+    // 2. Shrink across word boundaries (65 -> 31 -> 1 -> 0) then grow back (0 -> 33 -> 97): no stale upper bits!
+    const cfGrow = crossfilter.fromColumns({
+      id: Int32Array.from({ length: 65 }, (_, i) => i),
+      tag: Array.from({ length: 65 }, (_, i) => (i < 31 ? "k1" : (i === 31 ? "k2" : "drop"))),
+    });
+    const dId = cfGrow.dimension("id");
+    const dTag = cfGrow.dimension("tag");
+    dId.filterRange([0, 40]); // activates bitset across 3 words
+    dId.filterAll();
+    dTag.filterExact("drop");
+    cfGrow.remove(); // shrinks 65 -> 32
+    dTag.filterAll();
+    expect(cfGrow.size()).toBe(32);
+    expect(cfGrow._filteredCount()).toBe(32);
+
+    dTag.filterExact("k1");
+    cfGrow.remove(); // shrinks 32 -> 1
+    dTag.filterAll();
+    expect(cfGrow.size()).toBe(1);
+
+    cfGrow.remove(); // shrinks 1 -> 0
+    expect(cfGrow.size()).toBe(0);
+    expect(cfGrow._filteredCount()).toBe(0);
+
+    // Re-add 33 rows then 64 more rows (97 total) with an active filter across word boundaries
+    cfGrow.add(crossfilter.rowsFromColumns({
+      id: Int32Array.from({ length: 33 }, (_, i) => i),
+      tag: Array.from({ length: 33 }, (_, i) => (i % 2 === 0 ? "even" : "odd")),
+    }));
+    dTag.filterExact("even");
+    expect(cfGrow._filteredCount()).toBe(17);
+    cfGrow.add(crossfilter.rowsFromColumns({
+      id: Int32Array.from({ length: 64 }, (_, i) => 33 + i),
+      tag: Array.from({ length: 64 }, (_, i) => ((33 + i) % 2 === 0 ? "even" : "odd")),
+    }));
+    expect(cfGrow.size()).toBe(97);
+    expect(cfGrow._filteredCount()).toBe(49);
+    expect(cfGrow.allFilteredIndexes().length).toBe(49);
+
+    // 3. 36 simultaneous active filters + iterable dimension
+    const rows36 = Array.from({ length: 80 }, (_, i) => {
+      const r = { tags: i % 3 === 0 ? ["x", "y"] : (i % 3 === 1 ? ["y"] : []) };
+      for (let k = 0; k < 36; ++k) r[`f${k}`] = (i + k) % 4 < 3 ? 1 : 0;
+      return r;
+    });
+    const cf36 = crossfilter(rows36);
+    const dims36 = Array.from({ length: 36 }, (_, k) => cf36.dimension((r) => r[`f${k}`]));
+    const dTags = cf36.dimension((r) => r.tags, true);
+    for (let k = 0; k < 36; ++k) dims36[k].filterExact(1);
+    dTags.filterExact("x");
+    const expected36 = rows36
+      .map((r, i) => ({ r, i }))
+      .filter(({ r }) => r.tags.includes("x") && Array.from({ length: 36 }, (_, k) => r[`f${k}`]).every((v) => v === 1))
+      .map(({ i }) => i);
+    expect(cf36.allFilteredIndexes()).toEqual(expected36);
+    expect(cf36._filteredCount()).toBe(expected36.length);
+  });
+
+  it("Proposal #2: unfiltered CoW cache, complement subtraction (0%-100%, ghost-key cleanup, 1e16 cancellation guard, sparse split, CoW lifecycle)", () => {
+    // 1. Exact parity across 100%, 99%, 95%, 90%, 70%, 51%, 50%, 10%, 0% active WITH and WITHOUT OP_COUNT
+    const N = 400;
+    const cats = Array.from({ length: 10 }, (_, i) => `c${i}`);
+    const buckets = Array.from({ length: 100 }, (_, i) => i);
+    const splits = ["web", "app", "b2b"];
+    const rows = Array.from({ length: N }, (_, i) => ({
+      cat: cats[i % 10],
+      bkt: buckets[i % 100],
+      sp: splits[i % 3],
+      // Use 0.1 + 0.2 style decimals to provoke FP subtraction dust if empty-slot cleanup fails!
+      rev: ((i % 7) + 1) * 0.1,
+      cost: ((i % 5) + 1) * 0.2,
+    }));
+    const columns = {
+      cat: rows.map((r) => r.cat),
+      bkt: Int32Array.from(rows, (r) => r.bkt),
+      sp: rows.map((r) => r.sp),
+      rev: Float64Array.from(rows, (r) => r.rev),
+      cost: Float64Array.from(rows, (r) => r.cost),
+    };
+    const noCountMetrics = [
+      { id: "rev", op: "sum", field: "rev" },
+      { id: "cost", op: "sum", field: "cost" },
+    ];
+    const withCountMetrics = [
+      { id: "rows", op: "count" },
+      { id: "rev", op: "sum", field: "rev" },
+      { id: "avgCost", op: "avg", field: "cost" },
+    ];
+
+    const rt = crossfilter.createDashboardRuntime({
+      columns,
+      dimensions: ["cat", "bkt", "sp"],
+      kpis: noCountMetrics,
+      groups: [
+        { id: "gNoCount", field: "cat", metrics: noCountMetrics },
+        { id: "gWithCount", field: "cat", metrics: withCountMetrics },
+        { id: "gSplitNoCount", field: "cat", splitField: "sp", metrics: noCountMetrics },
+        { id: "gBkt", field: "bkt", metrics: noCountMetrics },
+      ],
+    });
+    // Populate unfiltered CoW cache
+    rt.snapshot();
+
+    const selectivities = [100, 99, 95, 90, 70, 51, 50, 10, 0, 100, 95, 100];
+    for (const pct of selectivities) {
+      const filters = pct === 100 ? {} : { bkt: { type: "range", range: [0, pct] } };
+      rt.updateFilters(filters);
+      const snap = rt.snapshot();
+      const act = oracleActiveIndices(rows, filters);
+
+      expectCloseObj(snap.kpis, oracleMetrics(rows, act, noCountMetrics), 9);
+
+      // Verify gNoCount & gWithCount & gSplitNoCount
+      for (const catVal of cats) {
+        const catAct = act.filter((i) => rows[i].cat === catVal);
+        const eNo = snap.groups.gNoCount.find((e) => e.key === catVal);
+        expectCloseObj(eNo.value, oracleMetrics(rows, catAct, noCountMetrics), 9);
+        if (catAct.length === 0) {
+          // MUST be exact 0, zero FP dust!
+          expect(eNo.value.rev).toBe(0);
+          expect(eNo.value.cost).toBe(0);
+        }
+
+        const eWith = snap.groups.gWithCount.find((e) => e.key === catVal);
+        expectCloseObj(eWith.value, oracleMetrics(rows, catAct, withCountMetrics), 9);
+
+        // Dense split without OP_COUNT: MUST have ZERO ghost split keys when all rows of a (cat, sp) pair are excluded!
+        const eSp = snap.groups.gSplitNoCount.find((e) => e.key === catVal);
+        const expectedSplitKeys = splits.filter((s) => catAct.some((i) => rows[i].sp === s)).sort();
+        expect(Object.keys(eSp.value).sort()).toEqual(expectedSplitKeys);
+        for (const s of expectedSplitKeys) {
+          expectCloseObj(eSp.value[s], oracleMetrics(rows, catAct.filter((i) => rows[i].sp === s), noCountMetrics), 9);
+        }
+      }
+    }
+
+    // CoW integrity after streaming append & removeFiltered
+    rt.updateFilters({});
+    rt.snapshot(); // buffersHoldUnfiltered = true
+    rt.appendColumns({
+      cat: ["c0", "c1"],
+      bkt: new Int32Array([0, 99]),
+      sp: ["web", "app"],
+      rev: new Float64Array([10, 20]),
+      cost: new Float64Array([1, 2]),
+    });
+    const postAppendUnf = rt.snapshot();
+    expect(postAppendUnf.kpis.rev).toBeCloseTo(rows.reduce((s, r) => s + r.rev, 0) + 30, 8);
+    rt.updateFilters({ bkt: { type: "range", range: [0, 95] } });
+    const postAppend95 = rt.snapshot();
+    const expected95 = rows.filter((r) => r.bkt < 95).reduce((s, r) => s + r.rev, 0) + 10;
+    expect(postAppend95.kpis.rev).toBeCloseTo(expected95, 8);
+    rt.updateFilters({ bkt: { type: "exact", value: 99 } });
+    rt.removeFiltered();
+    rt.updateFilters({});
+    const postRemUnf = rt.snapshot();
+    const expectedAfterRem = rows.filter((r) => r.bkt !== 99).reduce((s, r) => s + r.rev, 0) + 10;
+    expect(postRemUnf.kpis.rev).toBeCloseTo(expectedAfterRem, 8);
+    rt.dispose();
+
+    // 2. Catastrophic cancellation guard (|v| > 1e12): [1e16, 1, 1, 1, ...] excluding 1e16 MUST equal exact sum of 1s!
+    // Test BOTH small N (incremental removal of row 0) AND large N (complement subtraction > 1024 excluded)!
+    for (const [nExt, exclEnd] of [[300, 1], [5000, 1500]]) {
+      const extRev = Float64Array.from({ length: nExt }, (_, i) => (i === 0 ? 1e16 : 1));
+      const extCat = Array.from({ length: nExt }, (_, i) => (i % 2 === 0 ? "A" : "B"));
+      const extId = Int32Array.from({ length: nExt }, (_, i) => i);
+      const rtExt = crossfilter.createDashboardRuntime({
+        columns: { rev: extRev, cat: extCat, id: extId },
+        dimensions: ["cat", "id"],
+        kpis: [{ id: "rev", op: "sum", field: "rev" }],
+        groups: [
+          { id: "gCat", field: "cat", metrics: [{ id: "rev", op: "sum", field: "rev" }] },
+          { id: "gId", field: "id", metrics: [{ id: "rev", op: "sum", field: "rev" }] },
+        ],
+      });
+      rtExt.snapshot();
+      // Exclude [0, exclEnd) including row 0 (1e16) -> naive subtraction would compute (1e16 + sum) - 1e16 === 0!
+      rtExt.updateFilters({ id: { type: "range", range: [exclEnd, nExt] } });
+      const extSnap = rtExt.snapshot();
+      const remCount = nExt - exclEnd;
+      expect(extSnap.kpis.rev).toBe(remCount);
+      let expA = 0, expB = 0;
+      for (let i = exclEnd; i < nExt; ++i) {
+        if (i % 2 === 0) expA += 1;
+        else expB += 1;
+      }
+      expect(extSnap.groups.gCat.find((e) => e.key === "A").value.rev).toBe(expA);
+      expect(extSnap.groups.gCat.find((e) => e.key === "B").value.rev).toBe(expB);
+      // Consecutive range brush on `id` (Falcon must skip extreme column and stay exact!)
+      rtExt.updateFilters({ id: { type: "range", range: [exclEnd + 1, nExt] } });
+      const extSnap2 = rtExt.snapshot();
+      expect(extSnap2.kpis.rev).toBe(remCount - 1);
+      rtExt.dispose();
+    }
+
+    // 3. Sparse split complement subtraction (> 262,144 cells) at 95% active & clear
+    const spCount = 2000;
+    const rtSp = crossfilter.createDashboardRuntime({
+      columns: {
+        sku: Array.from({ length: spCount }, (_, i) => `s_${i}`),
+        tag: Array.from({ length: spCount }, (_, i) => `t_${i % 150}`),
+        grp: Int32Array.from({ length: spCount }, (_, i) => i % 20),
+        rev: Float64Array.from({ length: spCount }, () => 0.1),
+      },
+      dimensions: ["sku", "grp"],
+      groups: [{ id: "sp", field: "sku", splitField: "tag", metrics: [{ id: "rev", op: "sum", field: "rev" }] }],
+    });
+    rtSp.snapshot(); // warm unfiltered cache
+    rtSp.updateFilters({ grp: { type: "range", range: [0, 19] } }); // 95% active!
+    const sp95 = rtSp.snapshot().groups.sp;
+    let nonEmptySp = 0, totalRevSp = 0;
+    for (const e of sp95) {
+      const ks = Object.keys(e.value);
+      if (ks.length > 0) {
+        nonEmptySp += 1;
+        for (const k of ks) totalRevSp += e.value[k].rev;
+      }
+    }
+    expect(nonEmptySp).toBe(1900); // zero ghost split keys for the 100 excluded SKUs!
+    expect(totalRevSp).toBeCloseTo(190, 8);
+    rtSp.updateFilters({});
+    const sp100 = rtSp.snapshot().groups.sp;
+    expect(sp100.filter((e) => Object.keys(e.value).length > 0).length).toBe(2000);
+    rtSp.dispose();
+  });
+
+  it("Proposal #3: interleaved AoS + shared-scan co-scheduler across 1..7 fields, 8 groups + KPI, NaN/Inf, avgNonZero, and heterogeneous plans", () => {
+    const N = 240;
+    const rng = makeRng(777);
+    const cols = {};
+    for (let d = 0; d < 8; ++d) {
+      cols[`d${d}`] = Array.from({ length: N }, (_, i) => `d${d}_v${(i + d * 3) % (4 + d)}`);
+    }
+    for (let f = 0; f < 7; ++f) {
+      cols[`m${f}`] = Float64Array.from({ length: N }, (_, i) => {
+        if (f === 6 && i % 17 === 0) return NaN;
+        if (f === 6 && i % 29 === 0) return Infinity;
+        return i % 11 === 0 ? 0 : Math.round((1 + rng() * 50) * 100) / 100;
+      });
+    }
+    const rows = Array.from({ length: N }, (_, i) => {
+      const r = {};
+      for (const k of Object.keys(cols)) r[k] = cols[k][i];
+      return r;
+    });
+
+    // Test every field count 1..7 (hits ao1..ao6 + aoGeneral, coScan 1..6 + fallback) across 8 groups (> 5 chunk limit!)
+    for (const fieldCount of [1, 2, 3, 4, 5, 6, 7]) {
+      const metrics = [{ id: "rows", op: "count" }];
+      for (let f = 0; f < fieldCount; ++f) {
+        metrics.push({ id: `s${f}`, op: f === 1 ? "avg" : "sum", field: `m${f}` });
+      }
+      if (fieldCount >= 2) {
+        metrics.push({ id: "rat", op: "ratio", field: "m0", denominator: "m1" });
+      }
+      if (fieldCount === 7) {
+        metrics.push({ id: "nz", op: "avgNonZero", field: "m2" });
+      }
+
+      const groupSpecs = Array.from({ length: 8 }, (_, d) => ({
+        id: `g${d}`,
+        field: `d${d}`,
+        metrics: d === 7
+          ? [{ id: "alt", op: "sum", field: "m0" }, { id: "altNz", op: "avgNonZero", field: "m1" }] // heterogeneous plan!
+          : metrics,
+      }));
+
+      const rt = crossfilter.createDashboardRuntime({
+        columns: cols,
+        dimensions: Array.from({ length: 8 }, (_, d) => `d${d}`),
+        kpis: metrics,
+        groups: groupSpecs,
+      });
+
+      const testFilters = [
+        {},
+        { d0: { type: "exact", value: "d0_v0" } },
+        { d0: { type: "in", values: ["d0_v0", "d0_v1", "d0_v2"] } }, // 75% -> complement co-scan!
+        { d0: { type: "exact", value: "d0_v0" }, d1: { type: "exact", value: "d1_v1" } }, // low-sel co-scan!
+        {},
+      ];
+      for (const filters of testFilters) {
+        rt.updateFilters(filters);
+        const snap = rt.snapshot();
+        const act = oracleActiveIndices(rows, filters);
+        expectCloseObj(snap.kpis, oracleMetrics(rows, act, metrics), 6);
+        for (let d = 0; d < 8; ++d) {
+          const gAct = oracleActiveIndices(rows, filters, `d${d}`);
+          const gMetrics = groupSpecs[d].metrics;
+          for (const entry of snap.groups[`g${d}`]) {
+            const sub = gAct.filter((i) => rows[i][`d${d}`] === entry.key);
+            expectCloseObj(entry.value, oracleMetrics(rows, sub, gMetrics), 6);
+          }
+        }
+      }
+      // Also test subset rt.groups() (2 groups + 1 group)
+      rt.updateFilters({ d2: { type: "exact", value: "d2_v0" } });
+      const sub2 = rt.groups({ groups: { g0: {}, g3: {} } });
+      const act2 = oracleActiveIndices(rows, { d2: { type: "exact", value: "d2_v0" } });
+      for (const entry of sub2.g0.entries) {
+        expectCloseObj(entry.value, oracleMetrics(rows, act2.filter((i) => rows[i].d0 === entry.key), metrics), 6);
+      }
+      rt.dispose();
+    }
+  });
+
+  it("Proposal #4: lazy filter-only dimensions defer encoding across init, snapshot, append, remove, filterAll, dispose and materialize accurately on first use", () => {
+    const N = 120;
+    const readCounts = { unusedA: 0, unusedB: 0, forFilter: 0, forBounds: 0, forRows: 0, forGroup: 0 };
+    function trackedCol(name, arr) {
+      return new Proxy(arr, {
+        get(target, prop, receiver) {
+          if (typeof prop === "string" && /^\d+$/.test(prop)) {
+            readCounts[name] += 1;
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+    }
+
+    const baseCols = {
+      cat: Array.from({ length: N }, (_, i) => `c${i % 4}`),
+      rev: Float64Array.from({ length: N }, (_, i) => i + 1),
+      unusedA: trackedCol("unusedA", Array.from({ length: N }, (_, i) => `ua_${i % 10}`)),
+      unusedB: trackedCol("unusedB", Array.from({ length: N }, (_, i) => `ub_${i % 5}`)),
+      forFilter: trackedCol("forFilter", Array.from({ length: N }, (_, i) => `ff_${i % 3}`)),
+      forBounds: trackedCol("forBounds", Array.from({ length: N }, (_, i) => i * 2)),
+      forRows: trackedCol("forRows", Array.from({ length: N }, (_, i) => N - i)),
+      forGroup: trackedCol("forGroup", Array.from({ length: N }, (_, i) => `fg_${i % 4}`)),
+    };
+
+    const rt = crossfilter.createDashboardRuntime({
+      columns: baseCols,
+      dimensions: ["cat", "unusedA", "unusedB", "forFilter", "forBounds", "forRows", "forGroup"],
+      kpis: [{ id: "rev", op: "sum", field: "rev" }],
+      groups: [{ id: "byCat", field: "cat", metrics: [{ id: "rev", op: "sum", field: "rev" }] }],
+    });
+
+    // Initial snapshot, filter on `cat`, streaming append, filterAll -> ZERO reads of any filter-only dim!
+    expect(rt.snapshot().kpis.rev).toBe((N * (N + 1)) / 2);
+    rt.updateFilters({ cat: { type: "exact", value: "c0" } });
+    rt.snapshot();
+    rt.appendColumns({
+      cat: ["c0", "c1"],
+      rev: new Float64Array([100, 200]),
+      unusedA: ["ua_0", "ua_1"],
+      unusedB: ["ub_0", "ub_1"],
+      forFilter: ["ff_0", "ff_1"],
+      forBounds: [500, 600],
+      forRows: [999, 1000],
+      forGroup: ["fg_0", "fg_1"],
+    });
+    rt.updateFilters({});
+    rt.snapshot();
+
+    expect(readCounts).toEqual({ unusedA: 0, unusedB: 0, forFilter: 0, forBounds: 0, forRows: 0, forGroup: 0 });
+
+    // Even after removeFiltered() compacts columnar batches, unused dims still do not build dimension indexes
+    // and lazy dims materialize accurately against the compacted post-remove rows on first real use!
+    rt.updateFilters({ cat: { type: "exact", value: "c3" } });
+    rt.removeFiltered();
+    rt.updateFilters({});
+    rt.snapshot();
+    const afterRemoveReads = { ...readCounts };
+
+    // 1. Activate `forFilter` via filterExact
+    rt.updateFilters({ forFilter: { type: "exact", value: "ff_0" } });
+    expect(readCounts.unusedA).toBe(afterRemoveReads.unusedA);
+    const snapFF = rt.snapshot();
+    expect(snapFF.kpis.rev).toBeGreaterThan(0);
+
+    // 2. Activate `forBounds` via bounds()
+    const b = rt.bounds({ fields: ["forBounds"] });
+    expect(b.forBounds.min).toBe(0);
+    expect(b.forBounds.max).toBe(500);
+    expect(readCounts.unusedA).toBe(afterRemoveReads.unusedA);
+
+    // 3. Activate `forRows` via rows({ sortBy })
+    const topRows = rt.rows({ sortBy: "forRows", direction: "top", limit: 2, fields: ["forRows"] });
+    expect(topRows[0].forRows).toBe(999);
+    expect(readCounts.unusedA).toBe(afterRemoveReads.unusedA);
+
+    // 4. Disposing never materializes unusedA or unusedB
+    rt.dispose();
+    expect(readCounts.unusedA).toBe(afterRemoveReads.unusedA);
+    expect(readCounts.unusedB).toBe(afterRemoveReads.unusedB);
+
+    // 5. Direct crossfilter API: deferred dim materializes cleanly on group(), topIndex(), bottomIndex(), filterFunction(), and plain-JS-object add()
+    const cf = crossfilter.fromColumns({
+      x: trackedCol("forGroup", Array.from({ length: 10 }, (_, i) => i * 10)),
+      y: Array.from({ length: 10 }, (_, i) => `y${i % 2}`),
+    });
+    const dX = cf.dimension("x");
+    const dY = cf.dimension("y");
+    dY.filterExact("y0");
+    // Plain JS-object add forces deferred dim initialization cleanly
+    cf.add([{ x: 95, y: "y0" }]);
+    expect(dX.topIndex(1)).toEqual([10]);
+    expect(dX.bottomIndex(1)).toEqual([0]);
+    expect(dX.group().reduceCount().size()).toBe(11);
+    dX.filterFunction((v) => v >= 50);
+    expect(cf.allFilteredIndexes()).toEqual([6, 8, 10]);
+  });
+
+  it("Proposal #5: Falcon prefix-sum brush (discrete numeric/string + continuous float >2048 unique) matches brute-force oracle on every frame & across all mid-brush consumers", () => {
+    const rng = makeRng(2026);
+    const N = 3200; // > 2048 so continuous `rev` has > 2048 unique floats -> triggers continuous 256-bin quantile + CSR mode!
+    const countries = ["US", "UK", "DE", "FR", "JP", "CA"];
+    const categories = ["tech", "home", "food", "auto", "book"];
+    const baseDay = Date.UTC(2025, 0, 1);
+    const cols = {
+      country: new Array(N),
+      category: new Array(N),
+      day: new Float64Array(N),
+      dayStr: new Array(N), // lazyEncodedState string discrete brush!
+      rev: new Float64Array(N), // >2048 unique floats -> continuous Falcon brush!
+      cost: new Float64Array(N),
+      sku: new Array(N), // high-card 2500 SKUs -> exceeds cube cap (2500 * 365 * 6 > 4M) alongside low-card Falcon groups!
+    };
+    for (let i = 0; i < N; ++i) {
+      cols.country[i] = countries[(rng() * countries.length) | 0];
+      cols.category[i] = categories[(rng() * categories.length) | 0];
+      const d = (rng() * 120) | 0;
+      cols.day[i] = baseDay + d * 86400000;
+      cols.dayStr[i] = `2025-${String(1 + ((d / 30) | 0)).padStart(2, "0")}-${String(1 + (d % 30)).padStart(2, "0")}`;
+      // Guarantee >2500 unique floats
+      cols.rev[i] = Math.round((10 + i * 0.37 + rng() * 5) * 1000) / 1000;
+      cols.cost[i] = ((i % 7) + 1) * 0.1;
+      cols.sku[i] = `sku_${i % 2500}`;
+    }
+    const rows = Array.from({ length: N }, (_, i) => ({
+      country: cols.country[i],
+      category: cols.category[i],
+      day: cols.day[i],
+      dayStr: cols.dayStr[i],
+      rev: cols.rev[i],
+      cost: cols.cost[i],
+      sku: cols.sku[i],
+    }));
+
+    const metricsWithCount = [
+      { id: "rows", op: "count" },
+      { id: "rev", op: "sum", field: "rev" },
+      { id: "avgCost", op: "avg", field: "cost" },
+    ];
+    const metricsNoCount = [
+      { id: "rev", op: "sum", field: "rev" },
+      { id: "cost", op: "sum", field: "cost" },
+    ];
+
+    const rt = crossfilter.createDashboardRuntime({
+      columns: cols,
+      dimensions: ["country", "category", "day", "dayStr", "rev", "sku"],
+      kpis: metricsWithCount,
+      groups: [
+        { id: "byCountry", field: "country", metrics: metricsWithCount },
+        { id: "byCategory", field: "category", metrics: metricsNoCount },
+        { id: "byDay", field: "day", metrics: metricsWithCount },
+        { id: "bySku", field: "sku", metrics: metricsWithCount },
+      ],
+    });
+    rt.snapshot();
+
+    function assertSnapshotExact(filters) {
+      const snap = rt.snapshot();
+      const act = oracleActiveIndices(rows, filters);
+      expect(rt.rowCount()).toBe(act.length);
+      expectCloseObj(snap.kpis, oracleMetrics(rows, act, metricsWithCount), 5);
+      for (const e of snap.groups.byCountry) {
+        const gAct = oracleActiveIndices(rows, filters, "country").filter((i) => rows[i].country === e.key);
+        expectCloseObj(e.value, oracleMetrics(rows, gAct, metricsWithCount), 5);
+      }
+      for (const e of snap.groups.byCategory) {
+        const gAct = oracleActiveIndices(rows, filters, "category").filter((i) => rows[i].category === e.key);
+        expectCloseObj(e.value, oracleMetrics(rows, gAct, metricsNoCount), 5);
+        if (gAct.length === 0) {
+          expect(e.value.rev).toBe(0);
+          expect(e.value.cost).toBe(0);
+        }
+      }
+      // Also spot-check high-card bySku (which falls back outside Falcon cube cap!)
+      const skuTotals = snap.groups.bySku.reduce((s, e) => s + e.value.rows, 0);
+      expect(skuTotals).toBe(oracleActiveIndices(rows, filters, "sku").length);
+    }
+
+    // A. Discrete numeric brush (`day`) — 15 frames including empty, inverted, single-day, full 100%, exact hover
+    const discreteFrames = [
+      { day: { type: "range", range: [baseDay, baseDay + 40 * 86400000] } },
+      { day: { type: "range", range: [baseDay + 10 * 86400000, baseDay + 50 * 86400000] } }, // frame 2 builds Falcon discrete!
+      { day: { type: "range", range: [baseDay + 20 * 86400000, baseDay + 60 * 86400000] } },
+      { day: { type: "range", range: [baseDay + 50 * 86400000, baseDay + 20 * 86400000] } }, // inverted -> empty!
+      { day: { type: "range", range: [baseDay + 200 * 86400000, baseDay + 250 * 86400000] } }, // out of bounds -> empty!
+      { day: { type: "range", range: [baseDay - 86400000, baseDay + 300 * 86400000] } }, // 100% full range!
+      { day: { type: "exact", value: baseDay + 15 * 86400000 } }, // discrete exact hover!
+      { day: { type: "exact", value: baseDay + 16 * 86400000 } },
+      { day: { type: "exact", value: baseDay + 999 * 86400000 } }, // missing exact value -> 0!
+      { day: { type: "range", range: [baseDay + 5 * 86400000, baseDay + 85 * 86400000] } },
+    ];
+    for (const f of discreteFrames) {
+      rt.updateFilters(f);
+      assertSnapshotExact(f);
+    }
+
+    // B. Mid-brush non-Falcon consumers right after a 100%-matching brush frame AND after a partial brush frame!
+    const fullDayF = { day: { type: "range", range: [baseDay - 86400000, baseDay + 500 * 86400000] } };
+    rt.updateFilters(fullDayF);
+    expect(rt.rowCount()).toBe(N);
+    expect(rt.bounds({ fields: ["rev"] }).rev.min).toBeCloseTo(Math.min(...cols.rev), 6);
+    expect(rt.rows({ sortBy: "rev", direction: "top", limit: 3, fields: ["rev"] }).length).toBe(3);
+
+    const partDayF = { day: { type: "range", range: [baseDay + 10 * 86400000, baseDay + 30 * 86400000] } };
+    rt.updateFilters(partDayF);
+    // Call isolatedFilters mid-brush (must preserve brush state afterward!)
+    const iso = rt.query({ isolatedFilters: { country: { type: "exact", value: "US" } }, snapshot: false, rowCount: true });
+    expect(iso.rowCount).toBe(rows.filter((r) => r.country === "US").length);
+    assertSnapshotExact(partDayF);
+
+    // C. Discrete brush while ANOTHER dimension (`country`) is simultaneously filtered!
+    // Must keep `byCountry` ignoring `country`'s own filter while intersecting with `day`!
+    for (let step = 0; step < 5; ++step) {
+      const f = {
+        country: { type: "exact", value: "US" },
+        day: { type: "range", range: [baseDay + step * 15 * 86400000, baseDay + (step * 15 + 45) * 86400000] },
+      };
+      rt.updateFilters(f);
+      assertSnapshotExact(f);
+    }
+
+    // D. Discrete string brush (`dayStr` on lazyEncodedState)
+    for (let step = 0; step < 4; ++step) {
+      const f = {
+        dayStr: { type: "range", range: [`2025-0${step + 1}-05`, `2025-0${step + 1}-25`] },
+      };
+      rt.updateFilters(f);
+      assertSnapshotExact(f);
+    }
+
+    // E. Continuous float brush (`rev`, >2048 unique floats -> 256-bin quantile + CSR boundary scan!)
+    const contFrames = [
+      { rev: { type: "range", range: [50, 450] } },
+      { rev: { type: "range", range: [123.456, 678.901] } }, // frame 2 builds Falcon continuous!
+      { rev: { type: "range", range: [200.1, 205.9] } }, // tiny range inside 1-2 boundary bins (0 full interior bins!)
+      { rev: { type: "range", range: [10.0, 1000.0] } }, // wide range (many interior + 2 boundary bins)
+      { rev: { type: "range", range: [-100, 999999] } }, // 100% full range!
+      { rev: { type: "range", range: [500, 200] } }, // inverted -> empty!
+      { rev: { type: "range", range: [311.2, 888.7] } },
+      { rev: { type: "exact", value: cols.rev[100] } }, // exact on continuous exits Falcon cleanly!
+      { rev: { type: "range", range: [150.5, 550.5] } }, // resume range brush!
+      { rev: { type: "range", range: [160.5, 560.5] } },
+    ];
+    for (const f of contFrames) {
+      rt.updateFilters(f);
+      assertSnapshotExact(f);
+    }
+
+    // F. Append & removeFiltered during active Falcon brush -> invalidates cleanly & stays 100% exact!
+    const appendN = 40;
+    const extraCols = {
+      country: Array.from({ length: appendN }, (_, i) => countries[i % countries.length]),
+      category: Array.from({ length: appendN }, (_, i) => categories[i % categories.length]),
+      day: Float64Array.from({ length: appendN }, (_, i) => baseDay + (i % 60) * 86400000),
+      dayStr: Array.from({ length: appendN }, () => "2025-02-10"),
+      rev: Float64Array.from({ length: appendN }, (_, i) => 200 + i * 3.14),
+      cost: Float64Array.from({ length: appendN }, () => 0.3),
+      sku: Array.from({ length: appendN }, (_, i) => `sku_new_${i}`),
+    };
+    rt.appendColumns(extraCols);
+    for (let i = 0; i < appendN; ++i) {
+      rows.push({
+        country: extraCols.country[i],
+        category: extraCols.category[i],
+        day: extraCols.day[i],
+        dayStr: extraCols.dayStr[i],
+        rev: extraCols.rev[i],
+        cost: extraCols.cost[i],
+        sku: extraCols.sku[i],
+      });
+    }
+    assertSnapshotExact({ rev: { type: "range", range: [160.5, 560.5] } });
+
+    rt.removeFiltered();
+    for (let i = rows.length - 1; i >= 0; --i) {
+      if (rows[i].rev >= 160.5 && rows[i].rev < 560.5) rows.splice(i, 1);
+    }
+    rt.updateFilters({});
+    assertSnapshotExact({});
+    rt.dispose();
+  });
+
+  it("300-step randomized differential fuzz oracle exercising ALL 5 proposals together (bitsets, complement, AoS co-scan, lazy dims, discrete & continuous Falcon brush)", () => {
+    const rng = makeRng(314159);
+    const countries = ["US", "UK", "DE", "FR", "JP", "CA", "AU", "NL", "SE", "ES"];
+    const categories = ["c0", "c1", "c2", "c3", "c4", "c5"];
+    const channels = ["web", "app", "b2b", "retail"];
+    const lazyVals = ["L0", "L1", "L2", "L3", "L4"];
+    const baseDay = Date.UTC(2025, 0, 1);
+
+    function makeBatch(count, offset) {
+      const b = {
+        country: new Array(count),
+        category: new Array(count),
+        channel: new Array(count),
+        day: new Float64Array(count),
+        rev: new Float64Array(count),
+        cost: new Float64Array(count),
+        clicks: new Int32Array(count),
+        impressions: new Int32Array(count),
+        lazyA: new Array(count),
+        lazyB: new Float64Array(count),
+      };
+      for (let i = 0; i < count; ++i) {
+        b.country[i] = countries[(rng() * countries.length) | 0];
+        b.category[i] = categories[(rng() * categories.length) | 0];
+        b.channel[i] = channels[(rng() * channels.length) | 0];
+        b.day[i] = baseDay + ((rng() * 90) | 0) * 86400000;
+        b.rev[i] = Math.round((5 + ((offset + i) * 0.41) + rng() * 20) * 100) / 100;
+        b.cost[i] = (i % 19 === 0) ? NaN : Math.round((1 + rng() * 40) * 100) / 100;
+        b.impressions[i] = 10 + ((rng() * 100) | 0);
+        b.clicks[i] = (rng() * b.impressions[i] * 0.2) | 0;
+        b.lazyA[i] = lazyVals[(rng() * lazyVals.length) | 0];
+        b.lazyB[i] = Math.round(rng() * 1000) / 10;
+      }
+      return b;
+    }
+
+    const initBatch = makeBatch(2400, 0);
+    const rows = [];
+    function pushBatchToOracle(b, len) {
+      for (let i = 0; i < len; ++i) {
+        rows.push({
+          country: b.country[i],
+          category: b.category[i],
+          channel: b.channel[i],
+          day: b.day[i],
+          rev: b.rev[i],
+          cost: b.cost[i],
+          clicks: b.clicks[i],
+          impressions: b.impressions[i],
+          lazyA: b.lazyA[i],
+          lazyB: b.lazyB[i],
+        });
+      }
+    }
+    pushBatchToOracle(initBatch, 2400);
+
+    const metrics = [
+      { id: "rows", op: "count" },
+      { id: "rev", op: "sum", field: "rev" },
+      { id: "avgCost", op: "avg", field: "cost" },
+      { id: "ctr", op: "ratio", field: "clicks", denominator: "impressions" },
+    ];
+    const noCountMetrics = [
+      { id: "rev", op: "sum", field: "rev" },
+      { id: "ctr", op: "ratio", field: "clicks", denominator: "impressions" },
+    ];
+
+    const rt = crossfilter.createDashboardRuntime({
+      columns: initBatch,
+      dimensions: ["country", "category", "channel", "day", "rev", "lazyA", "lazyB"],
+      kpis: metrics,
+      groups: [
+        { id: "byCountry", field: "country", metrics },
+        { id: "byCategory", field: "category", metrics },
+        { id: "byChannel", field: "channel", metrics: noCountMetrics },
+        { id: "byDay", field: "day", metrics },
+        { id: "splitCatChan", field: "category", splitField: "channel", metrics: noCountMetrics },
+      ],
+    });
+
+    let filters = {};
+    let nextOffset = 2400;
+
+    function checkAll() {
+      const snap = rt.snapshot();
+      const act = oracleActiveIndices(rows, filters);
+      expect(rt.rowCount()).toBe(act.length);
+      expectCloseObj(snap.kpis, oracleMetrics(rows, act, metrics), 5);
+
+      for (const [gid, field, mSpec] of [
+        ["byCountry", "country", metrics],
+        ["byCategory", "category", metrics],
+        ["byChannel", "channel", noCountMetrics],
+      ]) {
+        const gAct = oracleActiveIndices(rows, filters, field);
+        for (const e of snap.groups[gid]) {
+          expectCloseObj(e.value, oracleMetrics(rows, gAct.filter((i) => rows[i][field] === e.key), mSpec), 5);
+        }
+      }
+
+      // Verify dense split group (with no OP_COUNT -> tests complement ghost-key cleanup!)
+      const spAct = oracleActiveIndices(rows, filters, "category");
+      for (const e of snap.groups.splitCatChan) {
+        const catRows = spAct.filter((i) => rows[i].category === e.key);
+        const expectedChans = channels.filter((ch) => catRows.some((i) => rows[i].channel === ch)).sort();
+        expect(Object.keys(e.value).sort()).toEqual(expectedChans);
+        for (const ch of expectedChans) {
+          expectCloseObj(e.value[ch], oracleMetrics(rows, catRows.filter((i) => rows[i].channel === ch), noCountMetrics), 5);
+        }
+      }
+    }
+
+    checkAll();
+
+    for (let step = 0; step < 300; ++step) {
+      const r = rng();
+      if (r < 0.14) {
+        // Clear all filters (unfiltered CoW restore!)
+        filters = {};
+        rt.updateFilters(filters);
+      } else if (r < 0.34) {
+        // Multi-frame discrete brush on `day` (2-4 consecutive frames -> Falcon discrete!)
+        const frames = 2 + ((rng() * 3) | 0);
+        const startD = (rng() * 60) | 0;
+        const span = 5 + ((rng() * 40) | 0);
+        for (let f = 0; f < frames; ++f) {
+          filters = {
+            ...filters,
+            day: { type: "range", range: [baseDay + (startD + f * 3) * 86400000, baseDay + (startD + f * 3 + span) * 86400000] },
+          };
+          rt.updateFilters(filters);
+          checkAll();
+        }
+        continue;
+      } else if (r < 0.54) {
+        // Multi-frame continuous brush on `rev` (2-4 consecutive frames -> Falcon continuous!)
+        const frames = 2 + ((rng() * 3) | 0);
+        const lo0 = rng() * 600;
+        const width = 30 + rng() * 450;
+        for (let f = 0; f < frames; ++f) {
+          filters = {
+            ...filters,
+            rev: { type: "range", range: [lo0 + f * 25.3, lo0 + f * 25.3 + width] },
+          };
+          rt.updateFilters(filters);
+          checkAll();
+        }
+        continue;
+      } else if (r < 0.68) {
+        // High-selectivity `in` filter (8-9 of 10 countries -> complement subtraction!)
+        const keep = countries.slice(0, 8 + ((rng() * 2) | 0));
+        filters = { ...filters, country: { type: "in", values: keep } };
+        rt.updateFilters(filters);
+      } else if (r < 0.80) {
+        // Low-selectivity single or multi-dim exact/in filter
+        filters = {
+          ...filters,
+          country: { type: "exact", value: countries[(rng() * countries.length) | 0] },
+          category: { type: "in", values: [categories[(rng() * 3) | 0], categories[3 + ((rng() * 3) | 0)]] },
+        };
+        rt.updateFilters(filters);
+      } else if (r < 0.88) {
+        // Activate / toggle lazy filter-only dimensions (`lazyA`, `lazyB`)
+        if (rng() < 0.5) {
+          filters = { ...filters, lazyA: { type: "in", values: [lazyVals[(rng() * 5) | 0], lazyVals[(rng() * 5) | 0]] } };
+        } else {
+          const lo = rng() * 400;
+          filters = { ...filters, lazyB: { type: "range", range: [lo, lo + 500] } };
+        }
+        rt.updateFilters(filters);
+      } else if (r < 0.93) {
+        // Mid-state bounds + rows + isolatedFilters check
+        const act = oracleActiveIndices(rows, filters);
+        const b = rt.bounds({ fields: ["rev", "lazyB"] });
+        if (act.length > 0) {
+          let minR = Infinity, maxR = -Infinity;
+          for (const i of act) {
+            if (rows[i].rev < minR) minR = rows[i].rev;
+            if (rows[i].rev > maxR) maxR = rows[i].rev;
+          }
+          expect(b.rev.min).toBeCloseTo(minR, 6);
+          expect(b.rev.max).toBeCloseTo(maxR, 6);
+        } else {
+          expect(b.rev).toEqual({ min: null, max: null });
+        }
+        const topR = rt.rows({ sortBy: "rev", direction: "top", limit: 3, fields: ["rev"] });
+        expect(topR.length).toBe(Math.min(3, act.length));
+        const iso = rt.query({ isolatedFilters: { channel: { type: "exact", value: "web" } }, snapshot: false, rowCount: true });
+        expect(iso.rowCount).toBe(rows.filter((x) => x.channel === "web").length);
+      } else if (r < 0.97) {
+        // Stream append 50 new rows
+        const nb = makeBatch(50, nextOffset);
+        nextOffset += 50;
+        rt.appendColumns(nb);
+        pushBatchToOracle(nb, 50);
+      } else if (rows.length > 400) {
+        // Remove currently filtered rows if small subset (< 20%)
+        const act = oracleActiveIndices(rows, filters);
+        if (act.length > 0 && act.length < rows.length * 0.2) {
+          rt.removeFiltered();
+          const dropSet = new Set(act);
+          for (let i = rows.length - 1; i >= 0; --i) {
+            if (dropSet.has(i)) rows.splice(i, 1);
+          }
+        }
+      }
+      checkAll();
+    }
+
+    rt.dispose();
+  });
+});

@@ -424,6 +424,8 @@ declare namespace crossfilter {
     hasCurrentFilter(): boolean;
     top(k: number, offset?: number): TRecord[];
     bottom(k: number, offset?: number): TRecord[];
+    topIndex(k: number, offset?: number): number[];
+    bottomIndex(k: number, offset?: number): number[];
     group<TKey extends NaturallyOrderedValue, TGroupValue>(
       groupValue?: (value: TValue) => TKey,
     ): Group<TRecord, TKey, TGroupValue>;
@@ -441,17 +443,23 @@ declare namespace crossfilter {
 
   export interface Crossfilter<T> {
     add(records: T[]): Crossfilter<T>;
+    batch<TResult>(fn: () => TResult): TResult;
     remove(predicate?: Predicate<T>): void;
-    dimension<TValue extends NaturallyOrderedValue>(
-      selector: OrderedValueSelector<T, TValue | TValue[]>,
+    dimension<TValue extends NaturallyOrderedValue = NaturallyOrderedValue>(
+      selector: string | OrderedValueSelector<T, TValue | TValue[]>,
       isArray?: boolean,
     ): Dimension<T, TValue>;
     groupAll<TGroupValue>(): GroupAll<T, TGroupValue>;
     size(): number;
     all(): ReadonlyArray<T>;
-    allFiltered(): T[];
+    allFiltered(ignoreDimensions?: ReadonlyArray<Dimension<T, any>>): T[];
+    allFilteredIndexes(ignoreDimensions?: ReadonlyArray<Dimension<T, any>>): number[];
+    takeColumns(
+      indexes: ArrayLike<number>,
+      fields?: string[],
+    ): DashboardColumnarRows;
     onChange(callback: (type: EventType) => void): () => void;
-    isElementFiltered(index: number, ignoreDimensions?: number[]): boolean;
+    isElementFiltered(index: number, ignoreDimensions?: ReadonlyArray<Dimension<T, any> | number>): boolean;
     configureRuntime(options: RuntimeOptions): RuntimeInfo;
     runtimeInfo(): RuntimeInfo;
   }
