@@ -1,85 +1,59 @@
 # crossfilter3
 
-> **A streaming-first, zero-copy analytics engine for the browser.**
+> **A streaming-first, columnar analytics and cross-filtering engine for browsers and Node.js.**
 
-Crossfilter3 is built on top of crossfilter2, already the fastest way to filter large datasets client-side. This fork turns it into a complete dashboard runtime — data streams in as Arrow IPC, decodes and filters inside a Web Worker (main thread never blocks), WASM accelerates the hot filter scan, and partial snapshots render the UI progressively before the download even finishes.
+[![npm version](https://img.shields.io/npm/v/crossfilter3.svg)](https://www.npmjs.com/package/crossfilter3)
+[![license](https://img.shields.io/npm/l/crossfilter3.svg)](LICENSE)
+![types](https://img.shields.io/badge/TypeScript-included-3178c6.svg)
+![formats](https://img.shields.io/badge/module-ESM%20%7C%20CJS%20%7C%20UMD-4c1.svg)
+![size](https://img.shields.io/badge/min%2Bgzip-~64%20kB-informational.svg)
 
-### What crossfilter3 adds to crossfilter2
+`crossfilter3` builds on [crossfilter2](https://github.com/crossfilter/crossfilter) and re-engineers the core for modern columnar analytics and interactive dashboards. It delivers **sub-millisecond multi-chart cross-filtering** up to 1M+ rows, **60fps range brushing**, **zero row-object materialization**, **unlimited dimensions** (removing the 32-dimension cap), and a **streaming Apache Arrow Web Worker** — while keeping 100% compatibility with the classic crossfilter API.
 
-| Layer | What changed | Why it matters |
-|-------|-------------|----------------|
-| **Ingest** | Columnar Arrow IPC streaming with batch coalescing (default 64K rows), multi-source lookup joins, projection/rename/type-coercion at ingest, zero-copy `Float64Array` fast path for numeric columns, Proxy-backed lazy row arrays via `COLUMNAR_BATCH_KEY` | Data goes from Cube.dev (or any Arrow source) straight into crossfilter's columnar indexes without building intermediate row objects — a 100K-row dataset allocates zero row objects until a panel actually reads one |
-| **1-bit columnar filter bitsets** | Per-dimension 1-bit `Uint32Array` bitsets (`src/filter-bitsets.js`) with **no 32-dimension limit**, 32-unrolled word packing, word-level XOR delta extraction with bailout, `Math.clz32` sparse active/excluded row traversal, SWAR `popcount32` for `filteredCount()`, and `O(1)` filter clear | Replaces byte-per-row bitmasks with 1 bit/row per *active* filter (0 bytes when unfiltered), accelerates sparse filter extraction & counting by 2–7×, and supports arbitrarily many dimensions |
-| **Lazy dimensions & encoding** | Filter-only string-accessor dimensions defer encoding completely until first filter/group/bounds/sort access; active dimensions use `Uint32Array` dictionary codes (2× amortized growth, incremental `codeCounts`) or raw numeric arrays; inline WASM filter acceleration (`src/wasm.js`) with JS fallback | Wide 20-dimension dashboards build **5–6× faster** because unused filter-only dimensions cost 0 CPU and 0 bytes; streaming appends are `O(batch)` instead of `O(n log n)` |
-| **AoS shared-scan & complement reduction** | Interleaved cache-line AoS `Float64Array` metric buffers (`src/columnar-reduce.js`), multi-group shared-scan co-scheduler (`_flushGroups`, up to 5 groups + KPI in a single pass via V8-friendly leaf kernels), Copy-on-Write unfiltered snapshot cache, and complement ("subtract-from-total") reduction when `> 50%` of rows remain active (with `\|v\| > 1e12` cancellation guards and exact empty-slot zeroing) | Clearing filters back to 100% is `O(slots)` (**9× faster** at 100K, **78× faster** at 1M); high-selectivity filters (90–95%) scan only the 5–10% excluded rows (**2–3.3× faster**); multi-chart clicks scan active rows once instead of once per chart |
-| **Falcon-style brush cache** | Automatic precomputed active-dimension 1D prefix-sum cubes (`src/falcon-brush.js`) activated on the 2nd consecutive `filterRange`/`filterExact` on the same dimension — discrete `O(slots)` prefix subtraction (`U ≤ 2048`) and continuous 256-bin quantile prefix cubes + CSR boundary bins (`U > 2048`) with deferred bitset materialization | Delivers **< 0.03 ms/frame** discrete brushing (**20× faster** at 100K, **240× faster** at 1M) and **1.6 ms/frame** continuous float brushing at 1M rows — smooth 60fps range sliders with zero overhead on single clicks |
-| **Aggregation** | Declarative KPIs (`count`, `sum`, `avg`, `avgNonZero`, `ratio`), declarative groups with time bucketing (`minute`/`hour`/`day`/`week`/`month`), dense & sparse split-field groups for nested aggregates keyed by a secondary dimension, incremental group updates on append | One config object replaces dozens of imperative `dimension().group().reduce()` chains |
-| **Worker runtime** | `createStreamingDashboardWorker` owns fetch → decode → filter → reduce → postMessage with Transferable typed-array buffers (zero-copy back to main thread); `createDashboardRuntime` for synchronous fallback; single `query()` round-trip returns filters + snapshot + paged rows + optional `rowCount` and `bounds` | The main thread only renders; structured-clone overhead is eliminated for the largest payloads (column arrays) |
-| **Query model** | Declarative filters (`exact`, `in`, `range`), `isolatedFilters` for within-group filtering without affecting global state, `rowSets` for multiple named row slices per query, `bounds` queries for min/max, ad-hoc `groups` queries | One postMessage round-trip replaces what would otherwise be 4–8 separate calls |
-| **Progressive UI** | Partial snapshot emission during streaming load (throttled at 250ms default), separate fetch-percent and rows-loaded progress events (throttled at 100ms) | Charts and KPIs appear within seconds even on million-row datasets |
-| **Live mutation** | `append()` / `appendColumns()` slot new rows into existing lazy indexes incrementally; `removeFiltered()` compacts columns and bitsets safely and invalidates caches | Dashboards stay live without full rebuild |
-| **Instance extensions** | `cf.batch(fn)` for atomic multi-dimension filter updates, `cf.allFilteredIndexes()`, `cf.isElementFiltered(index)`, `cf.takeColumns(indexes, fields)`, `dim.topIndex()`/`dim.bottomIndex()`, `cf.configureRuntime()` / `cf.runtimeInfo()` | Columnar extraction, zero-copy sorting, and atomic multi-filter transitions without materializing rows |
+## Why crossfilter3?
 
-The original crossfilter API (`cf.dimension()`, `group.all()`, etc.) is fully preserved — everything above is additive.
+- **Sub-millisecond interactive queries at 100K–1M+ rows** — multi-chart clicks run in `0.4–2.6 ms`, clearing filters takes `0.23 ms`, discrete brushing runs at `< 0.03 ms/frame`, and continuous float brushing runs at `0.39 ms/frame` steady-state at 1M rows.
+- **Zero-copy columnar ingest & unlimited dimensions** — ingest TypedArrays, Apache Arrow tables/IPC streams, or plain JS arrays without allocating row objects; per-dimension 1-bit bitsets remove crossfilter2's 32-dimension limit.
+- **Declarative dashboard runtime** — configure KPIs (`count`, `sum`, `avg`, `avgNonZero`, `ratio`), grouped charts, time bucketing, split-field breakdowns, top-K group queries, bounds, and paged columnar rows in a single `query()` call.
+- **Non-blocking Arrow IPC Web Worker** — streams, decodes, joins lookup tables, and emits progressive partial snapshots off the main thread, returning Transferable TypedArray buffers zero-copy.
+- **Drop-in `crossfilter2` compatible** — existing `cf.dimension()`, `group()`, and `reduce()` code works unchanged, with bundled TypeScript definitions (`index.d.ts`) and ESM, CommonJS, and UMD builds (~64 kB min+gzip).
 
-### Performance and memory characteristics
+## Performance at a glance
 
-#### Measured dashboard benchmarks (Node.js v22, built `crossfilter.cjs`)
+Measured on Node.js v22 using the built `crossfilter.cjs` bundle on a multi-chart dashboard (**6 groups × 4 metrics**: `count`, `sum(revenue)`, `sum(cost)`, `ratio(clicks, impressions)` + KPIs; 5,000 SKUs, 365 days, and continuous floats):
 
-Median timings across a multi-chart dashboard (6 groups × 4 metrics: `count`, `sum(revenue)`, `sum(cost)`, `ratio(clicks, impressions)` + KPIs; 5K high-cardinality SKUs + 365 days + continuous floats):
-
-| Workload | 100K rows | 1M rows | Primary mechanism |
-|----------|-----------|---------|-------------------|
-| Build + initial snapshot (6 dims, 6 groups) | **12.2 ms** | **108.7 ms** | Lazy encoding + AoS shared-scan |
-| Build + initial snapshot (20 dims, 4 groups) | **5.9 ms** | **59.7 ms** | Lazy filter-only dimensions (zero upfront work for unused dims) |
-| Single-dim click (10% active) + full snapshot | **0.44 ms** | **2.63 ms** | 1-bit `clz32` sparse scan + AoS multi-group co-scan |
-| Clear filter → 100% + full snapshot | **0.23 ms** | **0.23 ms** | Copy-on-Write unfiltered snapshot cache (`O(slots)`) |
+| Workload | 100K rows | 1M rows | How it stays fast |
+| --- | ---: | ---: | --- |
+| Build + initial snapshot (6 dims, 6 groups) | **12.2 ms** | **108.7 ms** | Columnar dictionary encoding + AoS shared-scan |
+| Build + initial snapshot (20 dims, 4 groups) | **5.9 ms** | **59.7 ms** | Lazy filter-only dims (0 CPU / 0 bytes until used) |
+| Single-dim click (10% active) + full snapshot | **0.44 ms** | **2.63 ms** | 1-bit `clz32` sparse scan + multi-group co-scan |
+| Clear filter → 100% + full snapshot | **0.23 ms** | **0.23 ms** | Copy-on-Write unfiltered snapshot restore (`O(slots)`) |
 | High-selectivity 95% (`in` 19/20) + clear | **0.68 ms** | **2.68 ms** | Complement subtraction (scans only 5% excluded rows) |
 | Low-selectivity 0.5% (2 active dims) + clear | **0.78 ms** | **3.83 ms** | 1-bit `AND` + `clz32` extraction + shared-scan |
-| Cold `rowCount()` after 2-dim filter change | **0.18 ms** | **1.72 ms** | SWAR `popcount32` over 1-bit bitsets |
-| Discrete range brush (60 frames, steady-state) | **0.026 ms/frame** | **0.021 ms/frame** | Falcon 1D prefix-sum cube (`O(slots)`, 0 row scans) |
-| Continuous float range brush (60 frames, `revenue`) | **0.26 ms/frame** | **1.61 ms/frame** | Falcon 256-bin quantile prefix cube + CSR boundary bins |
+| `rowCount()` alone / with 2-dim filter update | **0.01 / 0.18 ms** | **0.05 / 1.72 ms** | SWAR `popcount32` over 1-bit filter words |
+| Discrete range brush (steady-state per frame) | **0.026 ms/f** | **0.021 ms/f** | Falcon 1D prefix-sum cube (`O(slots)`, 0 row scans) |
+| Continuous float brush (steady-state / 60f avg) | **0.20 / 0.26 ms/f** | **0.39 / 1.61 ms/f** | Falcon 256-bin quantile prefix cube + CSR boundary bins |
 
-#### Memory footprint per dimension
-
-| Component | Size for N rows | Example (100K rows) | Notes |
-|-----------|----------------|---------------------|-------|
-| Unused filter-only dimension | **0 bytes** | **0 KB** | Deferred until first filter, group, bounds, or sort access |
-| Active filter bitset (1 bit/row) | `N / 8` bytes | **12.5 KB** | Allocated only while a dimension has an active filter; 0 bytes when unfiltered; **no 32-dimension limit** |
-| Encoded `codes` (`Uint32Array`) | `4 × N` bytes | 400 KB | Grows 2× amortized on streaming appends |
-| `codeCounts` (`Uint32Array`) | `4 × U` bytes | 4 KB (1K distinct) | Maintained incrementally on append |
-| `codeToValue` (`Array`) | `~50 × U` bytes | 50 KB (1K distinct) | Shared with `splitField` when field matches a dimension |
-| Raw numeric column (`Float64Array`) | `0 bytes` extra | **0 KB** | Zero-copy shared view for single-batch TypedArray/Arrow float64 columns |
-
-#### Row materialization savings
-
-In upstream crossfilter, every record is a JS object from the start. In crossfilter3, columnar ingest creates Proxy-backed arrays — rows materialize only on access.
-
-| Scenario | Upstream (all rows as objects) | Crossfilter3 (columnar + lazy) | Savings |
-|----------|-------------------------------|--------------------------------|---------|
-| 10K rows, 20 fields, 50 visible | ~5 MB (10K objects × ~500 bytes) | ~25 KB (50 objects) + columnar arrays already in memory | ~5 MB heap, ~10K fewer GC objects |
-| 100K rows, 20 fields, 50 visible | ~50 MB | ~25 KB + columnar | ~50 MB heap |
-| 1M rows, 20 fields, 100 visible | ~500 MB | ~50 KB + columnar | ~500 MB heap |
-
-The columnar arrays themselves (one typed/string array per field) are the same size either way — the saving is entirely in not creating N row objects with N × fields property slots.
-
-#### Append performance (lazy path)
-
-| Operation | Upstream | Crossfilter3 (lazy encoded) | Why |
-|-----------|----------|-----------------------------|-----|
-| Append 10K rows to 90K | O(n log n) re-sort + full reduce | O(m) codes extension + incremental `codeCounts` | Codes buffer grows 2× amortized; existing sorted indexes untouched; unused dims stay deferred |
-| `groupAll` after append | O(n) full scan | O(m) incremental scalar update | Singleton groups skip sorted-key rebuild |
+> Compared to pre-columnar `crossfilter3@3.0.3` on the exact same 100K-row suite (identical numeric digests), single/multi-dim clicks are **190×–605× faster**, clear-to-100% is **451× faster**, dashboard init is **13×–27× faster**, and discrete brushing is **120× faster** (over 1,000× faster at 1M rows). See [Under the hood](#under-the-hood) for architecture and memory details.
 
 ## Installation
+
+```bash
+npm install crossfilter3
+```
+
+If you stream or ingest Apache Arrow tables/IPC, install `apache-arrow` alongside it (optional — not required for TypedArray columns or JS object arrays):
 
 ```bash
 npm install crossfilter3 apache-arrow
 ```
 
-The streaming worker needs UMD bundles of both libraries available at public HTTP URLs. In a **Next.js** project, copy them into `public/` with a postinstall script:
+<details>
+<summary><strong>Browser Web Worker setup (Next.js / Vite / static hosting)</strong></summary>
+
+`createStreamingDashboardWorker` loads UMD bundles inside the worker via `importScripts` (unless you supply a custom `workerFactory`). Copy the UMD builds into your static assets directory (e.g. `public/vendor/`):
 
 ```json
-// package.json
 {
   "scripts": {
     "postinstall": "mkdir -p public/vendor && cp node_modules/crossfilter3/crossfilter.js public/vendor/ && cp node_modules/apache-arrow/Arrow.es2015.min.js public/vendor/"
@@ -87,17 +61,91 @@ The streaming worker needs UMD bundles of both libraries available at public HTT
 }
 ```
 
-Then reference them as absolute paths:
+Then pass `/vendor/crossfilter.js` and `/vendor/Arrow.es2015.min.js` as `crossfilterUrl` and `arrowRuntimeUrl`.
 
-```js
-const runtime = await crossfilter.createStreamingDashboardWorker({
-  crossfilterUrl: '/vendor/crossfilter.js',
-  arrowRuntimeUrl: '/vendor/Arrow.es2015.min.js',
-  // ...
-});
-```
+</details>
 
 ## Quick start
+
+### 1. Columnar dashboard runtime (zero dependencies, browser or Node.js)
+
+Pass column arrays directly — no row objects, no Arrow dependency, and instant sub-millisecond cross-filtering:
+
+```js
+import crossfilter from 'crossfilter3';
+
+const day = (n) => Date.UTC(2025, 0, 1 + n);
+
+const runtime = crossfilter.createDashboardRuntime({
+  columns: {
+    country: ['US', 'UK', 'US', 'DE', 'US', 'UK'],
+    channel: ['web', 'app', 'app', 'web', 'web', 'web'],
+    time: new Float64Array([day(0), day(0), day(1), day(1), day(2), day(2)]),
+    revenue: new Float64Array([120, 80, 95, 60, 210, 150]),
+    clicks: new Int32Array([12, 8, 9, 4, 21, 15]),
+    impressions: new Int32Array([200, 160, 150, 100, 300, 250]),
+  },
+  // Filter-only dimensions stay deferred (0 cost) until actually filtered or queried
+  dimensions: ['country', 'channel', 'time', 'revenue'],
+  kpis: [
+    { id: 'orders', op: 'count' },
+    { id: 'revenue', field: 'revenue', op: 'sum' },
+    // Re-derived locally as sum(clicks) / sum(impressions) on every filter
+    { id: 'ctr', field: 'clicks', denominator: 'impressions', op: 'ratio' },
+  ],
+  groups: [
+    {
+      id: 'byCountry',
+      field: 'country',
+      metrics: [
+        { id: 'orders', op: 'count' },
+        { id: 'revenue', field: 'revenue', op: 'sum' },
+      ],
+    },
+    {
+      id: 'timelineByChannel',
+      field: 'time',
+      bucket: { type: 'timeBucket', granularity: 'day' },
+      splitField: 'channel',
+      metrics: [{ id: 'revenue', field: 'revenue', op: 'sum' }],
+    },
+  ],
+});
+
+// Single atomic query: apply filters + read KPIs, shaped groups, bounds, rowCount, and paged rows
+const res = runtime.query({
+  filters: {
+    country: { type: 'in', values: ['US', 'UK'] },
+    time: { type: 'range', range: [day(0), day(2)] },
+  },
+  snapshot: {
+    groups: {
+      byCountry: { sort: 'desc', sortMetric: 'revenue', limit: 10, visibleOnly: true, includeTotals: true },
+    },
+  },
+  bounds: { fields: ['revenue'] },
+  rowCount: true,
+  rows: {
+    sortBy: 'revenue',
+    direction: 'top',
+    limit: 50,
+    fields: ['country', 'channel', 'revenue'],
+    columnar: true, // returns TypedArray/column slices instead of JS row objects
+  },
+});
+
+res.snapshot.kpis;                 // { orders: 3, revenue: 295, ctr: 0.05686... }
+res.snapshot.groups.byCountry;     // { entries: [...], total: 3, sort: 'desc', ... } (ignores country's own filter)
+res.bounds.revenue;                // { min: 80, max: 120 }
+res.rowCount;                      // 3
+res.rows;                          // { fields: [...], length: 3, columns: { country: [...], ... } }
+
+runtime.dispose();
+```
+
+### 2. Streaming Apache Arrow IPC in a Web Worker
+
+Stream large Arrow IPC responses directly inside a Web Worker with progressive snapshots and zero-copy Transferable payloads back to the main thread:
 
 ```js
 import crossfilter from 'crossfilter3';
@@ -105,21 +153,14 @@ import crossfilter from 'crossfilter3';
 const runtime = await crossfilter.createStreamingDashboardWorker({
   crossfilterUrl: '/vendor/crossfilter.js',
   arrowRuntimeUrl: '/vendor/Arrow.es2015.min.js',
-  wasm: true,
   emitSnapshots: true,
   batchCoalesceRows: 65536,
 
-  // Declare filterable fields (use post-projection names)
   dimensions: ['event', 'country', 'region', 'time'],
-
-  // Global aggregate metrics
   kpis: [
     { id: 'count', field: 'count', op: 'sum' },
-    // A rate re-derived locally from two summed components on every filter:
     { id: 'hitRate', field: 'hits', denominator: 'attempts', op: 'ratio' },
   ],
-
-  // Pre-computed group-by aggregations for charts
   groups: [
     { id: 'byEvent', field: 'event', metrics: [{ id: 'count', field: 'count', op: 'sum' }] },
     { id: 'byCountry', field: 'country', metrics: [{ id: 'count', field: 'count', op: 'sum' }] },
@@ -130,8 +171,6 @@ const runtime = await crossfilter.createStreamingDashboardWorker({
       metrics: [{ id: 'count', field: 'count', op: 'sum' }],
     },
   ],
-
-  // Arrow IPC source (fetched inside the worker)
   sources: [{
     id: 'primary',
     role: 'base',
@@ -139,21 +178,11 @@ const runtime = await crossfilter.createStreamingDashboardWorker({
     dataFetchInit: {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        format: 'arrow',
-        query: {
-          dimensions: ['events.country', 'events.event', 'events.region'],
-          measures: ['events.count'],
-          timeDimensions: [{ dimension: 'events.timestamp', granularity: 'month' }],
-          timezone: 'UTC',
-          limit: 1000000,
-        },
-      }),
+      body: JSON.stringify({ format: 'arrow', query: { /* ... */ } }),
     },
     projection: {
       rename: {
         'events.count': 'count',
-        'events__count': 'count',
         'events__timestamp_month': 'time',
         'events.event': 'event',
         'events.country': 'country',
@@ -166,16 +195,9 @@ const runtime = await crossfilter.createStreamingDashboardWorker({
     },
   }],
 });
-```
 
-## Progress and streaming snapshots
-
-While data loads, the worker emits progress and partial snapshots so the UI can render progressively:
-
-```js
 runtime.on('progress', (progress) => {
-  console.log(progress.status, progress.load.rowsLoaded, 'rows');
-  console.log(progress.fetch.percent, '% downloaded');
+  console.log(progress.status, progress.load.rowsLoaded, 'rows', progress.fetch.percent, '%');
 });
 
 runtime.on('snapshot', ({ snapshot }) => {
@@ -184,13 +206,7 @@ runtime.on('snapshot', ({ snapshot }) => {
 });
 
 await runtime.ready;
-```
 
-## Querying with filters
-
-After load, send declarative filters and get back pre-computed aggregations plus paged row data in a single worker round-trip:
-
-```js
 const result = await runtime.query({
   filters: {
     country: { type: 'in', values: ['US', 'UK'] },
@@ -200,180 +216,249 @@ const result = await runtime.query({
     sortBy: 'time',
     direction: 'top',
     limit: 50,
-    offset: 0,
     fields: ['event', 'country', 'region', 'time', 'count'],
+    columnar: true,
   },
 });
-
-result.snapshot.kpis;              // { count: 54321 }
-result.snapshot.groups.byEvent;    // [{ key: 'click', value: { count: 30000 } }, ...]
-result.snapshot.groups.timeline;   // [{ key: 1704067200000, value: { count: 12000 } }, ...]
-result.rows;                       // columnar row data for the table
 ```
 
-### Filter types
+> **Tip:** Send categorical columns as **Arrow Dictionary** vectors whenever your backend supports it — `crossfilter3` ingests Arrow Dictionary codes directly without JS string hashing, cutting 1M-row load time by ~3×.
 
-```js
-// Exact match
-{ type: 'exact', value: 'click' }
-
-// Set membership
-{ type: 'in', values: ['click', 'view', 'purchase'] }
-
-// Range (inclusive lower, exclusive upper)
-{ type: 'range', range: [startMs, endMs] }
-
-// Clear filter on a field
-null
-```
-
-## Live data mutation
-
-Append rows or remove filtered records without rebuilding the runtime:
-
-```js
-await runtime.append([
-  { event: 'click', country: 'US', region: 'CA', time: Date.now(), count: 1 },
-]);
-
-await runtime.removeFiltered('excluded');
-```
-
-## Synchronous fallback (no worker)
-
-For smaller datasets or environments where workers are unavailable:
+### 3. Synchronous Arrow table or classic crossfilter API
 
 ```js
 import crossfilter from 'crossfilter3';
 import { tableFromIPC } from 'apache-arrow';
 
-const buffer = await fetch('/data/result.arrow').then(r => r.arrayBuffer());
-const table = tableFromIPC(new Uint8Array(buffer));
-
+// Synchronous Arrow table runtime (no worker)
+const table = tableFromIPC(new Uint8Array(arrowBuffer));
 const runtime = crossfilter.createDashboardRuntime({
   table,
-  wasm: true,
   dimensions: ['country', 'event', 'time'],
-  groups: [
-    { id: 'byCountry', field: 'country', metrics: [{ id: 'count', op: 'count' }] },
-  ],
+  groups: [{ id: 'byCountry', field: 'country', metrics: [{ id: 'count', op: 'count' }] }],
   kpis: [{ id: 'total', op: 'count' }],
 });
-
-const snapshot = runtime.snapshot({
-  country: { type: 'in', values: ['US'] },
-});
+const snap = runtime.snapshot({ country: { type: 'in', values: ['US'] } });
 ```
-
-## Classic crossfilter API
-
-The original crossfilter API is still fully available:
 
 ```js
 import crossfilter from 'crossfilter3';
 
-const cf = crossfilter(records);
+// Classic crossfilter2 API + columnar & batch extensions
+const cf = crossfilter.fromColumns(columns); // or crossfilter(records)
 const country = cf.dimension('country');
-country.filterIn(['US', 'UK']);
-const group = country.group().reduceCount();
-console.log(group.all());
+const revenue = cf.dimension('revenue');
+const byCountry = country.group().reduceCount();
+
+// Atomic multi-dimension filter transition (coalesces listener updates)
+cf.batch(() => {
+  country.filterIn(['US', 'UK']);
+  revenue.filterRange([100, 500]);
+});
+
+const topIndexes = revenue.topIndex(20);
+const topCols = cf.takeColumns(topIndexes, ['country', 'revenue']);
 ```
 
-## Configuration reference
+## Querying, filtering, and live mutations
+
+### Declarative filter types
+
+```js
+{ type: 'exact', value: 'click' }               // exact match
+{ type: 'in', values: ['click', 'purchase'] }   // set membership
+{ type: 'range', range: [startMs, endMs] }      // half-open [min, max)
+{ type: 'all' } // or null                      // clear filter on this field
+```
+
+### Advanced `query()` capabilities
+
+A single `runtime.query(...)` call can combine:
+
+- **`filters`** — updates active global filters before reading results.
+- **`isolatedFilters`** — evaluates the query under a temporary filter state without mutating the dashboard's active filters (useful for comparison cards or drill-down previews).
+- **`snapshot`** — `{ groups: { [groupId]: GroupQuery | false } }` to shape/paginate specific groups, or `false` to skip snapshots entirely.
+- **`groups`** — ad-hoc shaped group reads without recomputing KPIs.
+- **`rows`** / **`rowSets`** — single or multiple named paged row slices; pass `columnar: true` for zero-copy `{ columns, fields, length }` output (omitting `columnar` returns an array of row objects).
+- **`bounds`** — `{ fields: ['revenue', 'time'] }` returns `{ min, max }` across currently filtered rows.
+- **`rowCount: true`** — returns the exact filtered row count via SWAR popcount.
+
+### Live data mutation
+
+Append new rows or prune filtered records without rebuilding the runtime:
+
+```js
+// Async worker runtime
+await runtime.append([
+  { event: 'click', country: 'US', region: 'CA', time: Date.now(), count: 1 },
+]);
+await runtime.removeFiltered('excluded'); // or 'included'
+
+// Sync runtime also supports zero-copy columnar & Arrow appends
+runtime.appendColumns(nextColumns);
+runtime.appendArrowTable(nextArrowTable);
+```
+
+## Configuration & API reference
+
+### `createDashboardRuntime(options)`
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `columns` | `Record<string, ColumnSource>` | — | Columnar arrays / TypedArrays (mutually exclusive with `table`, `records`) |
+| `table` | `ArrowTableLike` | — | Apache Arrow `Table` (mutually exclusive with `columns`, `records`) |
+| `records` | `TRecord[]` | — | Plain JS row objects (mutually exclusive with `columns`, `table`) |
+| `columnarOptions` | `ColumnarOptions` | — | Optional `{ fields, length, transforms, rowFactory }` |
+| `dimensions` | `string[]` | `[]` | Filterable field names (group fields are added automatically) |
+| `groups` | `DashboardGroupSpec[]` | `[]` | Declarative group-by specs (see below) |
+| `kpis` | `DashboardMetricSpec[]` | `[]` | Global aggregate metric specs (see below) |
+| `wasm` | `boolean` | `true` | Enable inline WASM filter acceleration where applicable |
 
 ### `createStreamingDashboardWorker(options)`
 
-| Option | Type | Description |
-|--------|------|-------------|
-| `crossfilterUrl` | `string` | URL to the UMD build (`crossfilter.js`) |
-| `arrowRuntimeUrl` | `string` | URL to Apache Arrow UMD (`Arrow.es2015.min.js`) |
-| `sources` | `Array` | Arrow IPC data sources (see below) |
-| `dimensions` | `string[]` | Field names to create filterable dimensions on |
-| `groups` | `Array` | Declarative group-by specs |
-| `kpis` | `Array` | Global aggregate metric specs |
-| `wasm` | `boolean` | Enable WASM-accelerated filter scans (default `true`) |
-| `emitSnapshots` | `boolean` | Emit partial snapshots during streaming load |
-| `batchCoalesceRows` | `number` | Buffer this many rows before flushing to the runtime (default `65536`) |
-| `maxRows` | `number` | Optional positive safe integer limiting total input rows across base and lookup sources, checked before projection/ingestion |
-| `maxBytes` | `number` | Optional positive safe integer limiting total encoded input bytes across sources, checked before decoding; bounded fetches require a readable response body |
-| `progressThrottleMs` | `number` | Min interval between progress events (default `100`) |
-| `snapshotThrottleMs` | `number` | Min interval between snapshot events (default `250`) |
-| `workerFactory` | `() => Worker` | Custom worker factory (skips `importScripts` entirely) |
+Accepts `dimensions`, `groups`, `kpis`, and `wasm` above, plus:
 
-### Source spec
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `crossfilterUrl` | `string` | — | URL to the UMD build (`crossfilter.js`) |
+| `arrowRuntimeUrl` | `string` | — | URL to Apache Arrow UMD (`Arrow.es2015.min.js`) |
+| `sources` | `DashboardStreamSource[]` | — | Arrow IPC base and lookup sources (see below) |
+| `emitSnapshots` | `boolean` | `false` | Emit throttled partial snapshots during streaming load |
+| `initialFilters` | `DashboardFilterState` | `null` | Filters applied as batches stream in |
+| `batchCoalesceRows` | `number` | `65536` | Rows buffered before flushing a coalesced batch into crossfilter |
+| `maxRows` | `number` | — | Optional positive safe integer cap across base and lookup sources (checked before projection/ingest) |
+| `maxBytes` | `number` | — | Optional positive safe integer cap on encoded input bytes (bounded fetches require a readable body) |
+| `progressThrottleMs` | `number` | `100` | Minimum interval between `'progress'` events |
+| `snapshotThrottleMs` | `number` | `250` | Minimum interval between streaming `'snapshot'` events |
+| `workerFactory` | `() => Worker` | — | Custom worker factory (skips `importScripts`) |
+
+### Source spec (`sources[]`)
 
 | Field | Type | Description |
-|-------|------|-------------|
+| --- | --- | --- |
 | `id` | `string` | Unique source identifier |
-| `role` | `'base' \| 'lookup'` | One base source required; lookups are joined in the worker |
+| `role` | `'base' \| 'lookup'` | One `'base'` source required; `'lookup'` sources are joined in the worker |
 | `dataUrl` | `string` | URL to fetch the Arrow IPC stream |
-| `dataFetchInit` | `RequestInit` | Fetch options (method, headers, body) |
-| `arrowBuffer` | `ArrayBuffer` | Pre-loaded Arrow buffer (alternative to `dataUrl`) |
-| `projection.rename` | `Record<string, string>` | Rename Arrow columns to internal field names |
-| `projection.transforms` | `Record<string, string>` | Type coercion: `'timestampMs'`, `'number'`, `'boolean'` (`'true'`, `'false'` or null), `'constantOne'` |
+| `dataFetchInit` | `RequestInit` | Fetch options (`method`, `headers`, `body`, etc.) |
+| `arrowBuffer` | `ArrayBuffer \| ArrayBufferView` | Pre-loaded Arrow IPC buffer (alternative to `dataUrl`) |
+| `lookup` | `{ keyFields: string[], valueFields: string[] }` | Join keys and columns to attach for `'lookup'` sources |
+| `projection.rename` | `Record<string, string>` | Rename incoming Arrow columns to internal field names |
+| `projection.transforms` | `Record<string, Transform>` | Coerce columns: `'timestampMs'`, `'number'`, `'boolean'` (`'true'`/`'false'`/`null`), `'constantOne'` |
 
-### Metric spec
+### Group spec (`groups[]`)
 
 | Field | Type | Description |
-|-------|------|-------------|
-| `id` | `string` | Key in the result (`snapshot.kpis[id]`, `group.value[id]`) |
-| `field` | `string` | Column to aggregate (not needed for `'count'`); the **numerator** column for `'ratio'` |
-| `op` | `string` | `'count'`, `'sum'`, `'avg'`, `'avgNonZero'`, `'ratio'` |
-| `denominator` | `string` | Required for `'ratio'`: the column summed as the divisor |
+| --- | --- | --- |
+| `id` | `string` | Group identifier in `snapshot.groups[id]` (defaults to `group_<index>`) |
+| `field` | `string` | Dimension field to group by |
+| `bucket` | `{ type: 'timeBucket', granularity: 'minute' \| 'hour' \| 'day' \| 'week' \| 'month' }` | Optional UTC time bucketing |
+| `splitField` | `string` | Optional secondary dimension producing nested `{ [splitKey]: metrics }` values |
+| `metrics` | `DashboardMetricSpec[]` | Metrics computed per bucket (defaults to row count) |
+| `sortMetric` | `string` | Default metric ID used when sorting this group |
 
-**`ratio`** sums the `field` (numerator) and the `denominator` independently and
-finalizes to `sum(field) / sum(denominator)` (or `null` when the denominator
-sums to zero). Because both components are re-summed on every filter, a rate or
-an average can be re-derived from pre-aggregated rows entirely client-side —
-no re-query. An average is just `{ op: 'ratio', field: <sum-of-x>, denominator:
-<count> }`; a rate is `{ op: 'ratio', field: <numerator-count>, denominator:
-<base-count> }`. The two component columns must themselves be summable.
+### Group query options (`snapshot.groups[id]` / `runtime.groups()`)
 
-### Async runtime methods
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `sort` | `'desc' \| 'asc' \| 'natural'` | `'desc'` | Sort by `sortMetric` or natural key order |
+| `sortMetric` | `string` | group default | Metric ID used for `'asc'`/`'desc'` ordering |
+| `limit` | `number \| null` | `null` | Max entries returned (uses top-K min/max heap when smaller than cardinality) |
+| `offset` | `number` | `0` | Pagination offset |
+| `visibleOnly` | `boolean` | `false` | Exclude buckets with zero contributing rows |
+| `includeTotals` | `boolean` | `false` | Include `total` count of matching buckets before pagination |
+| `nonEmptyKeys` | `boolean` | `false` | Exclude `null`, `undefined`, and `""` keys |
+| `keys` | `Array` | — | Restrict output to an allowlist of keys |
+| `includeKeys` | `Array` | — | Always include these keys even if outside `limit` (e.g. currently selected items) |
+| `search` | `string` | — | Case-insensitive substring filter on bucket keys |
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `runtime.ready` | `Promise<Progress>` | Resolves when all data is loaded |
-| `runtime.on(event, fn)` | `() => void` | Subscribe to `'progress'`, `'snapshot'`, `'error'` |
-| `runtime.query(request)` | `Promise<{ snapshot, rows }>` | Apply filters, return aggregations + row page |
-| `runtime.snapshot(filters)` | `Promise<Snapshot>` | Aggregations only, no row data |
-| `runtime.rows(query)` | `Promise<RowResult>` | Paged row data only |
-| `runtime.updateFilters(filters)` | `Promise` | Update filters without reading results |
-| `runtime.append(records)` | `Promise<number>` | Add rows, returns new dataset size |
-| `runtime.createGroup(spec)` | `Promise<string>` | Add a group at runtime, returns its ID |
-| `runtime.disposeGroup(id)` | `Promise<void>` | Remove a dynamically created group |
-| `runtime.removeFiltered(selection)` | `Promise<number>` | Remove `'included'` or `'excluded'` rows |
-| `runtime.bounds(request)` | `Promise` | Get min/max for fields |
-| `runtime.groups(request)` | `Promise` | Ad-hoc group queries |
-| `runtime.dispose()` | `Promise` | Terminate the worker |
+### Metric spec (`kpis[]` / `group.metrics[]`)
 
-## Architecture
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Output key (`snapshot.kpis[id]`, `entry.value[id]`) |
+| `op` | `'count' \| 'sum' \| 'avg' \| 'avgNonZero' \| 'ratio'` | Aggregation operator |
+| `field` | `string` | Numeric column to aggregate (omitted for `'count'`; numerator for `'ratio'`) |
+| `denominator` | `string` | Required for `'ratio'`: numeric column summed as the divisor |
 
+> **`ratio` metrics** sum `field` and `denominator` independently and finalize to `sum(field) / sum(denominator)` (or `null` when the denominator is `0`). Rates and weighted averages re-derive accurately from pre-aggregated rows entirely client-side on every filter with no server re-query.
+
+### Runtime methods
+
+All methods below exist on both `DashboardRuntime` (synchronous return) and `AsyncDashboardRuntime` (returns `Promise<...>`):
+
+| Method | Description |
+| --- | --- |
+| `query(request)` | Apply filters (or `isolatedFilters`), return `{ snapshot, rows, rowSets, groups, bounds, rowCount }` |
+| `snapshot(filters?, options?)` | Compute KPIs and groups without fetching row pages |
+| `groups(request?)` | Read/shape one or more groups directly |
+| `rows(query?)` / `rowSets(request?)` | Fetch single or multiple named paged row slices (object or columnar) |
+| `bounds(request?)` | Compute `{ min, max }` over active rows for requested fields |
+| `rowCount(request?)` | Return active row count |
+| `updateFilters(filters?)` | Update active filters without reading results |
+| `reset()` | Clear all active filters |
+| `append(records)` | Append JS row objects and return new dataset size *(sync also exposes `appendColumns`, `appendArrowTable`)* |
+| `removeFiltered(selection?)` | Remove `'included'` or `'excluded'` rows and return new dataset size |
+| `createGroup(spec)` / `disposeGroup(id)` | Add or remove a group dynamically at runtime |
+| `runtimeInfo()` | Inspect active runtime acceleration (`{ active, wasmEnabled, wasmSupported, lastError }`) |
+| `dispose()` | Release listeners/caches (and terminate the Web Worker for async runtimes) |
+| `ready` / `on(event, fn)` *(streaming worker)* | Promise resolving on load complete; subscribe to `'progress'`, `'snapshot'`, `'ready'`, `'error'` |
+
+## Under the hood
+
+### Architecture
+
+```text
+Arrow IPC / TypedArray columns / JS records
+    │
+    ▼  (optional Web Worker: fetch → Arrow RecordBatchReader → coalesced batch + lookup join)
+Columnar Store (zero-copy Float64Array views + lazy Proxy row array)
+    │
+    ├──► Lazy Filter-Only Dimensions      (0 work until first filter / group / bounds / sort)
+    ├──► 1-Bit Columnar Filter Bitsets    (N/8 B per active filter, no 32-dim cap, clz32 + SWAR popcount)
+    ├──► Falcon Prefix-Sum Brush Cache    (auto on 2nd consecutive range/exact brush, discrete & continuous)
+    └──► AoS Multi-Group Co-Scheduler     (interleaved Float64Array, up to 5 groups + KPI in 1 pass,
+                                           CoW unfiltered cache + complement subtraction when >50% active)
+    │
+    ▼  (postMessage with Transferable TypedArrays in worker mode)
+UI / Charts (renders snapshots & columnar row slices only)
 ```
-Arrow IPC source (Cube.dev, file, etc.)
-    |
-    v  HTTP streaming response
-Web Worker (owns fetch, decode, crossfilter instance)
-    |  Apache Arrow RecordBatchReader
-    |  Incremental batch append with projection/rename/transforms
-    |  Lazy filter-only dims + 1-bit columnar filter bitsets (clz32 + SWAR popcount)
-    |  AoS multi-group co-scan + CoW unfiltered/complement cache + Falcon brush cubes
-    v
-Declarative filters in, snapshots + row slices out
-    |
-    v  postMessage with Transferable buffers
-Main thread (renders UI only)
-```
 
-## Development
+### Key engine optimizations
+
+1. **1-bit columnar filter bitsets** — Each *active* filter owns a packed `Uint32Array` (1 bit/row, bit `1` = included); clearing a filter is `O(1)`. Sparse row extraction uses `Math.clz32` bit-scanning, `rowCount()` uses branchless SWAR `popcount32`, and there is **no 32-dimension limit**.
+2. **Copy-on-Write unfiltered cache + complement subtraction** — Unfiltered group buffers are cached copy-on-write (zero copy during unfiltered streaming appends). Clearing back to 100% is an `O(slots)` restore. When `> 50%` of rows remain active, groups restore the unfiltered cache and subtract only excluded rows, guarded against floating-point cancellation (`abs(v) > 1e12`) and with exact empty-slot zeroing so zero-row buckets never leak FP dust or ghost split keys.
+3. **Interleaved AoS buffers + multi-group co-scan** — All metrics for a group slot live contiguously on one cache line in a single `Float64Array`. Dirty groups sharing a metric plan are reduced together (up to 5 groups + KPI per pass) through small specialized leaf kernels for fast V8 JIT tier-up.
+4. **Lazy filter-only dimensions** — Declared filter dimensions on columnar data defer dictionary/numeric indexing across init, snapshots, appends, and `dispose()`, materializing transparently on first real access.
+5. **Falcon-style prefix-sum brush cache** — Activates automatically on the 2nd consecutive `filterRange`/`filterExact` on the same dimension while other filters stay fixed (0 overhead on single clicks). Discrete dimensions (`≤ 2,048` unique values) answer in `O(slots)` with 0 row scans; continuous float dimensions use 256-bin quantile prefix cubes + CSR boundary bins with deferred bitset materialization.
+
+### Memory footprint
+
+| Component | Size for *N* rows | Example (100K rows) | Notes |
+| --- | --- | ---: | --- |
+| Unused filter-only dimension | 0 bytes | **0 KB** | Deferred until first filter, group, bounds, or sort access |
+| Active filter bitset (1 bit/row) | `N / 8` bytes | **12.5 KB** | Allocated only while filtered; 0 KB when unfiltered; unlimited dims |
+| Dictionary `codes` (`Uint32Array`) | `4 × N` bytes | 400 KB | Grows 2× amortized on streaming appends |
+| `codeCounts` + `codeToValue` | `~54 × U` bytes | ~54 KB *(1K distinct)* | Shared with `splitField` when field matches a dimension |
+| Numeric column (`Float64Array`) | 0 bytes extra | **0 KB** | Zero-copy view for single-batch TypedArray / Arrow float64 columns |
+| Row objects (lazy Proxy array) | 0 bytes upfront | **~25 KB** *(50 visible)* | vs. ~50 MB for 100K materialized 20-field JS objects |
+
+## Package entry points
+
+- **ESM:** `import crossfilter from 'crossfilter3'` → `main.js`
+- **CommonJS:** `const crossfilter = require('crossfilter3')` → `crossfilter.cjs`
+- **Browser UMD / CDN:** `crossfilter.js` / `crossfilter.min.js`
+- **TypeScript:** `index.d.ts` (bundled automatically)
+
+## Development & benchmarks
 
 ```bash
 npm install
-npm test          # vitest + eslint src/
-npm run build     # rollup -> crossfilter.js, crossfilter.cjs, crossfilter.min.js
-npm run benchmark
+npm test                # Vitest suite (684 tests incl. differential fuzzing) + ESLint on src/
+npm run build           # Rollup -> crossfilter.js, crossfilter.cjs, crossfilter.min.js
+npm run benchmark       # Built-in 100K classic crossfilter benchmark
+npm run benchmark:arrow # Arrow ingest & columnar benchmark
 ```
 
 ## License
 
-[Apache-2.0](LICENSE). Based on the original [crossfilter](https://github.com/crossfilter/crossfilter) by Mike Bostock and Jason Davies.
+[Apache-2.0](LICENSE). Based on the original [crossfilter](https://github.com/crossfilter/crossfilter) by Mike Bostock and Jason Davies, and [crossfilter2](https://github.com/crossfilter/crossfilter).
