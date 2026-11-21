@@ -1,4 +1,4 @@
-// https://github.com/smartdataHQ/crossfilter v3.2.0 Copyright 2026 Mike Bostock
+// https://github.com/smartdataHQ/crossfilter v3.2.1 Copyright 2026 Mike Bostock
 (function (global, factory) {
   typeof exports === 'object' && typeof module !== 'undefined' ? module.exports = factory() :
   typeof define === 'function' && define.amd ? define(factory) :
@@ -17226,7 +17226,7 @@ self.onmessage = async function(event) {
         : 0x100000000;
   }
 
-  const version = "3.2.0";
+  const version = "3.2.1";
 
   crossfilter.version = version;
 

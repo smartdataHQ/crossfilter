@@ -1,4 +1,4 @@
-// https://github.com/smartdataHQ/crossfilter v3.2.0 Copyright 2026 Mike Bostock
+// https://github.com/smartdataHQ/crossfilter v3.2.1 Copyright 2026 Mike Bostock
 'use strict';
 
 let array8 = arrayUntyped,
@@ -17222,7 +17222,7 @@ function capacity(w) {
       : 0x100000000;
 }
 
-const version = "3.2.0";
+const version = "3.2.1";
 
 crossfilter.version = version;
 
